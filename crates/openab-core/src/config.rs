@@ -1322,6 +1322,15 @@ pub struct TeamsConfig {
     /// Webhook mount path. Env fallback: `TEAMS_WEBHOOK_PATH`
     /// (default `/webhook/teams`).
     pub webhook_path: Option<String>,
+    /// Process-local duplicate suppression window. Env fallback:
+    /// `TEAMS_DEDUPE_TTL_SECS` (default 600 seconds).
+    pub dedupe_ttl_secs: Option<u64>,
+    /// Ephemeral authenticated route lifetime. Env fallback:
+    /// `TEAMS_ROUTE_TTL_SECS` (default 3600 seconds).
+    pub route_ttl_secs: Option<u64>,
+    /// Shared capacity bound for route and dedupe caches. Env fallback:
+    /// `TEAMS_MAX_ROUTE_ENTRIES` (default 10000).
+    pub max_route_entries: Option<usize>,
     /// Explicit flag: true = allow all users, false = check `allowed_users`.
     /// Defaults to `false` (deny-all). Env fallback: `TEAMS_ALLOW_ALL_USERS`.
     pub allow_all_users: Option<bool>,
@@ -1339,6 +1348,9 @@ pub struct ResolvedTeams {
     pub oauth_endpoint: String,
     pub openid_metadata: String,
     pub webhook_path: String,
+    pub dedupe_ttl_secs: u64,
+    pub route_ttl_secs: u64,
+    pub max_route_entries: usize,
     pub allow_all_users: bool,
     pub allowed_users: Vec<String>,
 }
@@ -1363,6 +1375,26 @@ impl TeamsConfig {
                     .collect(),
             }
         };
+        let positive_u64 = |cfg: Option<u64>, env: &str, default: u64| {
+            cfg.filter(|value| *value > 0)
+                .or_else(|| {
+                    std::env::var(env)
+                        .ok()
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .filter(|value| *value > 0)
+                })
+                .unwrap_or(default)
+        };
+        let positive_usize = |cfg: Option<usize>, env: &str, default: usize| {
+            cfg.filter(|value| *value > 0)
+                .or_else(|| {
+                    std::env::var(env)
+                        .ok()
+                        .and_then(|value| value.parse::<usize>().ok())
+                        .filter(|value| *value > 0)
+                })
+                .unwrap_or(default)
+        };
         ResolvedTeams {
             app_id: opt_str(&self.app_id, "TEAMS_APP_ID"),
             app_secret: opt_str(&self.app_secret, "TEAMS_APP_SECRET"),
@@ -1376,6 +1408,13 @@ impl TeamsConfig {
                 }),
             webhook_path: opt_str(&self.webhook_path, "TEAMS_WEBHOOK_PATH")
                 .unwrap_or_else(|| "/webhook/teams".into()),
+            dedupe_ttl_secs: positive_u64(self.dedupe_ttl_secs, "TEAMS_DEDUPE_TTL_SECS", 600),
+            route_ttl_secs: positive_u64(self.route_ttl_secs, "TEAMS_ROUTE_TTL_SECS", 3600),
+            max_route_entries: positive_usize(
+                self.max_route_entries,
+                "TEAMS_MAX_ROUTE_ENTRIES",
+                10_000,
+            ),
             allow_all_users: self.allow_all_users.unwrap_or_else(|| {
                 std::env::var("TEAMS_ALLOW_ALL_USERS")
                     .ok()
@@ -2320,6 +2359,17 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
         );
         anyhow::ensure!(s.max_batch_tokens > 0, "slack.max_batch_tokens must be > 0");
     }
+    if let Some(ref teams) = config.teams {
+        if let Some(value) = teams.dedupe_ttl_secs {
+            anyhow::ensure!(value > 0, "teams.dedupe_ttl_secs must be > 0");
+        }
+        if let Some(value) = teams.route_ttl_secs {
+            anyhow::ensure!(value > 0, "teams.route_ttl_secs must be > 0");
+        }
+        if let Some(value) = teams.max_route_entries {
+            anyhow::ensure!(value > 0, "teams.max_route_entries must be > 0");
+        }
+    }
     if let Some(ref g) = config.gateway {
         anyhow::ensure!(
             g.max_buffered_messages > 0,
@@ -3044,7 +3094,13 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
     /// separate process, safe).
     #[test]
     fn teams_resolve_all_scenarios() {
-        for k in ["TEAMS_APP_ID", "TEAMS_OAUTH_ENDPOINT"] {
+        for k in [
+            "TEAMS_APP_ID",
+            "TEAMS_OAUTH_ENDPOINT",
+            "TEAMS_DEDUPE_TTL_SECS",
+            "TEAMS_ROUTE_TTL_SECS",
+            "TEAMS_MAX_ROUTE_ENTRIES",
+        ] {
             std::env::remove_var(k);
         }
         // --- defaults ---
@@ -3054,20 +3110,32 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         assert!(r.oauth_endpoint.contains("botframework.com"));
         assert!(r.openid_metadata.contains("openidconfiguration"));
         assert!(r.allowed_tenants.is_empty());
+        assert_eq!(r.dedupe_ttl_secs, 600);
+        assert_eq!(r.route_ttl_secs, 3600);
+        assert_eq!(r.max_route_entries, 10_000);
 
         // --- config wins over env ---
         std::env::set_var("TEAMS_APP_ID", "env-app");
         std::env::set_var("TEAMS_OAUTH_ENDPOINT", "https://env.example/token");
+        std::env::set_var("TEAMS_DEDUPE_TTL_SECS", "41");
+        std::env::set_var("TEAMS_ROUTE_TTL_SECS", "83");
+        std::env::set_var("TEAMS_MAX_ROUTE_ENTRIES", "122");
         let cfg = TeamsConfig {
             app_id: Some("cfg-app".into()),
             oauth_endpoint: Some("https://cfg.example/token".into()),
             allowed_tenants: Some(vec!["t1".into(), "t2".into()]),
+            dedupe_ttl_secs: Some(42),
+            route_ttl_secs: Some(84),
+            max_route_entries: Some(123),
             ..Default::default()
         };
         let r = cfg.resolve();
         assert_eq!(r.app_id.as_deref(), Some("cfg-app"));
         assert_eq!(r.oauth_endpoint, "https://cfg.example/token");
         assert_eq!(r.allowed_tenants, vec!["t1".to_string(), "t2".to_string()]);
+        assert_eq!(r.dedupe_ttl_secs, 42);
+        assert_eq!(r.route_ttl_secs, 84);
+        assert_eq!(r.max_route_entries, 123);
 
         // --- empty-string ${} expansion falls through to env ---
         let cfg = TeamsConfig {
@@ -3077,6 +3145,9 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         let r = cfg.resolve();
         assert_eq!(r.app_id.as_deref(), Some("env-app"));
         assert_eq!(r.oauth_endpoint, "https://env.example/token");
+        assert_eq!(r.dedupe_ttl_secs, 41);
+        assert_eq!(r.route_ttl_secs, 83);
+        assert_eq!(r.max_route_entries, 122);
 
         // --- trust_config() view ---
         let cfg = TeamsConfig {
@@ -3091,8 +3162,29 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
             Some(&["29:abc".to_string()][..])
         );
 
-        std::env::remove_var("TEAMS_APP_ID");
-        std::env::remove_var("TEAMS_OAUTH_ENDPOINT");
+        for k in [
+            "TEAMS_APP_ID",
+            "TEAMS_OAUTH_ENDPOINT",
+            "TEAMS_DEDUPE_TTL_SECS",
+            "TEAMS_ROUTE_TTL_SECS",
+            "TEAMS_MAX_ROUTE_ENTRIES",
+        ] {
+            std::env::remove_var(k);
+        }
+    }
+
+    #[test]
+    fn teams_runtime_bounds_reject_zero() {
+        for key in ["dedupe_ttl_secs", "route_ttl_secs", "max_route_entries"] {
+            let raw = format!("[teams]\n{key} = 0\n");
+            let error = parse_config(&raw, "test").unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("teams.{key} must be > 0")),
+                "unexpected error for {key}: {error}"
+            );
+        }
     }
 
     /// All `FEISHU_*` env scenarios in ONE test (env is process-global).

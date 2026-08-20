@@ -1,3 +1,8 @@
+use super::teams_ingress::{
+    wait_for_publish, PublishReservation, PublishState, TeamsIngressCleanupStats,
+    TeamsIngressRegistry, TeamsIngressRoute, TeamsRouteKey, DEFAULT_DEDUPE_TTL_SECS,
+    DEFAULT_MAX_ROUTE_ENTRIES, DEFAULT_ROUTE_TTL_SECS,
+};
 use crate::schema::*;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -11,7 +16,7 @@ use tracing::{debug, error, info, warn};
 // --- Bot Framework activity types ---
 
 #[allow(dead_code)] // Bot Framework schema fields — needed for future features
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Activity {
     #[serde(rename = "type")]
@@ -25,10 +30,11 @@ pub struct Activity {
     pub text: Option<String>,
     pub tenant: Option<TenantInfo>,
     pub channel_data: Option<ChannelData>,
+    pub reply_to_id: Option<String>,
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChannelAccount {
     pub id: Option<String>,
@@ -37,7 +43,7 @@ pub struct ChannelAccount {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConversationAccount {
     pub id: Option<String>,
@@ -46,17 +52,26 @@ pub struct ConversationAccount {
     pub tenant_id: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TenantInfo {
     pub id: Option<String>,
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ChannelData {
     pub tenant: Option<TenantInfo>,
+    pub team: Option<ChannelDataEntity>,
+    pub channel: Option<ChannelDataEntity>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelDataEntity {
+    pub id: Option<String>,
 }
 
 impl Activity {
@@ -76,6 +91,33 @@ impl Activity {
                     .as_ref()
                     .and_then(|c| c.tenant_id.as_deref())
             })
+    }
+
+    fn missing_required_message_field(&self) -> Option<&'static str> {
+        let present = |value: Option<&str>| value.is_some_and(|value| !value.trim().is_empty());
+        if !present(self.channel_id.as_deref()) {
+            return Some("channelId");
+        }
+        if !present(self.resolved_tenant_id()) {
+            return Some("tenant id");
+        }
+        if !present(
+            self.conversation
+                .as_ref()
+                .and_then(|conversation| conversation.id.as_deref()),
+        ) {
+            return Some("conversation id");
+        }
+        if !present(self.id.as_deref()) {
+            return Some("activity id");
+        }
+        if !present(self.from.as_ref().and_then(|sender| sender.id.as_deref())) {
+            return Some("sender id");
+        }
+        if !present(self.service_url.as_deref()) {
+            return Some("serviceUrl");
+        }
+        None
     }
 }
 
@@ -134,6 +176,9 @@ pub struct TeamsConfig {
     pub oauth_endpoint: String,
     pub openid_metadata: String,
     pub allowed_tenants: Vec<String>,
+    pub dedupe_ttl_secs: u64,
+    pub route_ttl_secs: u64,
+    pub max_route_entries: usize,
 }
 
 impl TeamsConfig {
@@ -162,7 +207,54 @@ impl TeamsConfig {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
+            dedupe_ttl_secs: parse_positive_u64(
+                read("TEAMS_DEDUPE_TTL_SECS"),
+                "TEAMS_DEDUPE_TTL_SECS",
+                DEFAULT_DEDUPE_TTL_SECS,
+            ),
+            route_ttl_secs: parse_positive_u64(
+                read("TEAMS_ROUTE_TTL_SECS"),
+                "TEAMS_ROUTE_TTL_SECS",
+                DEFAULT_ROUTE_TTL_SECS,
+            ),
+            max_route_entries: parse_positive_usize(
+                read("TEAMS_MAX_ROUTE_ENTRIES"),
+                "TEAMS_MAX_ROUTE_ENTRIES",
+                DEFAULT_MAX_ROUTE_ENTRIES,
+            ),
         })
+    }
+}
+
+fn parse_positive_u64(raw: Option<String>, key: &str, default: u64) -> u64 {
+    match raw.as_deref().map(str::trim) {
+        None | Some("") => default,
+        Some(value) => match value.parse::<u64>() {
+            Ok(value) if value > 0 => value,
+            _ => {
+                warn!(
+                    key,
+                    default, "invalid positive Teams runtime setting; using default"
+                );
+                default
+            }
+        },
+    }
+}
+
+fn parse_positive_usize(raw: Option<String>, key: &str, default: usize) -> usize {
+    match raw.as_deref().map(str::trim) {
+        None | Some("") => default,
+        Some(value) => match value.parse::<usize>() {
+            Ok(value) if value > 0 => value,
+            _ => {
+                warn!(
+                    key,
+                    default, "invalid positive Teams runtime setting; using default"
+                );
+                default
+            }
+        },
     }
 }
 
@@ -177,6 +269,7 @@ pub struct TeamsAdapter {
     openid_refresh_lock: Mutex<()>,
     jwks_cache: RwLock<Option<CachedJwks>>,
     jwks_refresh_lock: Mutex<()>,
+    ingress: Mutex<TeamsIngressRegistry>,
     allow_non_public_endpoints: bool,
 }
 
@@ -200,6 +293,11 @@ impl TeamsAdapter {
         client: reqwest::Client,
         allow_non_public_endpoints: bool,
     ) -> Self {
+        let ingress = TeamsIngressRegistry::new(
+            Duration::from_secs(config.dedupe_ttl_secs),
+            Duration::from_secs(config.route_ttl_secs),
+            config.max_route_entries,
+        );
         Self {
             config,
             client,
@@ -209,6 +307,7 @@ impl TeamsAdapter {
             openid_refresh_lock: Mutex::new(()),
             jwks_cache: RwLock::new(None),
             jwks_refresh_lock: Mutex::new(()),
+            ingress: Mutex::new(ingress),
             allow_non_public_endpoints,
         }
     }
@@ -221,6 +320,18 @@ impl TeamsAdapter {
     #[cfg(test)]
     fn new_for_test_with_timeout(config: TeamsConfig, request_timeout: Duration) -> Self {
         Self::with_client(config, build_http_client(request_timeout), true)
+    }
+
+    pub(crate) async fn cleanup_ingress(&self) -> TeamsIngressCleanupStats {
+        self.ingress.lock().await.cleanup(Instant::now())
+    }
+
+    pub(crate) fn route_ttl(&self) -> Duration {
+        Duration::from_secs(self.config.route_ttl_secs)
+    }
+
+    pub(crate) fn max_route_entries(&self) -> usize {
+        self.config.max_route_entries
     }
 
     async fn cached_token(&self) -> Option<String> {
@@ -956,6 +1067,13 @@ pub async fn webhook(
         }
     };
 
+    if activity.activity_type == "message" {
+        if let Some(field) = activity.missing_required_message_field() {
+            warn!(field, "teams: message missing required field");
+            return StatusCode::BAD_REQUEST;
+        }
+    }
+
     // JWT validation (with activity context for serviceUrl + channelId checks)
     if let Err(e) = teams.validate_jwt(&auth_header, &activity).await {
         warn!(error = %e, "teams JWT validation failed");
@@ -975,41 +1093,79 @@ pub async fn webhook(
         return StatusCode::FORBIDDEN;
     }
 
+    accept_message_activity(state, activity).await
+}
+
+enum LocalPublishOutcome {
+    Accepted { receiver_count: usize },
+    AcceptedDuplicate,
+    PublishingDuplicate(tokio::sync::watch::Receiver<PublishState>),
+    AtCapacity,
+    NoConsumer,
+    StateCommitFailed,
+}
+
+/// Publish one already-authenticated and tenant-authorized Teams message.
+///
+/// Keeping this post-auth path separate makes the local enqueue, route, and
+/// dedupe contract testable without weakening JWT validation in `webhook`.
+async fn accept_message_activity(state: Arc<crate::AppState>, activity: Activity) -> StatusCode {
+    let Some(teams) = state.teams.as_ref() else {
+        return StatusCode::NOT_FOUND;
+    };
+    if let Some(field) = activity.missing_required_message_field() {
+        warn!(field, "teams: message missing required field");
+        return StatusCode::BAD_REQUEST;
+    }
+
     let text = match activity.text.as_deref() {
-        Some(t) if !t.trim().is_empty() => t.trim(),
+        Some(text) if !text.trim().is_empty() => text.trim(),
         _ => return StatusCode::OK,
     };
-
-    let conversation_id = activity
+    let Some(tenant_id) = activity
+        .resolved_tenant_id()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        warn!("teams: message missing required tenant id");
+        return StatusCode::BAD_REQUEST;
+    };
+    let Some(conversation_id) = activity
         .conversation
         .as_ref()
-        .and_then(|c| c.id.as_deref())
-        .unwrap_or("");
-    let conversation_type = activity
-        .conversation
-        .as_ref()
-        .and_then(|c| c.conversation_type.as_deref())
-        .unwrap_or("personal");
-    let service_url = activity.service_url.as_deref().unwrap_or("");
-    let sender_id = activity
+        .and_then(|conversation| conversation.id.as_deref())
+        .filter(|value| !value.trim().is_empty())
+    else {
+        warn!("teams: message missing required conversation id");
+        return StatusCode::BAD_REQUEST;
+    };
+    let Some(activity_id) = activity
+        .id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        warn!("teams: message missing required activity id");
+        return StatusCode::BAD_REQUEST;
+    };
+    let Some(sender_id) = activity
         .from
         .as_ref()
-        .and_then(|f| f.id.as_deref())
-        .unwrap_or("");
-    let sender_name = activity
-        .from
-        .as_ref()
-        .and_then(|f| f.name.as_deref())
-        .unwrap_or("Unknown");
-    let activity_id = activity.id.as_deref().unwrap_or("");
+        .and_then(|sender| sender.id.as_deref())
+        .filter(|value| !value.trim().is_empty())
+    else {
+        warn!("teams: message missing required sender id");
+        return StatusCode::BAD_REQUEST;
+    };
+    let Some(service_url) = activity
+        .service_url
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        warn!("teams: message missing required service URL");
+        return StatusCode::BAD_REQUEST;
+    };
 
-    // B3: Guard against an absent or unsafe service URL before persisting a
-    // reply route. JWT validation binds this value to Microsoft; the public-
-    // cloud policy additionally prevents credential-bearing SSRF.
-    if service_url.is_empty() {
-        warn!("teams: activity missing service_url, cannot route replies");
-        return StatusCode::OK;
-    }
+    // JWT validation binds this value to Microsoft; the public-cloud policy
+    // additionally prevents credential-bearing SSRF before local persistence.
     let validated_service_url = match teams.validate_service_url(service_url) {
         Ok(url) => url,
         Err(error) => {
@@ -1017,31 +1173,67 @@ pub async fn webhook(
             return StatusCode::BAD_REQUEST;
         }
     };
+    let conversation_type = activity
+        .conversation
+        .as_ref()
+        .and_then(|conversation| conversation.conversation_type.as_deref())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("personal");
+    let sender_name = activity
+        .from
+        .as_ref()
+        .and_then(|sender| sender.name.as_deref())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("Unknown");
 
     let event = GatewayEvent::new(
         "teams",
         ChannelInfo {
-            id: conversation_id.to_string(),
-            channel_type: conversation_type.to_string(),
-            thread_id: None, // Teams conversations don't have sub-threads in the same way
+            id: conversation_id.to_owned(),
+            channel_type: conversation_type.to_owned(),
+            thread_id: None,
         },
         SenderInfo {
-            id: sender_id.to_string(),
-            name: sender_name.to_string(),
-            display_name: sender_name.to_string(),
+            id: sender_id.to_owned(),
+            name: sender_name.to_owned(),
+            display_name: sender_name.to_owned(),
             is_bot: false,
         },
         text,
         activity_id,
-        vec![], // Teams @mentions parsing deferred to future PR
+        vec![],
     );
-
-    // Store service_url for reply routing
-    state.teams_service_urls.lock().await.insert(
-        conversation_id.to_string(),
-        (validated_service_url.to_string(), Instant::now()),
+    let event_id = event.event_id.clone();
+    let route_key = TeamsRouteKey::new(
+        teams.config.app_id.clone(),
+        tenant_id,
+        conversation_id,
+        activity_id,
     );
-
+    let now = Instant::now();
+    let route = TeamsIngressRoute {
+        key: route_key.clone(),
+        event_id: event_id.clone(),
+        tenant_id: tenant_id.to_owned(),
+        conversation_id: conversation_id.to_owned(),
+        conversation_type: conversation_type.to_owned(),
+        inbound_activity_id: activity_id.to_owned(),
+        reply_chain_root_id: activity.reply_to_id.clone(),
+        service_url: validated_service_url.clone(),
+        team_id: activity
+            .channel_data
+            .as_ref()
+            .and_then(|data| data.team.as_ref())
+            .and_then(|team| team.id.clone())
+            .filter(|id| !id.trim().is_empty()),
+        channel_id: activity
+            .channel_data
+            .as_ref()
+            .and_then(|data| data.channel.as_ref())
+            .and_then(|channel| channel.id.clone())
+            .filter(|id| !id.trim().is_empty()),
+        created_at: now,
+    };
     let json = match serde_json::to_string(&event) {
         Ok(json) => json,
         Err(serialization_error) => {
@@ -1049,17 +1241,129 @@ pub async fn webhook(
             return StatusCode::INTERNAL_SERVER_ERROR;
         }
     };
-    let tenant_id = activity.resolved_tenant_id().unwrap_or("");
-    info!(
-        conversation = conversation_id,
-        sender = sender_name,
-        tenant = tenant_id,
-        service_host = validated_service_url.host_str().unwrap_or("unknown"),
-        "teams → gateway"
-    );
-    let _ = state.event_tx.send(json);
 
-    StatusCode::OK
+    // Preserve the existing reply path until PR 3 switches outbound routing to
+    // `event_id`. Cache before the publication transaction so a fast Core
+    // response cannot race this compatibility lookup.
+    let service_cache_token = cache_legacy_service_url(
+        &state,
+        conversation_id,
+        validated_service_url.as_str(),
+        teams.route_ttl(),
+        teams.max_route_entries(),
+    )
+    .await;
+
+    // Reserve, commit the route, and enqueue while holding one state lock. No
+    // await point exists after Publishing begins, so cancellation cannot leave
+    // an owner stranded between local enqueue and Accepted/Failed resolution.
+    let publish_outcome = {
+        let mut ingress = teams.ingress.lock().await;
+        match ingress.reserve(route_key.clone(), event_id.clone(), now) {
+            PublishReservation::AcceptedDuplicate => LocalPublishOutcome::AcceptedDuplicate,
+            PublishReservation::PublishingDuplicate(completion) => {
+                LocalPublishOutcome::PublishingDuplicate(completion)
+            }
+            PublishReservation::AtCapacity => LocalPublishOutcome::AtCapacity,
+            PublishReservation::Owner => {
+                if !ingress.accept(&route_key, &event_id, route, Instant::now()) {
+                    ingress.fail(&route_key, &event_id);
+                    LocalPublishOutcome::StateCommitFailed
+                } else {
+                    match state.event_tx.send(json) {
+                        Ok(receiver_count) => LocalPublishOutcome::Accepted { receiver_count },
+                        Err(_) => {
+                            ingress.fail(&route_key, &event_id);
+                            LocalPublishOutcome::NoConsumer
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    match publish_outcome {
+        LocalPublishOutcome::Accepted { receiver_count } => {
+            info!(
+                conversation = conversation_id,
+                sender = sender_name,
+                tenant = tenant_id,
+                service_host = validated_service_url.host_str().unwrap_or("unknown"),
+                receiver_count,
+                "teams → gateway"
+            );
+            StatusCode::OK
+        }
+        LocalPublishOutcome::AcceptedDuplicate => {
+            debug!("teams: accepted duplicate activity suppressed");
+            StatusCode::OK
+        }
+        LocalPublishOutcome::PublishingDuplicate(completion) => {
+            match wait_for_publish(completion).await {
+                PublishState::Accepted => StatusCode::OK,
+                PublishState::Publishing | PublishState::Failed => {
+                    remove_legacy_service_url(&state, conversation_id, service_cache_token).await;
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }
+        }
+        LocalPublishOutcome::AtCapacity => {
+            remove_legacy_service_url(&state, conversation_id, service_cache_token).await;
+            warn!("teams: ingress dedupe cache is saturated by active publications");
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        LocalPublishOutcome::NoConsumer => {
+            remove_legacy_service_url(&state, conversation_id, service_cache_token).await;
+            warn!("teams: no event consumer accepted the activity; returning retryable failure");
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        LocalPublishOutcome::StateCommitFailed => {
+            remove_legacy_service_url(&state, conversation_id, service_cache_token).await;
+            error!("teams: failed to commit ingress state before local enqueue");
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+async fn cache_legacy_service_url(
+    state: &crate::AppState,
+    conversation_id: &str,
+    service_url: &str,
+    route_ttl: Duration,
+    max_entries: usize,
+) -> Instant {
+    let now = Instant::now();
+    let mut urls = state.teams_service_urls.lock().await;
+    urls.retain(|_, (_, inserted_at)| now.saturating_duration_since(*inserted_at) < route_ttl);
+    if !urls.contains_key(conversation_id) && urls.len() >= max_entries {
+        if let Some(oldest_conversation) = urls
+            .iter()
+            .min_by_key(|(_, (_, inserted_at))| *inserted_at)
+            .map(|(conversation, _)| conversation.clone())
+        {
+            urls.remove(&oldest_conversation);
+            warn!(
+                max_entries,
+                "teams compatibility route cache evicted its oldest entry at capacity"
+            );
+        }
+    }
+    urls.insert(conversation_id.to_owned(), (service_url.to_owned(), now));
+    now
+}
+
+async fn remove_legacy_service_url(
+    state: &crate::AppState,
+    conversation_id: &str,
+    inserted_at: Instant,
+) {
+    let mut urls = state.teams_service_urls.lock().await;
+    let should_remove = urls
+        .get(conversation_id)
+        .is_some_and(|(_, current_inserted_at)| *current_inserted_at == inserted_at);
+    if should_remove {
+        urls.remove(conversation_id);
+    }
 }
 
 // --- Reply handler ---
@@ -1129,18 +1433,18 @@ mod tests {
     // --- Bot Connector URL and error hardening ---
 
     #[test]
-    fn connector_url_encodes_segments_and_preserves_service_path() {
+    fn connector_url_encodes_segments_and_preserves_service_path() -> anyhow::Result<()> {
         let url = connector_url(
             "https://smba.trafficmanager.net/teams/",
             "a/b?c",
             Some("message id/%"),
             false,
-        )
-        .unwrap();
+        )?;
         assert_eq!(
             url.as_str(),
             "https://smba.trafficmanager.net/teams/v3/conversations/a%2Fb%3Fc/activities/message%20id%2F%25"
         );
+        Ok(())
     }
 
     #[test]
@@ -1232,6 +1536,9 @@ mod tests {
             oauth_endpoint: "https://example.com/token".into(),
             openid_metadata: "https://example.com/openid".into(),
             allowed_tenants: tenants.into_iter().map(|s| s.to_string()).collect(),
+            dedupe_ttl_secs: DEFAULT_DEDUPE_TTL_SECS,
+            route_ttl_secs: DEFAULT_ROUTE_TTL_SECS,
+            max_route_entries: DEFAULT_MAX_ROUTE_ENTRIES,
         }
     }
 
@@ -1249,6 +1556,18 @@ mod tests {
             teams: Some(TeamsAdapter::new(make_config(vec![]))),
             ..crate::AppState::test_default(event_tx)
         })
+    }
+
+    fn make_routable_state() -> (
+        Arc<crate::AppState>,
+        tokio::sync::broadcast::Receiver<String>,
+    ) {
+        let (event_tx, event_rx) = tokio::sync::broadcast::channel(16);
+        let state = Arc::new(crate::AppState {
+            teams: Some(TeamsAdapter::new(make_config(vec![]))),
+            ..crate::AppState::test_default(event_tx)
+        });
+        (state, event_rx)
     }
 
     fn make_reply(command: Option<&str>) -> GatewayReply {
@@ -1285,6 +1604,42 @@ mod tests {
                 id: Some(id.into()),
             }),
             channel_data: None,
+            reply_to_id: None,
+        }
+    }
+
+    fn make_routable_activity(activity_id: &str) -> Activity {
+        Activity {
+            activity_type: "message".into(),
+            id: Some(activity_id.into()),
+            timestamp: None,
+            service_url: Some("https://smba.trafficmanager.net/emea/".into()),
+            channel_id: Some("msteams".into()),
+            from: Some(ChannelAccount {
+                id: Some("29:user".into()),
+                name: Some("Alice".into()),
+                aad_object_id: None,
+            }),
+            conversation: Some(ConversationAccount {
+                id: Some("conversation-1".into()),
+                conversation_type: Some("channel".into()),
+                is_group: Some(true),
+                tenant_id: None,
+            }),
+            text: Some("hello".into()),
+            tenant: Some(TenantInfo {
+                id: Some("tenant-1".into()),
+            }),
+            channel_data: Some(ChannelData {
+                tenant: None,
+                team: Some(ChannelDataEntity {
+                    id: Some("team-1".into()),
+                }),
+                channel: Some(ChannelDataEntity {
+                    id: Some("channel-1".into()),
+                }),
+            }),
+            reply_to_id: Some("root-activity".into()),
         }
     }
 
@@ -1312,6 +1667,147 @@ mod tests {
         .await;
 
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn webhook_rejects_missing_route_fields_before_jwt_fetch() -> anyhow::Result<()> {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer invalid".parse()?);
+        let status = webhook(
+            State(make_test_state()),
+            headers,
+            r#"{"type":"message","text":"hello"}"#.into(),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn post_auth_requires_all_route_and_identity_fields() -> anyhow::Result<()> {
+        let (state, _event_rx) = make_routable_state();
+
+        let mut cases = Vec::new();
+        let mut missing_channel_id = make_routable_activity("missing-channel-id");
+        missing_channel_id.channel_id = None;
+        cases.push(missing_channel_id);
+        let mut missing_tenant = make_routable_activity("missing-tenant");
+        missing_tenant.tenant = None;
+        cases.push(missing_tenant);
+        let mut missing_conversation = make_routable_activity("missing-conversation");
+        let Some(conversation) = missing_conversation.conversation.as_mut() else {
+            anyhow::bail!("test activity must include a conversation")
+        };
+        conversation.id = None;
+        cases.push(missing_conversation);
+        let mut missing_activity = make_routable_activity("missing-activity");
+        missing_activity.id = None;
+        cases.push(missing_activity);
+        let mut missing_sender = make_routable_activity("missing-sender");
+        let Some(sender) = missing_sender.from.as_mut() else {
+            anyhow::bail!("test activity must include a sender")
+        };
+        sender.id = None;
+        cases.push(missing_sender);
+        let mut missing_service_url = make_routable_activity("missing-service-url");
+        missing_service_url.service_url = None;
+        cases.push(missing_service_url);
+
+        for activity in cases {
+            assert_eq!(
+                accept_message_activity(state.clone(), activity).await,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn no_consumer_returns_503_without_leaving_a_dedupe_tombstone(
+    ) -> anyhow::Result<()> {
+        let (event_tx, event_rx) = tokio::sync::broadcast::channel(16);
+        drop(event_rx);
+        let state = Arc::new(crate::AppState {
+            teams: Some(TeamsAdapter::new(make_config(vec![]))),
+            ..crate::AppState::test_default(event_tx)
+        });
+        let activity = make_routable_activity("retryable-activity");
+
+        assert_eq!(
+            accept_message_activity(state.clone(), activity.clone()).await,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert!(state.teams_service_urls.lock().await.is_empty());
+
+        let mut event_rx = state.event_tx.subscribe();
+        assert_eq!(
+            accept_message_activity(state.clone(), activity).await,
+            StatusCode::OK
+        );
+        let event_json = event_rx.recv().await?;
+        let event: GatewayEvent = serde_json::from_str(&event_json)?;
+        let teams = state
+            .teams
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("test state must include Teams"))?;
+        let route = teams
+            .ingress
+            .lock()
+            .await
+            .route_for_event(&event.event_id, Instant::now())
+            .ok_or_else(|| anyhow::anyhow!("successful retry should commit an ingress route"))?;
+        assert_eq!(route.tenant_id, "tenant-1");
+        assert_eq!(route.conversation_id, "conversation-1");
+        assert_eq!(route.inbound_activity_id, "retryable-activity");
+        assert_eq!(route.reply_chain_root_id.as_deref(), Some("root-activity"));
+        assert_eq!(route.team_id.as_deref(), Some("team-1"));
+        assert_eq!(route.channel_id.as_deref(), Some("channel-1"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accepted_duplicate_publishes_exactly_one_gateway_event() -> anyhow::Result<()> {
+        let (state, mut event_rx) = make_routable_state();
+        let activity = make_routable_activity("duplicate-activity");
+
+        assert_eq!(
+            accept_message_activity(state.clone(), activity.clone()).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            accept_message_activity(state.clone(), activity).await,
+            StatusCode::OK
+        );
+        event_rx.recv().await?;
+        assert!(matches!(
+            event_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_duplicate_waiters_share_one_publish_result() -> anyhow::Result<()> {
+        let (state, mut event_rx) = make_routable_state();
+        let activity = make_routable_activity("concurrent-activity");
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            tasks.push(tokio::spawn(accept_message_activity(
+                state.clone(),
+                activity.clone(),
+            )));
+        }
+        for task in tasks {
+            assert_eq!(task.await?, StatusCode::OK);
+        }
+
+        event_rx.recv().await?;
+        assert!(matches!(
+            event_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        Ok(())
     }
 
     #[test]
@@ -1352,42 +1848,46 @@ mod tests {
     // --- resolved_tenant_id ---
 
     #[test]
-    fn resolved_tenant_falls_back_to_channel_data() {
+    fn resolved_tenant_falls_back_to_channel_data() -> anyhow::Result<()> {
         // Teams personal/channel webhooks put tenant in channelData, not top-level
         let json = r#"{
             "type": "message",
             "channelData": {"tenant": {"id": "from-channel-data"}}
         }"#;
-        let activity: Activity = serde_json::from_str(json).unwrap();
+        let activity: Activity = serde_json::from_str(json)?;
         assert_eq!(activity.resolved_tenant_id(), Some("from-channel-data"));
+        Ok(())
     }
 
     #[test]
-    fn resolved_tenant_prefers_top_level_over_channel_data() {
+    fn resolved_tenant_prefers_top_level_over_channel_data() -> anyhow::Result<()> {
         let json = r#"{
             "type": "message",
             "tenant": {"id": "top-level"},
             "channelData": {"tenant": {"id": "from-channel-data"}}
         }"#;
-        let activity: Activity = serde_json::from_str(json).unwrap();
+        let activity: Activity = serde_json::from_str(json)?;
         assert_eq!(activity.resolved_tenant_id(), Some("top-level"));
+        Ok(())
     }
 
     #[test]
-    fn resolved_tenant_falls_back_to_conversation_tenant_id() {
+    fn resolved_tenant_falls_back_to_conversation_tenant_id() -> anyhow::Result<()> {
         let json = r#"{
             "type": "message",
             "conversation": {"id": "c1", "tenantId": "from-conversation"}
         }"#;
-        let activity: Activity = serde_json::from_str(json).unwrap();
+        let activity: Activity = serde_json::from_str(json)?;
         assert_eq!(activity.resolved_tenant_id(), Some("from-conversation"));
+        Ok(())
     }
 
     #[test]
-    fn resolved_tenant_returns_none_when_absent() {
+    fn resolved_tenant_returns_none_when_absent() -> anyhow::Result<()> {
         let json = r#"{"type": "message"}"#;
-        let activity: Activity = serde_json::from_str(json).unwrap();
+        let activity: Activity = serde_json::from_str(json)?;
         assert_eq!(activity.resolved_tenant_id(), None);
+        Ok(())
     }
 
     // --- validate_jwt error paths ---
@@ -1420,16 +1920,17 @@ mod tests {
     // --- Activity deserialization ---
 
     #[test]
-    fn deserialize_minimal_activity() {
+    fn deserialize_minimal_activity() -> anyhow::Result<()> {
         let json = r#"{"type": "message"}"#;
-        let activity: Activity = serde_json::from_str(json).unwrap();
+        let activity: Activity = serde_json::from_str(json)?;
         assert_eq!(activity.activity_type, "message");
         assert!(activity.text.is_none());
         assert!(activity.from.is_none());
+        Ok(())
     }
 
     #[test]
-    fn deserialize_full_activity() {
+    fn deserialize_full_activity() -> anyhow::Result<()> {
         let json = r#"{
             "type": "message",
             "id": "act123",
@@ -1438,26 +1939,58 @@ mod tests {
             "from": {"id": "user1", "name": "Alice", "aadObjectId": "aad-123"},
             "conversation": {"id": "conv1", "conversationType": "personal", "isGroup": false},
             "text": "hello bot",
-            "tenant": {"id": "tenant-abc"}
+            "tenant": {"id": "tenant-abc"},
+            "replyToId": "root-activity",
+            "channelData": {
+                "team": {"id": "team-abc"},
+                "channel": {"id": "channel-abc"}
+            }
         }"#;
-        let activity: Activity = serde_json::from_str(json).unwrap();
+        let activity: Activity = serde_json::from_str(json)?;
         assert_eq!(activity.activity_type, "message");
         assert_eq!(activity.text.as_deref(), Some("hello bot"));
         assert_eq!(
-            activity.from.as_ref().unwrap().name.as_deref(),
+            activity
+                .from
+                .as_ref()
+                .and_then(|sender| sender.name.as_deref()),
             Some("Alice")
         );
         assert_eq!(
-            activity.tenant.as_ref().unwrap().id.as_deref(),
+            activity
+                .tenant
+                .as_ref()
+                .and_then(|tenant| tenant.id.as_deref()),
             Some("tenant-abc")
         );
+        assert_eq!(activity.reply_to_id.as_deref(), Some("root-activity"));
+        let channel_data = activity
+            .channel_data
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("channelData should deserialize"))?;
+        assert_eq!(
+            channel_data
+                .team
+                .as_ref()
+                .and_then(|team| team.id.as_deref()),
+            Some("team-abc")
+        );
+        assert_eq!(
+            channel_data
+                .channel
+                .as_ref()
+                .and_then(|channel| channel.id.as_deref()),
+            Some("channel-abc")
+        );
+        Ok(())
     }
 
     #[test]
-    fn deserialize_non_message_activity() {
+    fn deserialize_non_message_activity() -> anyhow::Result<()> {
         let json = r#"{"type": "conversationUpdate"}"#;
-        let activity: Activity = serde_json::from_str(json).unwrap();
+        let activity: Activity = serde_json::from_str(json)?;
         assert_eq!(activity.activity_type, "conversationUpdate");
+        Ok(())
     }
 
     #[test]
@@ -1469,7 +2002,7 @@ mod tests {
     // --- transport concurrency and HTTP policy ---
 
     #[tokio::test]
-    async fn concurrent_oauth_callers_share_one_refresh() {
+    async fn concurrent_oauth_callers_share_one_refresh() -> anyhow::Result<()> {
         let server = MockServer::start().await;
         let _token = Mock::given(method("POST"))
             .and(path("/token"))
@@ -1487,8 +2020,9 @@ mod tests {
         let adapter = TeamsAdapter::new_for_test(make_http_test_config(&server));
 
         let (first, second) = tokio::join!(adapter.get_token(), adapter.get_token());
-        assert_eq!(first.unwrap(), "singleflight-token");
-        assert_eq!(second.unwrap(), "singleflight-token");
+        assert_eq!(first?, "singleflight-token");
+        assert_eq!(second?, "singleflight-token");
+        Ok(())
     }
 
     #[tokio::test]
@@ -1512,7 +2046,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_jwks_callers_share_metadata_and_key_fetches() {
+    async fn concurrent_jwks_callers_share_metadata_and_key_fetches() -> anyhow::Result<()> {
         let server = MockServer::start().await;
         let _metadata = Mock::given(method("GET"))
             .and(path("/openid"))
@@ -1543,8 +2077,9 @@ mod tests {
         let adapter = TeamsAdapter::new_for_test(make_http_test_config(&server));
 
         let (first, second) = tokio::join!(adapter.get_jwks(), adapter.get_jwks());
-        assert_eq!(first.unwrap().keys.len(), 1);
-        assert_eq!(second.unwrap().keys.len(), 1);
+        assert_eq!(first?.keys.len(), 1);
+        assert_eq!(second?.keys.len(), 1);
+        Ok(())
     }
 
     #[tokio::test]
@@ -1702,7 +2237,7 @@ mod tests {
     // --- reply command dispatch ---
 
     #[tokio::test]
-    async fn unsupported_commands_never_fall_through_to_send_activity() {
+    async fn unsupported_commands_never_fall_through_to_send_activity() -> anyhow::Result<()> {
         let server = MockServer::start().await;
         let _no_post = Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(500))
@@ -1719,9 +2254,7 @@ mod tests {
         )]));
 
         for command in ["add_reaction", "remove_reaction"] {
-            let outcome = handle_reply(&make_reply(Some(command)), &adapter, &service_urls)
-                .await
-                .unwrap();
+            let outcome = handle_reply(&make_reply(Some(command)), &adapter, &service_urls).await?;
             assert_eq!(outcome, None, "reaction command {command} should be a no-op");
         }
 
@@ -1739,10 +2272,11 @@ mod tests {
                 "error should identify unsupported command {command}"
             );
         }
+        Ok(())
     }
 
     #[tokio::test]
-    async fn commandless_reply_still_sends_one_activity() {
+    async fn commandless_reply_still_sends_one_activity() -> anyhow::Result<()> {
         let server = MockServer::start().await;
         let _token = Mock::given(method("POST"))
             .and(path("/token"))
@@ -1770,13 +2304,38 @@ mod tests {
             (server.uri(), std::time::Instant::now()),
         )]));
 
-        let message_id = handle_reply(&make_reply(None), &adapter, &service_urls)
-            .await
-            .unwrap();
+        let message_id = handle_reply(&make_reply(None), &adapter, &service_urls).await?;
         assert_eq!(message_id.as_deref(), Some("activity-1"));
+        Ok(())
     }
 
     // --- TeamsConfig::from_env ---
+
+    #[test]
+    fn runtime_config_defaults_and_positive_overrides() -> anyhow::Result<()> {
+        let mut values = std::collections::HashMap::from([
+            ("TEAMS_APP_ID", "app"),
+            ("TEAMS_APP_SECRET", "secret"),
+            ("TEAMS_DEDUPE_TTL_SECS", "42"),
+            ("TEAMS_ROUTE_TTL_SECS", "84"),
+            ("TEAMS_MAX_ROUTE_ENTRIES", "123"),
+        ]);
+        let config = TeamsConfig::from_reader(|key| values.get(key).map(ToString::to_string))
+            .ok_or_else(|| anyhow::anyhow!("complete credentials should resolve"))?;
+        assert_eq!(config.dedupe_ttl_secs, 42);
+        assert_eq!(config.route_ttl_secs, 84);
+        assert_eq!(config.max_route_entries, 123);
+
+        values.insert("TEAMS_DEDUPE_TTL_SECS", "0");
+        values.insert("TEAMS_ROUTE_TTL_SECS", "invalid");
+        values.insert("TEAMS_MAX_ROUTE_ENTRIES", "0");
+        let config = TeamsConfig::from_reader(|key| values.get(key).map(ToString::to_string))
+            .ok_or_else(|| anyhow::anyhow!("complete credentials should resolve"))?;
+        assert_eq!(config.dedupe_ttl_secs, DEFAULT_DEDUPE_TTL_SECS);
+        assert_eq!(config.route_ttl_secs, DEFAULT_ROUTE_TTL_SECS);
+        assert_eq!(config.max_route_entries, DEFAULT_MAX_ROUTE_ENTRIES);
+        Ok(())
+    }
 
     #[test]
     fn config_from_env_returns_none_without_vars() {

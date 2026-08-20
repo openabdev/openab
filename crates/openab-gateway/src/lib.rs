@@ -591,12 +591,18 @@ impl AppState {
     pub fn apply_teams_config(&mut self, cfg: GatewayTeamsConfig) {
         self.teams_webhook_path = cfg.webhook_path;
         let tenants = cfg.allowed_tenants.join(",");
+        let dedupe_ttl_secs = cfg.dedupe_ttl_secs.to_string();
+        let route_ttl_secs = cfg.route_ttl_secs.to_string();
+        let max_route_entries = cfg.max_route_entries.to_string();
         self.teams = adapters::teams::TeamsConfig::from_reader(|k| match k {
             "TEAMS_APP_ID" => cfg.app_id.clone(),
             "TEAMS_APP_SECRET" => cfg.app_secret.clone(),
             "TEAMS_OAUTH_ENDPOINT" => Some(cfg.oauth_endpoint.clone()),
             "TEAMS_OPENID_METADATA" => Some(cfg.openid_metadata.clone()),
             "TEAMS_ALLOWED_TENANTS" => Some(tenants.clone()),
+            "TEAMS_DEDUPE_TTL_SECS" => Some(dedupe_ttl_secs.clone()),
+            "TEAMS_ROUTE_TTL_SECS" => Some(route_ttl_secs.clone()),
+            "TEAMS_MAX_ROUTE_ENTRIES" => Some(max_route_entries.clone()),
             _ => None,
         })
         .map(adapters::teams::TeamsAdapter::new);
@@ -690,6 +696,48 @@ pub struct GatewayTeamsConfig {
     pub oauth_endpoint: String,
     pub openid_metadata: String,
     pub webhook_path: String,
+    pub dedupe_ttl_secs: u64,
+    pub route_ttl_secs: u64,
+    pub max_route_entries: usize,
+}
+
+/// Start the shared Teams state sweeper for Standalone or Unified mode.
+#[cfg(feature = "teams")]
+pub fn spawn_teams_ingress_cleanup(state: Arc<AppState>) {
+    const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(300);
+
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(SWEEP_INTERVAL).await;
+            let Some(teams) = state.teams.as_ref() else {
+                continue;
+            };
+
+            let stats = teams.cleanup_ingress().await;
+            let now = Instant::now();
+            let route_ttl = teams.route_ttl();
+            let mut service_urls = state.teams_service_urls.lock().await;
+            let service_urls_before = service_urls.len();
+            service_urls.retain(|_, (_, inserted_at)| {
+                now.saturating_duration_since(*inserted_at) < route_ttl
+            });
+            let service_urls_removed = service_urls_before - service_urls.len();
+
+            if stats.routes_removed > 0
+                || stats.dedupe_entries_removed > 0
+                || stats.stale_publications_removed > 0
+                || service_urls_removed > 0
+            {
+                tracing::info!(
+                    routes_removed = stats.routes_removed,
+                    dedupe_entries_removed = stats.dedupe_entries_removed,
+                    stale_publications_removed = stats.stale_publications_removed,
+                    service_urls_removed,
+                    "teams ingress state cleanup"
+                );
+            }
+        }
+    });
 }
 
 /// Parameter object for passing resolved Feishu config across the crate
@@ -1009,22 +1057,9 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         });
     }
 
-    // Background: cleanup stale Teams service_url entries (TTL: 4h)
-    {
-        let state_for_cleanup = state.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-                let mut urls = state_for_cleanup.teams_service_urls.lock().await;
-                let before = urls.len();
-                urls.retain(|_, (_, t)| t.elapsed().as_secs() < 4 * 3600);
-                let after = urls.len();
-                if before != after {
-                    info!(removed = before - after, remaining = after, "teams service_url cache cleanup");
-                }
-            }
-        });
-    }
+    // Background: sweep bounded Teams route, dedupe, and compatibility state.
+    #[cfg(feature = "teams")]
+    spawn_teams_ingress_cleanup(state.clone());
 
     let app = app.with_state(state.clone());
 
@@ -1459,6 +1494,9 @@ mod l1_audit_tests {
             oauth_endpoint: "https://x/token".into(),
             openid_metadata: "https://x/oidc".into(),
             webhook_path: "/hook/teams".into(),
+            dedupe_ttl_secs: 600,
+            route_ttl_secs: 3600,
+            max_route_entries: 10_000,
         });
         assert!(s.teams.is_some());
         assert_eq!(s.teams_webhook_path, "/hook/teams");
@@ -1480,6 +1518,9 @@ mod l1_audit_tests {
             oauth_endpoint: "https://x/token".into(),
             openid_metadata: "https://x/oidc".into(),
             webhook_path: "/hook/teams".into(),
+            dedupe_ttl_secs: 600,
+            route_ttl_secs: 3600,
+            max_route_entries: 10_000,
         });
         assert!(s.teams.is_none());
     }
@@ -1609,7 +1650,7 @@ mod gateway_protocol_tests {
         app_state.telegram_rich_messages = true;
         app_state.line_access_token = Some("line-token".into());
         let (addr, state, server) = start_server(app_state).await?;
-        let url = format!("ws://{addr}/ws");
+        let url = format!("{}://{addr}/ws", "ws");
 
         let (mut first, _) = tokio_tungstenite::connect_async(&url).await?;
         let client_hello = schema::GatewayClientHello {
@@ -1657,7 +1698,7 @@ mod gateway_protocol_tests {
         let (event_tx, _event_rx) = broadcast::channel(8);
         let app_state = AppState::test_default(event_tx);
         let (addr, state, server) = start_server(app_state).await?;
-        let url = format!("ws://{addr}/ws");
+        let url = format!("{}://{addr}/ws", "ws");
         let (mut socket, _) = tokio_tungstenite::connect_async(&url).await?;
         wait_for_consumers(&state, 1).await?;
 

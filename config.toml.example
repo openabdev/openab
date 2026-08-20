@@ -134,6 +134,9 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 # app_secret = "${TEAMS_APP_SECRET}"    # env fallback: TEAMS_APP_SECRET
 # allowed_tenants = ["<tenant-guid>"]   # env fallback: TEAMS_ALLOWED_TENANTS (empty = all)
 # webhook_path = "/webhook/teams"       # env fallback: TEAMS_WEBHOOK_PATH
+# dedupe_ttl_secs = 600                 # env fallback: TEAMS_DEDUPE_TTL_SECS
+# route_ttl_secs = 3600                 # env fallback: TEAMS_ROUTE_TTL_SECS
+# max_route_entries = 10000             # env fallback: TEAMS_MAX_ROUTE_ENTRIES
 # allow_all_users = false               # env fallback: TEAMS_ALLOW_ALL_USERS
 # allowed_users = ["29:1abc..."]        # Bot Framework activity.from.id values (29:…)
 #                                       # env fallback: TEAMS_ALLOWED_USERS (comma-separated)

@@ -247,6 +247,9 @@ Full first-class Teams section (config-first parity, #1380) — credentials, con
 | `oauth_endpoint` | string | Bot Framework | HTTPS endpoint on `login.microsoftonline.com`; use a tenant-specific path for single-tenant bots. Env: `TEAMS_OAUTH_ENDPOINT`. |
 | `openid_metadata` | string | Bot Framework | HTTPS metadata endpoint on `login.botframework.com`. Env: `TEAMS_OPENID_METADATA`. |
 | `webhook_path` | string | `/webhook/teams` | Env: `TEAMS_WEBHOOK_PATH`. |
+| `dedupe_ttl_secs` | u64 | `600` | Process-local accepted-activity dedupe window. Must be greater than zero. Env: `TEAMS_DEDUPE_TTL_SECS`. |
+| `route_ttl_secs` | u64 | `3600` | Gateway-local authenticated ingress route lifetime. Must be greater than zero. Env: `TEAMS_ROUTE_TTL_SECS`. |
+| `max_route_entries` | usize | `10000` | Capacity bound applied independently to the route and dedupe caches. Must be greater than zero. Env: `TEAMS_MAX_ROUTE_ENTRIES`. |
 | `allow_all_users` | bool \| omit | `false` (deny-all) | Env: `TEAMS_ALLOW_ALL_USERS`. |
 | `allowed_users` | string[] | `[]` | `activity.from.id` values (`29:…`). Env: `TEAMS_ALLOWED_USERS`. |
 

@@ -1302,6 +1302,9 @@ async fn main() -> anyhow::Result<()> {
                     oauth_endpoint: r.oauth_endpoint,
                     openid_metadata: r.openid_metadata,
                     webhook_path: r.webhook_path,
+                    dedupe_ttl_secs: r.dedupe_ttl_secs,
+                    route_ttl_secs: r.route_ttl_secs,
+                    max_route_entries: r.max_route_entries,
                 });
             }
             // First-class `[feishu]` config overrides env-derived values
@@ -1315,6 +1318,8 @@ async fn main() -> anyhow::Result<()> {
                 });
             }
             let gw_state = Arc::new(gw_state_inner);
+            #[cfg(feature = "teams")]
+            openab_gateway::spawn_teams_ingress_cleanup(gw_state.clone());
 
             // Phase 1 L1 audit (#1356): warn if any active webhook platform has
             // no transport authentication configured. Called after

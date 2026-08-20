@@ -254,10 +254,11 @@ pr = ""
 [[openab_features]]
 feature = "group_routing"
 status = "implemented"
-note = "Session keyed by `conversation.id` (+ `conversation_type`); `serviceUrl` cached per conversation for reply routing, refreshed (timestamp) on each reply, with a periodic TTL cleanup task in the gateway."
+note = "Session remains keyed by `conversation.id` (+ `conversation_type`). Authenticated ingress now records a bounded gateway-local route under composite app/tenant/conversation/activity identity plus `event_id`; the conversation-only `serviceUrl` cache remains temporarily for the PR 1 outbound path and shares the configured route TTL/capacity."
 source = [
-  "crates/openab-gateway/src/adapters/teams.rs#handle_reply",
-  "crates/openab-gateway/src/lib.rs",
+  "crates/openab-gateway/src/adapters/teams.rs#accept_message_activity",
+  "crates/openab-gateway/src/adapters/teams_ingress.rs",
+  "crates/openab-gateway/src/lib.rs#spawn_teams_ingress_cleanup",
 ]
 pr = ""
 
@@ -272,11 +273,11 @@ pr = ""
 # ═══ Schema 3 — platform-quirks (freeform, dated findings log) ═══════════════
 
 [[quirks]]
-date = "2026-07-04"
-title = "serviceUrl is per-conversation and must be cached/refreshed"
-note = "Teams replies are POSTed to a `serviceUrl` that arrives on each inbound activity and can change over time. The adapter caches `conversation.id → (serviceUrl, timestamp)` on ingress and refreshes the timestamp on every reply to avoid TTL expiry mid-conversation; a background task in the gateway evicts stale entries (4 h TTL). If an inbound activity lacks `serviceUrl`, the event is dropped (can't route replies)."
+date = "2026-08-07"
+title = "serviceUrl remains gateway-local in bounded ephemeral route state"
+note = "For message activities, Teams requires non-empty Bot Framework channel, tenant, conversation, activity, sender, and service URL fields. The validated service URL is stored only in a process-local route keyed by app/tenant/conversation/activity and indexed by `event_id`; default route TTL is 3600 s with 10000 entries. The conversation-only compatibility cache remains until PR 3, with the same TTL/capacity. Missing required fields return 400."
 kind = "openab_decision"
-source = "crates/openab-gateway/src/adapters/teams.rs#handle_reply"
+source = "docs/adr/teams-ephemeral-ingress-state.md"
 
 [[quirks]]
 date = "2026-07-04"
@@ -298,6 +299,13 @@ title = "Auth is heavier than most adapters (endorsements + serviceUrl claim)"
 note = "JWT validation goes beyond signature/aud/iss/exp: it also enforces (B2) that the signing JWK endorses the activity's `channelId` and (B1) that the token's `serviceurl` claim equals the activity's `serviceUrl` — binding the token to the specific channel/service origin. JWKS keys are cached (1 h TTL) with a force-refresh-on-cache-miss path for Microsoft key rotation. The activity body is parsed before JWT auth (Bot Framework needs `serviceUrl`/`channelId` from the body to validate) — this is why the pre-auth body is capped at 256 KB."
 kind = "intrinsic"
 source = "https://learn.microsoft.com/en-us/azure/bot-service/rest-api/bot-framework-rest-connector-authentication?view=azure-bot-service-4.0"
+
+[[quirks]]
+date = "2026-08-07"
+title = "Accepted activity retries are process-locally deduplicated"
+note = "The composite key `(app_id, tenant_id, conversation_id, activity_id)` follows Vacant → Publishing → Accepted. Concurrent duplicates share the owner's local broadcast result; accepted duplicates return 200 without republishing. No consumer or local publish failure returns 503 and removes Publishing state, so a later retry is not blocked. Default dedupe TTL is 600 s and state is bounded to 10000 entries. This is not durable or cross-replica idempotency."
+kind = "openab_decision"
+source = "docs/adr/teams-ephemeral-ingress-state.md"
 
 [[quirks]]
 date = "2026-08-06"

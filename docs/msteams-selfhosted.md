@@ -40,6 +40,9 @@ app_id     = "${TEAMS_APP_ID}"
 app_secret = "${TEAMS_APP_SECRET}"
 allowed_tenants = ["<tenant-guid>"]
 allowed_users   = ["29:1abc..."]
+dedupe_ttl_secs  = 600
+route_ttl_secs   = 3600
+max_route_entries = 10000
 ```
 
 ### User Trust (`[teams]` section)
@@ -323,6 +326,9 @@ Azure Portal → your bot → **Configuration** → **Messaging endpoint**: `htt
 | `TEAMS_OPENID_METADATA` | No | `https://login.botframework.com/v1/.well-known/openidconfiguration` | HTTPS metadata endpoint on `login.botframework.com` |
 | `TEAMS_ALLOWED_TENANTS` | No | (allow all) | Comma-separated tenant IDs |
 | `TEAMS_WEBHOOK_PATH` | No | `/webhook/teams` | URL path the gateway listens on |
+| `TEAMS_DEDUPE_TTL_SECS` | No | `600` | Process-local duplicate suppression window |
+| `TEAMS_ROUTE_TTL_SECS` | No | `3600` | Authenticated ephemeral route lifetime |
+| `TEAMS_MAX_ROUTE_ENTRIES` | No | `10000` | Independent capacity bound for route and dedupe caches |
 
 > ⚠️ **M0 supports Microsoft commercial public cloud only.** Sovereign-cloud endpoints and custom OAuth/OpenID proxy hosts are rejected. Bot Connector replies accept only validated HTTPS service URLs on `smba.trafficmanager.net`; redirects cannot cross origin.
 

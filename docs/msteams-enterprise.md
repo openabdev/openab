@@ -615,6 +615,9 @@ the OAB `configToml` shown for each mode.
 | `TEAMS_OPENID_METADATA` | No | `https://login.botframework.com/v1/.well-known/openidconfiguration` | OpenID metadata for JWT validation |
 | `TEAMS_ALLOWED_TENANTS` | No | (allow all) | Comma-separated tenant IDs |
 | `TEAMS_WEBHOOK_PATH` | No | `/webhook/teams` | Webhook endpoint path |
+| `TEAMS_DEDUPE_TTL_SECS` | No | `600` | Process-local duplicate suppression window |
+| `TEAMS_ROUTE_TTL_SECS` | No | `3600` | Authenticated ephemeral route lifetime |
+| `TEAMS_MAX_ROUTE_ENTRIES` | No | `10000` | Independent capacity bound for route and dedupe caches |
 
 ## Troubleshooting
 
