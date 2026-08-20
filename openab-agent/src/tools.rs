@@ -345,6 +345,7 @@ where
 }
 
 const POST_KILL_PIPE_JOIN: Duration = Duration::from_secs(3);
+const POST_EXIT_PIPE_JOIN: Duration = Duration::from_secs(6);
 const POST_TIMEOUT_CLEANUP: Duration = Duration::from_secs(5);
 
 async fn join_shell_pipe(
@@ -416,7 +417,7 @@ async fn supervise_shell_process(
     };
 
     let pipe_limit = match process_outcome {
-        ProcessOutcome::Completed(_) => None,
+        ProcessOutcome::Completed(_) => Some(POST_EXIT_PIPE_JOIN),
         ProcessOutcome::Cancelled => Some(POST_KILL_PIPE_JOIN),
     };
     let (stdout, stderr) = join_shell_pipes(
@@ -892,6 +893,41 @@ mod tests {
             !tmp.path().join("cancel-orphan.txt").exists(),
             "controller returned before the Windows process tree was cleaned up"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_unix_completed_returns_when_setsid_descendant_holds_pipes() {
+        let tmp = TempDir::new().unwrap();
+        let command = "setsid sh -c 'echo $$ > escaped.pid; exec sleep 30' & exit 0";
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(8),
+            run_shell_command(
+                command,
+                tmp.path(),
+                Duration::from_secs(10),
+                &build_env(&[]),
+            ),
+        )
+        .await
+        .expect("completed path hung waiting for escaped descendant pipes");
+        assert!(
+            result.is_ok(),
+            "normal exit must not hang on leftover pipes: {result:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "completed-path pipe join must be bounded"
+        );
+
+        if let Ok(raw) = std::fs::read_to_string(tmp.path().join("escaped.pid")) {
+            if let Ok(pid) = raw.trim().parse::<i32>() {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .status();
+            }
+        }
     }
 
     #[cfg(unix)]

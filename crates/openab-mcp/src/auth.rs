@@ -2334,7 +2334,6 @@ mod tests {
         assert_eq!(token_of(map.get("mcp:github")).expires_at, 42);
     }
 
-    #[test]
     #[cfg(windows)]
     #[test]
     fn windows_auth_acl_uses_process_token_not_env_name() {
