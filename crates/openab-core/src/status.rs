@@ -291,6 +291,7 @@ mod tests {
             channel_id: "conversation-1".into(),
             thread_id: None,
             parent_id: None,
+            persistent_conversation: None,
             origin_event_id: Some("evt-last".into()),
         }
     }

@@ -581,7 +581,7 @@ For a rolling deployment with an older Gateway, absent additive scope falls back
 
 Attachment ingress must be explicitly enabled on both processes. Core downloads nothing unless a valid Gateway hello advertises `supports_attachment_materialization`; Gateway stores only bounded metadata until Core has admitted structural, typed L2, and L3 trust. Do not pass Microsoft download URLs or bot credentials through Core configuration.
 
-PR 11 conversation persistence is a Gateway-side opt-in. For a separate Standalone Gateway, set `TEAMS_CONVERSATION_REGISTRY_PATH` on that Gateway process—not only in Core `configToml`—and mount its parent directory on durable storage. Core receives only an additive capability and sends origin correlation after typed L2/L3 Allow; the persisted `serviceUrl` never crosses the WebSocket. The registry does not enable proactive sends or cron until PR 12.
+Conversation persistence is a Gateway-side opt-in. For a separate Standalone Gateway, set `TEAMS_CONVERSATION_REGISTRY_PATH` on that Gateway process—not only in Core `configToml`—and mount its parent directory on durable storage. Core receives only additive capabilities and sends origin correlation after typed L2/L3 Allow; the persisted `serviceUrl` never crosses the WebSocket. An operator may add a baseline `[[cron.jobs]]` block to Core `configToml` with `platform = "teams"`, exact `channel`, and exact `teams_tenant_id`. The Gateway must negotiate persistent-send support with one active Core consumer and find the full app/tenant/`msteams`/conversation key active and non-expired. Usercron, `/remind`, synthetic threads, and conversation creation remain unsupported.
 
 Install the chart version validated with Gateway 0.5.4:
 

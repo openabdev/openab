@@ -233,6 +233,7 @@ mod tests {
             channel_id: "C1".into(),
             thread_id: Some("T1".into()),
             parent_id: None,
+            persistent_conversation: None,
             origin_event_id: None,
         }
     }

@@ -334,6 +334,7 @@ impl AppState {
                     supports_reactions: teams.reactions_enabled(),
                     supports_attachment_materialization: teams.inbound_attachments_enabled(),
                     supports_conversation_registry: teams.conversation_registry_available(),
+                    supports_persistent_conversation_send: teams.conversation_registry_available(),
                     status_backend: if teams.reactions_enabled() {
                         StatusBackend::Reactions
                     } else {
@@ -1171,6 +1172,9 @@ fn build_gateway_hello(
         });
     }
     let active_consumers = state.active_oab_consumers.load(Ordering::Acquire);
+    if let Some(teams) = capabilities.get_mut("teams") {
+        teams.supports_persistent_conversation_send &= active_consumers == 1 && teams.send_ack;
+    }
     schema::GatewayHello {
         schema: schema::GATEWAY_HELLO_SCHEMA.into(),
         protocol_version: schema::GATEWAY_PROTOCOL_VERSION,
@@ -1265,6 +1269,8 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
         let mut attachment_materialization_negotiated = false;
         #[cfg(feature = "teams")]
         let mut conversation_registry_negotiated = false;
+        #[cfg(feature = "teams")]
+        let mut persistent_conversation_send_negotiated = false;
         while let Some(Ok(msg)) = ws_rx.next().await {
             if let Message::Text(text) = msg {
                 if let Ok(envelope) = serde_json::from_str::<schema::GatewayEnvelope>(&text) {
@@ -1296,6 +1302,17 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                                         && hello.capabilities.get("teams").is_some_and(
                                             |capability| capability.supports_conversation_registry,
                                         );
+                                    persistent_conversation_send_negotiated = client_hello
+                                        .protocol_version
+                                        == schema::GATEWAY_PROTOCOL_VERSION
+                                        && hello.topology.supported
+                                        && hello.capabilities.get("teams").is_some_and(
+                                            |capability| {
+                                                capability.send_ack
+                                                    && capability
+                                                        .supports_persistent_conversation_send
+                                            },
+                                        );
                                 }
                                 if let Ok(json) = serde_json::to_string(&hello) {
                                     if control_tx.send(json).await.is_err() {
@@ -1314,12 +1331,35 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
 
                 match serde_json::from_str::<schema::GatewayReply>(&text) {
                     Ok(reply) => {
+                        if reply.persistent_conversation.is_some() {
+                            info!(
+                                platform = %reply.platform,
+                                operation = ?reply.command.as_deref().unwrap_or("send"),
+                                "OAB → gateway persistent reply"
+                            );
+                        } else {
                         info!(
                             platform = %reply.platform,
                             channel = %redact_channel(&reply.channel.id),
                             command = ?reply.command.as_deref(),
                             "OAB → gateway reply"
                         );
+                        }
+                        #[cfg(feature = "teams")]
+                        if reply.persistent_conversation.is_some() && reply.platform != "teams" {
+                            publish_teams_write_outcome(
+                                &reply,
+                                schema::WriteOutcome::Rejected {
+                                    code: "persistent_platform_mismatch".into(),
+                                    message:
+                                        "persistent conversation send is only available for Teams"
+                                            .into(),
+                                    retry_after_ms: None,
+                                },
+                                &state_for_recv.event_tx,
+                            );
+                            continue;
+                        }
                         match reply.platform.as_str() {
                             #[cfg(feature = "telegram")]
                             "telegram" => {
@@ -1354,6 +1394,44 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                             }
                             #[cfg(feature = "teams")]
                             "teams" => {
+                                if reply.persistent_conversation.is_some() {
+                                    let has_request_id = reply
+                                        .request_id
+                                        .as_deref()
+                                        .is_some_and(|request_id| !request_id.trim().is_empty());
+                                    let topology_supported =
+                                        state_for_recv.active_oab_consumers.load(Ordering::Acquire)
+                                            == 1;
+                                    let command_supported = !matches!(
+                                        reply.command.as_deref(),
+                                        Some("register_conversation" | "materialize_attachment")
+                                    );
+                                    if !persistent_conversation_send_negotiated
+                                        || !topology_supported
+                                        || !has_request_id
+                                        || !command_supported
+                                    {
+                                        publish_teams_write_outcome(
+                                            &reply,
+                                            schema::WriteOutcome::Rejected {
+                                                code: if !topology_supported {
+                                                    "unsupported_topology"
+                                                } else if !has_request_id {
+                                                    "request_id_missing"
+                                                } else if !command_supported {
+                                                    "persistent_command_rejected"
+                                                } else {
+                                                    "capability_not_negotiated"
+                                                }
+                                                .into(),
+                                                message: "Teams persistent conversation send is unavailable".into(),
+                                                retry_after_ms: None,
+                                            },
+                                            &state_for_recv.event_tx,
+                                        );
+                                        continue;
+                                    }
+                                }
                                 if reply.command.as_deref() == Some("register_conversation") {
                                     let Some(_request_id) = reply
                                         .request_id
@@ -1494,6 +1572,13 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                                 };
                                 match &outcome {
                                     schema::WriteOutcome::Rejected { code, message, .. } => {
+                                        if reply.persistent_conversation.is_some() {
+                                            error!(
+                                                error_code = %code,
+                                                command = ?reply.command.as_deref(),
+                                                "teams persistent reply rejected"
+                                            );
+                                        } else {
                                         error!(
                                             error_code = %code,
                                             error = %message,
@@ -1501,12 +1586,20 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                                             "teams reply rejected"
                                         );
                                     }
+                                    }
                                     schema::WriteOutcome::Unknown { code, message } => {
-                                        warn!(
-                                            error_code = %code,
-                                            error = %message,
-                                            "teams reply delivery is unknown; not retrying"
-                                        );
+                                        if reply.persistent_conversation.is_some() {
+                                            warn!(
+                                                error_code = %code,
+                                                "teams persistent reply delivery is unknown; not retrying"
+                                            );
+                                        } else {
+                                            warn!(
+                                                error_code = %code,
+                                                error = %message,
+                                                "teams reply delivery is unknown; not retrying"
+                                            );
+                                        }
                                     }
                                     schema::WriteOutcome::Delivered { .. } => {}
                                 }
@@ -2055,6 +2148,7 @@ mod gateway_protocol_tests {
                     request_id: Some("request-1".into()),
                     quote_message_id: None,
                     target_message_id: None,
+                    persistent_conversation: None,
                 },
             )?))
             .await?;
@@ -2092,6 +2186,7 @@ mod gateway_protocol_tests {
                         request_id: Some(request_id.into()),
                         quote_message_id: None,
                         target_message_id: Some("teams-activity-1".into()),
+                        persistent_conversation: None,
                     },
                 )?))
                 .await?;
@@ -2172,6 +2267,7 @@ mod gateway_protocol_tests {
                     request_id: None,
                     quote_message_id: None,
                     target_message_id: None,
+                    persistent_conversation: None,
                 },
             )?))
             .await?;
@@ -2227,6 +2323,7 @@ mod gateway_protocol_tests {
         assert!(teams.supports_target_message_id);
         assert!(teams.supports_attachment_materialization);
         assert!(!teams.supports_conversation_registry);
+        assert!(!teams.supports_persistent_conversation_send);
         assert!(!teams.supports_reactions);
         assert_eq!(
             teams.message_limit,
@@ -2234,6 +2331,68 @@ mod gateway_protocol_tests {
                 max: schema::TEAMS_TEXT_UTF16_BUDGET_BYTES,
             }
         );
+    }
+
+    #[cfg(feature = "teams")]
+    #[test]
+    fn teams_persistent_send_capability_requires_registry_and_single_consumer() {
+        let root = std::fs::canonicalize(std::env::temp_dir()).expect("temp root");
+        let directory = root.join(format!(
+            "openab-gateway-persistent-capability-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&directory).expect("registry directory");
+        let registry_path = directory.join("registry.json");
+
+        let (event_tx, _event_rx) = broadcast::channel(8);
+        let mut state = AppState::test_default(event_tx);
+        state.apply_teams_config(GatewayTeamsConfig {
+            app_id: Some("app".into()),
+            app_secret: Some("secret".into()),
+            allowed_tenants: vec![],
+            oauth_endpoint: "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token"
+                .into(),
+            openid_metadata: "https://login.botframework.com/v1/.well-known/openidconfiguration"
+                .into(),
+            webhook_path: "/webhook/teams".into(),
+            dedupe_ttl_secs: 600,
+            route_ttl_secs: 3600,
+            max_route_entries: 10_000,
+            reactions_enabled: false,
+            inbound_attachments: false,
+            conversation_registry_path: Some(registry_path.to_string_lossy().into_owned()),
+            conversation_registry_max_entries: 1_000,
+            conversation_registry_ttl_secs: 365 * 24 * 60 * 60,
+        });
+        let client = schema::GatewayClientHello {
+            schema: schema::CLIENT_HELLO_SCHEMA.into(),
+            protocol_version: schema::GATEWAY_PROTOCOL_VERSION,
+            client_name: Some("test-core".into()),
+            requested_platforms: vec!["teams".into()],
+        };
+
+        state
+            .active_oab_consumers
+            .store(1, std::sync::atomic::Ordering::Release);
+        let hello = build_gateway_hello(&state, &client);
+        let teams = hello.capabilities.get("teams").unwrap();
+        assert!(teams.supports_conversation_registry);
+        assert!(teams.supports_persistent_conversation_send);
+
+        state
+            .active_oab_consumers
+            .store(2, std::sync::atomic::Ordering::Release);
+        let hello = build_gateway_hello(&state, &client);
+        assert!(!hello.capabilities["teams"].supports_persistent_conversation_send);
+
+        state
+            .active_oab_consumers
+            .store(0, std::sync::atomic::Ordering::Release);
+        let hello = build_gateway_hello(&state, &client);
+        assert!(!hello.capabilities["teams"].supports_persistent_conversation_send);
+
+        drop(state);
+        std::fs::remove_dir_all(directory).expect("remove registry directory");
     }
 
     #[cfg(feature = "teams")]
@@ -2287,6 +2446,7 @@ mod gateway_protocol_tests {
             quote_message_id: None,
             target_message_id: None,
             attachment_ref: None,
+            persistent_conversation: None,
         };
 
         socket
@@ -2434,6 +2594,7 @@ mod gateway_protocol_tests {
             quote_message_id: None,
             target_message_id: None,
             attachment_ref: Some("att-opaque".into()),
+            persistent_conversation: None,
         };
         socket
             .send(Message::Text(serde_json::to_string(
@@ -2542,6 +2703,7 @@ mod gateway_protocol_tests {
             request_id: Some("request-1".into()),
             quote_message_id: None,
             target_message_id: None,
+            persistent_conversation: None,
         };
         let expected_outcomes = [
             schema::WriteOutcome::Delivered {
@@ -2609,6 +2771,7 @@ mod gateway_protocol_tests {
             request_id: None,
             quote_message_id: None,
             target_message_id: None,
+            persistent_conversation: None,
         };
         socket
             .send(Message::Text(serde_json::to_string(&legacy_reply)?))

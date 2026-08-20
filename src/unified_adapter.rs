@@ -12,7 +12,10 @@ use openab_core::adapter::{WriteFailure, WriteOutcome as CoreWriteOutcome};
 use openab_core::gateway::apply_teams_progressive_capabilities;
 #[cfg(feature = "teams")]
 use openab_gateway::schema::WriteOutcome;
-use openab_gateway::schema::{Content, GatewayReply, ReplyChannel, TEAMS_TEXT_UTF16_BUDGET_BYTES};
+use openab_gateway::schema::{
+    Content, GatewayReply, PersistentConversationTarget as GatewayPersistentConversationTarget,
+    ReplyChannel, TEAMS_TEXT_UTF16_BUDGET_BYTES,
+};
 use openab_gateway::AppState;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -212,6 +215,13 @@ impl UnifiedGatewayAdapter {
                 id: channel.channel_id.clone(),
                 thread_id: channel.thread_id.clone(),
             },
+            persistent_conversation: channel.persistent_conversation.as_ref().map(|target| {
+                GatewayPersistentConversationTarget {
+                    tenant_id: target.tenant_id.clone(),
+                    bot_framework_channel_id: target.bot_framework_channel_id.clone(),
+                    conversation_id: target.conversation_id.clone(),
+                }
+            }),
             content: Content {
                 content_type: "text".into(),
                 text: content.into(),
@@ -357,6 +367,9 @@ impl ChatAdapter for UnifiedGatewayAdapter {
             supports_conversation_registry: platform == "teams"
                 && teams_available
                 && teams_conversation_registry,
+            supports_persistent_conversation_send: platform == "teams"
+                && teams_available
+                && teams_conversation_registry,
             can_edit,
             can_delete,
             streaming_mode,
@@ -495,6 +508,7 @@ impl ChatAdapter for UnifiedGatewayAdapter {
             channel_id: channel.channel_id.clone(),
             thread_id: Some(trigger_msg.message_id.clone()),
             parent_id: Some(channel.channel_id.clone()),
+            persistent_conversation: channel.persistent_conversation.clone(),
             origin_event_id: channel.origin_event_id.clone(),
         })
     }
@@ -697,11 +711,17 @@ mod tests {
         });
         let adapter = UnifiedGatewayAdapter::new(Arc::new(state));
         assert!(adapter.capabilities("teams").supports_conversation_registry);
+        assert!(
+            adapter
+                .capabilities("teams")
+                .supports_persistent_conversation_send
+        );
         let channel = ChannelRef {
             platform: "teams".into(),
             channel_id: "conversation-1".into(),
             thread_id: None,
             parent_id: None,
+            persistent_conversation: None,
             origin_event_id: Some("event-1".into()),
         };
         let reply = adapter.build_reply(&channel, "", Some("register_conversation"), None);
@@ -709,6 +729,34 @@ mod tests {
         assert!(!wire.contains("service_url"));
         assert!(!wire.contains("serviceUrl"));
         assert!(adapter.register_conversation(&channel).await.is_err());
+
+        let persistent_channel = ChannelRef {
+            platform: "teams".into(),
+            channel_id: "conversation-1".into(),
+            thread_id: None,
+            parent_id: None,
+            persistent_conversation: Some(Box::new(
+                openab_core::adapter::PersistentConversationTarget {
+                    tenant_id: "tenant-1".into(),
+                    bot_framework_channel_id: "msteams".into(),
+                    conversation_id: "conversation-1".into(),
+                },
+            )),
+            origin_event_id: None,
+        };
+        let reply = adapter.build_reply(&persistent_channel, "scheduled", None, None);
+        let target = reply.persistent_conversation.unwrap();
+        assert_eq!(target.tenant_id, "tenant-1");
+        assert_eq!(target.bot_framework_channel_id, "msteams");
+        assert_eq!(target.conversation_id, "conversation-1");
+        let wire = serde_json::to_string(&adapter.build_reply(
+            &persistent_channel,
+            "scheduled",
+            None,
+            None,
+        ))?;
+        assert!(!wire.contains("service_url"));
+        assert!(!wire.contains("serviceUrl"));
         assert!(!registry_path.exists());
         std::fs::remove_dir_all(directory)?;
         Ok(())
@@ -777,6 +825,7 @@ mod tests {
                 channel_id: "conversation-1".into(),
                 thread_id: None,
                 parent_id: None,
+                persistent_conversation: None,
                 origin_event_id: Some("event-1".into()),
             },
             message_id: "activity-1".into(),

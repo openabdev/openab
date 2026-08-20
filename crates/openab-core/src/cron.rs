@@ -1,4 +1,6 @@
-use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, SenderContext};
+use crate::adapter::{
+    AdapterRouter, ChannelRef, ChatAdapter, PersistentConversationTarget, SenderContext,
+};
 use crate::config::CronJobConfig;
 use crate::format;
 use chrono::{Timelike, Utc};
@@ -238,13 +240,21 @@ pub fn should_fire(schedule: &Schedule, tz: Tz) -> bool {
 }
 
 /// Known platforms that have adapter support.
-const VALID_PLATFORMS: &[&str] = &["discord", "slack", "telegram", "googlechat", "lineworks"];
+const VALID_PLATFORMS: &[&str] = &[
+    "discord",
+    "slack",
+    "telegram",
+    "googlechat",
+    "lineworks",
+    "teams",
+];
 
-/// Cron platforms that must NOT get a synthetic thread: Google Chat cron
-/// messages stay top-level by design, and LINE WORKS has no thread/topic API
-/// (its reply dispatch ignores topic creation), so a synthetic thread would
-/// silently deliver to the flat channel instead.
-const CRON_THREADLESS_PLATFORMS: &[&str] = &["googlechat", "lineworks"];
+/// Cron platforms that must NOT get a synthetic thread. Their configured
+/// destination already is the complete routing surface.
+const CRON_THREADLESS_PLATFORMS: &[&str] = &["googlechat", "lineworks", "teams"];
+const TEAMS_BOT_FRAMEWORK_CHANNEL_ID: &str = "msteams";
+const TEAMS_TENANT_ID_MAX_BYTES: usize = 256;
+const TEAMS_CONVERSATION_ID_MAX_BYTES: usize = 2_048;
 
 fn should_create_cron_thread(job: &CronJobConfig) -> bool {
     job.thread_id.is_none() && !CRON_THREADLESS_PLATFORMS.contains(&job.platform.as_str())
@@ -257,12 +267,78 @@ fn cron_sender_thread_id(channel: &ChannelRef) -> Option<String> {
         .or_else(|| channel.parent_id.as_ref().map(|_| channel.channel_id.clone()))
 }
 
-/// Validate all cronjob configs (fail-fast on bad cron expressions or timezones).
+fn valid_bounded_identifier(value: &str, max_bytes: usize) -> bool {
+    !value.trim().is_empty()
+        && value.trim() == value
+        && value.len() <= max_bytes
+        && !value.chars().any(char::is_control)
+}
+
+fn validate_cron_target_fields(index: usize, job: &CronJobConfig) -> anyhow::Result<()> {
+    if job.platform == "teams" {
+        let tenant_id = job.teams_tenant_id.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("cronjobs[{index}]: Teams jobs require teams_tenant_id")
+        })?;
+        if !valid_bounded_identifier(tenant_id, TEAMS_TENANT_ID_MAX_BYTES) {
+            anyhow::bail!("cronjobs[{index}]: Teams tenant identity is invalid");
+        }
+        if !valid_bounded_identifier(&job.channel, TEAMS_CONVERSATION_ID_MAX_BYTES) {
+            anyhow::bail!("cronjobs[{index}]: Teams conversation identity is invalid");
+        }
+        if job.thread_id.is_some() {
+            anyhow::bail!("cronjobs[{index}]: Teams jobs must not set thread_id");
+        }
+        if job.id.is_some()
+            || job.disable_on_success.is_some()
+            || job.disable_on_success_match.is_some()
+            || job.disable_on_success_working_dir.is_some()
+            || job.disable_on_success_timeout_secs != 60
+        {
+            anyhow::bail!("cronjobs[{index}]: Teams baseline jobs contain a usercron-only field");
+        }
+    } else if job.teams_tenant_id.is_some() {
+        anyhow::bail!(
+            "cronjobs[{index}]: teams_tenant_id is only valid when platform is \"teams\""
+        );
+    }
+    Ok(())
+}
+
+fn cron_channel_ref(job: &CronJobConfig) -> anyhow::Result<ChannelRef> {
+    let persistent_conversation = if job.platform == "teams" {
+        let tenant_id = job
+            .teams_tenant_id
+            .as_deref()
+            .filter(|value| valid_bounded_identifier(value, TEAMS_TENANT_ID_MAX_BYTES))
+            .ok_or_else(|| anyhow::anyhow!("Teams cron target is invalid"))?;
+        if !valid_bounded_identifier(&job.channel, TEAMS_CONVERSATION_ID_MAX_BYTES) {
+            anyhow::bail!("Teams cron target is invalid");
+        }
+        Some(Box::new(PersistentConversationTarget {
+            tenant_id: tenant_id.to_owned(),
+            bot_framework_channel_id: TEAMS_BOT_FRAMEWORK_CHANNEL_ID.into(),
+            conversation_id: job.channel.clone(),
+        }))
+    } else {
+        None
+    };
+    Ok(ChannelRef {
+        platform: job.platform.clone(),
+        channel_id: job.channel.clone(),
+        thread_id: job.thread_id.clone(),
+        parent_id: None,
+        persistent_conversation,
+        origin_event_id: None,
+    })
+}
+
+/// Validate all baseline cron configs before scheduler or adapter side effects.
 pub fn validate_cronjobs(
     cronjobs: &[CronJobConfig],
     configured_platforms: &[&str],
 ) -> anyhow::Result<()> {
     for (i, job) in cronjobs.iter().enumerate() {
+        validate_cron_target_fields(i, job)?;
         if !job.enabled {
             continue;
         }
@@ -327,8 +403,17 @@ pub fn load_usercron_file(path: &Path, configured_platforms: &[&str]) -> Vec<Cro
             return vec![];
         }
     };
-    // Validate each entry individually — keep valid ones, skip bad ones
+    // Validate each entry individually — keep valid ones, skip bad ones.
+    // Agent-writable usercron never receives durable Teams route authority.
     parsed.jobs.into_iter().enumerate().filter(|(i, job)| {
+        if job.platform == "teams" {
+            warn!(index = i, "usercron: Teams jobs are not allowed, skipping");
+            return false;
+        }
+        if job.teams_tenant_id.is_some() {
+            warn!(index = i, "usercron: Teams-only target field is not allowed, skipping");
+            return false;
+        }
         if let Err(e) = parse_cron_expr(&job.schedule) {
             warn!(index = i, schedule = %job.schedule, error = %e, "usercron: invalid cron expression, skipping");
             return false;
@@ -382,39 +467,60 @@ fn parse_job_list(
     source: &str,
     usercron_path: Option<&Path>,
 ) -> Vec<ParsedJob> {
-    configs.iter().filter(|job| {
+    configs
+        .iter()
+        .filter(|job| {
         if !job.enabled {
+                if job.platform == "teams" {
+                    info!(schedule = %job.schedule, source, "Teams cronjob disabled, skipping");
+                } else {
             info!(schedule = %job.schedule, channel = %job.channel, source, "cronjob disabled, skipping");
         }
+            }
         job.enabled
-    }).filter_map(|job| {
+        })
+        .filter_map(|job| {
         let schedule = match parse_cron_expr(&job.schedule) {
-            Ok(s) => s,
-            Err(e) => {
-                error!(schedule = %job.schedule, error = %e, source, "invalid cron expression, skipping");
+                Ok(schedule) => schedule,
+                Err(error) => {
+                    error!(schedule = %job.schedule, error = %error, source, "invalid cron expression, skipping");
                 return None;
             }
         };
         let tz: Tz = match job.timezone.parse() {
-            Ok(t) => t,
-            Err(e) => {
-                error!(timezone = %job.timezone, error = %e, source, "invalid timezone, skipping");
+                Ok(timezone) => timezone,
+                Err(error) => {
+                    error!(timezone = %job.timezone, error = %error, source, "invalid timezone, skipping");
                 return None;
             }
         };
+            if job.platform == "teams" {
         info!(
-            schedule = %job.schedule, timezone = %job.timezone,
-            channel = %job.channel, platform = %job.platform,
-            message = %job.message, source,
+                    schedule = %job.schedule,
+                    timezone = %job.timezone,
+                    platform = "teams",
+                    source,
+                    "Teams cronjob registered"
+                );
+            } else {
+                info!(
+                    schedule = %job.schedule,
+                    timezone = %job.timezone,
+                    channel = %job.channel,
+                    platform = %job.platform,
+                    message = %job.message,
+                    source,
             "cronjob registered"
         );
+            }
         Some(ParsedJob {
             schedule,
             tz,
             config: job.clone(),
             usercron_path: usercron_path.map(Path::to_path_buf),
         })
-    }).collect()
+        })
+        .collect()
 }
 
 /// Run the internal cron scheduler. Evaluates cron expressions once per minute.
@@ -513,10 +619,22 @@ pub async fn run_scheduler(
                     {
                         let running = in_flight.lock().await;
                         if running.contains(&idx) {
+                            if job.config.platform == "teams" {
+                                warn!(schedule = %job.config.schedule, platform = "teams", "skipping cronjob, previous execution still running");
+                            } else {
                             warn!(schedule = %job.config.schedule, channel = %job.config.channel, "skipping cronjob, previous execution still running");
+                            }
                             continue;
                         }
                     }
+                    if job.config.platform == "teams" {
+                        info!(
+                            schedule = %job.config.schedule,
+                            platform = "teams",
+                            source = if job.usercron_path.is_some() { "usercron" } else { "baseline" },
+                            "cronjob fired"
+                        );
+                    } else {
                     info!(
                         schedule = %job.config.schedule,
                         channel = %job.config.channel,
@@ -525,6 +643,7 @@ pub async fn run_scheduler(
                         sender = %job.config.sender_name,
                         "🔔 cronjob fired"
                     );
+                    }
                     in_flight.lock().await.insert(idx);
 
                     let config = job.config.clone();
@@ -591,9 +710,37 @@ async fn fire_cronjob(
     };
 
     let adapter = match adapters.get(&job.platform) {
-        Some(a) => a.clone(),
+        Some(adapter) => adapter.clone(),
         None => {
             error!(platform = %job.platform, "no adapter for platform, skipping cronjob");
+            return;
+        }
+    };
+
+    if job.platform == "teams" {
+        let capabilities = adapter.capabilities("teams");
+        if !capabilities.send_ack || !capabilities.supports_persistent_conversation_send {
+            warn!(
+                platform = "teams",
+                operation = "persistent_trigger_send",
+                "Teams cron persistent-send capability is unavailable; skipping execution"
+            );
+            return;
+        }
+    }
+
+    let thread_channel = match cron_channel_ref(job) {
+        Ok(channel) => channel,
+        Err(error) => {
+            if job.platform == "teams" {
+                warn!(
+                    platform = "teams",
+                    operation = "target_build",
+                    "Teams cron target is invalid"
+                );
+            } else {
+                error!(platform = %job.platform, error = %error, "failed to build cron target");
+            }
             return;
         }
     };
@@ -612,16 +759,9 @@ async fn fire_cronjob(
         if !marker.is_empty() {
             match check_disable_on_success(job, command, marker).await {
                 DisableOnSuccessResult::Achieved => {
-                    let channel = ChannelRef {
-                        platform: job.platform.clone(),
-                        channel_id: job.channel.clone(),
-                        thread_id: job.thread_id.clone(),
-                        parent_id: None,
-                        origin_event_id: None,
-                    };
                     if let Err(e) = adapter
                         .send_message(
-                            &channel,
+                            &thread_channel,
                             &format!(
                                 "✅ Goal achieved: `{}` matched `{}`. Disabling cronjob.",
                                 command, marker
@@ -655,14 +795,6 @@ async fn fire_cronjob(
         }
     }
 
-    let thread_channel = ChannelRef {
-        platform: job.platform.clone(),
-        channel_id: job.channel.clone(),
-        thread_id: job.thread_id.clone(),
-        parent_id: None,
-        origin_event_id: None,
-    };
-
     let trigger_msg = match adapter
         .send_message(
             &thread_channel,
@@ -670,9 +802,26 @@ async fn fire_cronjob(
         )
         .await
     {
-        Ok(msg) => msg,
-        Err(e) => {
-            error!(channel = %job.channel, error = %e, "failed to send cron message");
+        Ok(message) if job.platform == "teams" && message.message_id.trim().is_empty() => {
+            warn!(
+                platform = "teams",
+                operation = "persistent_trigger_send",
+                outcome = "unknown",
+                "Teams cron trigger returned no activity id; skipping agent work"
+            );
+            return;
+        }
+        Ok(message) => message,
+        Err(error) => {
+            if job.platform == "teams" {
+                warn!(
+                    platform = "teams",
+                    operation = "persistent_trigger_send",
+                    "Teams cron trigger was not delivered; skipping agent work"
+                );
+            } else {
+                error!(channel = %job.channel, error = %error, "failed to send cron message");
+            }
             return;
         }
     };
@@ -1255,6 +1404,7 @@ message = "hello"
         assert_eq!(job.sender_name, "openab-cron");
         assert_eq!(job.timezone, "UTC");
         assert!(job.thread_id.is_none());
+        assert!(job.teams_tenant_id.is_none());
         assert!(job.id.is_none());
         assert!(job.disable_on_success.is_none());
         assert!(job.disable_on_success_match.is_none());
@@ -1331,6 +1481,26 @@ message = "ping"
         let jobs = load_usercron_file(&path, &["discord"]);
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].message, "ping");
+    }
+
+    #[test]
+    fn load_usercron_rejects_teams_even_when_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cronjob.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[jobs]]
+schedule = "* * * * *"
+channel = "conversation-1"
+teams_tenant_id = "tenant-1"
+message = "must not run"
+platform = "teams"
+"#,
+        )
+        .unwrap();
+
+        assert!(load_usercron_file(&path, &["teams"]).is_empty());
     }
 
     #[test]
@@ -1439,6 +1609,7 @@ disable_on_success = "echo SUCCESS"
             enabled: true,
             schedule: "* * * * *".into(),
             channel: "123".into(),
+            teams_tenant_id: None,
             message: "hi".into(),
             platform: "discord".into(),
             sender_name: "test".into(),
@@ -1548,6 +1719,7 @@ message = "a"
             enabled: true,
             schedule: "* * * * *".into(),
             channel: "123".into(),
+            teams_tenant_id: None,
             message: "hi".into(),
             platform: "discord".into(),
             sender_name: "test".into(),
@@ -1569,6 +1741,31 @@ message = "a"
 
         job.thread_id = Some("spaces/TEST/threads/THREAD".into());
         assert!(!should_create_cron_thread(&job));
+    }
+
+    #[test]
+    fn teams_cron_target_is_exact_and_threadless() {
+        let mut job = test_cron_job();
+        job.id = None;
+        job.platform = "teams".into();
+        job.channel = "conversation-1".into();
+        job.teams_tenant_id = Some("tenant-1".into());
+        job.disable_on_success = None;
+        job.disable_on_success_match = None;
+
+        assert!(!should_create_cron_thread(&job));
+        let channel = cron_channel_ref(&job).unwrap();
+        assert_eq!(channel.channel_id, "conversation-1");
+        assert!(channel.thread_id.is_none());
+        assert!(channel.origin_event_id.is_none());
+        assert_eq!(
+            channel.persistent_conversation,
+            Some(Box::new(PersistentConversationTarget {
+                tenant_id: "tenant-1".into(),
+                bot_framework_channel_id: "msteams".into(),
+                conversation_id: "conversation-1".into(),
+            }))
+        );
     }
 
     #[test]
@@ -1598,6 +1795,7 @@ message = "a"
             channel_id: "spaces/TEST".into(),
             thread_id: None,
             parent_id: None,
+            persistent_conversation: None,
             origin_event_id: None,
         };
 
@@ -1611,6 +1809,7 @@ message = "a"
             channel_id: "spaces/TEST".into(),
             thread_id: Some("spaces/TEST/threads/THREAD".into()),
             parent_id: None,
+            persistent_conversation: None,
             origin_event_id: None,
         };
 
@@ -1627,10 +1826,14 @@ message = "a"
             channel_id: "thread-456".into(),
             thread_id: None,
             parent_id: Some("channel-123".into()),
+            persistent_conversation: None,
             origin_event_id: None,
         };
 
-        assert_eq!(cron_sender_thread_id(&channel).as_deref(), Some("thread-456"));
+        assert_eq!(
+            cron_sender_thread_id(&channel).as_deref(),
+            Some("thread-456")
+        );
     }
 
     // --- validate_cronjobs tests ---
@@ -1642,6 +1845,7 @@ message = "a"
             enabled: true,
             schedule: "0 9 * * 1-5".into(),
             channel: "123".into(),
+            teams_tenant_id: None,
             message: "hi".into(),
             platform: "discord".into(),
             sender_name: "test".into(),
@@ -1667,12 +1871,62 @@ message = "a"
     }
 
     #[test]
+    fn validate_cronjobs_accepts_bounded_teams_baseline() {
+        let mut job = test_cron_job();
+        job.id = None;
+        job.platform = "teams".into();
+        job.channel = "conversation-1".into();
+        job.teams_tenant_id = Some("tenant-1".into());
+        job.disable_on_success = None;
+        job.disable_on_success_match = None;
+
+        assert!(validate_cronjobs(&[job], &["teams"]).is_ok());
+    }
+
+    #[test]
+    fn validate_cronjobs_rejects_invalid_teams_target_shapes() {
+        let mut job = test_cron_job();
+        job.id = None;
+        job.platform = "teams".into();
+        job.channel = "conversation-1".into();
+        job.teams_tenant_id = Some("tenant-1".into());
+        job.disable_on_success = None;
+        job.disable_on_success_match = None;
+
+        let mut missing_tenant = job.clone();
+        missing_tenant.teams_tenant_id = None;
+        assert!(validate_cronjobs(&[missing_tenant], &["teams"]).is_err());
+
+        let mut empty_tenant = job.clone();
+        empty_tenant.teams_tenant_id = Some(String::new());
+        assert!(validate_cronjobs(&[empty_tenant], &["teams"]).is_err());
+
+        let mut oversized_tenant = job.clone();
+        oversized_tenant.teams_tenant_id = Some("t".repeat(TEAMS_TENANT_ID_MAX_BYTES + 1));
+        assert!(validate_cronjobs(&[oversized_tenant], &["teams"]).is_err());
+
+        let mut threaded = job.clone();
+        threaded.thread_id = Some("thread-1".into());
+        assert!(validate_cronjobs(&[threaded], &["teams"]).is_err());
+
+        let mut usercron_field = job.clone();
+        usercron_field.enabled = false;
+        usercron_field.disable_on_success = Some("echo done".into());
+        assert!(validate_cronjobs(&[usercron_field], &["teams"]).is_err());
+
+        let mut cross_platform = job;
+        cross_platform.platform = "discord".into();
+        assert!(validate_cronjobs(&[cross_platform], &["discord"]).is_err());
+    }
+
+    #[test]
     fn validate_cronjobs_invalid_cron_fails() {
         let jobs = vec![CronJobConfig {
             id: None,
             enabled: true,
             schedule: "bad".into(),
             channel: "123".into(),
+            teams_tenant_id: None,
             message: "hi".into(),
             platform: "discord".into(),
             sender_name: "test".into(),
@@ -1694,6 +1948,7 @@ message = "a"
             enabled: true,
             schedule: "* * * * *".into(),
             channel: "123".into(),
+            teams_tenant_id: None,
             message: "hi".into(),
             platform: "discord".into(),
             sender_name: "test".into(),
@@ -1715,6 +1970,7 @@ message = "a"
             enabled: true,
             schedule: "* * * * *".into(),
             channel: "123".into(),
+            teams_tenant_id: None,
             message: "hi".into(),
             platform: "matrix".into(),
             sender_name: "test".into(),
@@ -1736,6 +1992,7 @@ message = "a"
             enabled: true,
             schedule: "* * * * *".into(),
             channel: "123".into(),
+            teams_tenant_id: None,
             message: "hi".into(),
             platform: "slack".into(),
             sender_name: "test".into(),
@@ -1757,6 +2014,7 @@ message = "a"
             enabled: false,
             schedule: "bad".into(),
             channel: "123".into(),
+            teams_tenant_id: None,
             message: "hi".into(),
             platform: "discord".into(),
             sender_name: "test".into(),
@@ -1777,6 +2035,7 @@ message = "a"
             enabled: true,
             schedule: "bad".into(),
             channel: "123".into(),
+            teams_tenant_id: None,
             message: "hi".into(),
             platform: "discord".into(),
             sender_name: "test".into(),
@@ -1831,13 +2090,25 @@ schedule = "*/30 * * * *"
 channel = "456"
 message = "ping"
 platform = "slack"
+
+[[cron.jobs]]
+schedule = "0 9 * * 1-5"
+channel = "conversation-1"
+teams_tenant_id = "tenant-1"
+message = "scheduled"
+platform = "teams"
 "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert!(cfg.cron.usercron_enabled);
         assert_eq!(cfg.cron.usercron_path.as_deref(), Some("cronjob.toml"));
-        assert_eq!(cfg.cron.jobs.len(), 2);
+        assert_eq!(cfg.cron.jobs.len(), 3);
         assert_eq!(cfg.cron.jobs[0].message, "hello");
         assert_eq!(cfg.cron.jobs[1].platform, "slack");
+        assert_eq!(cfg.cron.jobs[2].platform, "teams");
+        assert_eq!(
+            cfg.cron.jobs[2].teams_tenant_id.as_deref(),
+            Some("tenant-1")
+        );
     }
 
     #[test]

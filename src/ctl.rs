@@ -243,6 +243,7 @@ impl CtlHandler for RuntimeHandler {
                     channel_id: tid,
                     thread_id: None,
                     parent_id: None,
+                    persistent_conversation: None,
                     origin_event_id: None,
                 };
                 match adapter.rename_thread(&channel, value).await {
@@ -282,6 +283,7 @@ impl CtlHandler for RuntimeHandler {
                     channel_id: tid,
                     thread_id: None,
                     parent_id: None,
+                    persistent_conversation: None,
                     origin_event_id: None,
                 };
                 Response {

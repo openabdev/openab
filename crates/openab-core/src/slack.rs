@@ -465,6 +465,7 @@ impl ChatAdapter for SlackAdapter {
                 channel_id: channel.channel_id.clone(),
                 thread_id: channel.thread_id.clone(),
                 parent_id: None,
+                persistent_conversation: None,
                 origin_event_id: None,
             },
             message_id: ts.to_string(),
@@ -483,6 +484,7 @@ impl ChatAdapter for SlackAdapter {
             channel_id: channel.channel_id.clone(),
             thread_id: Some(trigger_msg.message_id.clone()),
             parent_id: None,
+            persistent_conversation: None,
             origin_event_id: None,
         })
     }
@@ -579,6 +581,7 @@ impl ChatAdapter for SlackAdapter {
                 channel_id: channel.channel_id.clone(),
                 thread_id: channel.thread_id.clone(),
                 parent_id: None,
+                persistent_conversation: None,
                 origin_event_id: None,
             },
             message_id: ts,
@@ -1075,6 +1078,7 @@ pub async fn run_slack_adapter(
                                                                 channel_id: channel_id.to_string(),
                                                                 thread_id: event["thread_ts"].as_str().map(|s| s.to_string()),
                                                                 parent_id: None,
+                                                                persistent_conversation: None,
                                                                 origin_event_id: None,
                                                             };
                                                             let adapter = adapter.clone();
@@ -1430,6 +1434,7 @@ async fn handle_message(
                 channel_id: channel_id.clone(),
                 thread_id: thread_ts.clone(),
                 parent_id: None,
+                persistent_conversation: None,
                 origin_event_id: None,
             },
             message_id: ts.clone(),
@@ -1555,6 +1560,7 @@ async fn handle_message(
                             channel_id: channel_id.clone(),
                             thread_id: thread_ts.clone(),
                             parent_id: None,
+                            persistent_conversation: None,
                             origin_event_id: None,
                         },
                         message_id: ts.clone(),
@@ -1698,6 +1704,7 @@ async fn handle_message(
             channel_id: channel_id.clone(),
             thread_id: thread_ts.clone().or_else(|| Some(ts.clone())),
             parent_id: None,
+            persistent_conversation: None,
             origin_event_id: None,
         };
         let file_list = failed_image_files
@@ -1742,6 +1749,7 @@ async fn handle_message(
             channel_id: channel_id.clone(),
             thread_id: thread_ts.clone(),
             parent_id: None,
+            persistent_conversation: None,
             origin_event_id: None,
         },
         message_id: ts.clone(),
@@ -1753,6 +1761,7 @@ async fn handle_message(
         channel_id: channel_id.clone(),
         thread_id: Some(thread_ts.unwrap_or(ts)),
         parent_id: None,
+        persistent_conversation: None,
         origin_event_id: None,
     };
 

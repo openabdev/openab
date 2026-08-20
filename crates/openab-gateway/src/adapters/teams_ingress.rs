@@ -554,6 +554,22 @@ impl TeamsIngressRegistry {
         Ok(candidate.route.clone())
     }
 
+    pub(super) fn owned_route_for_exact_target(
+        &mut self,
+        app_id: &str,
+        tenant_id: &str,
+        conversation_id: &str,
+        activity_id: &str,
+        now: Instant,
+    ) -> Result<TeamsIngressRoute, OwnershipLookupError> {
+        self.cleanup(now);
+        let key = TeamsRouteKey::new(app_id, tenant_id, conversation_id, activity_id);
+        self.owned
+            .get(&key)
+            .map(|entry| entry.route.clone())
+            .ok_or(OwnershipLookupError::NotOwned)
+    }
+
     pub(super) fn remove_owned(&mut self, route: &TeamsIngressRoute, activity_id: &str) -> bool {
         self.owned
             .remove(&route.key.with_activity_id(activity_id))

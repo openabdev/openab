@@ -564,6 +564,7 @@ mod tests {
             channel_id: "conversation".into(),
             thread_id: None,
             parent_id: None,
+            persistent_conversation: None,
             origin_event_id: Some("event".into()),
         }
     }

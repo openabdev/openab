@@ -53,8 +53,8 @@ Each agent lives under `agents.<name>`.
 | `gateway.teams.conversationRegistryPath` | Opt in to the Gateway-local persistent Teams conversation registry. Mount the path separately. | `""` |
 | `gateway.teams.conversationRegistryMaxEntries` | Persistent Teams registry entry cap. | `1000` |
 | `gateway.teams.conversationRegistryTtlSecs` | Active/disabled registry retention window. | `31536000` |
-| `cron.usercronEnabled` | Enable user-provided cron configuration. | `false` |
-| `cronjobs` | Config-driven scheduled messages for an agent. | `[]` |
+| `configToml` | Raw authoritative `config.toml`, including baseline `[[cron.jobs]]`. Required unless `configUrl` is used. | `""` |
+| `configUrl` | External authoritative config URL; mutually exclusive with the rendered ConfigMap path. | `""` |
 | `persistence.enabled` | Enable persistent storage for auth and settings. | `true` |
 | `persistence.existingClaim` | Reuse an existing PVC instead of creating one. | `""` |
 | `agentsMd` | Contents of `AGENTS.md` mounted into the working directory. | `""` |
@@ -132,6 +132,20 @@ Presence of any of these four fields opts into typed L2 policy. In Standalone Ga
 `gateway.teams.inboundAttachments=true` is the exception that must stay aligned across processes: the chart emits `TEAMS_INBOUND_ATTACHMENTS=true` into both Core and Gateway. It enables bounded metadata-first image/text materialization only after Core trust admission. When `gateway.deploy=false`, configure the same environment variable on the external Gateway yourself.
 
 `gateway.teams.conversationRegistryPath` is a separate Gateway-only opt-in. The chart does not silently provision or attach a Gateway PVC; use `gateway.extraVolumeMounts` and `gateway.extraVolumes` (prefer an externally managed PVC with `"helm.sh/resource-policy": keep`) so the configured file survives pod replacement. An empty path preserves the previous process-local behavior and emits no registry environment variables.
+
+Teams operator cron belongs only in the raw Core `configToml`; the chart does not create a parallel target selector:
+
+```toml
+[[cron.jobs]]
+schedule = "0 9 * * 1-5"
+platform = "teams"
+channel = "<teams-conversation-id>"
+teams_tenant_id = "<tenant-id>"
+message = "summarize yesterday's merged work"
+timezone = "Asia/Taipei"
+```
+
+This requires an exact active record in the Gateway registry. `serviceUrl` remains Gateway-local, `thread_id` is invalid for Teams, and agent-writable usercron cannot select the record.
 
 ### Discord ID precision warning
 

@@ -177,7 +177,12 @@ fn has_unified_platform(cfg: &config::Config) -> bool {
         || (cfg!(feature = "feishu") && std::env::var("FEISHU_APP_ID").is_ok())
         || (cfg!(feature = "wecom")
             && (std::env::var("WECOM_CORP_ID").is_ok() || has_unified_wecom_config(cfg)))
-        || (cfg!(feature = "teams") && std::env::var("TEAMS_APP_ID").is_ok())
+        || (cfg!(feature = "teams")
+            && (std::env::var("TEAMS_APP_ID").is_ok()
+                || cfg.teams.as_ref().is_some_and(|teams| {
+                    let resolved = teams.resolve();
+                    resolved.app_id.is_some() && resolved.app_secret.is_some()
+                })))
         || (cfg!(feature = "googlechat")
             && cfg
                 .googlechat
@@ -193,6 +198,38 @@ fn has_unified_platform(cfg: &config::Config) -> bool {
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false))
         || (cfg!(feature = "lineworks") && lineworks_activated(cfg.lineworks.as_ref()))
+}
+
+fn unified_teams_configured(cfg: &config::Config) -> bool {
+    if !cfg!(feature = "teams") {
+        return false;
+    }
+    let resolved = cfg.teams.clone().unwrap_or_default().resolve();
+    resolved.app_id.is_some() && resolved.app_secret.is_some()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TeamsCronAdapterMode {
+    Standalone,
+    Unified,
+}
+
+fn select_teams_cron_adapter(
+    has_enabled_job: bool,
+    standalone: bool,
+    unified: bool,
+) -> anyhow::Result<Option<TeamsCronAdapterMode>> {
+    if !has_enabled_job {
+        return Ok(None);
+    }
+    match (standalone, unified) {
+        (true, false) => Ok(Some(TeamsCronAdapterMode::Standalone)),
+        (false, true) => Ok(Some(TeamsCronAdapterMode::Unified)),
+        (true, true) => anyhow::bail!(
+            "Teams cron requires exactly one delivery adapter; both Standalone and Unified are configured"
+        ),
+        (false, false) => anyhow::bail!("Teams cron requires a configured delivery adapter"),
+    }
 }
 
 /// Single LINE WORKS activation validator: the resolved (config → env →
@@ -546,6 +583,18 @@ async fn main() -> anyhow::Result<()> {
     let teams_processing_indicator = teams_processing_indicator_enabled(&cfg);
     let teams_streaming = teams_streaming_enabled(&cfg);
     let teams_inbound_attachments = teams_inbound_attachments_enabled(&cfg);
+    let standalone_teams_gateway = cfg
+        .gateway
+        .as_ref()
+        .is_some_and(|gateway| gateway.platform == "teams");
+    let unified_teams = unified_teams_configured(&cfg);
+    let has_teams_baseline = cfg
+        .cron
+        .jobs
+        .iter()
+        .any(|job| job.enabled && job.platform == "teams");
+    let teams_cron_adapter =
+        select_teams_cron_adapter(has_teams_baseline, standalone_teams_gateway, unified_teams)?;
     let teams_routing_active = cfg
         .gateway
         .as_ref()
@@ -981,6 +1030,11 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(not(feature = "discord"))]
     let shared_discord_adapter: Option<Arc<dyn adapter::ChatAdapter>> = None;
 
+    let shared_gateway_adapter = cfg
+        .gateway
+        .as_ref()
+        .map(|gateway| gateway::GatewayAdapterProxy::new(gateway.platform.clone()));
+
     let session_ttl_dur = std::time::Duration::from_secs(ttl_secs);
 
     // Initialize multibot cache
@@ -1081,6 +1135,9 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "lineworks")]
     if lineworks_activated(cfg.lineworks.as_ref()) {
         configured_platforms.push("lineworks");
+    }
+    if standalone_teams_gateway || unified_teams {
+        configured_platforms.push("teams");
     }
     cron::validate_cronjobs(&cfg.cron.jobs, &configured_platforms)?;
 
@@ -1192,18 +1249,22 @@ async fn main() -> anyhow::Result<()> {
             teams_scope_policy: teams_scope_policy.clone(),
         };
         let gw_router = router.clone();
+        let gw_adapter_proxy = shared_gateway_adapter
+            .clone()
+            .expect("gateway proxy must exist when gateway config is present");
         #[cfg(feature = "filestore")]
         let gw_filestore = filestore.clone();
         Some(tokio::spawn(async move {
-            if let Err(e) =
-                gateway::run_gateway_adapter(
-                    params,
-                    shutdown_rx,
-                    gw_dispatcher,
-                    gw_router,
-                    #[cfg(feature = "filestore")]
-                    gw_filestore,
-                ).await
+            if let Err(e) = gateway::run_gateway_adapter(
+                params,
+                shutdown_rx,
+                gw_dispatcher,
+                gw_router,
+                gw_adapter_proxy,
+                #[cfg(feature = "filestore")]
+                gw_filestore,
+            )
+            .await
             {
                 error!("gateway adapter error: {e}");
             }
@@ -1698,6 +1759,19 @@ async fn main() -> anyhow::Result<()> {
         if let Some(ref a) = shared_unified_adapter {
             cron_adapters.insert("lineworks".into(), a.clone());
         }
+        if teams_cron_adapter == Some(TeamsCronAdapterMode::Standalone) {
+            let adapter = shared_gateway_adapter
+                .as_ref()
+                .expect("Standalone Teams cron requires the stable Gateway proxy");
+            cron_adapters.insert("teams".into(), adapter.clone());
+        }
+        #[cfg(feature = "teams")]
+        if teams_cron_adapter == Some(TeamsCronAdapterMode::Unified) {
+            let adapter = shared_unified_adapter
+                .as_ref()
+                .expect("Unified Teams cron requires the in-process Gateway adapter");
+            cron_adapters.insert("teams".into(), adapter.clone());
+        }
         let cron_platforms: Vec<String> =
             configured_platforms.iter().map(|s| s.to_string()).collect();
         info!(baseline = cronjobs.len(), usercron = ?usercron_path, "starting cron scheduler");
@@ -2010,6 +2084,21 @@ mod tests {
     fn cli_setup_subcommand() {
         let cli = Cli::try_parse_from(["openab", "setup"]).unwrap();
         assert!(matches!(cli.command.unwrap(), Commands::Setup { .. }));
+    }
+
+    #[test]
+    fn teams_cron_adapter_selection_is_exact_and_job_scoped() {
+        assert_eq!(select_teams_cron_adapter(false, true, true).unwrap(), None);
+        assert_eq!(
+            select_teams_cron_adapter(true, true, false).unwrap(),
+            Some(TeamsCronAdapterMode::Standalone)
+        );
+        assert_eq!(
+            select_teams_cron_adapter(true, false, true).unwrap(),
+            Some(TeamsCronAdapterMode::Unified)
+        );
+        assert!(select_teams_cron_adapter(true, true, true).is_err());
+        assert!(select_teams_cron_adapter(true, false, false).is_err());
     }
 
     #[test]

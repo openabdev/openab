@@ -71,7 +71,19 @@ If all four typed fields are omitted, Core logs and preserves the legacy convers
 
 `streaming = true` is an independent, default-off content opt-in. Core creates at most one real placeholder and coalesces bot-owned PUT updates every 1.5 seconds. Standalone requires a valid hello with required send/edit/delete ACKs, real target IDs, and placeholder support; otherwise it remains send-once. Generic Gateway or Telegram streaming settings do not enable Teams. Unknown POST/PUT/DELETE outcomes are never retried or converted into a fresh final activity. No Graph/RSC grant is required. Microsoft 365 live validation remains pending.
 
-`conversation_registry_path` opts in to PR 11 restart-persistent routing state. Core requests promotion only after structural, typed L2, and L3 Allow; the Gateway derives the record from its authenticated route, and the Bot Framework `serviceUrl` never enters Core or ACP. The file is versioned, bounded to 16 MiB, atomically replaced, and mode `0600` on Unix. In Standalone mode the path belongs to the Gateway container and must be mounted on durable storage explicitly. This registry alone does not send proactive messages or enable Teams cron.
+`conversation_registry_path` opts in to PR 11 restart-persistent routing state. Core requests promotion only after structural, typed L2, and L3 Allow; the Gateway derives the record from its authenticated route, and the Bot Framework `serviceUrl` never enters Core or ACP. The file is versioned, bounded to 16 MiB, atomically replaced, and mode `0600` on Unix. In Standalone mode the path belongs to the Gateway container and must be mounted on durable storage explicitly. The registry does not send by itself; an operator-owned baseline may select one exact active record:
+
+```toml
+[[cron.jobs]]
+schedule = "0 9 * * 1-5"
+platform = "teams"
+channel = "<teams-conversation-id>"
+teams_tenant_id = "<tenant-id>"
+message = "summarize yesterday's merged work"
+timezone = "Asia/Taipei"
+```
+
+Teams cron is threadless and requires a real-ID trigger delivery before ACP work. Old peers, disconnected Standalone Gateway, registry-off state, or missing/expired/disabled/revoked/mismatched records fail closed. Agent-writable `cronjob.toml` and `/remind` cannot target the registry.
 
 ### User Trust (`[teams]` section)
 

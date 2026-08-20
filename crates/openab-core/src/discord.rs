@@ -182,6 +182,7 @@ impl ChatAdapter for DiscordAdapter {
             channel_id: thread.id.to_string(),
             thread_id: None,
             parent_id: Some(channel.channel_id.clone()),
+            persistent_conversation: None,
             origin_event_id: None,
         })
     }
@@ -590,6 +591,7 @@ impl EventHandler for Handler {
                         channel_id: channel_id.to_string(),
                         thread_id: None,
                         parent_id: None,
+                        persistent_conversation: None,
                         origin_event_id: None,
                     };
 
@@ -752,6 +754,7 @@ impl EventHandler for Handler {
                         channel_id: channel_id.to_string(),
                         thread_id: None,
                         parent_id: None,
+                        persistent_conversation: None,
                         origin_event_id: None,
                     };
 
@@ -1035,6 +1038,7 @@ impl EventHandler for Handler {
                 channel_id: msg.channel_id.get().to_string(),
                 thread_id: None,
                 parent_id: thread_parent_id.clone(),
+                persistent_conversation: None,
                 origin_event_id: None,
             }
         } else {
@@ -1239,24 +1243,32 @@ impl EventHandler for Handler {
                     if !in_allowed_thread {
                         return;
                     }
-                    (ChannelRef {
-                        platform: "discord".into(),
-                        channel_id: channel_id.get().to_string(),
-                        thread_id: None,
-                        parent_id: parent.map(|p| p.to_string()),
-                        origin_event_id: None,
-                    }, true)
+                    (
+                        ChannelRef {
+                            platform: "discord".into(),
+                            channel_id: channel_id.get().to_string(),
+                            thread_id: None,
+                            parent_id: parent.map(|p| p.to_string()),
+                            persistent_conversation: None,
+                            origin_event_id: None,
+                        },
+                        true,
+                    )
                 } else {
                     if !in_allowed_channel {
                         return;
                     }
-                    (ChannelRef {
-                        platform: "discord".into(),
-                        channel_id: channel_id.get().to_string(),
-                        thread_id: None,
-                        parent_id: None,
-                        origin_event_id: None,
-                    }, false)
+                    (
+                        ChannelRef {
+                            platform: "discord".into(),
+                            channel_id: channel_id.get().to_string(),
+                            thread_id: None,
+                            parent_id: None,
+                            persistent_conversation: None,
+                            origin_event_id: None,
+                        },
+                        false,
+                    )
                 }
             }
             _ => return,
@@ -1347,6 +1359,7 @@ impl EventHandler for Handler {
                     channel_id: channel_id.get().to_string(),
                     thread_id: None,
                     parent_id: None,
+                    persistent_conversation: None,
                     origin_event_id: None,
                 },
                 message_id: message_id.to_string(),
@@ -2691,6 +2704,7 @@ fn discord_msg_ref(msg: &Message) -> MessageRef {
             channel_id: msg.channel_id.get().to_string(),
             thread_id: None,
             parent_id: None,
+            persistent_conversation: None,
             origin_event_id: None,
         },
         message_id: msg.id.to_string(),
@@ -2989,6 +3003,7 @@ async fn get_or_create_thread(
                 channel_id: msg.channel_id.get().to_string(),
                 thread_id: None,
                 parent_id: None,
+                persistent_conversation: None,
                 origin_event_id: None,
             });
         }
@@ -3000,6 +3015,7 @@ async fn get_or_create_thread(
         channel_id: msg.channel_id.get().to_string(),
         thread_id: None,
         parent_id: None,
+        persistent_conversation: None,
         origin_event_id: None,
     };
     let trigger_ref = discord_msg_ref(msg);
@@ -3034,6 +3050,7 @@ async fn get_or_create_thread(
                 channel_id: existing.id.to_string(),
                 thread_id: None,
                 parent_id: Some(msg.channel_id.get().to_string()),
+                persistent_conversation: None,
                 origin_event_id: None,
             })
         }
@@ -4319,6 +4336,7 @@ mod tests {
             channel_id: "111".into(),
             thread_id: None,
             parent_id: None,
+            persistent_conversation: None,
             origin_event_id: None,
         };
         assert_eq!(DiscordAdapter::resolve_channel(&ch), "111");
@@ -4331,6 +4349,7 @@ mod tests {
             channel_id: "111".into(),
             thread_id: Some("222".into()),
             parent_id: None,
+            persistent_conversation: None,
             origin_event_id: None,
         };
         assert_eq!(DiscordAdapter::resolve_channel(&ch), "222");

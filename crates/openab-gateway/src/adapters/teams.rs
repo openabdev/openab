@@ -4,10 +4,8 @@ use super::teams_ingress::{
     TeamsAttachmentSourceKind, TeamsIngressCleanupStats, TeamsIngressRegistry, TeamsIngressRoute,
     TeamsRouteKey, DEFAULT_DEDUPE_TTL_SECS, DEFAULT_MAX_ROUTE_ENTRIES, DEFAULT_ROUTE_TTL_SECS,
 };
-#[cfg(test)]
-use super::teams_registry::RegistryCounts;
 use super::teams_registry::{
-    key_from_parts, PromotionKind, TeamsConversationRegistry,
+    key_from_parts, PromotionKind, TeamsConversationKey, TeamsConversationRegistry,
     DEFAULT_CONVERSATION_REGISTRY_MAX_ENTRIES, DEFAULT_CONVERSATION_REGISTRY_TTL_SECS,
 };
 use crate::schema::*;
@@ -436,6 +434,8 @@ pub struct TeamsAdapter {
     conversation_registry: Option<Arc<StdMutex<TeamsConversationRegistry>>>,
     conversation_writes: Vec<Mutex<()>>,
     allow_non_public_endpoints: bool,
+    #[cfg(test)]
+    persistent_service_url_override: StdMutex<Option<reqwest::Url>>,
 }
 
 const AUTH_CACHE_TTL: Duration = Duration::from_secs(3600);
@@ -460,6 +460,28 @@ enum ConnectorWriteBody<'a> {
     Absent,
     Empty,
     Json(&'a serde_json::Value),
+}
+
+#[derive(Clone, Copy)]
+struct ConnectorWritePolicy {
+    operation: &'static str,
+    allow_rate_limit_retry: bool,
+}
+
+impl ConnectorWritePolicy {
+    const fn reactive(operation: &'static str) -> Self {
+        Self {
+            operation,
+            allow_rate_limit_retry: true,
+        }
+    }
+
+    const fn persistent(operation: &'static str) -> Self {
+        Self {
+            operation,
+            allow_rate_limit_retry: false,
+        }
+    }
 }
 
 impl TeamsAdapter {
@@ -525,6 +547,8 @@ impl TeamsAdapter {
             conversation_registry,
             conversation_writes: (0..TEAMS_WRITE_SHARDS).map(|_| Mutex::new(())).collect(),
             allow_non_public_endpoints,
+            #[cfg(test)]
+            persistent_service_url_override: StdMutex::new(None),
         }
     }
 
@@ -662,6 +686,161 @@ impl TeamsAdapter {
         self.conversation_registry.is_some()
     }
 
+    async fn resolve_persistent_route(
+        &self,
+        target: &PersistentConversationTarget,
+    ) -> Result<(TeamsConversationKey, TeamsIngressRoute), WriteOutcome> {
+        if target.bot_framework_channel_id != "msteams"
+            || (!self.config.allowed_tenants.is_empty()
+                && !self
+                    .config
+                    .allowed_tenants
+                    .iter()
+                    .any(|tenant| tenant == &target.tenant_id))
+        {
+            return Err(rejected_outcome(
+                "persistent_target_rejected",
+                "Teams persistent conversation target is unavailable",
+            ));
+        }
+        let key = key_from_parts(
+            &self.config.app_id,
+            &target.tenant_id,
+            &target.bot_framework_channel_id,
+            &target.conversation_id,
+        )
+        .map_err(|_| {
+            rejected_outcome(
+                "persistent_target_invalid",
+                "Teams persistent conversation target is invalid",
+            )
+        })?;
+        let Some(registry) = self.conversation_registry.clone() else {
+            return Err(rejected_outcome(
+                "conversation_registry_unavailable",
+                "Teams persistent conversation registry is unavailable",
+            ));
+        };
+        let lookup_key = key.clone();
+        let entry = match tokio::task::spawn_blocking(move || {
+            let registry = registry
+                .lock()
+                .map_err(|_| anyhow::anyhow!("conversation registry lock is poisoned"))?;
+            Ok::<_, anyhow::Error>(registry.active(&lookup_key, chrono::Utc::now()))
+        })
+        .await
+        {
+            Ok(Ok(Some(entry))) => entry,
+            Ok(Ok(None)) => {
+                return Err(rejected_outcome(
+                    "persistent_route_unavailable",
+                    "Teams persistent conversation route is unavailable",
+                ))
+            }
+            Ok(Err(_)) | Err(_) => {
+                return Err(rejected_outcome(
+                    "conversation_registry_unavailable",
+                    "Teams persistent conversation registry is unavailable",
+                ))
+            }
+        };
+        let service_url = self.validate_service_url(&entry.service_url).map_err(|_| {
+            rejected_outcome(
+                "persistent_route_invalid",
+                "Teams persistent conversation route is invalid",
+            )
+        })?;
+        #[cfg(test)]
+        let service_url = if self.allow_non_public_endpoints {
+            self.persistent_service_url_override
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+                .unwrap_or(service_url)
+        } else {
+            service_url
+        };
+        let route = TeamsIngressRoute {
+            key: TeamsRouteKey::new(
+                key.app_id.clone(),
+                key.tenant_id.clone(),
+                key.conversation_id.clone(),
+                String::new(),
+            ),
+            event_id: String::new(),
+            tenant_id: key.tenant_id.clone(),
+            bot_framework_channel_id: key.bot_framework_channel_id.clone(),
+            conversation_id: key.conversation_id.clone(),
+            conversation_type: entry.conversation_type,
+            inbound_activity_id: String::new(),
+            reply_chain_root_id: None,
+            service_url,
+            team_id: entry.team_id,
+            channel_id: entry.channel_id,
+            attachment_sources: HashMap::new(),
+            attachment_materialized_bytes: 0,
+            created_at: Instant::now(),
+        };
+        Ok((key, route))
+    }
+
+    async fn reconcile_persistent_write(&self, key: &TeamsConversationKey, outcome: &WriteOutcome) {
+        let reason_code = match outcome {
+            WriteOutcome::Delivered { .. } => None,
+            WriteOutcome::Rejected { code, .. }
+                if matches!(
+                    code.as_str(),
+                    "message_writes_blocked" | "bot_not_in_conversation_roster"
+                ) =>
+            {
+                Some(code.clone())
+            }
+            _ => return,
+        };
+        let Some(registry) = self.conversation_registry.clone() else {
+            return;
+        };
+        let key = key.clone();
+        let transition = reason_code.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let mut registry = registry
+                .lock()
+                .map_err(|_| anyhow::anyhow!("conversation registry lock is poisoned"))?;
+            let changed = match transition.as_deref() {
+                Some(reason) => {
+                    registry.record_forbidden_write(&key, reason, chrono::Utc::now())?
+                }
+                None => registry.record_success(&key, chrono::Utc::now())?,
+            };
+            Ok::<_, anyhow::Error>((changed, registry.counts()))
+        })
+        .await;
+        match result {
+            Ok(Ok((changed, counts))) => {
+                if changed {
+                    info!(
+                        operation = if reason_code.is_some() {
+                            "forbidden_write"
+                        } else {
+                            "delivery_reset"
+                        },
+                        reason_code = reason_code.as_deref().unwrap_or("delivered"),
+                        active = counts.active,
+                        disabled = counts.disabled,
+                        revoked = counts.revoked,
+                        "teams persistent conversation state reconciled"
+                    );
+                }
+            }
+            Ok(Err(_)) | Err(_) => {
+                error!(
+                    operation = "persistent_registry_reconciliation",
+                    "teams persistent conversation reconciliation failed"
+                );
+            }
+        }
+    }
+
     async fn register_conversation(&self, event_id: &str, conversation_id: &str) -> WriteOutcome {
         let route =
             {
@@ -765,7 +944,9 @@ impl TeamsAdapter {
     }
 
     #[cfg(test)]
-    pub(crate) fn conversation_registry_counts(&self) -> Option<RegistryCounts> {
+    pub(crate) fn conversation_registry_counts(
+        &self,
+    ) -> Option<super::teams_registry::RegistryCounts> {
         self.conversation_registry.as_ref().map(|registry| {
             registry
                 .lock()
@@ -1220,7 +1401,7 @@ impl TeamsAdapter {
         method: reqwest::Method,
         url: reqwest::Url,
         body: ConnectorWriteBody<'_>,
-        operation: &'static str,
+        policy: ConnectorWritePolicy,
     ) -> WriteOutcome {
         let token = match self.get_token().await {
             Ok(token) => token,
@@ -1254,7 +1435,7 @@ impl TeamsAdapter {
                     };
                     return WriteOutcome::Unknown {
                         code: code.into(),
-                        message: safe_request_error(operation, &error).to_string(),
+                        message: safe_request_error(policy.operation, &error).to_string(),
                     };
                 }
             };
@@ -1262,8 +1443,9 @@ impl TeamsAdapter {
                 return WriteOutcome::Delivered { message_id: None };
             }
 
-            let outcome = classify_write_failure(response, operation, &[token.as_str()]).await;
-            if !retried_rate_limit {
+            let outcome =
+                classify_write_failure(response, policy.operation, &[token.as_str()]).await;
+            if policy.allow_rate_limit_retry && !retried_rate_limit {
                 if let WriteOutcome::Rejected {
                     code,
                     retry_after_ms: Some(delay_ms),
@@ -1273,7 +1455,7 @@ impl TeamsAdapter {
                     let delay = Duration::from_millis(*delay_ms);
                     if code == "rate_limited" && delay <= TEAMS_MUTATION_RETRY_MAX_DELAY {
                         warn!(
-                            operation,
+                            operation = policy.operation,
                             retry_after_ms = *delay_ms,
                             "teams: retrying rate-limited Connector write once"
                         );
@@ -1294,7 +1476,7 @@ impl TeamsAdapter {
         conversation_id: &str,
         activity_id: &str,
         body: Option<&serde_json::Value>,
-        operation: &'static str,
+        policy: ConnectorWritePolicy,
     ) -> WriteOutcome {
         let url = match self.connector_url(service_url, conversation_id, Some(activity_id)) {
             Ok(url) => url,
@@ -1307,7 +1489,7 @@ impl TeamsAdapter {
             }
         };
         let body = body.map_or(ConnectorWriteBody::Absent, ConnectorWriteBody::Json);
-        self.idempotent_connector_write_outcome(method, url, body, operation)
+        self.idempotent_connector_write_outcome(method, url, body, policy)
             .await
     }
 
@@ -1330,7 +1512,31 @@ impl TeamsAdapter {
             conversation_id,
             activity_id,
             Some(&body),
-            "Bot Framework update",
+            ConnectorWritePolicy::reactive("Bot Framework update"),
+        )
+        .await
+    }
+
+    async fn update_activity_outcome_without_retry(
+        &self,
+        service_url: &str,
+        conversation_id: &str,
+        activity_id: &str,
+        text: &str,
+    ) -> WriteOutcome {
+        let body = serde_json::json!({
+            "type": "message",
+            "from": { "id": &self.config.app_id },
+            "text": text,
+            "textFormat": "markdown",
+        });
+        self.mutate_activity_outcome(
+            reqwest::Method::PUT,
+            service_url,
+            conversation_id,
+            activity_id,
+            Some(&body),
+            ConnectorWritePolicy::persistent("Bot Framework update"),
         )
         .await
     }
@@ -1347,7 +1553,24 @@ impl TeamsAdapter {
             conversation_id,
             activity_id,
             None,
-            "Bot Framework delete",
+            ConnectorWritePolicy::reactive("Bot Framework delete"),
+        )
+        .await
+    }
+
+    async fn delete_activity_outcome_without_retry(
+        &self,
+        service_url: &str,
+        conversation_id: &str,
+        activity_id: &str,
+    ) -> WriteOutcome {
+        self.mutate_activity_outcome(
+            reqwest::Method::DELETE,
+            service_url,
+            conversation_id,
+            activity_id,
+            None,
+            ConnectorWritePolicy::persistent("Bot Framework delete"),
         )
         .await
     }
@@ -1359,7 +1582,7 @@ impl TeamsAdapter {
         conversation_id: &str,
         activity_id: &str,
         reaction: &str,
-        operation: &'static str,
+        policy: ConnectorWritePolicy,
     ) -> WriteOutcome {
         let Some(reaction_type) = teams_reaction_type(reaction) else {
             return WriteOutcome::Rejected {
@@ -1383,7 +1606,7 @@ impl TeamsAdapter {
                 };
             }
         };
-        self.idempotent_connector_write_outcome(method, url, ConnectorWriteBody::Empty, operation)
+        self.idempotent_connector_write_outcome(method, url, ConnectorWriteBody::Empty, policy)
             .await
     }
 
@@ -1400,7 +1623,25 @@ impl TeamsAdapter {
             conversation_id,
             activity_id,
             reaction,
-            "Bot Framework add reaction",
+            ConnectorWritePolicy::reactive("Bot Framework add reaction"),
+        )
+        .await
+    }
+
+    async fn add_reaction_outcome_without_retry(
+        &self,
+        service_url: &str,
+        conversation_id: &str,
+        activity_id: &str,
+        reaction: &str,
+    ) -> WriteOutcome {
+        self.reaction_activity_outcome(
+            reqwest::Method::PUT,
+            service_url,
+            conversation_id,
+            activity_id,
+            reaction,
+            ConnectorWritePolicy::persistent("Bot Framework add reaction"),
         )
         .await
     }
@@ -1418,7 +1659,25 @@ impl TeamsAdapter {
             conversation_id,
             activity_id,
             reaction,
-            "Bot Framework remove reaction",
+            ConnectorWritePolicy::reactive("Bot Framework remove reaction"),
+        )
+        .await
+    }
+
+    async fn remove_reaction_outcome_without_retry(
+        &self,
+        service_url: &str,
+        conversation_id: &str,
+        activity_id: &str,
+        reaction: &str,
+    ) -> WriteOutcome {
+        self.reaction_activity_outcome(
+            reqwest::Method::DELETE,
+            service_url,
+            conversation_id,
+            activity_id,
+            reaction,
+            ConnectorWritePolicy::persistent("Bot Framework remove reaction"),
         )
         .await
     }
@@ -1668,19 +1927,24 @@ async fn classify_write_failure(
         .then(|| parse_retry_after_ms(response.headers()))
         .flatten();
     let body = read_bounded_error_body(response, sensitive_values).await;
-    let message = format!("{operation} failed with HTTP {status}: {body}");
+    let message = format!("{operation} failed with HTTP {status}: {}", body.display);
     if status.is_server_error() {
         WriteOutcome::Unknown {
             code: "connector_server_error".into(),
             message,
         }
     } else {
-        let code = match status.as_u16() {
-            401 | 403 => "authorization_rejected",
+        let code = if status == StatusCode::FORBIDDEN {
+            body.exact_forbidden_code
+                .unwrap_or("authorization_rejected")
+        } else {
+            match status.as_u16() {
+                401 => "authorization_rejected",
             413 => "message_too_large",
             429 => "rate_limited",
             300..=399 => "redirect_rejected",
             _ => "connector_rejected",
+            }
         };
         WriteOutcome::Rejected {
             code: code.into(),
@@ -1710,13 +1974,31 @@ async fn require_http_success(
 
     let status = response.status();
     let body = read_bounded_error_body(response, sensitive_values).await;
-    anyhow::bail!("{operation} failed with HTTP {status}: {body}")
+    anyhow::bail!("{operation} failed with HTTP {status}: {}", body.display)
+}
+
+struct BoundedConnectorError {
+    display: String,
+    exact_forbidden_code: Option<&'static str>,
+}
+
+fn exact_forbidden_code(bytes: &[u8]) -> Option<&'static str> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let code = value
+        .pointer("/error/code")
+        .or_else(|| value.get("code"))?
+        .as_str()?;
+    match code {
+        "MessageWritesBlocked" => Some("message_writes_blocked"),
+        "BotNotInConversationRoster" => Some("bot_not_in_conversation_roster"),
+        _ => None,
+    }
 }
 
 async fn read_bounded_error_body(
     mut response: reqwest::Response,
     sensitive_values: &[&str],
-) -> String {
+) -> BoundedConnectorError {
     let mut bytes = Vec::with_capacity(TEAMS_ERROR_BODY_LIMIT);
     let mut truncated = false;
     loop {
@@ -1742,6 +2024,7 @@ async fn read_bounded_error_body(
         }
     }
 
+    let exact_forbidden_code = exact_forbidden_code(&bytes);
     let mut redacted = match String::from_utf8(bytes) {
         Ok(text) => redact_sensitive_text(&text, sensitive_values),
         Err(_) => "[non-UTF-8 error body]".into(),
@@ -1753,7 +2036,10 @@ async fn read_bounded_error_body(
     if truncated {
         redacted.push_str(" [truncated]");
     }
-    redacted
+    BoundedConnectorError {
+        display: redacted,
+        exact_forbidden_code,
+    }
 }
 
 fn redact_sensitive_text(input: &str, sensitive_values: &[&str]) -> String {
@@ -2944,6 +3230,263 @@ fn rejected_outcome(code: &str, message: impl Into<String>) -> WriteOutcome {
     }
 }
 
+fn validate_persistent_envelope(
+    reply: &GatewayReply,
+    target: &PersistentConversationTarget,
+) -> Result<(), WriteOutcome> {
+    if reply.platform != "teams"
+        || reply.channel.id != target.conversation_id
+        || reply.channel.thread_id.is_some()
+        || !reply.reply_to.is_empty()
+    {
+        return Err(rejected_outcome(
+            "persistent_target_mismatch",
+            "Teams persistent conversation target is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn sanitize_persistent_outcome(outcome: WriteOutcome) -> WriteOutcome {
+    match outcome {
+        delivered @ WriteOutcome::Delivered { .. } => delivered,
+        WriteOutcome::Rejected {
+            code,
+            retry_after_ms,
+            ..
+        } => WriteOutcome::Rejected {
+            code,
+            message: "Teams persistent conversation write was rejected".into(),
+            retry_after_ms,
+        },
+        WriteOutcome::Unknown { code, .. } => WriteOutcome::Unknown {
+            code,
+            message: "Teams persistent conversation write outcome is unknown".into(),
+        },
+    }
+}
+
+async fn persistent_target_is_owned(
+    teams: &TeamsAdapter,
+    key: &TeamsConversationKey,
+    activity_id: &str,
+) -> bool {
+    teams
+        .ingress
+        .lock()
+        .await
+        .owned_route_for_exact_target(
+            &key.app_id,
+            &key.tenant_id,
+            &key.conversation_id,
+            activity_id,
+            Instant::now(),
+        )
+        .is_ok()
+}
+
+async fn handle_persistent_send(reply: &GatewayReply, teams: &TeamsAdapter) -> WriteOutcome {
+    let target = reply
+        .persistent_conversation
+        .as_ref()
+        .expect("persistent send dispatch requires a target");
+    if let Err(outcome) = validate_persistent_envelope(reply, target) {
+        return outcome;
+    }
+    let (_, route) = match teams.resolve_persistent_route(target).await {
+        Ok(route) => route,
+        Err(outcome) => return outcome,
+    };
+    let _write_guard = teams.lock_conversation(&route).await;
+    let (key, route) = match teams.resolve_persistent_route(target).await {
+        Ok(route) => route,
+        Err(outcome) => return outcome,
+    };
+    let quote_activity_id = match reply
+        .quote_message_id
+        .as_deref()
+        .filter(|activity_id| !activity_id.trim().is_empty())
+    {
+        Some(activity_id) if persistent_target_is_owned(teams, &key, activity_id).await => {
+            Some(activity_id)
+        }
+        Some(_) => {
+            debug!(
+                operation = "persistent_send",
+                "teams persistent quote target is not bot-owned; sending without quote"
+            );
+            None
+        }
+        None => None,
+    };
+
+    info!(
+        operation = "persistent_send",
+        "gateway → teams persistent write"
+    );
+    let outcome = teams
+        .send_activity_outcome(
+            route.service_url.as_str(),
+            &route.conversation_id,
+            &reply.content.text,
+            quote_activity_id,
+        )
+        .await;
+    if let WriteOutcome::Delivered {
+        message_id: Some(activity_id),
+    } = &outcome
+    {
+        teams
+            .ingress
+            .lock()
+            .await
+            .record_owned(&route, activity_id, Instant::now());
+        debug!(
+            operation = "persistent_send",
+            "teams activity ownership recorded"
+        );
+    }
+    teams.reconcile_persistent_write(&key, &outcome).await;
+    sanitize_persistent_outcome(outcome)
+}
+
+async fn handle_persistent_mutation(
+    reply: &GatewayReply,
+    teams: &TeamsAdapter,
+    command: &str,
+) -> WriteOutcome {
+    let target = reply
+        .persistent_conversation
+        .as_ref()
+        .expect("persistent mutation dispatch requires a target");
+    if let Err(outcome) = validate_persistent_envelope(reply, target) {
+        return outcome;
+    }
+    let Some(activity_id) = reply
+        .target_message_id
+        .as_deref()
+        .filter(|activity_id| !activity_id.trim().is_empty())
+    else {
+        return rejected_outcome(
+            "invalid_target",
+            "Teams persistent mutation is missing a target activity",
+        );
+    };
+    let (_, route) = match teams.resolve_persistent_route(target).await {
+        Ok(route) => route,
+        Err(outcome) => return outcome,
+    };
+    let _write_guard = teams.lock_conversation(&route).await;
+    let (key, route) = match teams.resolve_persistent_route(target).await {
+        Ok(route) => route,
+        Err(outcome) => return outcome,
+    };
+    if !persistent_target_is_owned(teams, &key, activity_id).await {
+        return rejected_outcome(
+            "message_not_owned",
+            "Teams target is not a bot-owned activity in this process",
+        );
+    }
+
+    info!(operation = command, "gateway → teams persistent mutation");
+    let outcome = match command {
+        "edit_message" => {
+            teams
+                .update_activity_outcome_without_retry(
+                    route.service_url.as_str(),
+                    &route.conversation_id,
+                    activity_id,
+                    &reply.content.text,
+                )
+                .await
+        }
+        "delete_message" => {
+            teams
+                .delete_activity_outcome_without_retry(
+                    route.service_url.as_str(),
+                    &route.conversation_id,
+                    activity_id,
+                )
+                .await
+        }
+        _ => unreachable!("persistent mutation dispatch is command-checked"),
+    };
+    if command == "delete_message" && matches!(outcome, WriteOutcome::Delivered { .. }) {
+        teams.ingress.lock().await.remove_owned(&route, activity_id);
+    }
+    teams.reconcile_persistent_write(&key, &outcome).await;
+    sanitize_persistent_outcome(outcome)
+}
+
+async fn handle_persistent_reaction(
+    reply: &GatewayReply,
+    teams: &TeamsAdapter,
+    command: &str,
+) -> WriteOutcome {
+    let target = reply
+        .persistent_conversation
+        .as_ref()
+        .expect("persistent reaction dispatch requires a target");
+    if let Err(outcome) = validate_persistent_envelope(reply, target) {
+        return outcome;
+    }
+    let Some(activity_id) = reply
+        .target_message_id
+        .as_deref()
+        .filter(|activity_id| !activity_id.trim().is_empty())
+    else {
+        return rejected_outcome(
+            "invalid_target",
+            "Teams persistent reaction is missing a target activity",
+        );
+    };
+    let (_, route) = match teams.resolve_persistent_route(target).await {
+        Ok(route) => route,
+        Err(outcome) => return outcome,
+    };
+    if !teams.reactions_enabled() {
+        return WriteOutcome::Delivered { message_id: None };
+    }
+    let _write_guard = teams.lock_conversation(&route).await;
+    let (key, route) = match teams.resolve_persistent_route(target).await {
+        Ok(route) => route,
+        Err(outcome) => return outcome,
+    };
+    if !persistent_target_is_owned(teams, &key, activity_id).await {
+        return rejected_outcome(
+            "reaction_target_not_known",
+            "Teams reaction target is not bot-owned in this process",
+        );
+    }
+
+    info!(operation = command, "gateway → teams persistent reaction");
+    let outcome = match command {
+        "add_reaction" => {
+            teams
+                .add_reaction_outcome_without_retry(
+                    route.service_url.as_str(),
+                    &route.conversation_id,
+                    activity_id,
+                    &reply.content.text,
+                )
+                .await
+        }
+        "remove_reaction" => {
+            teams
+                .remove_reaction_outcome_without_retry(
+                    route.service_url.as_str(),
+                    &route.conversation_id,
+                    activity_id,
+                    &reply.content.text,
+                )
+                .await
+        }
+        _ => unreachable!("persistent reaction dispatch is command-checked"),
+    };
+    teams.reconcile_persistent_write(&key, &outcome).await;
+    sanitize_persistent_outcome(outcome)
+}
+
 async fn resolve_send_route(
     teams: &TeamsAdapter,
     reply: &GatewayReply,
@@ -3199,6 +3742,22 @@ async fn handle_reaction(
 }
 
 pub async fn handle_reply(reply: &GatewayReply, teams: &TeamsAdapter) -> WriteOutcome {
+    if reply.persistent_conversation.is_some() {
+        return match reply.command.as_deref() {
+            None => handle_persistent_send(reply, teams).await,
+            Some(command @ ("edit_message" | "delete_message")) => {
+                handle_persistent_mutation(reply, teams, command).await
+            }
+            Some(command @ ("add_reaction" | "remove_reaction")) => {
+                handle_persistent_reaction(reply, teams, command).await
+            }
+            Some(_) => rejected_outcome(
+                "persistent_command_rejected",
+                "command is unavailable for a Teams persistent conversation",
+            ),
+        };
+    }
+
     match reply.command.as_deref() {
         None => handle_send_reply(reply, teams).await,
         Some("register_conversation") => {
@@ -3222,6 +3781,7 @@ pub async fn handle_reply(reply: &GatewayReply, teams: &TeamsAdapter) -> WriteOu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::teams_registry::{RegistryCounts, TeamsConversationEntry};
     use wiremock::{
         matchers::{body_json, header, method, path},
         Mock, MockServer, ResponseTemplate,
@@ -3422,6 +3982,7 @@ mod tests {
     fn make_reply(command: Option<&str>) -> GatewayReply {
         GatewayReply {
             attachment_ref: None,
+            persistent_conversation: None,
             schema: "openab.gateway.reply.v1".into(),
             reply_to: "evt-1".into(),
             platform: "teams".into(),
@@ -3439,6 +4000,68 @@ mod tests {
             quote_message_id: None,
             target_message_id: None,
         }
+    }
+
+    fn make_persistent_reply(text: &str) -> GatewayReply {
+        let mut reply = make_reply(None);
+        reply.reply_to.clear();
+        reply.request_id = Some("request-persistent".into());
+        reply.content.text = text.into();
+        reply.persistent_conversation = Some(PersistentConversationTarget {
+            tenant_id: "tenant-1".into(),
+            bot_framework_channel_id: "msteams".into(),
+            conversation_id: "conversation-1".into(),
+        });
+        reply
+    }
+
+    fn install_persistent_test_route(
+        adapter: &TeamsAdapter,
+        service_url: &str,
+    ) -> TeamsConversationKey {
+        *adapter
+            .persistent_service_url_override
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(reqwest::Url::parse(service_url).unwrap());
+        let route = TeamsIngressRoute {
+            key: TeamsRouteKey::new("test-app", "tenant-1", "conversation-1", String::new()),
+            event_id: String::new(),
+            tenant_id: "tenant-1".into(),
+            bot_framework_channel_id: "msteams".into(),
+            conversation_id: "conversation-1".into(),
+            conversation_type: "personal".into(),
+            inbound_activity_id: String::new(),
+            reply_chain_root_id: None,
+            service_url: reqwest::Url::parse("https://smba.trafficmanager.net/teams").unwrap(),
+            team_id: None,
+            channel_id: None,
+            attachment_sources: HashMap::new(),
+            attachment_materialized_bytes: 0,
+            created_at: Instant::now(),
+        };
+        adapter
+            .conversation_registry
+            .as_ref()
+            .expect("persistent test registry")
+            .lock()
+            .unwrap()
+            .insert_route_unchecked_for_test(&route, chrono::Utc::now());
+        key_from_parts("test-app", "tenant-1", "msteams", "conversation-1").unwrap()
+    }
+
+    fn persistent_entry(
+        adapter: &TeamsAdapter,
+        key: &TeamsConversationKey,
+    ) -> TeamsConversationEntry {
+        adapter
+            .conversation_registry
+            .as_ref()
+            .expect("persistent test registry")
+            .lock()
+            .unwrap()
+            .entry_for_test(key)
+            .expect("persistent test entry")
     }
 
     #[test]
@@ -3498,6 +4121,215 @@ mod tests {
 
         let reopened = TeamsAdapter::new_for_test(config);
         assert_eq!(reopened.conversation_registry_counts().unwrap().active, 1);
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn exact_forbidden_classifier_accepts_only_structured_codes() {
+        assert_eq!(
+            exact_forbidden_code(br#"{"error":{"code":"MessageWritesBlocked"}}"#),
+            Some("message_writes_blocked")
+        );
+        assert_eq!(
+            exact_forbidden_code(br#"{"error":{"code":"BotNotInConversationRoster"}}"#),
+            Some("bot_not_in_conversation_roster")
+        );
+        assert_eq!(
+            exact_forbidden_code(
+                br#"{"error":{"code":"OtherForbidden","message":"MessageWritesBlocked"}}"#
+            ),
+            None
+        );
+        assert_eq!(exact_forbidden_code(b"MessageWritesBlocked"), None);
+    }
+
+    #[tokio::test]
+    async fn persistent_send_is_exact_outcome_aware_and_reconciles_state() -> anyhow::Result<()> {
+        let connector = MockServer::start().await;
+        let _token = Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "test-token",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount_as_scoped(&connector)
+            .await;
+        let connector_body = |text: &str| {
+            serde_json::json!({
+                "type": "message",
+                "from": { "id": "test-app" },
+                "text": text,
+                "textFormat": "markdown"
+            })
+        };
+        let _generic = Mock::given(method("POST"))
+            .and(path("/v3/conversations/conversation-1/activities"))
+            .and(body_json(connector_body("generic")))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": { "code": "OtherForbidden", "message": "generic-body-secret" }
+            })))
+            .expect(1)
+            .mount_as_scoped(&connector)
+            .await;
+        let _unknown = Mock::given(method("POST"))
+            .and(path("/v3/conversations/conversation-1/activities"))
+            .and(body_json(connector_body("unknown")))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "error": { "code": "Transient", "message": "server-body-secret" }
+            })))
+            .expect(1)
+            .mount_as_scoped(&connector)
+            .await;
+        let _blocked = Mock::given(method("POST"))
+            .and(path("/v3/conversations/conversation-1/activities"))
+            .and(body_json(connector_body("blocked")))
+            .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                "error": { "code": "MessageWritesBlocked", "message": "blocked-body-secret" }
+            })))
+            .expect(3)
+            .mount_as_scoped(&connector)
+            .await;
+        let _delivered = Mock::given(method("POST"))
+            .and(path("/v3/conversations/conversation-1/activities"))
+            .and(body_json(connector_body("delivered")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "persistent-activity-1"})),
+            )
+            .expect(1)
+            .mount_as_scoped(&connector)
+            .await;
+        let _edit_rate_limited = Mock::given(method("PUT"))
+            .and(path(
+                "/v3/conversations/conversation-1/activities/persistent-activity-1",
+            ))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0"))
+            .expect(1)
+            .mount_as_scoped(&connector)
+            .await;
+
+        let (directory, path) = registry_test_path("persistent-send");
+        let mut config = make_http_test_config(&connector);
+        config.allowed_tenants = vec!["tenant-1".into()];
+        config.conversation_registry_path = Some(path.to_string_lossy().into_owned());
+        let adapter = TeamsAdapter::new_for_test(config);
+        let key = install_persistent_test_route(&adapter, &connector.uri());
+
+        let mut mismatch = make_persistent_reply("never");
+        mismatch.channel.id = "other-conversation".into();
+        assert!(matches!(
+            handle_reply(&mismatch, &adapter).await,
+            WriteOutcome::Rejected { code, .. } if code == "persistent_target_mismatch"
+        ));
+        let mut wrong_tenant = make_persistent_reply("never");
+        wrong_tenant
+            .persistent_conversation
+            .as_mut()
+            .unwrap()
+            .tenant_id = "tenant-2".into();
+        assert!(matches!(
+            handle_reply(&wrong_tenant, &adapter).await,
+            WriteOutcome::Rejected { code, .. } if code == "persistent_target_rejected"
+        ));
+        let mut wrong_transport = make_persistent_reply("never");
+        wrong_transport
+            .persistent_conversation
+            .as_mut()
+            .unwrap()
+            .bot_framework_channel_id = "other-channel".into();
+        assert!(matches!(
+            handle_reply(&wrong_transport, &adapter).await,
+            WriteOutcome::Rejected { code, .. } if code == "persistent_target_rejected"
+        ));
+        let mut missing = make_persistent_reply("never");
+        missing.channel.id = "missing-conversation".into();
+        missing
+            .persistent_conversation
+            .as_mut()
+            .unwrap()
+            .conversation_id = "missing-conversation".into();
+        assert!(matches!(
+            handle_reply(&missing, &adapter).await,
+            WriteOutcome::Rejected { code, .. } if code == "persistent_route_unavailable"
+        ));
+
+        let generic = handle_reply(&make_persistent_reply("generic"), &adapter).await;
+        assert!(matches!(
+            &generic,
+            WriteOutcome::Rejected { code, message, .. }
+                if code == "authorization_rejected"
+                    && !message.contains("generic-body-secret")
+        ));
+        assert_eq!(
+            persistent_entry(&adapter, &key).consecutive_forbidden_writes,
+            0
+        );
+
+        let unknown = handle_reply(&make_persistent_reply("unknown"), &adapter).await;
+        assert!(matches!(
+            &unknown,
+            WriteOutcome::Unknown { code, message }
+                if code == "connector_server_error"
+                    && !message.contains("server-body-secret")
+        ));
+        assert_eq!(
+            persistent_entry(&adapter, &key).consecutive_forbidden_writes,
+            0
+        );
+
+        let first_blocked = handle_reply(&make_persistent_reply("blocked"), &adapter).await;
+        assert!(matches!(
+            &first_blocked,
+            WriteOutcome::Rejected { code, message, .. }
+                if code == "message_writes_blocked"
+                    && !message.contains("blocked-body-secret")
+        ));
+        assert_eq!(
+            persistent_entry(&adapter, &key).consecutive_forbidden_writes,
+            1
+        );
+
+        assert_eq!(
+            handle_reply(&make_persistent_reply("delivered"), &adapter).await,
+            WriteOutcome::Delivered {
+                message_id: Some("persistent-activity-1".into())
+            }
+        );
+        assert_eq!(
+            persistent_entry(&adapter, &key).consecutive_forbidden_writes,
+            0
+        );
+
+        let mut edit = make_persistent_reply("edited");
+        edit.command = Some("edit_message".into());
+        edit.target_message_id = Some("persistent-activity-1".into());
+        assert!(matches!(
+            handle_reply(&edit, &adapter).await,
+            WriteOutcome::Rejected { code, retry_after_ms, .. }
+                if code == "rate_limited" && retry_after_ms == Some(0)
+        ));
+        assert_eq!(
+            persistent_entry(&adapter, &key).consecutive_forbidden_writes,
+            0
+        );
+
+        assert!(matches!(
+            handle_reply(&make_persistent_reply("blocked"), &adapter).await,
+            WriteOutcome::Rejected { code, .. } if code == "message_writes_blocked"
+        ));
+        assert!(matches!(
+            handle_reply(&make_persistent_reply("blocked"), &adapter).await,
+            WriteOutcome::Rejected { code, .. } if code == "message_writes_blocked"
+        ));
+        assert_eq!(adapter.conversation_registry_counts().unwrap().disabled, 1);
+        assert!(matches!(
+            handle_reply(&make_persistent_reply("never"), &adapter).await,
+            WriteOutcome::Rejected { code, .. } if code == "persistent_route_unavailable"
+        ));
+
+        drop(adapter);
         std::fs::remove_dir_all(directory)?;
         Ok(())
     }

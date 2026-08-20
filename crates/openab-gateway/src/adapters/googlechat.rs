@@ -2074,6 +2074,7 @@ mod tests {
             quote_message_id: None,
             target_message_id: None,
             attachment_ref: None,
+            persistent_conversation: None,
         };
 
         adapter.handle_reply(&reply, &event_tx).await;
@@ -2121,6 +2122,7 @@ mod tests {
             quote_message_id: None,
             target_message_id: None,
             attachment_ref: None,
+            persistent_conversation: None,
         };
 
         adapter.handle_reply(&reply, &event_tx).await;
@@ -2173,6 +2175,7 @@ mod tests {
             quote_message_id: None,
             target_message_id: None,
             attachment_ref: None,
+            persistent_conversation: None,
         };
 
         adapter.handle_reply(&reply, &event_tx).await;
@@ -2220,6 +2223,7 @@ mod tests {
             quote_message_id: None,
             target_message_id: None,
             attachment_ref: None,
+            persistent_conversation: None,
         };
 
         adapter.handle_reply(&reply, &event_tx).await;
@@ -2257,6 +2261,7 @@ mod tests {
             quote_message_id: None,
             target_message_id: None,
             attachment_ref: None,
+            persistent_conversation: None,
         };
 
         adapter.handle_reply(&reply, &event_tx).await;
@@ -2305,6 +2310,7 @@ mod tests {
             quote_message_id: None,
             target_message_id: None,
             attachment_ref: None,
+            persistent_conversation: None,
         };
 
         adapter.handle_reply(&reply, &event_tx).await;
@@ -2350,6 +2356,7 @@ mod tests {
             quote_message_id: None,
             target_message_id: None,
             attachment_ref: None,
+            persistent_conversation: None,
         };
 
         adapter.handle_reply(&reply, &event_tx).await;
@@ -2410,6 +2417,7 @@ mod tests {
             quote_message_id: None,
             target_message_id: None,
             attachment_ref: None,
+            persistent_conversation: None,
         };
 
         adapter.handle_reply(&reply, &event_tx).await;

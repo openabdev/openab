@@ -1650,6 +1650,7 @@ mod tests {
             channel_id: thread.into(),
             thread_id: Some(thread.into()),
             parent_id: None,
+            persistent_conversation: None,
             origin_event_id: None,
         }
     }
@@ -1825,6 +1826,7 @@ mod tests {
             channel_id: "parent-channel".into(),
             thread_id: None,
             parent_id: None,
+            persistent_conversation: None,
             origin_event_id: Some("evt-fresh".into()),
         };
         assert!(tx.send(msg).await.is_ok());
@@ -1837,6 +1839,7 @@ mod tests {
                 channel_id: "topic-42".into(),
                 thread_id: Some("topic-42".into()),
                 parent_id: Some("parent-channel".into()),
+                persistent_conversation: None,
                 origin_event_id: Some("evt-stale".into()),
             },
             rx,

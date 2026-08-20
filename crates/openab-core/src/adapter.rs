@@ -222,6 +222,14 @@ pub(crate) fn finalize_body(
 /// Compare with `SenderContext`, which is **metadata for the agent**: there
 /// `channel_id` is the parent channel and `thread_id` is the thread,
 /// matching Slack's model for cross-platform consistency.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersistentConversationTarget {
+    pub tenant_id: String,
+    pub bot_framework_channel_id: String,
+    pub conversation_id: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct ChannelRef {
     pub platform: String,
@@ -231,6 +239,9 @@ pub struct ChannelRef {
     pub thread_id: Option<String>,
     /// Parent channel if this is a thread-as-channel (Discord).
     pub parent_id: Option<String>,
+    /// Exact logical identity for a Gateway-local durable conversation route.
+    /// The stored reference and service URL never enter Core.
+    pub persistent_conversation: Option<Box<PersistentConversationTarget>>,
     /// Originating gateway event ID, propagated back in `GatewayReply.reply_to`
     /// so the gateway can correlate replies with inbound events (e.g. LINE reply tokens).
     /// Excluded from Hash/Eq — two ChannelRefs pointing to the same channel are
@@ -244,6 +255,7 @@ impl PartialEq for ChannelRef {
             && self.channel_id == other.channel_id
             && self.thread_id == other.thread_id
             && self.parent_id == other.parent_id
+            && self.persistent_conversation == other.persistent_conversation
     }
 }
 
@@ -255,6 +267,7 @@ impl std::hash::Hash for ChannelRef {
         self.channel_id.hash(state);
         self.thread_id.hash(state);
         self.parent_id.hash(state);
+        self.persistent_conversation.hash(state);
     }
 }
 
@@ -399,6 +412,8 @@ pub struct AdapterCapabilities {
     pub supports_attachment_materialization: bool,
     /// Gateway can durably register an authenticated route after Core trust.
     pub supports_conversation_registry: bool,
+    /// Gateway can resolve an exact durable conversation target for proactive writes.
+    pub supports_persistent_conversation_send: bool,
     pub can_edit: bool,
     pub can_delete: bool,
     pub streaming_mode: StreamingMode,
@@ -417,6 +432,7 @@ impl Default for AdapterCapabilities {
             supports_reactions: false,
             supports_attachment_materialization: false,
             supports_conversation_registry: false,
+            supports_persistent_conversation_send: false,
             can_edit: false,
             can_delete: false,
             streaming_mode: StreamingMode::Disabled,
@@ -2619,6 +2635,7 @@ mod tests {
             channel_id: "U123".into(),
             thread_id: None,
             parent_id: None,
+            persistent_conversation: None,
             origin_event_id: Some("evt_aaa".into()),
         };
         let b = ChannelRef {
@@ -2626,6 +2643,7 @@ mod tests {
             channel_id: "U123".into(),
             thread_id: None,
             parent_id: None,
+            persistent_conversation: None,
             origin_event_id: Some("evt_bbb".into()),
         };
         assert_eq!(a, b, "same channel with different event IDs must be equal");
@@ -2639,6 +2657,7 @@ mod tests {
             channel_id: "U123".into(),
             thread_id: None,
             parent_id: None,
+            persistent_conversation: None,
             origin_event_id: Some("evt_aaa".into()),
         };
         let b = ChannelRef {
@@ -2646,6 +2665,7 @@ mod tests {
             channel_id: "U123".into(),
             thread_id: None,
             parent_id: None,
+            persistent_conversation: None,
             origin_event_id: Some("evt_bbb".into()),
         };
         let mut map = HashMap::new();
@@ -2657,12 +2677,42 @@ mod tests {
     }
 
     #[test]
+    fn persistent_conversation_participates_in_routing_equality_and_hash() {
+        use std::collections::HashSet;
+
+        let channel = |tenant: &str| ChannelRef {
+            platform: "teams".into(),
+            channel_id: "conversation-1".into(),
+            thread_id: None,
+            parent_id: None,
+            persistent_conversation: Some(Box::new(PersistentConversationTarget {
+                tenant_id: tenant.into(),
+                bot_framework_channel_id: "msteams".into(),
+                conversation_id: "conversation-1".into(),
+            })),
+            origin_event_id: None,
+        };
+        let first = channel("tenant-1");
+        let second = channel("tenant-2");
+        assert_ne!(first, second);
+        let mut routes = HashSet::new();
+        routes.insert(first.clone());
+        routes.insert(second);
+        assert_eq!(routes.len(), 2);
+        assert_eq!(
+            first.clone().persistent_conversation.unwrap().tenant_id,
+            "tenant-1"
+        );
+    }
+
+    #[test]
     fn origin_event_id_survives_clone() {
         let ch = ChannelRef {
             platform: "line".into(),
             channel_id: "U123".into(),
             thread_id: None,
             parent_id: None,
+            persistent_conversation: None,
             origin_event_id: Some("evt_abc".into()),
         };
         // Simulates create_thread propagation: clone preserves origin_event_id

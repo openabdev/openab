@@ -251,7 +251,7 @@ Full first-class Teams section (config-first parity, #1380) — credentials, con
 >
 > `inbound_attachments = true` enables metadata-first Teams image/text ingress. Gateway publishes only bounded metadata and an opaque process-local reference; Core requests bytes only after structural, typed L2, and L3 identity admission. URLs, query strings, and Microsoft credentials stay in Gateway. Inline images work in all scopes; Personal `file.download.info` image and UTF-8 text files additionally require a separate manifest profile with `supportsFiles: true`. Group-chat/channel paperclip files remain unsupported without Graph. Standalone requires the opt-in on both processes plus a valid Gateway hello advertising the additive materialization capability; malformed switches, old peers, route expiry, restart, scope mismatch, and oversized data fail closed without retry.
 >
-> `conversation_registry_path` explicitly opts Gateway into restart-persistent Teams conversation references. Relative paths resolve beneath `$HOME/.openab/`; absence means no registry file, filesystem access, or advertised capability. Core sends only origin correlation after structural, typed L2, and L3 Allow; Gateway derives the record from its authenticated ephemeral route, and `serviceUrl` never enters Core or ACP. The versioned JSON file is capped at 16 MiB, written atomically, and protected as mode `0600` on Unix. Standalone operators must mount the selected Gateway path on durable storage themselves. This registry does not enable proactive sends or Teams cron by itself.
+> `conversation_registry_path` explicitly opts Gateway into restart-persistent Teams conversation references. Relative paths resolve beneath `$HOME/.openab/`; absence means no registry file, filesystem access, or advertised capability. Core sends only origin correlation after structural, typed L2, and L3 Allow; Gateway derives the record from its authenticated ephemeral route, and `serviceUrl` never enters Core or ACP. The versioned JSON file is capped at 16 MiB, written atomically, and protected as mode `0600` on Unix. Standalone operators must mount the selected Gateway path on durable storage themselves. The registry does not send by itself; an operator-owned Teams baseline `[[cron.jobs]]` entry may select one exact active record as documented below.
 >
 > Teams Personal, group-chat, and channel scope is derived from the authenticated Bot Framework activity. Presence of any of `allowed_teams`, `allowed_channels`, `allow_personal`, or `allow_group_chats` (or its environment variable) opts into typed L2 policy. With neither list populated, all Team channels are admitted; otherwise a Team **or** channel ID match admits the channel. Personal and group chats use their booleans. L3 user trust is still evaluated independently. The two boolean environment variables accept `true`/`false` or `1`/`0`; any other explicitly present value resolves to `false` (fail closed).
 >
@@ -828,6 +828,16 @@ channel = "123456789"
 message = "generate weekly status report"
 platform = "discord"
 timezone = "UTC"
+
+# Teams is operator-baseline-only and resolves through the Gateway registry.
+[[cron.jobs]]
+schedule = "0 9 * * 1-5"
+platform = "teams"
+channel = "<teams-conversation-id>"
+teams_tenant_id = "<tenant-id>"
+message = "summarize yesterday's merged work"
+sender_name = "DailyOps"
+timezone = "Asia/Taipei"
 ```
 
 ### `[cron]` fields
@@ -843,14 +853,17 @@ timezone = "UTC"
 |-----|------|---------|-------------|
 | `enabled` | bool | `true` | Set `false` to disable without removing the entry. |
 | `schedule` | string | *required* | Cron expression (minute, hour, day-of-month, month, day-of-week). |
-| `channel` | string | *required* | Target Discord channel/thread ID or Slack channel ID. |
+| `channel` | string | *required* | Platform destination. For Teams this is the exact trusted conversation ID, bounded to 2,048 bytes. |
+| `teams_tenant_id` | string | *required for Teams* | Exact Teams tenant ID, bounded to 256 bytes. Invalid on every other platform. |
 | `message` | string | *required* | Message sent to the agent as a prompt. |
-| `platform` | string | `"discord"` | Target platform (`"discord"` or `"slack"`). |
+| `platform` | string | `"discord"` | `"discord"`, `"slack"`, `"telegram"`, `"googlechat"`, `"lineworks"`, or `"teams"`. |
 | `sender_name` | string | `"openab-cron"` | Sender attribution shown in the prompt context. |
 | `timezone` | string | `"UTC"` | IANA timezone for schedule evaluation (e.g. `"America/New_York"`, `"Europe/Berlin"`). |
-| `thread_id` | string | `""` | Optional thread ID to post into an existing thread. |
+| `thread_id` | string | `""` | Optional existing thread for supported platforms. Teams rejects this field and never creates a scheduler thread. |
 
-The external `cronjob.toml` uses `[[jobs]]` (same fields). See [Usercron docs](cronjob.md#usercron--hot-reload-with-cronjobtoml) for details.
+Teams jobs require an available PR 11 registry and a Gateway peer that advertises persistent-send support. Gateway combines configured app identity with `teams_tenant_id`, the fixed `msteams` transport, and `channel`; only an exact active, non-expired record is eligible. The visible trigger must return a real Bot Framework activity ID before OpenAB starts or reuses an ACP session. `serviceUrl` and the stored record remain Gateway-local.
+
+The external `cronjob.toml` uses `[[jobs]]` for non-Teams jobs. Every usercron entry with `platform = "teams"` or `teams_tenant_id` is rejected before lookup or ACP work. See [Usercron docs](cronjob.md#usercron--hot-reload-with-cronjobtoml) for details.
 
 ### Usercron-only `[[jobs]]` fields
 
@@ -896,69 +909,43 @@ disable_on_success_working_dir = "/workspace/my-project"
 - Scheduler evaluates expressions once per minute
 - If a previous execution is still running, the next tick is skipped (no overlap)
 - Failed executions are logged but do not block other jobs or chat traffic
-- Stateless — no persistence needed, re-evaluated from config on restart
+- Stateless — no scheduler persistence or catch-up; schedules are re-evaluated from config on restart
+- Teams sends are threadless, required-ACK, and never retried after an ambiguous outcome
+
+> **Helm:** chart v0.10.0 no longer renders `agents.<name>.cronjobs`. Put the complete baseline block in `agents.<name>.configToml`, or provide it through `configUrl`. This is intentional: Teams tenant/conversation authority has no second Helm values surface.
 
 ---
 
 ## Customizing via Helm
 
-When deploying with the Helm chart (`charts/openab`), the `config.toml` is generated from `values.yaml`. Each agent is defined under the `agents` map:
+Chart v0.10.0 treats `config.toml` as an authoritative raw document. Supply it through `agents.<name>.configToml`, load it with `--set-file`, or use `agents.<name>.configUrl`; the chart no longer maps adapter, pool, or cron fields into TOML.
 
 ```yaml
 agents:
   kiro:
-    command: kiro-cli
-    args: ["acp", "--trust-all-tools"]
-    discord:
-      enabled: true
-      allowedChannels: ["1234567890"]
-      allowBotMessages: "mentions"
-      trustedBotIds: ["9876543210"]
-    pool:
-      maxSessions: 10
-      sessionTtlHours: 24
-    reactions:
-      enabled: true
-    stt:
-      enabled: true
-      apiKey: "your-groq-key"
+    configToml: |
+      [discord]
+      bot_token = "${DISCORD_BOT_TOKEN}"
+      allowed_channels = ["1234567890"]
+
+      [agent]
+      command = "kiro-cli"
+      args = ["acp", "--trust-all-tools"]
+
+      [[cron.jobs]]
+      schedule = "0 9 * * 1-5"
+      channel = "1234567890"
+      message = "summarize yesterday's merged PRs"
 ```
 
-Key mapping (`values.yaml` → `config.toml`):
+For a standalone file:
 
-| Helm value | Config key |
-|---|---|
-| `agents.<name>.discord.allowedChannels` | `[discord] allowed_channels` |
-| `agents.<name>.discord.allowBotMessages` | `[discord] allow_bot_messages` |
-| `agents.<name>.discord.trustedBotIds` | `[discord] trusted_bot_ids` |
-| `agents.<name>.discord.allowUserMessages` | `[discord] allow_user_messages` |
-| `agents.<name>.discord.messageProcessingMode` | `[discord] message_processing_mode` |
-| `agents.<name>.discord.maxBufferedMessages` | `[discord] max_buffered_messages` |
-| `agents.<name>.discord.maxBatchTokens` | `[discord] max_batch_tokens` |
-| `agents.<name>.slack.*` | `[slack] *` (same pattern) |
-| `agents.<name>.pool.maxSessions` | `[pool] max_sessions` |
-| `agents.<name>.pool.sessionTtlHours` | `[pool] session_ttl_hours` |
-| `agents.<name>.workspace.aliases.<alias>` | `[workspace.aliases] <alias>` |
-| `agents.<name>.reactions.enabled` | `[reactions] enabled` |
-| `agents.<name>.reactions.toolDisplay` | `[reactions] tool_display` |
-| `agents.<name>.stt.apiKey` | `[stt] api_key` |
-| `agents.<name>.cronjobs[].enabled` | `[[cron.jobs]] enabled` |
-| `agents.<name>.cronjobs[].schedule` | `[[cron.jobs]] schedule` |
-| `agents.<name>.cronjobs[].channel` | `[[cron.jobs]] channel` |
-| `agents.<name>.cronjobs[].message` | `[[cron.jobs]] message` |
-| `agents.<name>.cronjobs[].platform` | `[[cron.jobs]] platform` |
-| `agents.<name>.cronjobs[].senderName` | `[[cron.jobs]] sender_name` |
-| `agents.<name>.cronjobs[].timezone` | `[[cron.jobs]] timezone` |
-| `agents.<name>.cronjobs[].threadId` | `[[cron.jobs]] thread_id` |
+```bash
+helm upgrade --install mybot charts/openab \
+  --set-file agents.kiro.configToml=./config.toml
+```
 
-> ⚠️ Use `--set-string` (not `--set`) for Discord/Slack IDs to avoid float64 precision loss:
->
-> ```bash
-> helm upgrade --install mybot charts/openab \
->   --set-string agents.kiro.discord.allowedChannels[0]="1234567890"
-> ```
-
-See `charts/openab/values.yaml` for the full list of Helm values including `persistence`, `image`, `resources`, and multi-agent examples.
+This raw contract is especially important for Teams: `teams_tenant_id` and the conversation ID exist only in baseline `[[cron.jobs]]`; Gateway credentials, registry path, and persisted `serviceUrl` stay on the Gateway side. See [`migrate-to-configtoml.md`](migrate-to-configtoml.md) and `charts/openab/values.yaml` for deployment-only values such as persistence, images, resources, and volume mounts.
 
 ---
 

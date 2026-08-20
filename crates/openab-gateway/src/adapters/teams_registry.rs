@@ -317,6 +317,41 @@ impl TeamsConversationRegistry {
     fn generation(&self) -> u64 {
         self.state.generation
     }
+
+    #[cfg(test)]
+    pub(super) fn insert_route_unchecked_for_test(
+        &mut self,
+        route: &TeamsIngressRoute,
+        now: DateTime<Utc>,
+    ) {
+        let key = key_for_route(route);
+        self.state.entries.retain(|entry| entry.key != key);
+        self.state.entries.push(TeamsConversationEntry {
+            schema_version: REGISTRY_VERSION,
+            key,
+            conversation_type: route.conversation_type.clone(),
+            service_url: route.service_url.as_str().into(),
+            team_id: route.team_id.clone(),
+            channel_id: route.channel_id.clone(),
+            last_validated_at: now,
+            updated_at: now,
+            state: TeamsConversationState::Active,
+            reason_code: None,
+            consecutive_forbidden_writes: 0,
+        });
+    }
+
+    #[cfg(test)]
+    pub(super) fn entry_for_test(
+        &self,
+        key: &TeamsConversationKey,
+    ) -> Option<TeamsConversationEntry> {
+        self.state
+            .entries
+            .iter()
+            .find(|entry| &entry.key == key)
+            .cloned()
+    }
 }
 
 pub(super) fn key_for_route(route: &TeamsIngressRoute) -> TeamsConversationKey {

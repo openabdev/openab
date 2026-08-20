@@ -2133,6 +2133,7 @@ mod tests {
     fn text_reply(channel_id: &str, text: &str, command: Option<&str>) -> GatewayReply {
         GatewayReply {
             attachment_ref: None,
+            persistent_conversation: None,
             schema: "openab.gateway.reply.v1".into(),
             reply_to: "evt_1".into(),
             platform: "lineworks".into(),

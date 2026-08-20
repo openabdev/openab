@@ -4274,6 +4274,7 @@ mod tests {
             quote_message_id: Some("om_specific".into()),
             target_message_id: None,
             attachment_ref: None,
+            persistent_conversation: None,
         };
         // quote_message_id should take priority
         let reply_target = reply.quote_message_id.as_deref()
@@ -4302,6 +4303,7 @@ mod tests {
             quote_message_id: None,
             target_message_id: None,
             attachment_ref: None,
+            persistent_conversation: None,
         };
         let reply_target = reply.quote_message_id.as_deref()
             .or(reply.channel.thread_id.as_deref());
@@ -4329,6 +4331,7 @@ mod tests {
             quote_message_id: None,
             target_message_id: None,
             attachment_ref: None,
+            persistent_conversation: None,
         };
         let reply_target = reply.quote_message_id.as_deref()
             .or(reply.channel.thread_id.as_deref());
@@ -4397,6 +4400,7 @@ mod tests {
             quote_message_id: Some("om_invalid".into()),
             target_message_id: None,
             attachment_ref: None,
+            persistent_conversation: None,
         };
 
         handle_reply(&reply, &adapter, &event_tx).await;
@@ -4675,6 +4679,7 @@ mod tests {
             quote_message_id: None,
             target_message_id: None,
             attachment_ref: None,
+            persistent_conversation: None,
         };
 
         handle_reply(&reply, &adapter, &event_tx).await;
@@ -4711,6 +4716,7 @@ mod tests {
             quote_message_id: None,
             target_message_id: None,
             attachment_ref: None,
+            persistent_conversation: None,
         };
 
         handle_reply(&reply, &adapter, &event_tx).await;
@@ -4772,6 +4778,7 @@ mod tests {
             quote_message_id: None,
             target_message_id: None,
             attachment_ref: None,
+            persistent_conversation: None,
         }
     }
 
@@ -4995,6 +5002,7 @@ mod tests {
             quote_message_id: None,
             target_message_id: None,
             attachment_ref: None,
+            persistent_conversation: None,
         };
 
         handle_reply(&reply, &adapter, &tx).await;

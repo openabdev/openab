@@ -3911,6 +3911,7 @@ mod acp_review_fixes {
             quote_message_id: None,
             target_message_id: None,
             attachment_ref: None,
+            persistent_conversation: None,
         }
     }
 

@@ -1935,6 +1935,8 @@ pub struct CronJobConfig {
     pub schedule: String,
     /// Target channel ID
     pub channel: String,
+    /// Required tenant identity for operator-owned Microsoft Teams jobs.
+    pub teams_tenant_id: Option<String>,
     /// Message to send to the agent
     pub message: String,
     /// Target platform (default: "discord")

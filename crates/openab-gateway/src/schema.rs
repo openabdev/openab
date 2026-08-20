@@ -215,6 +215,9 @@ pub struct AdapterCapabilities {
     /// Persist an authenticated Teams route only after Core trust admission.
     #[serde(default)]
     pub supports_conversation_registry: bool,
+    /// Resolve an exact durable Teams conversation for proactive writes.
+    #[serde(default)]
+    pub supports_persistent_conversation_send: bool,
     pub can_edit: bool,
     pub can_delete: bool,
     pub streaming_mode: StreamingMode,
@@ -233,6 +236,7 @@ impl Default for AdapterCapabilities {
             supports_reactions: false,
             supports_attachment_materialization: false,
             supports_conversation_registry: false,
+            supports_persistent_conversation_send: false,
             can_edit: false,
             can_delete: false,
             streaming_mode: StreamingMode::Disabled,
@@ -271,12 +275,22 @@ pub struct GatewayTopology {
 
 // --- Reply schema (ADR openab.gateway.reply.v1) ---
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersistentConversationTarget {
+    pub tenant_id: String,
+    pub bot_framework_channel_id: String,
+    pub conversation_id: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GatewayReply {
     pub schema: String,
     pub reply_to: String,
     pub platform: String,
     pub channel: ReplyChannel,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent_conversation: Option<PersistentConversationTarget>,
     pub content: Content,
     #[serde(default)]
     pub command: Option<String>,
@@ -597,6 +611,7 @@ mod protocol_tests {
                 id: "conversation-1".into(),
                 thread_id: None,
             },
+            persistent_conversation: None,
             content: Content {
                 content_type: "text".into(),
                 text: "updated".into(),
@@ -626,6 +641,57 @@ mod protocol_tests {
         assert!(decoded_without_target.target_message_id.is_none());
         assert!(decoded_without_target.attachment_ref.is_none());
         assert_eq!(decoded_without_target.reply_to, "legacy-activity");
+        Ok(())
+    }
+
+    #[test]
+    fn persistent_conversation_target_is_additive_and_closed() -> anyhow::Result<()> {
+        #[derive(serde::Deserialize)]
+        struct LegacyReply {
+            platform: String,
+            channel: ReplyChannel,
+        }
+
+        let value = serde_json::json!({
+            "schema": "openab.gateway.reply.v1",
+            "reply_to": "",
+            "platform": "teams",
+            "channel": { "id": "conversation-1", "thread_id": null },
+            "persistent_conversation": {
+                "tenant_id": "tenant-1",
+                "bot_framework_channel_id": "msteams",
+                "conversation_id": "conversation-1"
+            },
+            "content": { "type": "text", "text": "scheduled", "attachments": [] },
+            "command": null,
+            "request_id": "request-1"
+        });
+        let decoded: GatewayReply = serde_json::from_value(value.clone())?;
+        assert_eq!(
+            decoded.persistent_conversation,
+            Some(PersistentConversationTarget {
+                tenant_id: "tenant-1".into(),
+                bot_framework_channel_id: "msteams".into(),
+                conversation_id: "conversation-1".into(),
+            })
+        );
+        let legacy: LegacyReply = serde_json::from_value(value.clone())?;
+        assert_eq!(legacy.platform, "teams");
+        assert_eq!(legacy.channel.id, "conversation-1");
+
+        let mut unknown = value;
+        unknown["persistent_conversation"]["service_url"] =
+            serde_json::Value::String("https://example.invalid".into());
+        assert!(serde_json::from_value::<GatewayReply>(unknown).is_err());
+
+        let old: GatewayReply = serde_json::from_value(serde_json::json!({
+            "schema": "openab.gateway.reply.v1",
+            "reply_to": "event-1",
+            "platform": "teams",
+            "channel": { "id": "conversation-1", "thread_id": null },
+            "content": { "type": "text", "text": "reactive", "attachments": [] }
+        }))?;
+        assert!(old.persistent_conversation.is_none());
         Ok(())
     }
 
@@ -785,6 +851,7 @@ mod protocol_tests {
         let modern = AdapterCapabilities {
             send_ack: true,
             supports_conversation_registry: true,
+            supports_persistent_conversation_send: true,
             ..AdapterCapabilities::default()
         };
         let json = serde_json::to_string(&modern).unwrap();
@@ -794,6 +861,7 @@ mod protocol_tests {
         let old_wire = serde_json::json!({ "send_ack": true });
         let decoded: AdapterCapabilities = serde_json::from_value(old_wire).unwrap();
         assert!(!decoded.supports_conversation_registry);
+        assert!(!decoded.supports_persistent_conversation_send);
     }
 
     #[test]
@@ -823,6 +891,7 @@ mod protocol_tests {
         assert!(!capabilities.supports_reactions);
         assert!(!capabilities.supports_attachment_materialization);
         assert!(!capabilities.supports_conversation_registry);
+        assert!(!capabilities.supports_persistent_conversation_send);
         assert!(!capabilities.can_edit);
         assert!(!capabilities.can_delete);
         assert_eq!(capabilities.streaming_mode, StreamingMode::Disabled);

@@ -1,7 +1,8 @@
 use crate::acp::ContentBlock;
 use crate::adapter::{
     AdapterCapabilities, ChannelRef, ChatAdapter, MaterializedAttachment, MessageLimit, MessageRef,
-    SenderContext, StatusBackend, StreamingMode, WriteFailure, WriteOutcome, WriteOutcomeKind,
+    PersistentConversationTarget, SenderContext, StatusBackend, StreamingMode, WriteFailure,
+    WriteOutcome, WriteOutcomeKind,
 };
 use crate::commands::{parse_command, render_text_result, Command, CommandContext, CommandService};
 use anyhow::Result;
@@ -9,8 +10,8 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, RwLock};
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
@@ -68,6 +69,7 @@ fn legacy_gateway_capabilities(
         supports_reactions: true,
         supports_attachment_materialization: false,
         supports_conversation_registry: false,
+        supports_persistent_conversation_send: false,
         can_edit,
         can_delete: platform == "feishu",
         streaming_mode: if streaming && can_edit {
@@ -586,6 +588,8 @@ struct GatewayReply {
     target_message_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     attachment_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    persistent_conversation: Option<Box<PersistentConversationTarget>>,
 }
 
 #[derive(Serialize)]
@@ -774,6 +778,156 @@ type SharedWsTx = Arc<
     >,
 >;
 
+/// Stable adapter handle shared with cron while the standalone Gateway socket
+/// reconnects. It never opens a socket and clears only the generation that
+/// installed the current concrete adapter.
+pub struct GatewayAdapterProxy {
+    platform_name: &'static str,
+    next_generation: AtomicU64,
+    current: RwLock<Option<(u64, Arc<dyn ChatAdapter>)>>,
+}
+
+impl GatewayAdapterProxy {
+    pub fn new(platform: String) -> Arc<Self> {
+        Self::with_platform_name(Box::leak(platform.into_boxed_str()))
+    }
+
+    fn with_platform_name(platform_name: &'static str) -> Arc<Self> {
+        Arc::new(Self {
+            platform_name,
+            next_generation: AtomicU64::new(1),
+            current: RwLock::new(None),
+        })
+    }
+
+    fn install(&self, adapter: Arc<dyn ChatAdapter>) -> u64 {
+        let generation = self.next_generation.fetch_add(1, AtomicOrdering::AcqRel);
+        *self
+            .current
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((generation, adapter));
+        generation
+    }
+
+    fn clear_generation(&self, generation: u64) {
+        let mut current = self
+            .current
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if current
+            .as_ref()
+            .is_some_and(|(installed, _)| *installed == generation)
+        {
+            *current = None;
+        }
+    }
+
+    fn current(&self) -> Result<Arc<dyn ChatAdapter>> {
+        self.current
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|(_, adapter)| adapter.clone())
+            .ok_or_else(|| {
+                write_failure(WriteOutcome::Rejected {
+                    code: "gateway_disconnected".into(),
+                    message: "Gateway connection is unavailable".into(),
+                    retry_after_ms: None,
+                })
+            })
+    }
+}
+
+#[async_trait]
+impl ChatAdapter for GatewayAdapterProxy {
+    fn platform(&self) -> &'static str {
+        self.platform_name
+    }
+
+    fn message_limit(&self) -> usize {
+        self.current()
+            .map_or(4096, |adapter| adapter.message_limit())
+    }
+
+    fn capabilities(&self, platform: &str) -> AdapterCapabilities {
+        self.current().map_or_else(
+            |_| AdapterCapabilities::default(),
+            |adapter| adapter.capabilities(platform),
+        )
+    }
+
+    async fn materialize_attachment(
+        &self,
+        channel: &ChannelRef,
+        reference: &str,
+    ) -> Result<MaterializedAttachment> {
+        self.current()?
+            .materialize_attachment(channel, reference)
+            .await
+    }
+
+    async fn register_conversation(&self, channel: &ChannelRef) -> Result<()> {
+        self.current()?.register_conversation(channel).await
+    }
+
+    async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
+        self.current()?.send_message(channel, content).await
+    }
+
+    async fn send_message_with_reply(
+        &self,
+        channel: &ChannelRef,
+        content: &str,
+        reply_to_message_id: &str,
+    ) -> Result<MessageRef> {
+        self.current()?
+            .send_message_with_reply(channel, content, reply_to_message_id)
+            .await
+    }
+
+    async fn create_thread(
+        &self,
+        channel: &ChannelRef,
+        trigger_msg: &MessageRef,
+        title: &str,
+    ) -> Result<ChannelRef> {
+        self.current()?
+            .create_thread(channel, trigger_msg, title)
+            .await
+    }
+
+    async fn add_reaction(&self, msg: &MessageRef, emoji: &str) -> Result<()> {
+        self.current()?.add_reaction(msg, emoji).await
+    }
+
+    async fn remove_reaction(&self, msg: &MessageRef, emoji: &str) -> Result<()> {
+        self.current()?.remove_reaction(msg, emoji).await
+    }
+
+    async fn edit_message(&self, msg: &MessageRef, content: &str) -> Result<()> {
+        self.current()?.edit_message(msg, content).await
+    }
+
+    async fn delete_message(&self, msg: &MessageRef) -> Result<()> {
+        self.current()?.delete_message(msg).await
+    }
+
+    fn use_streaming(&self, other_bot_present: bool) -> bool {
+        self.current()
+            .is_ok_and(|adapter| adapter.use_streaming(other_bot_present))
+    }
+
+    fn show_streaming_placeholder(&self) -> bool {
+        self.current()
+            .is_ok_and(|adapter| adapter.show_streaming_placeholder())
+    }
+
+    fn renders_native_tables(&self, platform: &str) -> bool {
+        self.current()
+            .is_ok_and(|adapter| adapter.renders_native_tables(platform))
+    }
+}
+
 struct GatewayAdapterOptions {
     platform_name: &'static str,
     streaming: bool,
@@ -851,6 +1005,8 @@ impl GatewayAdapter {
                 && self.capability_state.topology_supported();
             capabilities.supports_conversation_registry &=
                 negotiated && self.capability_state.topology_supported();
+            capabilities.supports_persistent_conversation_send &=
+                negotiated && self.capability_state.topology_supported() && capabilities.send_ack;
             // Teams has an independent default-off opt-in. Do not inherit the
             // generic Gateway streaming or placeholder switches.
             apply_teams_progressive_capabilities(
@@ -882,6 +1038,112 @@ impl GatewayAdapter {
         self.resolved_capabilities_with_mode(platform).1
     }
 
+    fn ensure_persistent_write_available(
+        &self,
+        channel: &ChannelRef,
+        negotiated: bool,
+        capabilities: &AdapterCapabilities,
+    ) -> Result<()> {
+        let Some(target) = channel.persistent_conversation.as_ref() else {
+            return Ok(());
+        };
+        let identity_valid = channel.platform == "teams"
+            && channel.channel_id == target.conversation_id
+            && channel.thread_id.is_none()
+            && channel.origin_event_id.as_deref().is_none_or(str::is_empty)
+            && target.bot_framework_channel_id == "msteams";
+        let capability_available = self.connection_active.load(AtomicOrdering::Acquire)
+            && negotiated
+            && self.capability_state.topology_supported()
+            && capabilities.send_ack
+            && capabilities.supports_target_message_id
+            && capabilities.supports_persistent_conversation_send;
+        if identity_valid && capability_available {
+            return Ok(());
+        }
+        Err(write_failure(WriteOutcome::Rejected {
+            code: if identity_valid {
+                "persistent_send_unavailable".into()
+            } else {
+                "persistent_target_invalid".into()
+            },
+            message: "Gateway persistent conversation send is unavailable".into(),
+            retry_after_ms: None,
+        }))
+    }
+
+    async fn send_reaction_command(
+        &self,
+        msg: &MessageRef,
+        emoji: &str,
+        command: &'static str,
+    ) -> Result<()> {
+        let (negotiated, capabilities) =
+            self.resolved_capabilities_with_mode(&msg.channel.platform);
+        self.ensure_persistent_write_available(&msg.channel, negotiated, &capabilities)?;
+        let required_ack = msg.channel.persistent_conversation.is_some();
+        let request_id = required_ack.then(|| format!("req_{}", uuid::Uuid::new_v4()));
+        let pending_rx = if let Some(ref id) = request_id {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.pending.lock().await.insert(id.clone(), tx);
+            Some(rx)
+        } else {
+            None
+        };
+        let (reply_to, target_message_id) = command_target_fields(msg, negotiated, &capabilities);
+        let reply = GatewayReply {
+            attachment_ref: None,
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to,
+            platform: msg.channel.platform.clone(),
+            channel: ReplyChannel {
+                id: msg.channel.channel_id.clone(),
+                thread_id: msg.channel.thread_id.clone(),
+            },
+            content: ReplyContent {
+                content_type: "text".into(),
+                text: emoji.into(),
+            },
+            command: Some(command.into()),
+            quote_message_id: None,
+            target_message_id,
+            request_id: request_id.clone(),
+            persistent_conversation: msg.channel.persistent_conversation.clone(),
+        };
+        let json = serde_json::to_string(&reply)?;
+        if let Err(error) = self.ws_tx.lock().await.send(Message::Text(json)).await {
+            if let Some(ref id) = request_id {
+                self.pending.lock().await.remove(id);
+            }
+            return Err(unknown_write_failure(
+                "gateway_reaction_send_failed",
+                error.to_string(),
+            ));
+        }
+        let (Some(rx), Some(id)) = (pending_rx, request_id) else {
+            return Ok(());
+        };
+        match tokio::time::timeout(self.ack_timeout, rx).await {
+            Ok(Ok(response)) => match response.write_outcome() {
+                WriteOutcome::Delivered { .. } => Ok(()),
+                outcome @ (WriteOutcome::Rejected { .. } | WriteOutcome::Unknown { .. }) => {
+                    Err(write_failure(outcome))
+                }
+            },
+            Ok(Err(_)) => Err(unknown_write_failure(
+                "reaction_ack_channel_closed",
+                "required reaction ACK channel closed",
+            )),
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                Err(unknown_write_failure(
+                    "reaction_ack_timeout",
+                    "required reaction ACK timed out",
+                ))
+            }
+        }
+    }
+
     /// Internal helper for send_message / send_message_with_reply.
     async fn send_gateway_reply(
         &self,
@@ -890,6 +1152,7 @@ impl GatewayAdapter {
         quote_message_id: Option<&str>,
     ) -> Result<MessageRef> {
         let (negotiated, capabilities) = self.resolved_capabilities_with_mode(&channel.platform);
+        self.ensure_persistent_write_available(channel, negotiated, &capabilities)?;
         let required_ack = negotiated && capabilities.send_ack;
         // Preserve legacy streaming correlation without turning a missing ACK
         // into failure. New peers request an ACK only when it was advertised.
@@ -919,6 +1182,7 @@ impl GatewayAdapter {
             request_id: req_id.clone(),
             quote_message_id: quote_message_id.map(|s| s.to_string()),
             target_message_id: None,
+            persistent_conversation: channel.persistent_conversation.clone(),
         };
         let json = serde_json::to_string(&reply)?;
         if let Err(e) = self.ws_tx.lock().await.send(Message::Text(json)).await {
@@ -1040,6 +1304,7 @@ impl GatewayAdapter {
             quote_message_id: None,
             target_message_id: None,
             attachment_ref: Some(reference.to_owned()),
+            persistent_conversation: channel.persistent_conversation.clone(),
         };
         let json = serde_json::to_string(&reply)?;
         if let Err(error) = self.ws_tx.lock().await.send(Message::Text(json)).await {
@@ -1137,6 +1402,7 @@ impl GatewayAdapter {
             quote_message_id: None,
             target_message_id: None,
             attachment_ref: None,
+            persistent_conversation: channel.persistent_conversation.clone(),
         };
         let json = serde_json::to_string(&reply)?;
         if let Err(error) = self.ws_tx.lock().await.send(Message::Text(json)).await {
@@ -1250,6 +1516,13 @@ impl ChatAdapter for GatewayAdapter {
         _trigger_msg: &MessageRef,
         title: &str,
     ) -> Result<ChannelRef> {
+        if channel.persistent_conversation.is_some() {
+            return Err(write_failure(WriteOutcome::Rejected {
+                code: "persistent_thread_unsupported".into(),
+                message: "Teams persistent conversations do not support synthetic threads".into(),
+                retry_after_ms: None,
+            }));
+        }
         // Send create_topic command to gateway
         let req_id = format!("req_{}", uuid::Uuid::new_v4());
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -1272,6 +1545,7 @@ impl ChatAdapter for GatewayAdapter {
             request_id: Some(req_id.clone()),
             quote_message_id: None,
             target_message_id: None,
+            persistent_conversation: channel.persistent_conversation.clone(),
         };
         let json = serde_json::to_string(&reply)?;
         self.ws_tx.lock().await.send(Message::Text(json)).await?;
@@ -1283,6 +1557,7 @@ impl ChatAdapter for GatewayAdapter {
                 channel_id: channel.channel_id.clone(),
                 thread_id: resp.thread_id,
                 parent_id: None,
+                persistent_conversation: channel.persistent_conversation.clone(),
                 origin_event_id: channel.origin_event_id.clone(),
             }),
             Ok(Ok(resp)) => {
@@ -1298,57 +1573,12 @@ impl ChatAdapter for GatewayAdapter {
     }
 
     async fn add_reaction(&self, msg: &MessageRef, emoji: &str) -> Result<()> {
-        let (negotiated, capabilities) =
-            self.resolved_capabilities_with_mode(&msg.channel.platform);
-        let (reply_to, target_message_id) = command_target_fields(msg, negotiated, &capabilities);
-        let reply = GatewayReply {
-            attachment_ref: None,
-            schema: "openab.gateway.reply.v1".into(),
-            reply_to,
-            platform: msg.channel.platform.clone(),
-            channel: ReplyChannel {
-                id: msg.channel.channel_id.clone(),
-                thread_id: msg.channel.thread_id.clone(),
-            },
-            content: ReplyContent {
-                content_type: "text".into(),
-                text: emoji.into(),
-            },
-            command: Some("add_reaction".into()),
-            quote_message_id: None,
-            target_message_id,
-            request_id: None,
-        };
-        let json = serde_json::to_string(&reply)?;
-        self.ws_tx.lock().await.send(Message::Text(json)).await?;
-        Ok(())
+        self.send_reaction_command(msg, emoji, "add_reaction").await
     }
 
     async fn remove_reaction(&self, msg: &MessageRef, emoji: &str) -> Result<()> {
-        let (negotiated, capabilities) =
-            self.resolved_capabilities_with_mode(&msg.channel.platform);
-        let (reply_to, target_message_id) = command_target_fields(msg, negotiated, &capabilities);
-        let reply = GatewayReply {
-            attachment_ref: None,
-            schema: "openab.gateway.reply.v1".into(),
-            reply_to,
-            platform: msg.channel.platform.clone(),
-            channel: ReplyChannel {
-                id: msg.channel.channel_id.clone(),
-                thread_id: msg.channel.thread_id.clone(),
-            },
-            content: ReplyContent {
-                content_type: "text".into(),
-                text: emoji.into(),
-            },
-            command: Some("remove_reaction".into()),
-            quote_message_id: None,
-            target_message_id,
-            request_id: None,
-        };
-        let json = serde_json::to_string(&reply)?;
-        self.ws_tx.lock().await.send(Message::Text(json)).await?;
-        Ok(())
+        self.send_reaction_command(msg, emoji, "remove_reaction")
+            .await
     }
 
     async fn edit_message(&self, msg: &MessageRef, content: &str) -> Result<()> {
@@ -1363,6 +1593,14 @@ impl ChatAdapter for GatewayAdapter {
         const LEGACY_EDIT_RESPONSE_TIMEOUT_MS: u64 = 800;
         let (negotiated, capabilities) =
             self.resolved_capabilities_with_mode(&msg.channel.platform);
+        self.ensure_persistent_write_available(&msg.channel, negotiated, &capabilities)?;
+        if msg.channel.persistent_conversation.is_some() && !capabilities.edit_ack {
+            return Err(write_failure(WriteOutcome::Rejected {
+                code: "persistent_edit_unavailable".into(),
+                message: "Gateway persistent edit is unavailable".into(),
+                retry_after_ms: None,
+            }));
+        }
         let required_ack = negotiated && capabilities.edit_ack;
         let needs_response =
             required_ack || (!negotiated && self.streaming && capabilities.edit_ack);
@@ -1402,6 +1640,7 @@ impl ChatAdapter for GatewayAdapter {
             quote_message_id: None,
             target_message_id,
             request_id: req_id.clone(),
+            persistent_conversation: msg.channel.persistent_conversation.clone(),
         };
         let json = serde_json::to_string(&reply)?;
         if let Err(e) = self.ws_tx.lock().await.send(Message::Text(json)).await {
@@ -1475,6 +1714,14 @@ impl ChatAdapter for GatewayAdapter {
     async fn delete_message(&self, msg: &MessageRef) -> Result<()> {
         let (negotiated, capabilities) =
             self.resolved_capabilities_with_mode(&msg.channel.platform);
+        self.ensure_persistent_write_available(&msg.channel, negotiated, &capabilities)?;
+        if msg.channel.persistent_conversation.is_some() && !capabilities.delete_ack {
+            return Err(write_failure(WriteOutcome::Rejected {
+                code: "persistent_delete_unavailable".into(),
+                message: "Gateway persistent delete is unavailable".into(),
+                retry_after_ms: None,
+            }));
+        }
         let required_ack = negotiated && capabilities.delete_ack;
         let request_id = required_ack.then(|| format!("req_{}", uuid::Uuid::new_v4()));
         let pending_rx = if let Some(ref id) = request_id {
@@ -1502,6 +1749,7 @@ impl ChatAdapter for GatewayAdapter {
             quote_message_id: None,
             target_message_id,
             request_id: request_id.clone(),
+            persistent_conversation: msg.channel.persistent_conversation.clone(),
         };
         let json = serde_json::to_string(&reply)?;
         if let Err(error) = self.ws_tx.lock().await.send(Message::Text(json)).await {
@@ -1600,9 +1848,13 @@ pub async fn run_gateway_adapter(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
     dispatcher: Arc<crate::dispatch::Dispatcher>,
     router: Arc<crate::adapter::AdapterRouter>,
+    adapter_proxy: Arc<GatewayAdapterProxy>,
     #[cfg(feature = "filestore")] filestore: Option<Arc<crate::filestore::Filestore>>,
 ) -> Result<()> {
-    let platform: &'static str = Box::leak(params.platform.into_boxed_str());
+    if adapter_proxy.platform_name != params.platform {
+        anyhow::bail!("Gateway adapter proxy platform does not match configuration");
+    }
+    let platform = adapter_proxy.platform_name;
 
     // Append auth token as query param if configured
     let gateway_url = params.url;
@@ -1698,6 +1950,7 @@ pub async fn run_gateway_adapter(
                 gateway_ack_timeout_secs,
             },
         ));
+        let adapter_generation = adapter_proxy.install(adapter.clone());
         let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
         // Hoist filter params outside loop — all fields are loop-invariant.
@@ -1835,6 +2088,7 @@ pub async fn run_gateway_adapter(
                                         channel_id: event.channel.id.clone(),
                                         thread_id: event.channel.thread_id.clone(),
                                         parent_id: None,
+                                        persistent_conversation: None,
                                         origin_event_id: Some(event.event_id.clone()),
                                     };
 
@@ -2121,6 +2375,7 @@ pub async fn run_gateway_adapter(
                 }
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
+                        adapter_proxy.clear_generation(adapter_generation);
                         connection_active.store(false, AtomicOrdering::Release);
                         pending.lock().await.clear();
                         info!("gateway adapter shutting down, waiting for {} in-flight tasks", tasks.len());
@@ -2131,9 +2386,9 @@ pub async fn run_gateway_adapter(
             }
         } // inner loop — break here means reconnect
 
-        // Stop new attachment commands and wake any request waiting on a
-        // response that cannot arrive on this connection. Queued event tasks
-        // then fail materialization immediately and can still dispatch text.
+        // Stop new proxy calls and wake requests owned by this generation. A
+        // later generation cannot clear or satisfy any of these waiters.
+        adapter_proxy.clear_generation(adapter_generation);
         connection_active.store(false, AtomicOrdering::Release);
         pending.lock().await.clear();
 
@@ -2273,6 +2528,7 @@ fn gate_gateway_event(
                     channel_id: event.channel.id.clone(),
                     thread_id: event.channel.thread_id.clone(),
                     parent_id: None,
+                    persistent_conversation: None,
                     origin_event_id: Some(event.event_id.clone()),
                 };
                 let msg = format!(
@@ -2345,6 +2601,7 @@ pub async fn process_gateway_event(
         channel_id: event.channel.id.clone(),
         thread_id: event.channel.thread_id.clone(),
         parent_id: None,
+        persistent_conversation: None,
         origin_event_id: Some(event.event_id.clone()),
     };
 
@@ -2781,6 +3038,58 @@ mod tests {
         }
     }
 
+    struct ProxyProbeAdapter {
+        message_id: &'static str,
+        persistent_send: bool,
+    }
+
+    #[async_trait]
+    impl ChatAdapter for ProxyProbeAdapter {
+        fn platform(&self) -> &'static str {
+            "teams"
+        }
+
+        fn message_limit(&self) -> usize {
+            4_096
+        }
+
+        fn capabilities(&self, platform: &str) -> AdapterCapabilities {
+            AdapterCapabilities {
+                send_ack: platform == "teams" && self.persistent_send,
+                supports_persistent_conversation_send: platform == "teams" && self.persistent_send,
+                ..AdapterCapabilities::default()
+            }
+        }
+
+        async fn send_message(&self, channel: &ChannelRef, _content: &str) -> Result<MessageRef> {
+            Ok(MessageRef {
+                channel: channel.clone(),
+                message_id: self.message_id.into(),
+            })
+        }
+
+        async fn create_thread(
+            &self,
+            channel: &ChannelRef,
+            _trigger_msg: &MessageRef,
+            _title: &str,
+        ) -> Result<ChannelRef> {
+            Ok(channel.clone())
+        }
+
+        async fn add_reaction(&self, _msg: &MessageRef, _emoji: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn remove_reaction(&self, _msg: &MessageRef, _emoji: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn use_streaming(&self, _other_bot_present: bool) -> bool {
+            false
+        }
+    }
+
     struct OutcomeProbeAdapter {
         sends: AtomicUsize,
         outcome: WriteOutcome,
@@ -2992,6 +3301,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn standalone_proxy_is_disconnected_and_generation_safe() {
+        let proxy = GatewayAdapterProxy::with_platform_name("teams");
+        let channel = ChannelRef {
+            platform: "teams".into(),
+            channel_id: "conversation-1".into(),
+            thread_id: None,
+            parent_id: None,
+            persistent_conversation: None,
+            origin_event_id: None,
+        };
+
+        let error = proxy
+            .send_message(&channel, "before connect")
+            .await
+            .unwrap_err();
+        let failure = error.downcast_ref::<WriteFailure>().unwrap();
+        assert!(matches!(
+            &failure.outcome,
+            WriteOutcome::Rejected { code, .. } if code == "gateway_disconnected"
+        ));
+        assert!(
+            !proxy
+                .capabilities("teams")
+                .supports_persistent_conversation_send
+        );
+
+        let first = proxy.install(Arc::new(ProxyProbeAdapter {
+            message_id: "generation-1",
+            persistent_send: false,
+        }));
+        assert_eq!(
+            proxy
+                .send_message(&channel, "first")
+                .await
+                .unwrap()
+                .message_id,
+            "generation-1"
+        );
+
+        let second = proxy.install(Arc::new(ProxyProbeAdapter {
+            message_id: "generation-2",
+            persistent_send: true,
+        }));
+        proxy.clear_generation(first);
+        assert!(
+            proxy
+                .capabilities("teams")
+                .supports_persistent_conversation_send
+        );
+        assert_eq!(
+            proxy
+                .send_message(&channel, "second")
+                .await
+                .unwrap()
+                .message_id,
+            "generation-2"
+        );
+
+        proxy.clear_generation(second);
+        let error = proxy
+            .send_message(&channel, "after disconnect")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            &error.downcast_ref::<WriteFailure>().unwrap().outcome,
+            WriteOutcome::Rejected { code, .. } if code == "gateway_disconnected"
+        ));
+    }
+
+    #[tokio::test]
     async fn recognized_command_precedes_attachment_materialization() -> anyhow::Result<()> {
         let probe = Arc::new(AttachmentProbeAdapter::default());
         let context = trusted_probe_context(probe.clone());
@@ -3169,6 +3548,7 @@ mod tests {
                     channel_id: "conversation-1".into(),
                     thread_id: None,
                     parent_id: None,
+                    persistent_conversation: None,
                     origin_event_id: Some("event".into()),
                 },
             )
@@ -3196,6 +3576,7 @@ mod tests {
                 channel_id: "conversation-1".into(),
                 thread_id: None,
                 parent_id: None,
+                persistent_conversation: None,
                 origin_event_id: Some("event".into()),
             },
         );
@@ -3629,6 +4010,7 @@ mod tests {
                 channel_id: "conversation-1".into(),
                 thread_id: None,
                 parent_id: None,
+                persistent_conversation: None,
                 origin_event_id: Some("event-1".into()),
             },
             message_id: "activity-1".into(),
@@ -3667,13 +4049,9 @@ mod tests {
             }
         }))
         .expect("old hello should remain decodable");
-        assert!(
-            !hello
-                .capabilities
-                .get("teams")
-                .expect("Teams capability")
-                .supports_conversation_registry
-        );
+        let teams = hello.capabilities.get("teams").expect("Teams capability");
+        assert!(!teams.supports_conversation_registry);
+        assert!(!teams.supports_persistent_conversation_send);
     }
 
     #[test]

@@ -357,10 +357,21 @@ error_hold_ms = 2500
 # schedule = "0 9 * * 1-5"                    # weekdays at 9:00 AM
 # channel = "123456789"                        # target channel/thread ID
 # message = "summarize yesterday's merged PRs" # prompt for the agent
-# platform = "discord"                         # "discord" or "slack"
+# platform = "discord"                         # discord/slack/telegram/googlechat/lineworks/teams
 # sender_name = "DailyOps"                     # attribution (default: "openab-cron")
 # timezone = "America/New_York"                # IANA timezone (default: "UTC")
-# thread_id = ""                               # optional: post to existing thread
+# thread_id = ""                               # optional existing thread; rejected for Teams
+
+# Teams operator baseline: requires an active Gateway conversation-registry record.
+# `channel` is the trusted Teams conversation ID; do not configure serviceUrl.
+# [[cron.jobs]]
+# schedule = "0 9 * * 1-5"
+# platform = "teams"
+# channel = "<teams-conversation-id>"
+# teams_tenant_id = "<tenant-id>"
+# message = "summarize yesterday's merged work"
+# sender_name = "DailyOps"
+# timezone = "Asia/Taipei"
 
 # [[cron.jobs]]
 # schedule = "0 0 * * 0"

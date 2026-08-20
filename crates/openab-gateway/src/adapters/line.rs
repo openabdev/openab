@@ -1310,6 +1310,7 @@ mod tests {
             Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let reply = GatewayReply {
             attachment_ref: None,
+            persistent_conversation: None,
             schema: "openab.gateway.reply.v1".into(),
             reply_to: "evt1".into(),
             platform: "line".into(),

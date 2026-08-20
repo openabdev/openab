@@ -351,6 +351,7 @@ mod tests {
                 channel_id: "channel".into(),
                 thread_id: None,
                 parent_id: None,
+                persistent_conversation: None,
                 origin_event_id: None,
             },
             message_id: "message".into(),
