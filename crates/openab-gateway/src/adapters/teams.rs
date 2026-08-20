@@ -1,13 +1,14 @@
 use super::teams_ingress::{
-    wait_for_publish, OwnershipLookupError, PublishReservation, PublishState, RouteLookupError,
-    TeamsIngressCleanupStats, TeamsIngressRegistry, TeamsIngressRoute, TeamsRouteKey,
-    DEFAULT_DEDUPE_TTL_SECS, DEFAULT_MAX_ROUTE_ENTRIES, DEFAULT_ROUTE_TTL_SECS,
+    wait_for_publish, OwnershipLookupError, PublishReservation, PublishState, ReactionLookupError,
+    RouteLookupError, TeamsIngressCleanupStats, TeamsIngressRegistry, TeamsIngressRoute,
+    TeamsRouteKey, DEFAULT_DEDUPE_TTL_SECS, DEFAULT_MAX_ROUTE_ENTRIES, DEFAULT_ROUTE_TTL_SECS,
 };
 use crate::schema::*;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
+use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -181,6 +182,7 @@ pub struct TeamsConfig {
     pub dedupe_ttl_secs: u64,
     pub route_ttl_secs: u64,
     pub max_route_entries: usize,
+    pub reactions_enabled: bool,
 }
 
 impl TeamsConfig {
@@ -224,7 +226,24 @@ impl TeamsConfig {
                 "TEAMS_MAX_ROUTE_ENTRIES",
                 DEFAULT_MAX_ROUTE_ENTRIES,
             ),
+            reactions_enabled: parse_opt_in_bool(
+                read("TEAMS_REACTIONS_ENABLED"),
+                "TEAMS_REACTIONS_ENABLED",
+            ),
         })
+    }
+}
+
+fn parse_opt_in_bool(raw: Option<String>, key: &str) -> bool {
+    match raw.as_deref().map(str::trim) {
+        None | Some("") | Some("0") => false,
+        Some(value) if value.eq_ignore_ascii_case("false") => false,
+        Some("1") => true,
+        Some(value) if value.eq_ignore_ascii_case("true") => true,
+        Some(_) => {
+            warn!(key, "invalid opt-in Teams boolean; using false");
+            false
+        }
     }
 }
 
@@ -288,6 +307,13 @@ const TEAMS_PUBLIC_SERVICE_HOST: &str = "smba.trafficmanager.net";
 const TEAMS_PUBLIC_OAUTH_HOST: &str = "login.microsoftonline.com";
 const TEAMS_PUBLIC_OPENID_HOST: &str = "login.botframework.com";
 
+#[derive(Clone, Copy)]
+enum ConnectorWriteBody<'a> {
+    Absent,
+    Empty,
+    Json(&'a serde_json::Value),
+}
+
 impl TeamsAdapter {
     pub fn new(config: TeamsConfig) -> Self {
         Self::with_client(config, build_http_client(TEAMS_REQUEST_TIMEOUT), false)
@@ -298,6 +324,9 @@ impl TeamsAdapter {
         client: reqwest::Client,
         allow_non_public_endpoints: bool,
     ) -> Self {
+        if config.reactions_enabled {
+            warn!("teams message reactions are enabled through a Microsoft public-preview API");
+        }
         let ingress = TeamsIngressRegistry::new(
             Duration::from_secs(config.dedupe_ttl_secs),
             Duration::from_secs(config.route_ttl_secs),
@@ -369,6 +398,10 @@ impl TeamsAdapter {
 
     pub(crate) async fn cleanup_ingress(&self) -> TeamsIngressCleanupStats {
         self.ingress.lock().await.cleanup(Instant::now())
+    }
+
+    pub fn reactions_enabled(&self) -> bool {
+        self.config.reactions_enabled
     }
 
     fn conversation_write_shard(route: &TeamsIngressRoute) -> usize {
@@ -667,6 +700,22 @@ impl TeamsAdapter {
         )
     }
 
+    fn reaction_url(
+        &self,
+        service_url: &str,
+        conversation_id: &str,
+        activity_id: &str,
+        reaction_type: &str,
+    ) -> anyhow::Result<reqwest::Url> {
+        reaction_url(
+            service_url,
+            conversation_id,
+            activity_id,
+            reaction_type,
+            self.allow_non_public_endpoints,
+        )
+    }
+
     fn validate_service_url(&self, service_url: &str) -> anyhow::Result<reqwest::Url> {
         validate_public_cloud_endpoint(
             service_url,
@@ -796,25 +845,13 @@ impl TeamsAdapter {
         }
     }
 
-    async fn mutate_activity_outcome(
+    async fn idempotent_connector_write_outcome(
         &self,
         method: reqwest::Method,
-        service_url: &str,
-        conversation_id: &str,
-        activity_id: &str,
-        body: Option<&serde_json::Value>,
+        url: reqwest::Url,
+        body: ConnectorWriteBody<'_>,
         operation: &'static str,
     ) -> WriteOutcome {
-        let url = match self.connector_url(service_url, conversation_id, Some(activity_id)) {
-            Ok(url) => url,
-            Err(error) => {
-                return WriteOutcome::Rejected {
-                    code: "invalid_route".into(),
-                    message: error.to_string(),
-                    retry_after_ms: None,
-                };
-            }
-        };
         let token = match self.get_token().await {
             Ok(token) => token,
             Err(error) => {
@@ -832,9 +869,11 @@ impl TeamsAdapter {
                 .client
                 .request(method.clone(), url.clone())
                 .bearer_auth(&token);
-            if let Some(body) = body {
-                request = request.json(body);
-            }
+            request = match body {
+                ConnectorWriteBody::Absent => request,
+                ConnectorWriteBody::Empty => request.header(reqwest::header::CONTENT_LENGTH, "0"),
+                ConnectorWriteBody::Json(body) => request.json(body),
+            };
             let response = match request.send().await {
                 Ok(response) => response,
                 Err(error) => {
@@ -863,6 +902,11 @@ impl TeamsAdapter {
                 {
                     let delay = Duration::from_millis(*delay_ms);
                     if code == "rate_limited" && delay <= TEAMS_MUTATION_RETRY_MAX_DELAY {
+                        warn!(
+                            operation,
+                            retry_after_ms = *delay_ms,
+                            "teams: retrying rate-limited Connector write once"
+                        );
                         retried_rate_limit = true;
                         tokio::time::sleep(delay).await;
                         continue;
@@ -871,6 +915,30 @@ impl TeamsAdapter {
             }
             return outcome;
         }
+    }
+
+    async fn mutate_activity_outcome(
+        &self,
+        method: reqwest::Method,
+        service_url: &str,
+        conversation_id: &str,
+        activity_id: &str,
+        body: Option<&serde_json::Value>,
+        operation: &'static str,
+    ) -> WriteOutcome {
+        let url = match self.connector_url(service_url, conversation_id, Some(activity_id)) {
+            Ok(url) => url,
+            Err(error) => {
+                return WriteOutcome::Rejected {
+                    code: "invalid_route".into(),
+                    message: error.to_string(),
+                    retry_after_ms: None,
+                };
+            }
+        };
+        let body = body.map_or(ConnectorWriteBody::Absent, ConnectorWriteBody::Json);
+        self.idempotent_connector_write_outcome(method, url, body, operation)
+            .await
     }
 
     pub async fn update_activity_outcome(
@@ -910,6 +978,77 @@ impl TeamsAdapter {
             activity_id,
             None,
             "Bot Framework delete",
+        )
+        .await
+    }
+
+    async fn reaction_activity_outcome(
+        &self,
+        method: reqwest::Method,
+        service_url: &str,
+        conversation_id: &str,
+        activity_id: &str,
+        reaction: &str,
+        operation: &'static str,
+    ) -> WriteOutcome {
+        let Some(reaction_type) = teams_reaction_type(reaction) else {
+            return WriteOutcome::Rejected {
+                code: "unsupported_reaction".into(),
+                message: "Teams reaction is not a supported emoji or reaction ID".into(),
+                retry_after_ms: None,
+            };
+        };
+        let url = match self.reaction_url(
+            service_url,
+            conversation_id,
+            activity_id,
+            reaction_type.as_ref(),
+        ) {
+            Ok(url) => url,
+            Err(error) => {
+                return WriteOutcome::Rejected {
+                    code: "invalid_route".into(),
+                    message: error.to_string(),
+                    retry_after_ms: None,
+                };
+            }
+        };
+        self.idempotent_connector_write_outcome(method, url, ConnectorWriteBody::Empty, operation)
+            .await
+    }
+
+    pub async fn add_reaction_outcome(
+        &self,
+        service_url: &str,
+        conversation_id: &str,
+        activity_id: &str,
+        reaction: &str,
+    ) -> WriteOutcome {
+        self.reaction_activity_outcome(
+            reqwest::Method::PUT,
+            service_url,
+            conversation_id,
+            activity_id,
+            reaction,
+            "Bot Framework add reaction",
+        )
+        .await
+    }
+
+    pub async fn remove_reaction_outcome(
+        &self,
+        service_url: &str,
+        conversation_id: &str,
+        activity_id: &str,
+        reaction: &str,
+    ) -> WriteOutcome {
+        self.reaction_activity_outcome(
+            reqwest::Method::DELETE,
+            service_url,
+            conversation_id,
+            activity_id,
+            reaction,
+            "Bot Framework remove reaction",
         )
         .await
     }
@@ -1041,6 +1180,66 @@ fn connector_url(
             segments.push(activity_id);
         }
     }
+    Ok(url)
+}
+
+fn teams_reaction_type(value: &str) -> Option<Cow<'_, str>> {
+    let mapped = match value {
+        "👀" => "1f440_eyes",
+        "🤔" => "think",
+        "🔥" => "fire",
+        "👨‍💻" => "mantechie",
+        "⚡" | "⚡️" => "26a1_highvoltagesign",
+        "🆗" => "1f197_squaredok",
+        "🥱" => "1f971_yawningface",
+        "😨" => "fearful",
+        "😱" => "screamingfear",
+        "😊" => "smileeyes",
+        "😎" => "cool",
+        "🫡" => "salute",
+        "🤓" => "nerdy",
+        "😏" => "smirk",
+        "✌" | "✌️" => "victory",
+        "💪" => "muscle",
+        "🦾" => "1f9be_mechanicalarm",
+        "👍" => "like",
+        "❤" | "❤️" => "heart",
+        "✅" => "2705_whiteheavycheckmark",
+        "❌" => "274c_crossmark",
+        "⏳" => "holdon",
+        value
+            if value.len() <= 128
+                && !value.is_empty()
+                && value.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+                }) =>
+        {
+            return Some(Cow::Borrowed(value));
+        }
+        _ => return None,
+    };
+    Some(Cow::Borrowed(mapped))
+}
+
+fn reaction_url(
+    service_url: &str,
+    conversation_id: &str,
+    activity_id: &str,
+    reaction_type: &str,
+    allow_non_public_endpoints: bool,
+) -> anyhow::Result<reqwest::Url> {
+    validate_connector_id(reaction_type, "reaction type")?;
+    let mut url = connector_url(
+        service_url,
+        conversation_id,
+        Some(activity_id),
+        allow_non_public_endpoints,
+    )?;
+    let mut segments = url
+        .path_segments_mut()
+        .map_err(|_| anyhow::anyhow!("Teams service URL cannot be used as a base URL"))?;
+    segments.push("reactions").push(reaction_type);
+    drop(segments);
     Ok(url)
 }
 
@@ -1782,15 +1981,103 @@ async fn handle_owned_mutation(
     outcome
 }
 
+async fn resolve_reaction_route(
+    teams: &TeamsAdapter,
+    reply: &GatewayReply,
+    target_activity_id: &str,
+    origin_event_id: Option<&str>,
+) -> Result<TeamsIngressRoute, WriteOutcome> {
+    let result = teams.ingress.lock().await.route_for_reaction_target(
+        &teams.config.app_id,
+        origin_event_id,
+        &reply.channel.id,
+        target_activity_id,
+        Instant::now(),
+    );
+    match result {
+        Ok(route) => Ok(route),
+        Err(ReactionLookupError::TargetNotKnown) => Err(rejected_outcome(
+            "reaction_target_not_known",
+            "Teams reaction target is not authenticated in this process",
+        )),
+        Err(ReactionLookupError::OriginRouteNotFound) => Err(rejected_outcome(
+            "target_origin_not_found",
+            "Teams reaction origin route is missing or expired",
+        )),
+        Err(ReactionLookupError::ConversationMismatch) => Err(rejected_outcome(
+            "target_scope_mismatch",
+            "Teams reaction conversation does not match its origin route",
+        )),
+        Err(ReactionLookupError::AmbiguousScope) => Err(rejected_outcome(
+            "target_scope_ambiguous",
+            "Teams legacy reaction target is ambiguous across tenant scope",
+        )),
+    }
+}
+
+async fn handle_reaction(
+    reply: &GatewayReply,
+    teams: &TeamsAdapter,
+    command: &str,
+) -> WriteOutcome {
+    if !teams.reactions_enabled() {
+        debug!(
+            command,
+            "teams: reaction preview is disabled; ignoring command"
+        );
+        return WriteOutcome::Delivered { message_id: None };
+    }
+
+    let (target_activity_id, origin_event_id) = match command_target(reply) {
+        Ok(target) => target,
+        Err(outcome) => return outcome,
+    };
+    let route =
+        match resolve_reaction_route(teams, reply, target_activity_id, origin_event_id).await {
+            Ok(route) => route,
+            Err(outcome) => return outcome,
+        };
+    let _write_guard = teams.lock_conversation(&route).await;
+    let route =
+        match resolve_reaction_route(teams, reply, target_activity_id, origin_event_id).await {
+            Ok(route) => route,
+            Err(outcome) => return outcome,
+        };
+
+    info!(conversation = %route.conversation_id, command, "gateway → teams reaction");
+    match command {
+        "add_reaction" => {
+            teams
+                .add_reaction_outcome(
+                    route.service_url.as_str(),
+                    &route.conversation_id,
+                    target_activity_id,
+                    &reply.content.text,
+                )
+                .await
+        }
+        "remove_reaction" => {
+            teams
+                .remove_reaction_outcome(
+                    route.service_url.as_str(),
+                    &route.conversation_id,
+                    target_activity_id,
+                    &reply.content.text,
+                )
+                .await
+        }
+        _ => unreachable!("reaction dispatch is command-checked"),
+    }
+}
+
 pub async fn handle_reply(reply: &GatewayReply, teams: &TeamsAdapter) -> WriteOutcome {
     match reply.command.as_deref() {
         None => handle_send_reply(reply, teams).await,
         Some(command @ ("edit_message" | "delete_message")) => {
             handle_owned_mutation(reply, teams, command).await
         }
-        Some("add_reaction" | "remove_reaction") => {
-            debug!(command = ?reply.command.as_deref(), "teams: ignoring unsupported reaction command");
-            WriteOutcome::Delivered { message_id: None }
+        Some(command @ ("add_reaction" | "remove_reaction")) => {
+            handle_reaction(reply, teams, command).await
         }
         Some(command) => rejected_outcome(
             "unsupported_command",
@@ -1803,7 +2090,7 @@ pub async fn handle_reply(reply: &GatewayReply, teams: &TeamsAdapter) -> WriteOu
 mod tests {
     use super::*;
     use wiremock::{
-        matchers::{body_json, method, path},
+        matchers::{body_json, header, method, path},
         Mock, MockServer, ResponseTemplate,
     };
 
@@ -1821,6 +2108,42 @@ mod tests {
             url.as_str(),
             "https://smba.trafficmanager.net/teams/v3/conversations/a%2Fb%3Fc/activities/message%20id%2F%25"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn reaction_url_and_default_status_emojis_use_teams_ids() -> anyhow::Result<()> {
+        let url = reaction_url(
+            "https://smba.trafficmanager.net/teams/",
+            "a/b?c",
+            "message id/%",
+            "1f440_eyes",
+            false,
+        )?;
+        assert_eq!(
+            url.as_str(),
+            "https://smba.trafficmanager.net/teams/v3/conversations/a%2Fb%3Fc/activities/message%20id%2F%25/reactions/1f440_eyes"
+        );
+        for (emoji, expected) in [
+            ("👀", "1f440_eyes"),
+            ("🤔", "think"),
+            ("🔥", "fire"),
+            ("👨‍💻", "mantechie"),
+            ("⚡", "26a1_highvoltagesign"),
+            ("🆗", "1f197_squaredok"),
+            ("🥱", "1f971_yawningface"),
+            ("😨", "fearful"),
+            ("😱", "screamingfear"),
+            ("🫡", "salute"),
+            ("✅", "2705_whiteheavycheckmark"),
+        ] {
+            assert_eq!(teams_reaction_type(emoji).as_deref(), Some(expected));
+        }
+        assert_eq!(
+            teams_reaction_type("1f44b_wavinghand-tone4").as_deref(),
+            Some("1f44b_wavinghand-tone4")
+        );
+        assert!(teams_reaction_type("not/a/reaction").is_none());
         Ok(())
     }
 
@@ -1916,6 +2239,7 @@ mod tests {
             dedupe_ttl_secs: DEFAULT_DEDUPE_TTL_SECS,
             route_ttl_secs: DEFAULT_ROUTE_TTL_SECS,
             max_route_entries: DEFAULT_MAX_ROUTE_ENTRIES,
+            reactions_enabled: false,
         }
     }
 
@@ -2758,6 +3082,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enabled_reactions_add_remove_and_accept_legacy_targets() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let server = MockServer::start().await;
+        let _token = Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "test-token",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let _add = Mock::given(method("PUT"))
+            .and(path(
+                "/v3/conversations/conversation-1/activities/inbound-1/reactions/1f440_eyes",
+            ))
+            .and(header("content-length", "0"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let _remove = Mock::given(method("DELETE"))
+            .and(path(
+                "/v3/conversations/conversation-1/activities/inbound-1/reactions/1f440_eyes",
+            ))
+            .and(header("content-length", "0"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let _legacy_add = Mock::given(method("PUT"))
+            .and(path(
+                "/v3/conversations/conversation-1/activities/inbound-1/reactions/heart",
+            ))
+            .and(header("content-length", "0"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let responder_attempts = attempts.clone();
+        let _rate_limited = Mock::given(method("PUT"))
+            .and(path(
+                "/v3/conversations/conversation-1/activities/inbound-1/reactions/think",
+            ))
+            .and(header("content-length", "0"))
+            .respond_with(move |_request: &wiremock::Request| {
+                if responder_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(429).insert_header("retry-after", "0")
+                } else {
+                    ResponseTemplate::new(204)
+                }
+            })
+            .expect(2)
+            .mount_as_scoped(&server)
+            .await;
+
+        let mut config = make_http_test_config(&server);
+        config.reactions_enabled = true;
+        let adapter = TeamsAdapter::new_for_test(config);
+        accept_test_route(&adapter, &server.uri(), "evt-1", "inbound-1", None).await?;
+
+        for command in ["add_reaction", "remove_reaction"] {
+            let mut reply = make_reply(Some(command));
+            reply.target_message_id = Some("inbound-1".into());
+            reply.content.text = "👀".into();
+            assert_eq!(
+                handle_reply(&reply, &adapter).await,
+                WriteOutcome::Delivered { message_id: None }
+            );
+        }
+
+        let mut legacy = make_reply(Some("add_reaction"));
+        legacy.reply_to = "inbound-1".into();
+        legacy.content.text = "❤️".into();
+        assert_eq!(
+            handle_reply(&legacy, &adapter).await,
+            WriteOutcome::Delivered { message_id: None }
+        );
+
+        let mut rate_limited = make_reply(Some("add_reaction"));
+        rate_limited.target_message_id = Some("inbound-1".into());
+        rate_limited.content.text = "🤔".into();
+        assert_eq!(
+            handle_reply(&rate_limited, &adapter).await,
+            WriteOutcome::Delivered { message_id: None }
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+        let mut unknown = make_reply(Some("add_reaction"));
+        unknown.target_message_id = Some("untrusted-activity".into());
+        unknown.content.text = "👀".into();
+        assert!(matches!(
+            handle_reply(&unknown, &adapter).await,
+            WriteOutcome::Rejected { ref code, .. } if code == "reaction_target_not_known"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn commandless_reply_still_sends_one_activity() -> anyhow::Result<()> {
         let server = MockServer::start().await;
         let _token = Mock::given(method("POST"))
@@ -3278,15 +3703,23 @@ mod tests {
         assert_eq!(config.dedupe_ttl_secs, 42);
         assert_eq!(config.route_ttl_secs, 84);
         assert_eq!(config.max_route_entries, 123);
+        assert!(!config.reactions_enabled);
+
+        values.insert("TEAMS_REACTIONS_ENABLED", "true");
+        let config = TeamsConfig::from_reader(|key| values.get(key).map(ToString::to_string))
+            .ok_or_else(|| anyhow::anyhow!("complete credentials should resolve"))?;
+        assert!(config.reactions_enabled);
 
         values.insert("TEAMS_DEDUPE_TTL_SECS", "0");
         values.insert("TEAMS_ROUTE_TTL_SECS", "invalid");
         values.insert("TEAMS_MAX_ROUTE_ENTRIES", "0");
+        values.insert("TEAMS_REACTIONS_ENABLED", "invalid");
         let config = TeamsConfig::from_reader(|key| values.get(key).map(ToString::to_string))
             .ok_or_else(|| anyhow::anyhow!("complete credentials should resolve"))?;
         assert_eq!(config.dedupe_ttl_secs, DEFAULT_DEDUPE_TTL_SECS);
         assert_eq!(config.route_ttl_secs, DEFAULT_ROUTE_TTL_SECS);
         assert_eq!(config.max_route_entries, DEFAULT_MAX_ROUTE_ENTRIES);
+        assert!(!config.reactions_enabled);
         Ok(())
     }
 

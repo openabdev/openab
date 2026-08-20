@@ -212,6 +212,14 @@ impl ChatAdapter for UnifiedGatewayAdapter {
             .gw_state
             .telegram_streaming
             .unwrap_or(self.gw_state.telegram_rich_messages);
+        #[cfg(feature = "teams")]
+        let teams_reactions = self
+            .gw_state
+            .teams
+            .as_ref()
+            .is_some_and(|teams| teams.reactions_enabled());
+        #[cfg(not(feature = "teams"))]
+        let teams_reactions = false;
         let (can_edit, can_delete, streaming_mode, status_backend) = match platform {
             "telegram" => (
                 self.gw_state.telegram_rich_messages,
@@ -243,7 +251,11 @@ impl ChatAdapter for UnifiedGatewayAdapter {
                 cfg!(feature = "teams"),
                 cfg!(feature = "teams"),
                 StreamingMode::Disabled,
-                StatusBackend::None,
+                if teams_reactions {
+                    StatusBackend::Reactions
+                } else {
+                    StatusBackend::None
+                },
             ),
             "line" | "lineworks" | "acp" => {
                 (false, false, StreamingMode::Disabled, StatusBackend::None)
@@ -401,6 +413,28 @@ mod tests {
         assert!(capabilities.can_edit);
         assert!(capabilities.can_delete);
         assert_eq!(capabilities.status_backend, StatusBackend::None);
+
+        let (event_tx, _event_rx) = tokio::sync::broadcast::channel(4);
+        let mut state = AppState::test_default(event_tx);
+        state.apply_teams_config(openab_gateway::GatewayTeamsConfig {
+            app_id: Some("app".into()),
+            app_secret: Some("secret".into()),
+            allowed_tenants: Vec::new(),
+            oauth_endpoint: "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token"
+                .into(),
+            openid_metadata: "https://login.botframework.com/v1/.well-known/openidconfiguration"
+                .into(),
+            webhook_path: "/webhook/teams".into(),
+            dedupe_ttl_secs: 600,
+            route_ttl_secs: 3600,
+            max_route_entries: 10_000,
+            reactions_enabled: true,
+        });
+        let adapter = UnifiedGatewayAdapter::new(Arc::new(state));
+        assert_eq!(
+            adapter.capabilities("teams").status_backend,
+            StatusBackend::Reactions
+        );
     }
 
     #[cfg(feature = "teams")]

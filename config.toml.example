@@ -137,6 +137,7 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 # dedupe_ttl_secs = 600                 # env fallback: TEAMS_DEDUPE_TTL_SECS
 # route_ttl_secs = 3600                 # env fallback: TEAMS_ROUTE_TTL_SECS
 # max_route_entries = 10000             # independent route/dedupe/ownership caps; env: TEAMS_MAX_ROUTE_ENTRIES
+# reactions_enabled = false             # public-preview reactions; env: TEAMS_REACTIONS_ENABLED
 # allow_all_users = false               # env fallback: TEAMS_ALLOW_ALL_USERS
 # allowed_users = ["29:1abc..."]        # Bot Framework activity.from.id values (29:…)
 #                                       # env fallback: TEAMS_ALLOWED_USERS (comma-separated)

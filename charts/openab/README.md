@@ -48,6 +48,7 @@ Each agent lives under `agents.<name>`.
 | `stt.baseUrl` | STT API base URL. | `"https://api.groq.com/openai/v1"` |
 | `gateway.enabled` | Enable the gateway config block for webhook-based platforms. | `false` |
 | `gateway.deploy` | Deploy the gateway Deployment and Service. | `true` |
+| `gateway.teams.reactionsEnabled` | Opt in to Microsoft public-preview Bot Connector reactions. | `false` |
 | `cron.usercronEnabled` | Enable user-provided cron configuration. | `false` |
 | `cronjobs` | Config-driven scheduled messages for an agent. | `[]` |
 | `persistence.enabled` | Enable persistent storage for auth and settings. | `true` |

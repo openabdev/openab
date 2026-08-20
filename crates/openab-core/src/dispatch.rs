@@ -625,16 +625,23 @@ async fn dispatch_batch(
     let batch_size = batch.len();
     let session_key = Dispatcher::session_key(thread_channel);
 
-    // Apply 👀 only when the platform selected the reactions status backend.
-    // Assistant/typing/none backends must not leak into the emoji lifecycle.
+    let Some(trigger_msg) = batch.last().map(|msg| msg.trigger_msg.clone()) else {
+        return;
+    };
+    let reactions_config = target.reactions_config().clone();
+
+    // Apply a permanent 👀 receipt marker to every event in the batch, as
+    // required by turn-boundary-batching ADR §6.7. The progress controller
+    // below is intentionally separate and anchors only on the final event.
     let reaction_status = adapter
         .capabilities(&thread_channel.platform)
         .status_backend
         == StatusBackend::Reactions;
     if reaction_status {
-        let queued_emoji = &target.reactions_config().emojis.queued;
-        for msg in batch.iter() {
-            let _ = adapter.add_reaction(&msg.trigger_msg, queued_emoji).await;
+        for msg in &batch {
+            let _ = adapter
+                .add_reaction(&msg.trigger_msg, &reactions_config.emojis.queued)
+                .await;
         }
     }
 
@@ -650,8 +657,6 @@ async fn dispatch_batch(
     // batch attributes to the most recent sender; None for non-Slack/bot turns.
     let recipient: Option<(String, String)> = batch.last().and_then(|m| m.recipient.clone());
 
-    // Anchor reactions on the last message in the batch (before consuming).
-    let trigger_msg = batch.last().unwrap().trigger_msg.clone();
     let dispatch_channel = ChannelRef {
         // Reply correlation is event-scoped, but the dispatcher consumer is
         // thread-scoped. Rebuild the per-dispatch channel from the stable
@@ -759,7 +764,6 @@ async fn dispatch_batch(
     }
     let packed_block_count = content_blocks.len();
 
-    let reactions_config = target.reactions_config().clone();
     let reactions = Arc::new(StatusReactionController::new(
         reactions_config.enabled,
         adapter.clone(),
@@ -767,7 +771,8 @@ async fn dispatch_batch(
         reactions_config.emojis.clone(),
         reactions_config.timing.clone(),
     ));
-    // 👀 already applied above; skip set_queued() to avoid double-reaction.
+    // 👀 receipt markers are intentionally outside this controller and remain
+    // visible after the turn completes (turn-boundary-batching ADR §6.7).
 
     let result = target
         .stream_prompt_blocks(
@@ -1447,10 +1452,24 @@ mod tests {
         }
     }
 
-    /// Mock `ChatAdapter` — every method is a no-op success. The dispatch loop
-    /// invokes `add_reaction` (queued 👀), `platform`, and on the error path
-    /// `send_message`; nothing else needs real behavior here.
-    struct MockChatAdapter;
+    /// Mock `ChatAdapter` — records reaction lifecycle calls and otherwise
+    /// returns success without touching a platform API.
+    #[derive(Default)]
+    struct MockChatAdapter {
+        reaction_events: Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl MockChatAdapter {
+        fn reaction_events_mut(&self) -> std::sync::MutexGuard<'_, Vec<(String, String, String)>> {
+            self.reaction_events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        fn reaction_events(&self) -> Vec<(String, String, String)> {
+            self.reaction_events_mut().clone()
+        }
+    }
 
     #[async_trait]
     impl ChatAdapter for MockChatAdapter {
@@ -1477,10 +1496,17 @@ mod tests {
             Ok(channel.clone())
         }
 
-        async fn add_reaction(&self, _msg: &MessageRef, _emoji: &str) -> Result<()> {
+        async fn add_reaction(&self, msg: &MessageRef, emoji: &str) -> Result<()> {
+            self.reaction_events_mut()
+                .push(("add".into(), msg.message_id.clone(), emoji.into()));
             Ok(())
         }
-        async fn remove_reaction(&self, _msg: &MessageRef, _emoji: &str) -> Result<()> {
+        async fn remove_reaction(&self, msg: &MessageRef, emoji: &str) -> Result<()> {
+            self.reaction_events_mut().push((
+                "remove".into(),
+                msg.message_id.clone(),
+                emoji.into(),
+            ));
             Ok(())
         }
         fn use_streaming(&self, _other_bot_present: bool) -> bool {
@@ -1525,7 +1551,7 @@ mod tests {
     ) -> Vec<RecordedDispatch> {
         let mock = Arc::new(MockDispatchTarget::new());
         let target: Arc<dyn DispatchTarget> = mock.clone();
-        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter::default());
         let (tx, rx) = tokio::sync::mpsc::channel::<BufferedMessage>(msgs.len().max(1));
         for m in msgs {
             tx.send(m).await.unwrap();
@@ -1545,6 +1571,38 @@ mod tests {
         .await;
 
         mock.calls()
+    }
+
+    #[tokio::test]
+    async fn dispatch_preserves_batch_receipts_and_anchors_progress_on_last_event() {
+        let mock = Arc::new(MockDispatchTarget::new());
+        let target: Arc<dyn DispatchTarget> = mock;
+        let recording = Arc::new(MockChatAdapter::default());
+        let adapter: Arc<dyn ChatAdapter> = recording.clone();
+
+        dispatch_batch(
+            "mock:T",
+            &make_channel("T"),
+            &target,
+            &adapter,
+            vec![make_msg("first", 10), make_msg("last", 10)],
+            false,
+        )
+        .await;
+
+        let events = recording.reaction_events();
+        assert_eq!(events.len(), 4, "unexpected reaction lifecycle: {events:?}");
+        assert_eq!(events[0], ("add".into(), "m-first".into(), "👀".into()));
+        assert_eq!(events[1], ("add".into(), "m-last".into(), "👀".into()));
+        assert_eq!(events[2], ("add".into(), "m-last".into(), "🆗".into()));
+        assert_eq!(events[3].0, "add");
+        assert_eq!(events[3].1, "m-last");
+        assert!(
+            events
+                .iter()
+                .all(|(operation, _, emoji)| operation != "remove" || emoji != "👀"),
+            "batch receipt markers must remain visible after dispatch: {events:?}"
+        );
     }
 
     #[tokio::test]
@@ -1602,7 +1660,7 @@ mod tests {
     async fn consumer_dispatch_preserves_thread_route_while_refreshing_origin_event_id() {
         let mock = Arc::new(MockDispatchTarget::new());
         let target: Arc<dyn DispatchTarget> = mock.clone();
-        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter::default());
         let (tx, rx) = tokio::sync::mpsc::channel::<BufferedMessage>(1);
 
         let mut msg = make_msg("hi", 10);
@@ -1658,7 +1716,7 @@ mod tests {
         // "all senders dropped" branch.
         let mock = Arc::new(MockDispatchTarget::new());
         let target: Arc<dyn DispatchTarget> = mock.clone();
-        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter::default());
         let (tx, rx) = tokio::sync::mpsc::channel::<BufferedMessage>(1);
         let consumer = tokio::spawn(consumer_loop(
             "mock:T".into(),
@@ -1696,7 +1754,7 @@ mod tests {
             BatchGrouping::Thread,
             DEFAULT_CONSUMER_IDLE_TIMEOUT,
         );
-        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter);
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(MockChatAdapter::default());
 
         let key = "mock:T".to_string();
         let parked = {

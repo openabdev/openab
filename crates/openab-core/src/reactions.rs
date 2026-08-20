@@ -137,16 +137,16 @@ impl StatusReactionController {
         cancel_debounce(&mut inner);
         let old = inner.current.clone();
         inner.current = emoji.to_string();
-        let adapter = inner.adapter.clone();
-        let msg = inner.message.clone();
         let new = emoji.to_string();
-        drop(inner);
 
-        let _ = adapter.add_reaction(&msg, &new).await;
+        // Keep the controller lock for the complete swap. A later state must
+        // not overtake add(new) -> remove(old), otherwise the old status can
+        // become orphaned and remain visible forever.
+        let _ = inner.adapter.add_reaction(&inner.message, &new).await;
         if !old.is_empty() && old != new {
-            let _ = adapter.remove_reaction(&msg, &old).await;
+            let _ = inner.adapter.remove_reaction(&inner.message, &old).await;
         }
-        self.reset_stall_timers().await;
+        self.reset_stall_timers_inner(&mut inner);
     }
 
     async fn schedule_debounced(&self, emoji: &str) {
@@ -166,15 +166,16 @@ impl StatusReactionController {
             if inner.finished {
                 return;
             }
+            // The handle only owns the pending delay. Once the delay fires,
+            // detach this task so a later status update cannot abort it between
+            // adding the new reaction and removing the previous one.
+            let _ = inner.debounce_handle.take();
             let old = inner.current.clone();
             inner.current = emoji.clone();
-            let adapter = inner.adapter.clone();
-            let msg = inner.message.clone();
-            drop(inner);
 
-            let _ = adapter.add_reaction(&msg, &emoji).await;
+            let _ = inner.adapter.add_reaction(&inner.message, &emoji).await;
             if !old.is_empty() && old != emoji {
-                let _ = adapter.remove_reaction(&msg, &old).await;
+                let _ = inner.adapter.remove_reaction(&inner.message, &old).await;
             }
         }));
         self.reset_stall_timers_inner(&mut inner);
@@ -190,20 +191,12 @@ impl StatusReactionController {
 
         let old = inner.current.clone();
         inner.current = emoji.to_string();
-        let adapter = inner.adapter.clone();
-        let msg = inner.message.clone();
         let new = emoji.to_string();
-        drop(inner);
 
-        let _ = adapter.add_reaction(&msg, &new).await;
+        let _ = inner.adapter.add_reaction(&inner.message, &new).await;
         if !old.is_empty() && old != new {
-            let _ = adapter.remove_reaction(&msg, &old).await;
+            let _ = inner.adapter.remove_reaction(&inner.message, &old).await;
         }
-    }
-
-    async fn reset_stall_timers(&self) {
-        let mut inner = self.inner.lock().await;
-        self.reset_stall_timers_inner(&mut inner);
     }
 
     fn reset_stall_timers_inner(&self, inner: &mut Inner) {
@@ -226,14 +219,12 @@ impl StatusReactionController {
                 if inner.finished {
                     return;
                 }
+                let _ = inner.stall_soft_handle.take();
                 let old = inner.current.clone();
                 inner.current = "🥱".to_string();
-                let adapter = inner.adapter.clone();
-                let msg = inner.message.clone();
-                drop(inner);
-                let _ = adapter.add_reaction(&msg, "🥱").await;
+                let _ = inner.adapter.add_reaction(&inner.message, "🥱").await;
                 if !old.is_empty() && old != "🥱" {
-                    let _ = adapter.remove_reaction(&msg, &old).await;
+                    let _ = inner.adapter.remove_reaction(&inner.message, &old).await;
                 }
             }
         }));
@@ -244,14 +235,12 @@ impl StatusReactionController {
             if inner.finished {
                 return;
             }
+            let _ = inner.stall_hard_handle.take();
             let old = inner.current.clone();
             inner.current = "😨".to_string();
-            let adapter = inner.adapter.clone();
-            let msg = inner.message.clone();
-            drop(inner);
-            let _ = adapter.add_reaction(&msg, "😨").await;
+            let _ = inner.adapter.add_reaction(&inner.message, "😨").await;
             if !old.is_empty() && old != "😨" {
-                let _ = adapter.remove_reaction(&msg, &old).await;
+                let _ = inner.adapter.remove_reaction(&inner.message, &old).await;
             }
         }));
     }
@@ -272,5 +261,144 @@ fn cancel_timers(inner: &mut Inner) {
     }
     if let Some(h) = inner.stall_hard_handle.take() {
         h.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapter::ChannelRef;
+    use anyhow::{anyhow, Result};
+    use async_trait::async_trait;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex as StdMutex,
+    };
+    use tokio::sync::Notify;
+
+    struct BlockingAdapter {
+        events: StdMutex<Vec<String>>,
+        thinking_add_started: Notify,
+        release_thinking_add: Notify,
+        blocked_once: AtomicBool,
+    }
+
+    impl BlockingAdapter {
+        fn new() -> Self {
+            Self {
+                events: StdMutex::new(Vec::new()),
+                thinking_add_started: Notify::new(),
+                release_thinking_add: Notify::new(),
+                blocked_once: AtomicBool::new(false),
+            }
+        }
+
+        fn events(&self) -> std::sync::MutexGuard<'_, Vec<String>> {
+            self.events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+    }
+
+    #[async_trait]
+    impl ChatAdapter for BlockingAdapter {
+        fn platform(&self) -> &'static str {
+            "test"
+        }
+
+        fn message_limit(&self) -> usize {
+            2_000
+        }
+
+        async fn send_message(&self, _channel: &ChannelRef, _content: &str) -> Result<MessageRef> {
+            Err(anyhow!("not used"))
+        }
+
+        async fn create_thread(
+            &self,
+            channel: &ChannelRef,
+            _trigger_msg: &MessageRef,
+            _title: &str,
+        ) -> Result<ChannelRef> {
+            Ok(channel.clone())
+        }
+
+        async fn add_reaction(&self, _msg: &MessageRef, emoji: &str) -> Result<()> {
+            self.events().push(format!("add:{emoji}"));
+            if emoji == "🤔" && !self.blocked_once.swap(true, Ordering::SeqCst) {
+                self.thinking_add_started.notify_one();
+                self.release_thinking_add.notified().await;
+            }
+            Ok(())
+        }
+
+        async fn remove_reaction(&self, _msg: &MessageRef, emoji: &str) -> Result<()> {
+            self.events().push(format!("remove:{emoji}"));
+            Ok(())
+        }
+
+        fn use_streaming(&self, _other_bot_present: bool) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn fired_debounce_finishes_reaction_swap_when_turn_finishes() {
+        let adapter = Arc::new(BlockingAdapter::new());
+        let message = MessageRef {
+            channel: ChannelRef {
+                platform: "test".into(),
+                channel_id: "channel".into(),
+                thread_id: None,
+                parent_id: None,
+                origin_event_id: None,
+            },
+            message_id: "message".into(),
+        };
+        let timing = ReactionTiming {
+            debounce_ms: 0,
+            stall_soft_ms: 60_000,
+            stall_hard_ms: 60_000,
+            ..ReactionTiming::default()
+        };
+        let controller = StatusReactionController::new(
+            true,
+            adapter.clone(),
+            message,
+            ReactionEmojis::default(),
+            timing,
+        );
+
+        controller.set_queued().await;
+        controller.set_thinking().await;
+        let add_started = tokio::time::timeout(
+            Duration::from_secs(1),
+            adapter.thinking_add_started.notified(),
+        )
+        .await;
+        assert!(add_started.is_ok(), "thinking reaction add did not start");
+
+        // Finishing cancels pending timers. It must wait for a swap that has
+        // already started instead of overtaking or aborting it midway.
+        let controller = Arc::new(controller);
+        let finish = tokio::spawn({
+            let controller = controller.clone();
+            async move { controller.set_error().await }
+        });
+        tokio::task::yield_now().await;
+        adapter.release_thinking_add.notify_waiters();
+
+        let finished = tokio::time::timeout(Duration::from_secs(1), finish).await;
+        assert!(
+            matches!(finished, Ok(Ok(()))),
+            "final reaction transition did not finish"
+        );
+        let events = adapter.events();
+        let queued_remove = events.iter().position(|event| event == "remove:👀");
+        let error_add = events.iter().position(|event| event == "add:😱");
+        assert!(
+            matches!((queued_remove, error_add), (Some(remove), Some(add)) if remove < add),
+            "final status overtook or omitted the in-flight reaction swap: {events:?}"
+        );
     }
 }

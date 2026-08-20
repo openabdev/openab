@@ -42,7 +42,7 @@ source = "https://learn.microsoft.com/en-us/microsoftteams/platform/bots/how-to/
 bot_can_add = true
 bot_can_remove = true
 bot_receives_events = true
-note = "Bot receives reaction events via `messageReaction` activities (`reactionsAdded`/`reactionsRemoved`). Bot add/remove own reactions supported via SDK reaction APIs / connector."
+note = "Microsoft public preview: bot receives `messageReaction` activities and can add/remove reactions through Bot Connector PUT/DELETE endpoints using its existing bot identity; no Graph/RSC grant is required."
 source = "https://learn.microsoft.com/en-us/microsoftteams/platform/teams-sdk/in-depth-guides/message-reactions"
 
 [capability.edit_message]
@@ -181,9 +181,13 @@ pr = ""
 
 [[openab_features]]
 feature = "emoji_reactions"
-status = "not_implemented"
-note = "`handle_reply` explicitly early-returns (silently ignores) `add_reaction`/`remove_reaction`. Platform supports bot reactions, but OpenAB does not send them for Teams."
-source = ["crates/openab-gateway/src/adapters/teams.rs#handle_reply"]
+status = "partial"
+note = "Default remains a successful no-op. With `teams.reactions_enabled = true`, OpenAB maps status emoji to Teams IDs and calls scoped Bot Connector PUT/DELETE reaction endpoints in Standalone and Unified modes. The API is Microsoft public preview; inbound `messageReaction` activities are still ignored."
+source = [
+  "crates/openab-gateway/src/adapters/teams.rs#handle_reaction",
+  "crates/openab-gateway/src/adapters/teams.rs#add_reaction_outcome",
+  "docs/adr/teams-message-reactions-preview.md",
+]
 pr = ""
 
 [[openab_features]]
@@ -320,7 +324,7 @@ source = "crates/openab-gateway/src/adapters/teams.rs"
 [[quirks]]
 date = "2026-08-09"
 title = "Unsupported write-side commands fail closed"
-note = "Teams supports commandless sends plus bot-owned edit/delete. Reactions remain an explicit no-op; `create_topic` and unknown commands return a structured `unsupported_command` rejection before route lookup or network I/O, preventing unsupported commands from becoming plain sends."
+note = "Teams supports commandless sends plus bot-owned edit/delete. Reactions remain a no-op unless the public-preview opt-in is enabled; `create_topic` and unknown commands return a structured `unsupported_command` rejection before route lookup or network I/O, preventing unsupported commands from becoming plain sends."
 kind = "openab_decision"
 source = "crates/openab-gateway/src/adapters/teams.rs#handle_reply"
 
@@ -360,11 +364,11 @@ kind = "intrinsic"
 source = "https://learn.microsoft.com/en-us/microsoftteams/platform/bots/build-conversational-capability"
 
 [[quirks]]
-date = "2026-07-04"
-title = "Reactions supported by platform, unused by OpenAB"
-note = "Bots can add/remove reactions and receive `messageReaction` (`reactionsAdded`/`reactionsRemoved`) events; OpenAB uses neither for Teams."
-kind = "intrinsic"
-source = "https://learn.microsoft.com/en-us/microsoftteams/platform/teams-sdk/in-depth-guides/message-reactions"
+date = "2026-08-09"
+title = "Reaction transport is opt-in public preview"
+note = "Bots can add/remove reactions through Bot Connector without Graph/RSC and receive `messageReaction` events. OpenAB implements outbound add/remove only when explicitly enabled, with authenticated target scope and a bounded 429 retry; inbound reaction events remain deferred. Microsoft documents a two-reactions-per-second limit."
+kind = "openab_decision"
+source = "docs/adr/teams-message-reactions-preview.md"
 
 [[quirks]]
 date = "2026-07-04"

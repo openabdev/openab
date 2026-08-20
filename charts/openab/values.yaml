@@ -461,6 +461,7 @@ agents:
         openidMetadata: ""     # Override for sovereign clouds → TEAMS_OPENID_METADATA
         allowedTenants: []     # List of tenant IDs → TEAMS_ALLOWED_TENANTS
         webhookPath: ""        # Gateway default: /webhook/teams → TEAMS_WEBHOOK_PATH
+        reactionsEnabled: false # Public-preview Bot Connector reactions → TEAMS_REACTIONS_ENABLED
       # Feishu/Lark adapter config (gateway-side env vars)
       # See docs/feishu.md for full setup guide
       feishu:

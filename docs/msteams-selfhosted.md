@@ -43,6 +43,7 @@ allowed_users   = ["29:1abc..."]
 dedupe_ttl_secs  = 600
 route_ttl_secs   = 3600
 max_route_entries = 10000
+reactions_enabled = false # opt in only for the public-preview reaction API
 ```
 
 ### User Trust (`[teams]` section)
@@ -195,6 +196,9 @@ TEAMS_APP_SECRET="<YOUR_CLIENT_SECRET>"
 # Multi tenant: leave this line out (uses default)
 TEAMS_OAUTH_ENDPOINT="https://login.microsoftonline.com/<YOUR_TENANT_ID>/oauth2/v2.0/token"
 
+# Optional Microsoft public-preview status reactions
+# TEAMS_REACTIONS_ENABLED=true
+
 # Only needed if you use the Cloudflare Tunnel service below.
 # Skip this line if you expose the gateway via a different reverse proxy.
 TUNNEL_TOKEN="<YOUR_CLOUDFLARE_TUNNEL_TOKEN>"
@@ -312,7 +316,7 @@ Azure Portal → your bot → **Configuration** → **Messaging endpoint**: `htt
 
 ## Current Limitations
 
-- **Reactions** — status reactions (👀 / 🤔 / ⚡ / 🆗) are silently dropped for Teams replies
+- **Reactions** — outbound status reactions are disabled by default and must be explicitly enabled; inbound `messageReaction` events are still ignored
 - **Thread replies** — all messages in a personal chat or channel share one agent session
 - **Streaming edits** — replies are sent as one final message, not progressively edited
 
@@ -329,8 +333,17 @@ Azure Portal → your bot → **Configuration** → **Messaging endpoint**: `htt
 | `TEAMS_DEDUPE_TTL_SECS` | No | `600` | Process-local duplicate suppression window |
 | `TEAMS_ROUTE_TTL_SECS` | No | `3600` | Authenticated ephemeral route lifetime |
 | `TEAMS_MAX_ROUTE_ENTRIES` | No | `10000` | Independent capacity bound for route, dedupe, and bot-owned activity caches |
+| `TEAMS_REACTIONS_ENABLED` | No | `false` | Opt in to public-preview Bot Connector add/remove reactions |
 
 > ⚠️ **M0 supports Microsoft commercial public cloud only.** Sovereign-cloud endpoints and custom OAuth/OpenID proxy hosts are rejected. Bot Connector replies accept only validated HTTPS service URLs on `smba.trafficmanager.net`; redirects cannot cross origin.
+
+### Test public-preview bot reactions
+
+No Graph or RSC grant is required. Set `[teams].reactions_enabled = true` in Unified mode, or `TEAMS_REACTIONS_ENABLED=true` on the Standalone Gateway, then restart both peers so hello negotiation advertises `status_backend = reactions`.
+
+Send the bot a normal message in personal chat, group chat, and a channel mention. During the turn, the reaction on that inbound message should move through the configured status lifecycle. OpenAB maps its default emoji to Teams reaction IDs, serializes the writes with other conversation operations, and retries at most once after an explicit short `429 Retry-After`.
+
+Expected Gateway logs include `gateway → teams reaction`. A missing reaction with `reaction_target_not_known` means the authenticated event route expired or the target crossed tenant/conversation scope. This preview does not yet process reactions that users add to bot messages.
 
 ## Troubleshooting
 

@@ -1328,9 +1328,13 @@ pub struct TeamsConfig {
     /// Ephemeral authenticated route lifetime. Env fallback:
     /// `TEAMS_ROUTE_TTL_SECS` (default 3600 seconds).
     pub route_ttl_secs: Option<u64>,
-    /// Shared capacity bound for route and dedupe caches. Env fallback:
+    /// Shared capacity bound for route, dedupe, and ownership caches. Env fallback:
     /// `TEAMS_MAX_ROUTE_ENTRIES` (default 10000).
     pub max_route_entries: Option<usize>,
+    /// Opt in to the public-preview Bot Connector reaction API and advertise
+    /// the reaction status backend. Env fallback: `TEAMS_REACTIONS_ENABLED`.
+    /// Defaults to `false` so existing deployments remain side-effect free.
+    pub reactions_enabled: Option<bool>,
     /// Explicit flag: true = allow all users, false = check `allowed_users`.
     /// Defaults to `false` (deny-all). Env fallback: `TEAMS_ALLOW_ALL_USERS`.
     pub allow_all_users: Option<bool>,
@@ -1351,6 +1355,7 @@ pub struct ResolvedTeams {
     pub dedupe_ttl_secs: u64,
     pub route_ttl_secs: u64,
     pub max_route_entries: usize,
+    pub reactions_enabled: bool,
     pub allow_all_users: bool,
     pub allowed_users: Vec<String>,
 }
@@ -1415,6 +1420,11 @@ impl TeamsConfig {
                 "TEAMS_MAX_ROUTE_ENTRIES",
                 10_000,
             ),
+            reactions_enabled: self.reactions_enabled.unwrap_or_else(|| {
+                std::env::var("TEAMS_REACTIONS_ENABLED")
+                    .ok()
+                    .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            }),
             allow_all_users: self.allow_all_users.unwrap_or_else(|| {
                 std::env::var("TEAMS_ALLOW_ALL_USERS")
                     .ok()
@@ -3100,6 +3110,7 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
             "TEAMS_DEDUPE_TTL_SECS",
             "TEAMS_ROUTE_TTL_SECS",
             "TEAMS_MAX_ROUTE_ENTRIES",
+            "TEAMS_REACTIONS_ENABLED",
         ] {
             std::env::remove_var(k);
         }
@@ -3113,6 +3124,7 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         assert_eq!(r.dedupe_ttl_secs, 600);
         assert_eq!(r.route_ttl_secs, 3600);
         assert_eq!(r.max_route_entries, 10_000);
+        assert!(!r.reactions_enabled);
 
         // --- config wins over env ---
         std::env::set_var("TEAMS_APP_ID", "env-app");
@@ -3120,6 +3132,7 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         std::env::set_var("TEAMS_DEDUPE_TTL_SECS", "41");
         std::env::set_var("TEAMS_ROUTE_TTL_SECS", "83");
         std::env::set_var("TEAMS_MAX_ROUTE_ENTRIES", "122");
+        std::env::set_var("TEAMS_REACTIONS_ENABLED", "false");
         let cfg = TeamsConfig {
             app_id: Some("cfg-app".into()),
             oauth_endpoint: Some("https://cfg.example/token".into()),
@@ -3127,6 +3140,7 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
             dedupe_ttl_secs: Some(42),
             route_ttl_secs: Some(84),
             max_route_entries: Some(123),
+            reactions_enabled: Some(true),
             ..Default::default()
         };
         let r = cfg.resolve();
@@ -3136,8 +3150,10 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         assert_eq!(r.dedupe_ttl_secs, 42);
         assert_eq!(r.route_ttl_secs, 84);
         assert_eq!(r.max_route_entries, 123);
+        assert!(r.reactions_enabled);
 
         // --- empty-string ${} expansion falls through to env ---
+        std::env::set_var("TEAMS_REACTIONS_ENABLED", "true");
         let cfg = TeamsConfig {
             app_id: Some("".into()),
             ..Default::default()
@@ -3148,6 +3164,7 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         assert_eq!(r.dedupe_ttl_secs, 41);
         assert_eq!(r.route_ttl_secs, 83);
         assert_eq!(r.max_route_entries, 122);
+        assert!(r.reactions_enabled);
 
         // --- trust_config() view ---
         let cfg = TeamsConfig {
@@ -3168,6 +3185,7 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
             "TEAMS_DEDUPE_TTL_SECS",
             "TEAMS_ROUTE_TTL_SECS",
             "TEAMS_MAX_ROUTE_ENTRIES",
+            "TEAMS_REACTIONS_ENABLED",
         ] {
             std::env::remove_var(k);
         }

@@ -230,6 +230,7 @@ agents:
       oauth_endpoint = "${TEAMS_OAUTH_ENDPOINT}"
       allowed_tenants = ["<YOUR_TENANT_ID>"]
       allowed_users = ["29:1abc..."]
+      # reactions_enabled = true # public-preview live-tenant test only
 
       [agent]
       command = "kiro-cli"
@@ -618,6 +619,7 @@ the OAB `configToml` shown for each mode.
 | `TEAMS_DEDUPE_TTL_SECS` | No | `600` | Process-local duplicate suppression window |
 | `TEAMS_ROUTE_TTL_SECS` | No | `3600` | Authenticated ephemeral route lifetime |
 | `TEAMS_MAX_ROUTE_ENTRIES` | No | `10000` | Independent capacity bound for route, dedupe, and bot-owned activity caches |
+| `TEAMS_REACTIONS_ENABLED` | No | `false` | Opt in to public-preview Bot Connector add/remove reactions; no Graph/RSC grant required |
 
 ## Troubleshooting
 
@@ -680,6 +682,13 @@ For `message_not_owned`, `target_origin_not_found`, or `target_scope_*`, verify
 that the target is a bot activity created by the same Gateway process and that
 its origin event, tenant, and conversation still match. Restart, TTL expiry,
 capacity eviction, or a user-message target intentionally fails closed.
+
+For the reaction preview, set `[teams].reactions_enabled = true` in Unified mode
+or `TEAMS_REACTIONS_ENABLED=true` on the Standalone Gateway. Restart both peers,
+then verify `gateway → teams reaction` logs and visible status transitions in
+personal, group-chat, and channel scopes. No Graph/RSC consent is needed. A
+`reaction_target_not_known` rejection indicates expired or cross-scope route
+evidence; inbound user reaction events remain deferred.
 
 > **Release validation:** Before marking Teams PR 3／PR 4 complete, record
 > personal, group-chat, channel-root, channel-reply, explicit-quote, and

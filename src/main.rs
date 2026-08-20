@@ -1305,6 +1305,7 @@ async fn main() -> anyhow::Result<()> {
                     dedupe_ttl_secs: r.dedupe_ttl_secs,
                     route_ttl_secs: r.route_ttl_secs,
                     max_route_entries: r.max_route_entries,
+                    reactions_enabled: r.reactions_enabled,
                 });
             }
             // First-class `[feishu]` config overrides env-derived values

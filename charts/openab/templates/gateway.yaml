@@ -108,6 +108,10 @@ spec:
             - name: TEAMS_WEBHOOK_PATH
               value: {{ ($cfg.gateway).teams.webhookPath | quote }}
             {{- end }}
+            {{- if hasKey (($cfg.gateway).teams) "reactionsEnabled" }}
+            - name: TEAMS_REACTIONS_ENABLED
+              value: {{ ($cfg.gateway).teams.reactionsEnabled | quote }}
+            {{- end }}
             {{- end }}
             {{- $hasFeishu := and (($cfg.gateway).feishu).appId (($cfg.gateway).feishu).appSecret }}
             {{- if $hasFeishu }}

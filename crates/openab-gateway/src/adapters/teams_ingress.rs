@@ -105,6 +105,14 @@ pub(super) enum OwnershipLookupError {
     AmbiguousScope,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ReactionLookupError {
+    TargetNotKnown,
+    OriginRouteNotFound,
+    ConversationMismatch,
+    AmbiguousScope,
+}
+
 #[derive(Debug, Default, Eq, PartialEq)]
 pub(crate) struct TeamsIngressCleanupStats {
     pub(crate) routes_removed: usize,
@@ -306,6 +314,78 @@ impl TeamsIngressRegistry {
             .map(str::to_owned);
 
         Ok((route, quote_activity_id))
+    }
+
+    pub(super) fn route_for_reaction_target(
+        &mut self,
+        app_id: &str,
+        origin_event_id: Option<&str>,
+        conversation_id: &str,
+        activity_id: &str,
+        now: Instant,
+    ) -> Result<TeamsIngressRoute, ReactionLookupError> {
+        self.cleanup(now);
+
+        if let Some(origin_event_id) = origin_event_id {
+            if origin_event_id.is_empty() {
+                return Err(ReactionLookupError::OriginRouteNotFound);
+            }
+            let origin_route = self
+                .routes_by_event
+                .get(origin_event_id)
+                .cloned()
+                .ok_or(ReactionLookupError::OriginRouteNotFound)?;
+            if origin_route.conversation_id != conversation_id {
+                return Err(ReactionLookupError::ConversationMismatch);
+            }
+            if origin_route.key.app_id != app_id {
+                return Err(ReactionLookupError::TargetNotKnown);
+            }
+            if origin_route.inbound_activity_id == activity_id
+                || origin_route.reply_chain_root_id.as_deref() == Some(activity_id)
+            {
+                return Ok(origin_route);
+            }
+
+            let target_key = origin_route.key.with_activity_id(activity_id);
+            if let Some(route) = self
+                .event_by_key
+                .get(&target_key)
+                .and_then(|event_id| self.routes_by_event.get(event_id))
+            {
+                return Ok(route.clone());
+            }
+            return self
+                .owned
+                .get(&target_key)
+                .map(|entry| entry.route.clone())
+                .ok_or(ReactionLookupError::TargetNotKnown);
+        }
+
+        let mut candidates = HashMap::<TeamsRouteKey, TeamsIngressRoute>::new();
+        for route in self.routes_by_event.values().filter(|route| {
+            route.key.app_id == app_id
+                && route.conversation_id == conversation_id
+                && route.inbound_activity_id == activity_id
+        }) {
+            candidates.insert(route.key.clone(), route.clone());
+        }
+        for (key, entry) in self.owned.iter().filter(|(key, _)| {
+            key.app_id == app_id
+                && key.conversation_id == conversation_id
+                && key.activity_id == activity_id
+        }) {
+            candidates.insert(key.clone(), entry.route.clone());
+        }
+
+        let mut candidates = candidates.into_values();
+        let route = candidates
+            .next()
+            .ok_or(ReactionLookupError::TargetNotKnown)?;
+        if candidates.next().is_some() {
+            return Err(ReactionLookupError::AmbiguousScope);
+        }
+        Ok(route)
     }
 
     pub(super) fn record_owned(
@@ -733,6 +813,66 @@ mod tests {
         assert!(matches!(
             registry.route_for_reply("missing-event", "conversation", None, now),
             Err(RouteLookupError::NotFound)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn reaction_targets_require_authenticated_scope_and_legacy_uniqueness() -> anyhow::Result<()> {
+        let now = Instant::now();
+        let mut registry =
+            TeamsIngressRegistry::new(Duration::from_secs(60), Duration::from_secs(60), 10);
+        let route_key = key(1);
+        let mut origin_route = route(route_key.clone(), "event-1", now)?;
+        origin_route.reply_chain_root_id = Some("root-1".into());
+        assert!(matches!(
+            registry.reserve(route_key.clone(), "event-1".into(), now),
+            PublishReservation::Owner
+        ));
+        assert!(registry.accept(&route_key, "event-1", origin_route.clone(), now));
+        registry.record_owned(&origin_route, "bot-1", now);
+
+        for target in ["activity-1", "root-1", "bot-1"] {
+            let resolved = registry
+                .route_for_reaction_target("app", Some("event-1"), "conversation", target, now)
+                .map_err(|error| anyhow::anyhow!("unexpected reaction route error: {error:?}"))?;
+            assert_eq!(resolved.tenant_id, "tenant");
+        }
+        assert!(matches!(
+            registry.route_for_reaction_target(
+                "app",
+                Some("event-1"),
+                "conversation",
+                "unknown",
+                now
+            ),
+            Err(ReactionLookupError::TargetNotKnown)
+        ));
+        assert!(matches!(
+            registry.route_for_reaction_target(
+                "app",
+                Some("event-1"),
+                "other-conversation",
+                "activity-1",
+                now
+            ),
+            Err(ReactionLookupError::ConversationMismatch)
+        ));
+        assert!(registry
+            .route_for_reaction_target("app", None, "conversation", "activity-1", now)
+            .is_ok());
+
+        let other_key = TeamsRouteKey::new("app", "other-tenant", "conversation", "activity-1");
+        let mut other_route = route(other_key.clone(), "event-2", now)?;
+        other_route.tenant_id = "other-tenant".into();
+        assert!(matches!(
+            registry.reserve(other_key.clone(), "event-2".into(), now),
+            PublishReservation::Owner
+        ));
+        assert!(registry.accept(&other_key, "event-2", other_route, now));
+        assert!(matches!(
+            registry.route_for_reaction_target("app", None, "conversation", "activity-1", now),
+            Err(ReactionLookupError::AmbiguousScope)
         ));
         Ok(())
     }

@@ -314,7 +314,7 @@ impl AppState {
             );
         }
         #[cfg(feature = "teams")]
-        if self.teams.is_some() {
+        if let Some(teams) = &self.teams {
             insert(
                 "teams",
                 AdapterCapabilities {
@@ -326,7 +326,11 @@ impl AppState {
                     can_delete: true,
                     show_streaming_placeholder: true,
                     message_limit: characters(4096),
-                    status_backend: StatusBackend::None,
+                    status_backend: if teams.reactions_enabled() {
+                        StatusBackend::Reactions
+                    } else {
+                        StatusBackend::None
+                    },
                     ..AdapterCapabilities::default()
                 },
             );
@@ -597,6 +601,7 @@ impl AppState {
         let dedupe_ttl_secs = cfg.dedupe_ttl_secs.to_string();
         let route_ttl_secs = cfg.route_ttl_secs.to_string();
         let max_route_entries = cfg.max_route_entries.to_string();
+        let reactions_enabled = cfg.reactions_enabled.to_string();
         self.teams = adapters::teams::TeamsConfig::from_reader(|k| match k {
             "TEAMS_APP_ID" => cfg.app_id.clone(),
             "TEAMS_APP_SECRET" => cfg.app_secret.clone(),
@@ -606,6 +611,7 @@ impl AppState {
             "TEAMS_DEDUPE_TTL_SECS" => Some(dedupe_ttl_secs.clone()),
             "TEAMS_ROUTE_TTL_SECS" => Some(route_ttl_secs.clone()),
             "TEAMS_MAX_ROUTE_ENTRIES" => Some(max_route_entries.clone()),
+            "TEAMS_REACTIONS_ENABLED" => Some(reactions_enabled.clone()),
             _ => None,
         })
         .map(adapters::teams::TeamsAdapter::new);
@@ -702,6 +708,7 @@ pub struct GatewayTeamsConfig {
     pub dedupe_ttl_secs: u64,
     pub route_ttl_secs: u64,
     pub max_route_entries: usize,
+    pub reactions_enabled: bool,
 }
 
 /// Start the shared Teams state sweeper for Standalone or Unified mode.
@@ -1532,6 +1539,7 @@ mod l1_audit_tests {
             dedupe_ttl_secs: 600,
             route_ttl_secs: 3600,
             max_route_entries: 10_000,
+            reactions_enabled: true,
         });
         assert!(s.teams.is_some());
         assert_eq!(s.teams_webhook_path, "/hook/teams");
@@ -1547,7 +1555,10 @@ mod l1_audit_tests {
         assert!(teams.can_delete);
         assert_eq!(teams.streaming_mode, super::schema::StreamingMode::Disabled);
         assert!(teams.show_streaming_placeholder);
-        assert_eq!(teams.status_backend, super::schema::StatusBackend::None);
+        assert_eq!(
+            teams.status_backend,
+            super::schema::StatusBackend::Reactions
+        );
 
         // Missing secret → adapter disabled (same as env-only semantics).
         s.apply_teams_config(GatewayTeamsConfig {
@@ -1560,6 +1571,7 @@ mod l1_audit_tests {
             dedupe_ttl_secs: 600,
             route_ttl_secs: 3600,
             max_route_entries: 10_000,
+            reactions_enabled: false,
         });
         assert!(s.teams.is_none());
     }
@@ -1697,6 +1709,7 @@ mod gateway_protocol_tests {
             dedupe_ttl_secs: 600,
             route_ttl_secs: 3600,
             max_route_entries: 10_000,
+            reactions_enabled: false,
         }
     }
 
@@ -1994,6 +2007,7 @@ mod gateway_protocol_tests {
             dedupe_ttl_secs: 600,
             route_ttl_secs: 3600,
             max_route_entries: 10_000,
+            reactions_enabled: false,
         });
         let hello = build_gateway_hello(
             &state,
