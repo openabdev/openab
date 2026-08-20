@@ -1176,7 +1176,7 @@ mod tests {
     fn cloud_map_service_id_parses_from_arn() {
         assert_eq!(
             cloud_map_service_id_from_arn(
-                "arn:aws:servicediscovery:us-east-1:903779448426:service/srv-abc123"
+                "arn:aws:servicediscovery:us-east-1:123456789012:service/srv-abc123"
             ),
             Some("srv-abc123".to_string())
         );
