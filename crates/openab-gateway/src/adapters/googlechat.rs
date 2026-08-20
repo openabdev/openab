@@ -384,14 +384,14 @@ impl GoogleChatAdapter {
                 "googlechat reply (dry-run, no credentials configured)"
             );
             if let Some(ref req_id) = reply.request_id {
-                let resp = crate::schema::GatewayResponse {
-                    schema: "openab.gateway.response.v1".into(),
-                    request_id: req_id.clone(),
-                    success: false,
-                    thread_id: None,
-                    message_id: None,
-                    error: Some("no credentials configured".into()),
-                };
+                let resp = crate::schema::GatewayResponse::from_write_outcome(
+                    req_id.clone(),
+                    crate::schema::WriteOutcome::Rejected {
+                        code: "not_configured".into(),
+                        message: "no credentials configured".into(),
+                        retry_after_ms: None,
+                    },
+                );
                 if let Ok(json) = serde_json::to_string(&resp) {
                     let _ = event_tx.send(json);
                 }
@@ -405,14 +405,14 @@ impl GoogleChatAdapter {
         // Empty message: short-circuit, send failure ack and skip API call
         if chunks.is_empty() {
             if let Some(ref req_id) = reply.request_id {
-                let resp = crate::schema::GatewayResponse {
-                    schema: "openab.gateway.response.v1".into(),
-                    request_id: req_id.clone(),
-                    success: false,
-                    thread_id: None,
-                    message_id: None,
-                    error: Some("empty message".into()),
-                };
+                let resp = crate::schema::GatewayResponse::from_write_outcome(
+                    req_id.clone(),
+                    crate::schema::WriteOutcome::Rejected {
+                        code: "invalid_request".into(),
+                        message: "empty message".into(),
+                        retry_after_ms: None,
+                    },
+                );
                 if let Ok(json) = serde_json::to_string(&resp) {
                     let _ = event_tx.send(json);
                 }
@@ -432,18 +432,20 @@ impl GoogleChatAdapter {
             .await;
 
             if let Some(ref req_id) = reply.request_id {
-                let (success, message_id, error) = match result {
-                    Ok(name) => (true, Some(name), None),
-                    Err(e) => (false, None, Some(e)),
+                let outcome = match result {
+                    Ok(name) => crate::schema::WriteOutcome::Delivered {
+                        message_id: Some(name),
+                    },
+                    Err(message) => crate::schema::WriteOutcome::Rejected {
+                        code: "send_failed".into(),
+                        message,
+                        retry_after_ms: None,
+                    },
                 };
-                let resp = crate::schema::GatewayResponse {
-                    schema: "openab.gateway.response.v1".into(),
-                    request_id: req_id.clone(),
-                    success,
-                    thread_id: None,
-                    message_id,
-                    error,
-                };
+                let resp = crate::schema::GatewayResponse::from_write_outcome(
+                    req_id.clone(),
+                    outcome,
+                );
                 if let Ok(json) = serde_json::to_string(&resp) {
                     let _ = event_tx.send(json);
                 }
@@ -475,13 +477,29 @@ impl GoogleChatAdapter {
                 }
             }
             if let Some(ref req_id) = reply.request_id {
-                let resp = crate::schema::GatewayResponse {
-                    schema: "openab.gateway.response.v1".into(),
-                    request_id: req_id.clone(),
-                    success: first_msg_name.is_some() && first_error.is_none(),
-                    thread_id: None,
-                    message_id: first_msg_name,
-                    error: first_error,
+                let resp = match (first_msg_name, first_error) {
+                    (Some(message_id), None) => {
+                        crate::schema::GatewayResponse::from_write_outcome(
+                            req_id.clone(),
+                            crate::schema::WriteOutcome::Delivered {
+                                message_id: Some(message_id),
+                            },
+                        )
+                    }
+                    (message_id, error) => {
+                        let mut response = crate::schema::GatewayResponse::from_write_outcome(
+                            req_id.clone(),
+                            crate::schema::WriteOutcome::Rejected {
+                                code: "partial_delivery".into(),
+                                message: error.unwrap_or_else(|| "no message delivered".into()),
+                                retry_after_ms: None,
+                            },
+                        );
+                        // Preserve the first successful ID for legacy diagnostics;
+                        // the structured outcome remains rejected and is not retried.
+                        response.message_id = message_id;
+                        response
+                    }
                 };
                 if let Ok(json) = serde_json::to_string(&resp) {
                     let _ = event_tx.send(json);
@@ -2060,6 +2078,7 @@ mod tests {
         let resp: GatewayResponse = serde_json::from_str(&received.unwrap()).unwrap();
         assert_eq!(resp.request_id, "req_123");
         assert!(resp.success);
+        assert_eq!(resp.outcome, Some(crate::schema::WriteOutcomeKind::Delivered));
         assert_eq!(resp.message_id, Some("spaces/TEST/messages/msg_abc".into()));
     }
 
@@ -2104,6 +2123,8 @@ mod tests {
         let resp: GatewayResponse = serde_json::from_str(&received.unwrap()).unwrap();
         assert_eq!(resp.request_id, "req_fail");
         assert!(!resp.success);
+        assert_eq!(resp.outcome, Some(crate::schema::WriteOutcomeKind::Rejected));
+        assert_eq!(resp.error_code.as_deref(), Some("send_failed"));
         assert!(resp.message_id.is_none());
         let err = resp.error.expect("error should be set on send failure");
         assert!(err.contains("500"), "error should include status code, got: {}", err);

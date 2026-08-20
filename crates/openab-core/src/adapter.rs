@@ -1,6 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{error, warn};
 
@@ -310,6 +310,119 @@ pub struct SenderContext {
     pub receiver_id: Option<String>,
 }
 
+// --- Adapter capability and delivery contracts ---
+
+/// How an adapter can progressively deliver response content.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamingMode {
+    /// Send one final message; no placeholder or edit loop.
+    #[default]
+    Disabled,
+    /// Send a placeholder and edit it with complete snapshots.
+    Edit,
+    /// Use a platform-native append/finalize streaming API.
+    Native,
+}
+
+/// Platform message-size budget. The router converts non-character limits to a
+/// conservative character bound until byte-aware splitting is implemented.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "unit", rename_all = "snake_case")]
+pub enum MessageLimit {
+    Characters { max: usize },
+    Bytes { max: usize },
+    Utf16Bytes { max: usize },
+    Unlimited,
+}
+
+impl Default for MessageLimit {
+    fn default() -> Self {
+        Self::Characters { max: 4096 }
+    }
+}
+
+impl MessageLimit {
+    pub fn conservative_char_limit(self) -> usize {
+        match self {
+            Self::Characters { max } => max.max(1),
+            Self::Bytes { max } => (max / 4).max(1),
+            Self::Utf16Bytes { max } => (max / 4).max(1),
+            Self::Unlimited => usize::MAX,
+        }
+    }
+}
+
+/// User-visible status mechanism, kept independent from content streaming.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusBackend {
+    #[default]
+    None,
+    Reactions,
+    Assistant,
+    Typing,
+}
+
+/// Platform-aware behavior contract used by direct, unified, and standalone
+/// gateway adapters. Defaults are deliberately conservative for unknown peers.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AdapterCapabilities {
+    pub send_ack: bool,
+    pub edit_ack: bool,
+    pub delete_ack: bool,
+    pub can_edit: bool,
+    pub can_delete: bool,
+    pub streaming_mode: StreamingMode,
+    pub show_streaming_placeholder: bool,
+    pub message_limit: MessageLimit,
+    pub status_backend: StatusBackend,
+}
+
+impl Default for AdapterCapabilities {
+    fn default() -> Self {
+        Self {
+            send_ack: false,
+            edit_ack: false,
+            delete_ack: false,
+            can_edit: false,
+            can_delete: false,
+            streaming_mode: StreamingMode::Disabled,
+            show_streaming_placeholder: true,
+            message_limit: MessageLimit::default(),
+            status_backend: StatusBackend::None,
+        }
+    }
+}
+
+/// Result of a platform write. `Unknown` is distinct from rejection because a
+/// timed-out POST may have reached the platform and must not be blindly retried.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WriteOutcome {
+    Delivered {
+        message_id: Option<String>,
+    },
+    Rejected {
+        code: String,
+        message: String,
+        retry_after_ms: Option<u64>,
+    },
+    Unknown {
+        code: String,
+        message: String,
+    },
+}
+
+/// Stable wire discriminator carried by additive GatewayResponse fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteOutcomeKind {
+    Delivered,
+    Rejected,
+    Unknown,
+}
+
 // --- ChatAdapter trait ---
 
 #[async_trait]
@@ -321,6 +434,39 @@ pub trait ChatAdapter: Send + Sync + 'static {
     /// replies into multiple messages at this bound. Platform-specific (e.g. 2000
     /// for Discord; Slack uses its Block Kit `markdown` block cap).
     fn message_limit(&self) -> usize;
+
+    /// Platform-aware capability view. Shared adapters override this method to
+    /// select behavior using `ChannelRef.platform`; direct adapters inherit a
+    /// backward-compatible view derived from their existing trait methods.
+    fn capabilities(&self, platform: &str) -> AdapterCapabilities {
+        let streaming_mode = if self.uses_native_streaming(false) {
+            StreamingMode::Native
+        } else if self.use_streaming(false) {
+            StreamingMode::Edit
+        } else {
+            StreamingMode::Disabled
+        };
+        let message_limit = if platform == "acp" {
+            MessageLimit::Unlimited
+        } else {
+            MessageLimit::Characters {
+                max: self.message_limit(),
+            }
+        };
+        AdapterCapabilities {
+            can_edit: streaming_mode != StreamingMode::Disabled,
+            can_delete: streaming_mode != StreamingMode::Disabled,
+            streaming_mode,
+            show_streaming_placeholder: self.show_streaming_placeholder(),
+            message_limit,
+            status_backend: if self.uses_assistant_status() {
+                StatusBackend::Assistant
+            } else {
+                StatusBackend::Reactions
+            },
+            ..AdapterCapabilities::default()
+        }
+    }
 
     /// Send a new message, returns a reference to the sent message.
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef>;
@@ -605,10 +751,13 @@ impl AdapterRouter {
             return Err(e);
         }
 
-        // In assistant-status mode (e.g. Slack assistant_mode), status is conveyed
-        // via assistant.threads.setStatus, so the emoji-reaction lifecycle is skipped
-        // entirely — mirrors dispatch_batch so per-message and batched modes agree.
-        let assistant_status = adapter.uses_assistant_status();
+        // Status and content streaming are separate capabilities. Only the
+        // reactions backend drives the emoji lifecycle here; assistant status is
+        // handled inside stream_prompt_blocks and `none` remains side-effect free.
+        let reaction_status = adapter
+            .capabilities(&ctx.thread_channel.platform)
+            .status_backend
+            == StatusBackend::Reactions;
 
         let reactions = Arc::new(StatusReactionController::new(
             self.reactions_config.enabled,
@@ -617,7 +766,7 @@ impl AdapterRouter {
             self.reactions_config.emojis.clone(),
             self.reactions_config.timing.clone(),
         ));
-        if !assistant_status {
+        if reaction_status {
             reactions.set_queued().await;
         }
 
@@ -632,7 +781,7 @@ impl AdapterRouter {
             )
             .await;
 
-        if !assistant_status {
+        if reaction_status {
             match &result {
                 Ok(()) => reactions.set_done().await,
                 Err(_) => reactions.set_error().await,
@@ -700,16 +849,15 @@ impl AdapterRouter {
     ) -> Result<()> {
         let adapter = adapter.clone();
         let thread_channel = thread_channel.clone();
-        let message_limit = reply_message_limit(&thread_channel.platform, adapter.message_limit());
-        // ACP must not inherit the unified adapter's Telegram streaming flag (wrong
-        // coupling): it streams append-only `agent_message_chunk` deltas built from the
-        // post+edit (`edit_message` snapshot) path, i.e. streaming=false. Decide it
-        // explicitly by platform rather than by whatever Telegram happens to be set to.
-        let streaming = if thread_channel.platform == "acp" {
-            false
-        } else {
-            adapter.use_streaming(other_bot_present)
-        };
+        let capabilities = adapter.capabilities(&thread_channel.platform);
+        let capability_limit = capabilities.message_limit.conservative_char_limit();
+        let message_limit = reply_message_limit(&thread_channel.platform, capability_limit);
+        // ACP stays append-only and cannot use the post+edit path. For all other
+        // platforms, the platform-aware capability is authoritative; multi-bot
+        // participation still disables streaming for the current turn.
+        let streaming = thread_channel.platform != "acp"
+            && capabilities.streaming_mode != StreamingMode::Disabled
+            && !other_bot_present;
         // Keep the full turn text (incl. inter-tool narration) when streaming
         // (it was already shown live) OR when `[reactions] narration_display` is
         // set. Otherwise a send-once turn delivers only the final answer block.
@@ -717,8 +865,9 @@ impl AdapterRouter {
         // `tool_display`. `streaming` still drives the placeholder / native-stream
         // paths below; only the final-text selection uses `keep_full_text`.
         let keep_full_text = streaming || self.reactions_config.narration_display;
-        let native = adapter.uses_native_streaming(other_bot_present);
-        let assistant_status = adapter.uses_assistant_status();
+        let native = streaming && capabilities.streaming_mode == StreamingMode::Native;
+        let assistant_status = capabilities.status_backend == StatusBackend::Assistant;
+        let reaction_status = capabilities.status_backend == StatusBackend::Reactions;
         // Platforms that render Markdown tables natively (e.g. Slack Block Kit
         // `markdown` blocks / `markdown_text` stream chunks) skip the
         // table→code/bullets pre-pass so the raw table renders natively.
@@ -745,7 +894,7 @@ impl AdapterRouter {
                     let (mut rx, request_id) = conn.session_prompt(content_blocks).await?;
                     if assistant_status {
                         let _ = adapter.set_status(&thread_channel, "Thinking…").await;
-                    } else {
+                    } else if reaction_status {
                         reactions.set_thinking().await;
                     }
 
@@ -780,7 +929,7 @@ impl AdapterRouter {
                         } else {
                             "…".to_string()
                         };
-                        let msg = if adapter.show_streaming_placeholder() {
+                        let msg = if capabilities.show_streaming_placeholder {
                             adapter.send_message(&thread_channel, &initial).await?
                         } else {
                             // Dummy ref for edit loop — gateway uses drafts, doesn't need real msg_id
@@ -973,7 +1122,7 @@ impl AdapterRouter {
                                         let _ = adapter
                                             .set_status(&thread_channel, "Thinking…")
                                             .await;
-                                    } else {
+                                    } else if reaction_status {
                                         reactions.set_thinking().await;
                                     }
                                 }
@@ -986,7 +1135,7 @@ impl AdapterRouter {
                                                 &format!("Using {title}…"),
                                             )
                                             .await;
-                                    } else {
+                                    } else if reaction_status {
                                         reactions.set_tool(&title).await;
                                     }
                                     // Record the tool in BOTH modes so the finalized message keeps
@@ -1030,7 +1179,7 @@ impl AdapterRouter {
                                         let _ = adapter
                                             .set_status(&thread_channel, "Thinking…")
                                             .await;
-                                    } else {
+                                    } else if reaction_status {
                                         reactions.set_thinking().await;
                                     }
                                     // Update the tool's state in BOTH modes (see ToolStart) so the
@@ -1744,6 +1893,34 @@ mod tests {
         // and a long reply under the ACP limit is a single chunk (delivered whole)
         let long = "x".repeat(50_000);
         assert_eq!(crate::format::split_message(&long, reply_message_limit("acp", 4096)).len(), 1);
+    }
+
+    #[test]
+    fn capability_message_limits_are_authoritative_and_conservative() {
+        assert_eq!(
+            MessageLimit::Characters { max: 8_000 }.conservative_char_limit(),
+            8_000
+        );
+        assert_eq!(
+            MessageLimit::Bytes { max: 4_000 }.conservative_char_limit(),
+            1_000
+        );
+        assert_eq!(
+            MessageLimit::Utf16Bytes { max: 4_000 }.conservative_char_limit(),
+            1_000
+        );
+        assert_eq!(
+            MessageLimit::Unlimited.conservative_char_limit(),
+            usize::MAX
+        );
+        assert_eq!(
+            MessageLimit::Characters { max: 0 }.conservative_char_limit(),
+            1
+        );
+        assert_eq!(
+            AdapterCapabilities::default().status_backend,
+            StatusBackend::None
+        );
     }
 
     #[test]

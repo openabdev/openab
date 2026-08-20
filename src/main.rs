@@ -1105,6 +1105,7 @@ async fn main() -> anyhow::Result<()> {
             streaming: gw_cfg.streaming,
             streaming_placeholder: gw_cfg.streaming_placeholder,
             telegram_rich_messages: gw_cfg.telegram_rich_messages,
+            gateway_ack_timeout_secs: gw_cfg.gateway_ack_timeout_secs,
             stt: cfg.stt.clone(),
         };
         let gw_router = router.clone();

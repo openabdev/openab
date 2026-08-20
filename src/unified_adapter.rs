@@ -3,7 +3,10 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use openab_core::adapter::{ChannelRef, ChatAdapter, MessageRef};
+use openab_core::adapter::{
+    AdapterCapabilities, ChannelRef, ChatAdapter, MessageLimit, MessageRef, StatusBackend,
+    StreamingMode,
+};
 use openab_gateway::schema::{Content, GatewayReply, ReplyChannel};
 use openab_gateway::AppState;
 use std::collections::HashMap;
@@ -152,7 +155,68 @@ impl ChatAdapter for UnifiedGatewayAdapter {
     }
 
     fn message_limit(&self) -> usize {
-        4096 // conservative limit across platforms
+        4096 // conservative legacy limit across platforms
+    }
+
+    fn capabilities(&self, platform: &str) -> AdapterCapabilities {
+        let telegram_streaming = self
+            .gw_state
+            .telegram_streaming
+            .unwrap_or(self.gw_state.telegram_rich_messages);
+        let (can_edit, can_delete, streaming_mode, status_backend) = match platform {
+            "telegram" => (
+                self.gw_state.telegram_rich_messages,
+                false,
+                if telegram_streaming && self.gw_state.telegram_rich_messages {
+                    StreamingMode::Edit
+                } else {
+                    StreamingMode::Disabled
+                },
+                StatusBackend::Reactions,
+            ),
+            // Unified mode currently has no per-platform streaming switch for
+            // these adapters. Keep them send-once rather than inheriting the
+            // unrelated Telegram setting.
+            "feishu" => (
+                true,
+                true,
+                StreamingMode::Disabled,
+                StatusBackend::Reactions,
+            ),
+            "googlechat" => (
+                true,
+                false,
+                StreamingMode::Disabled,
+                StatusBackend::Reactions,
+            ),
+            "wecom" => (false, false, StreamingMode::Disabled, StatusBackend::None),
+            "teams" | "line" | "lineworks" | "acp" => {
+                (false, false, StreamingMode::Disabled, StatusBackend::None)
+            }
+            _ => (
+                false,
+                false,
+                StreamingMode::Disabled,
+                StatusBackend::Reactions,
+            ),
+        };
+        AdapterCapabilities {
+            send_ack: false,
+            edit_ack: false,
+            delete_ack: false,
+            can_edit,
+            can_delete,
+            streaming_mode,
+            show_streaming_placeholder: !(platform == "telegram"
+                && self.gw_state.telegram_rich_messages),
+            message_limit: match platform {
+                "acp" => MessageLimit::Unlimited,
+                "lineworks" => MessageLimit::Characters { max: 2000 },
+                "wecom" => MessageLimit::Characters { max: 2048 },
+                _ => MessageLimit::Characters { max: 4096 },
+            },
+            status_backend,
+        }
     }
 
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
@@ -245,5 +309,48 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         // table→code-block pre-pass so tables display with proper formatting.
         // Only applies to Telegram; other platforms in unified mode keep wrapping.
         platform == "telegram" && self.gw_state.telegram_rich_messages
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn adapter_with_telegram_streaming(streaming: bool) -> UnifiedGatewayAdapter {
+        let (event_tx, _event_rx) = tokio::sync::broadcast::channel(4);
+        let mut state = AppState::test_default(event_tx);
+        state.telegram_streaming = Some(streaming);
+        state.telegram_rich_messages = streaming;
+        UnifiedGatewayAdapter::new(Arc::new(state))
+    }
+
+    #[test]
+    fn teams_capabilities_do_not_inherit_telegram_streaming() {
+        let adapter = adapter_with_telegram_streaming(true);
+        let capabilities = adapter.capabilities("teams");
+        assert_eq!(capabilities.streaming_mode, StreamingMode::Disabled);
+        assert!(!capabilities.can_edit);
+        assert_eq!(capabilities.status_backend, StatusBackend::None);
+    }
+
+    #[test]
+    fn telegram_capabilities_follow_telegram_streaming() {
+        let adapter = adapter_with_telegram_streaming(true);
+        let capabilities = adapter.capabilities("telegram");
+        assert_eq!(capabilities.streaming_mode, StreamingMode::Edit);
+        assert!(!capabilities.show_streaming_placeholder);
+    }
+
+    #[test]
+    fn telegram_without_rich_drafts_is_send_once() {
+        let (event_tx, _event_rx) = tokio::sync::broadcast::channel(4);
+        let mut state = AppState::test_default(event_tx);
+        state.telegram_streaming = Some(true);
+        state.telegram_rich_messages = false;
+        let adapter = UnifiedGatewayAdapter::new(Arc::new(state));
+
+        let capabilities = adapter.capabilities("telegram");
+        assert_eq!(capabilities.streaming_mode, StreamingMode::Disabled);
+        assert!(!capabilities.can_edit);
     }
 }

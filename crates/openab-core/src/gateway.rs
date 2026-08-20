@@ -1,5 +1,8 @@
 use crate::acp::ContentBlock;
-use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext};
+use crate::adapter::{
+    AdapterCapabilities, AdapterRouter, ChannelRef, ChatAdapter, MessageLimit, MessageRef,
+    SenderContext, StatusBackend, StreamingMode, WriteOutcome, WriteOutcomeKind,
+};
 use anyhow::Result;
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
@@ -10,59 +13,39 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
-/// Timeout for waiting on gateway reply acknowledgement.
-const GATEWAY_REPLY_TIMEOUT_SECS: u64 = 5;
+const LEGACY_GATEWAY_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Platforms whose gateway adapter emits a `GatewayResponse` for `edit_message`
-/// so core can observe edit success or failure (used to gate the per-edit
-/// response-wait below).
-///
-/// Today only Feishu does, because it is the only adapter with a known
-/// per-message edit cap (errcode 230072) that requires core-side recovery, and
-/// the only one wired to ack edits.
-///
-/// NOTE: this gates the `edit_message` response-wait only. `delete_message` is
-/// unconditionally fire-and-forget (the recovery path sends fresh content
-/// regardless of the delete outcome), so it does not consult this list.
-///
-/// TECH DEBT: this is platform-identity standing in for a *capability*. The
-/// right model is a capability handshake at gateway-connect time ("does this
-/// adapter acknowledge edits?") rather than a hardcoded platform name. We
-/// accept the hardcode now because there is no handshake protocol yet; when one
-/// lands, replace this allowlist with a negotiated capability flag. Any new
-/// adapter that wires request/response for edits MUST be added here, or its
-/// edit failures stay invisible to core (silent failure mode).
-const EDIT_RESPONSE_PLATFORMS: &[&str] = &["feishu"];
-
-/// Whether `platform` acknowledges `edit_message` with a `GatewayResponse`.
-/// See `EDIT_RESPONSE_PLATFORMS`.
-fn platform_acks_writes(platform: &str) -> bool {
-    EDIT_RESPONSE_PLATFORMS.contains(&platform)
-}
-
-/// Gateway platforms whose messaging API cannot edit a message after it is sent.
-///
-/// Cosmetic (typewriter) streaming works by posting a placeholder and then
-/// repeatedly editing it in place with the growing text. On a platform with no
-/// edit endpoint, each of those "edits" is delivered as a brand-new message
-/// instead — so the user sees the same reply posted several times, each copy
-/// longer than the last. Streaming is therefore force-disabled (send-once) for
-/// these platforms regardless of the configured `streaming` flag.
-///
-/// LINE's Messaging API only exposes reply/push (no edit), so it lives here.
-/// (The in-process unified adapter additionally hard-drops stray edit_message
-/// commands in the LINE adapter itself — see `dispatch_line_reply`.)
-///
-/// NOTE: like `EDIT_RESPONSE_PLATFORMS`, this is platform-identity standing in
-/// for a *capability*. The right long-term model is a capability handshake at
-/// gateway-connect time ("can this adapter edit messages?"); until that exists,
-/// any new gateway platform that lacks a message-edit API MUST be added here.
-const NON_EDITABLE_PLATFORMS: &[&str] = &["line", "lineworks"];
-
-/// Whether cosmetic streaming (placeholder + in-place edits) is possible on
-/// `platform`. See `NON_EDITABLE_PLATFORMS`.
-fn platform_supports_streaming(platform: &str) -> bool {
-    !NON_EDITABLE_PLATFORMS.contains(&platform)
+/// Capability fallback used only when the peer does not negotiate a hello.
+/// It preserves the pre-handshake behavior while keeping platform identity out
+/// of the write and streaming control paths themselves.
+fn legacy_gateway_capabilities(
+    platform: &str,
+    streaming: bool,
+    streaming_placeholder: bool,
+) -> AdapterCapabilities {
+    // Preserve the pre-handshake platform behavior exactly. ACP was already
+    // forced send-once by the router; LINE and LINE WORKS were the only legacy
+    // gateway platforms on the non-editable allowlist.
+    let can_edit = !matches!(platform, "line" | "lineworks" | "acp");
+    AdapterCapabilities {
+        send_ack: false,
+        edit_ack: platform == "feishu",
+        delete_ack: false,
+        can_edit,
+        can_delete: platform == "feishu",
+        streaming_mode: if streaming && can_edit {
+            StreamingMode::Edit
+        } else {
+            StreamingMode::Disabled
+        },
+        show_streaming_placeholder: streaming_placeholder,
+        message_limit: if platform == "acp" {
+            MessageLimit::Unlimited
+        } else {
+            MessageLimit::Characters { max: 4096 }
+        },
+        status_backend: StatusBackend::Reactions,
+    }
 }
 
 /// Shared filter parameters for gateway event gating.
@@ -211,6 +194,124 @@ struct GatewayResponse {
     thread_id: Option<String>,
     message_id: Option<String>,
     error: Option<String>,
+    #[serde(default)]
+    outcome: Option<WriteOutcomeKind>,
+    #[serde(default)]
+    error_code: Option<String>,
+    #[serde(default)]
+    retry_after_ms: Option<u64>,
+}
+
+impl GatewayResponse {
+    fn write_outcome(&self) -> WriteOutcome {
+        match self.outcome {
+            Some(WriteOutcomeKind::Delivered) => WriteOutcome::Delivered {
+                message_id: self.message_id.clone(),
+            },
+            Some(WriteOutcomeKind::Rejected) => WriteOutcome::Rejected {
+                code: self.error_code.clone().unwrap_or_else(|| "rejected".into()),
+                message: self
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "gateway rejected write".into()),
+                retry_after_ms: self.retry_after_ms,
+            },
+            Some(WriteOutcomeKind::Unknown) => WriteOutcome::Unknown {
+                code: self.error_code.clone().unwrap_or_else(|| "unknown".into()),
+                message: self
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "gateway write outcome is unknown".into()),
+            },
+            None if self.success => WriteOutcome::Delivered {
+                message_id: self.message_id.clone(),
+            },
+            None => WriteOutcome::Rejected {
+                code: "legacy_failure".into(),
+                message: self
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "gateway reported failure".into()),
+                retry_after_ms: None,
+            },
+        }
+    }
+}
+
+const CLIENT_HELLO_SCHEMA: &str = "openab.gateway.client_hello.v1";
+const GATEWAY_HELLO_SCHEMA: &str = "openab.gateway.hello.v1";
+const GATEWAY_PROTOCOL_VERSION: u32 = 1;
+
+#[derive(Debug, Deserialize)]
+struct GatewayEnvelope {
+    schema: String,
+}
+
+#[derive(Debug, Serialize)]
+struct GatewayClientHello {
+    schema: String,
+    protocol_version: u32,
+    client_name: Option<String>,
+    requested_platforms: Vec<String>,
+}
+
+fn build_client_hello() -> GatewayClientHello {
+    GatewayClientHello {
+        schema: CLIENT_HELLO_SCHEMA.into(),
+        protocol_version: GATEWAY_PROTOCOL_VERSION,
+        client_name: Some(format!("openab-core/{}", env!("CARGO_PKG_VERSION"))),
+        // A standalone Gateway can publish several platforms over one socket,
+        // so Core requests the full configured capability map.
+        requested_platforms: Vec::new(),
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GatewayHello {
+    schema: String,
+    protocol_version: u32,
+    #[serde(default)]
+    capabilities: HashMap<String, AdapterCapabilities>,
+    topology: GatewayTopology,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct GatewayTopology {
+    active_consumers: usize,
+    supported: bool,
+    delivery_mode: String,
+}
+
+#[derive(Default)]
+struct GatewayCapabilityState {
+    hello: std::sync::RwLock<Option<GatewayHello>>,
+}
+
+impl GatewayCapabilityState {
+    fn update(&self, hello: GatewayHello) {
+        *self
+            .hello
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hello);
+    }
+
+    fn resolve(&self, platform: &str, legacy: &AdapterCapabilities) -> (bool, AdapterCapabilities) {
+        let hello = self
+            .hello
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match hello.as_ref() {
+            Some(hello) => (
+                true,
+                hello
+                    .capabilities
+                    .get(platform)
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+            None => (false, legacy.clone()),
+        }
+    }
 }
 
 // --- GatewayAdapter: ChatAdapter over WebSocket ---
@@ -227,32 +328,70 @@ type SharedWsTx = Arc<
     >,
 >;
 
-pub struct GatewayAdapter {
-    ws_tx: SharedWsTx,
-    pending: PendingRequests,
+struct GatewayAdapterOptions {
     platform_name: &'static str,
     streaming: bool,
     streaming_placeholder: bool,
     telegram_rich_messages: bool,
+    gateway_ack_timeout_secs: u64,
+}
+
+pub struct GatewayAdapter {
+    ws_tx: SharedWsTx,
+    pending: PendingRequests,
+    capability_state: Arc<GatewayCapabilityState>,
+    legacy_capabilities: AdapterCapabilities,
+    platform_name: &'static str,
+    streaming: bool,
+    streaming_placeholder: bool,
+    telegram_rich_messages: bool,
+    ack_timeout: std::time::Duration,
 }
 
 impl GatewayAdapter {
     fn new(
         ws_tx: SharedWsTx,
         pending: PendingRequests,
-        platform_name: &'static str,
-        streaming: bool,
-        streaming_placeholder: bool,
-        telegram_rich_messages: bool,
+        capability_state: Arc<GatewayCapabilityState>,
+        options: GatewayAdapterOptions,
     ) -> Self {
-        Self {
-            ws_tx,
-            pending,
+        let GatewayAdapterOptions {
             platform_name,
             streaming,
             streaming_placeholder,
             telegram_rich_messages,
+            gateway_ack_timeout_secs,
+        } = options;
+        Self {
+            ws_tx,
+            pending,
+            capability_state,
+            legacy_capabilities: legacy_gateway_capabilities(
+                platform_name,
+                streaming,
+                streaming_placeholder,
+            ),
+            platform_name,
+            streaming,
+            streaming_placeholder,
+            telegram_rich_messages,
+            ack_timeout: std::time::Duration::from_secs(gateway_ack_timeout_secs.max(1)),
         }
+    }
+
+    fn resolved_capabilities_with_mode(&self, platform: &str) -> (bool, AdapterCapabilities) {
+        let (negotiated, mut capabilities) = self
+            .capability_state
+            .resolve(platform, &self.legacy_capabilities);
+        if !self.streaming {
+            capabilities.streaming_mode = StreamingMode::Disabled;
+        }
+        capabilities.show_streaming_placeholder &= self.streaming_placeholder;
+        (negotiated, capabilities)
+    }
+
+    fn resolved_capabilities(&self, platform: &str) -> AdapterCapabilities {
+        self.resolved_capabilities_with_mode(platform).1
     }
 
     /// Internal helper for send_message / send_message_with_reply.
@@ -262,11 +401,12 @@ impl GatewayAdapter {
         content: &str,
         quote_message_id: Option<&str>,
     ) -> Result<MessageRef> {
-        let req_id = if self.streaming {
-            Some(format!("req_{}", uuid::Uuid::new_v4()))
-        } else {
-            None
-        };
+        let (negotiated, capabilities) = self.resolved_capabilities_with_mode(&channel.platform);
+        let required_ack = negotiated && capabilities.send_ack;
+        // Preserve legacy streaming correlation without turning a missing ACK
+        // into failure. New peers request an ACK only when it was advertised.
+        let request_ack = required_ack || (!negotiated && self.streaming);
+        let req_id = request_ack.then(|| format!("req_{}", uuid::Uuid::new_v4()));
         let pending_rx = if let Some(ref id) = req_id {
             let (tx, rx) = tokio::sync::oneshot::channel();
             self.pending.lock().await.insert(id.clone(), tx);
@@ -298,32 +438,63 @@ impl GatewayAdapter {
             return Err(e.into());
         }
         let msg_id = if let (Some(rx), Some(ref id)) = (pending_rx, &req_id) {
-            match tokio::time::timeout(std::time::Duration::from_secs(GATEWAY_REPLY_TIMEOUT_SECS), rx).await {
-                Ok(Ok(resp)) if resp.success => resp.message_id.unwrap_or_else(|| "gw_sent".into()),
-                Ok(Ok(resp)) => {
-                    // Gateway explicitly reported failure (success=false). Surface
-                    // as Err so dispatch sets ❌ instead of 🆗 over an incomplete
-                    // delivery. Examples: Feishu edit cap reached after append-new
-                    // fallback also failed; chunked send delivered N/M chunks.
-                    let err_msg = resp.error.clone()
-                        .unwrap_or_else(|| "gateway reported failure".to_string());
-                    tracing::warn!(request_id = %id, error = %err_msg, "gateway replied with failure");
-                    return Err(anyhow::anyhow!("gateway reported failure: {err_msg}"));
+            let response_timeout = if required_ack {
+                self.ack_timeout
+            } else {
+                LEGACY_GATEWAY_REPLY_TIMEOUT
+            };
+            match tokio::time::timeout(response_timeout, rx).await {
+                Ok(Ok(resp)) => match resp.write_outcome() {
+                    WriteOutcome::Delivered { message_id } => match message_id {
+                        Some(message_id) if !message_id.is_empty() => message_id,
+                        _ if required_ack => {
+                            return Err(anyhow::anyhow!(
+                                "gateway delivered send without a message id"
+                            ));
+                        }
+                        _ => "gw_sent".into(),
+                    },
+                    WriteOutcome::Rejected {
+                        code,
+                        message,
+                        retry_after_ms,
+                    } => {
+                        warn!(
+                            request_id = %id,
+                            error_code = %code,
+                            retry_after_ms,
+                            error = %message,
+                            "gateway rejected write"
+                        );
+                        return Err(anyhow::anyhow!(
+                            "gateway rejected write ({code}): {message}"
+                        ));
+                    }
+                    WriteOutcome::Unknown { code, message } => {
+                        warn!(
+                            request_id = %id,
+                            error_code = %code,
+                            error = %message,
+                            "gateway write outcome unknown; not retrying"
+                        );
+                        return Err(anyhow::anyhow!(
+                            "gateway write outcome unknown ({code}): {message}"
+                        ));
+                    }
+                },
+                Ok(Err(_)) if required_ack => {
+                    return Err(anyhow::anyhow!("required gateway ACK channel closed"));
                 }
                 Ok(Err(_)) => {
-                    // Channel closed (gateway shutting down or pending dropped).
-                    // Maintain legacy behavior — adapters that don't implement
-                    // GatewayResponse for all reply types (LINE, Teams) rely on
-                    // this for non-failure outcomes.
-                    tracing::warn!(request_id = %id, "gateway response channel closed");
+                    warn!(request_id = %id, "legacy gateway response channel closed");
                     "gw_sent".into()
                 }
+                Err(_) if required_ack => {
+                    self.pending.lock().await.remove(id);
+                    return Err(anyhow::anyhow!("required gateway ACK timed out"));
+                }
                 Err(_) => {
-                    // Timeout. Many adapters (LINE, Teams) intentionally do not
-                    // emit GatewayResponse for replies, so timeout is the expected
-                    // path for them. Maintain legacy behavior to avoid breaking
-                    // platforms that have not yet wired request/response feedback.
-                    tracing::warn!(request_id = %id, "gateway reply timed out");
+                    warn!(request_id = %id, "legacy gateway reply timed out");
                     self.pending.lock().await.remove(id);
                     "gw_sent".into()
                 }
@@ -499,7 +670,11 @@ impl ChatAdapter for GatewayAdapter {
     }
 
     fn message_limit(&self) -> usize {
-        4096 // Telegram limit
+        4096 // Legacy conservative limit; negotiated capabilities are platform-aware.
+    }
+
+    fn capabilities(&self, platform: &str) -> AdapterCapabilities {
+        self.resolved_capabilities(platform)
     }
 
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
@@ -617,12 +792,19 @@ impl ChatAdapter for GatewayAdapter {
         // signals — cosmetic streaming would keep flushing forever and the final
         // edit fallback to send_message could not trigger.
         //
-        // Scope intentionally limited to platforms that ack writes (see
-        // EDIT_RESPONSE_PLATFORMS). Other adapters (LINE, Teams, Slack, Discord,
-        // …) keep the original fire-and-forget path so cosmetic streaming on
-        // those platforms does not pay a response-wait penalty per flush.
-        const EDIT_RESPONSE_TIMEOUT_MS: u64 = 800;
-        let needs_response = self.streaming && platform_acks_writes(&msg.channel.platform);
+        // Only negotiated/legacy capabilities that explicitly advertise edit
+        // acknowledgements pay the response-wait cost.
+        const LEGACY_EDIT_RESPONSE_TIMEOUT_MS: u64 = 800;
+        let (negotiated, capabilities) =
+            self.resolved_capabilities_with_mode(&msg.channel.platform);
+        let required_ack = negotiated && capabilities.edit_ack;
+        let needs_response =
+            required_ack || (!negotiated && self.streaming && capabilities.edit_ack);
+        let response_timeout = if required_ack {
+            self.ack_timeout
+        } else {
+            std::time::Duration::from_millis(LEGACY_EDIT_RESPONSE_TIMEOUT_MS)
+        };
 
         let req_id = if needs_response {
             Some(format!("req_{}", uuid::Uuid::new_v4()))
@@ -660,32 +842,38 @@ impl ChatAdapter for GatewayAdapter {
             return Err(e.into());
         }
         if let (Some(rx), Some(ref id)) = (pending_rx, &req_id) {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(EDIT_RESPONSE_TIMEOUT_MS),
-                rx,
-            ).await {
-                Ok(Ok(resp)) if resp.success => Ok(()),
-                Ok(Ok(resp)) => {
-                    let err_msg = resp.error.clone()
-                        .unwrap_or_else(|| "gateway reported edit failure".to_string());
-                    tracing::warn!(request_id = %id, error = %err_msg, "edit_message gateway replied failure");
-                    Err(anyhow::anyhow!("edit failure: {err_msg}"))
+            match tokio::time::timeout(response_timeout, rx).await {
+                Ok(Ok(resp)) => match resp.write_outcome() {
+                    WriteOutcome::Delivered { .. } => Ok(()),
+                    WriteOutcome::Rejected { code, message, .. } => {
+                        warn!(request_id = %id, error_code = %code, error = %message, "gateway rejected edit");
+                        Err(anyhow::anyhow!("edit rejected ({code}): {message}"))
+                    }
+                    WriteOutcome::Unknown { code, message } => {
+                        warn!(request_id = %id, error_code = %code, error = %message, "gateway edit outcome unknown");
+                        Err(anyhow::anyhow!("edit outcome unknown ({code}): {message}"))
+                    }
+                },
+                Ok(Err(_)) if required_ack => {
+                    Err(anyhow::anyhow!("required edit ACK channel closed"))
                 }
                 Ok(Err(_)) => {
-                    tracing::debug!(request_id = %id, "edit_message gateway response channel closed");
+                    tracing::debug!(request_id = %id, "legacy edit response channel closed");
                     Ok(())
                 }
+                Err(_) if required_ack => {
+                    self.pending.lock().await.remove(id);
+                    Err(anyhow::anyhow!("required edit ACK timed out"))
+                }
                 Err(_) => {
-                    // Timeout — feishu didn't respond within the window
-                    // (probably a slow API). Treat as success to avoid
-                    // false-positive ❌; the cap-reached path already short-
-                    // circuits much faster (gateway returns immediately).
+                    // Legacy Feishu used a short best-effort observation window;
+                    // preserve that behavior when no capability was negotiated.
                     self.pending.lock().await.remove(id);
                     Ok(())
                 }
             }
         } else {
-            // Non-feishu (or non-streaming): fire-and-forget, no added latency.
+            // An unadvertised edit remains fire-and-forget with no added latency.
             Ok(())
         }
     }
@@ -698,13 +886,20 @@ impl ChatAdapter for GatewayAdapter {
     /// to avoid duplicated content. The default zero-width-edit fallback would
     /// itself fail on a cap-reached message, leaving the placeholder visible.
     ///
-    /// Fire-and-forget: gateway adapters that don't implement delete will simply
-    /// ignore the command. Failure is non-fatal — if delete fails, the user sees
-    /// the placeholder remain (same behavior as before this override). We do not
-    /// wait on a response here: the recovery path sends fresh content regardless
-    /// of whether the delete landed, so a response would only buy an extra log
-    /// line at the cost of a per-finalize wait.
+    /// Legacy peers remain fire-and-forget. A negotiated peer is awaited only
+    /// when it explicitly advertises `delete_ack`.
     async fn delete_message(&self, msg: &MessageRef) -> Result<()> {
+        let (negotiated, capabilities) =
+            self.resolved_capabilities_with_mode(&msg.channel.platform);
+        let required_ack = negotiated && capabilities.delete_ack;
+        let request_id = required_ack.then(|| format!("req_{}", uuid::Uuid::new_v4()));
+        let pending_rx = if let Some(ref id) = request_id {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.pending.lock().await.insert(id.clone(), tx);
+            Some(rx)
+        } else {
+            None
+        };
         let reply = GatewayReply {
             schema: "openab.gateway.reply.v1".into(),
             reply_to: msg.message_id.clone(),
@@ -719,19 +914,50 @@ impl ChatAdapter for GatewayAdapter {
             },
             command: Some("delete_message".into()),
             quote_message_id: None,
-            request_id: None,
+            request_id: request_id.clone(),
         };
         let json = serde_json::to_string(&reply)?;
-        self.ws_tx.lock().await.send(Message::Text(json)).await?;
-        Ok(())
+        if let Err(error) = self.ws_tx.lock().await.send(Message::Text(json)).await {
+            if let Some(ref id) = request_id {
+                self.pending.lock().await.remove(id);
+            }
+            return Err(error.into());
+        }
+
+        let (Some(rx), Some(id)) = (pending_rx, request_id) else {
+            return Ok(());
+        };
+        match tokio::time::timeout(self.ack_timeout, rx).await {
+            Ok(Ok(response)) => match response.write_outcome() {
+                WriteOutcome::Delivered { .. } => Ok(()),
+                WriteOutcome::Rejected { code, message, .. } => {
+                    warn!(request_id = %id, error_code = %code, error = %message, "gateway rejected delete");
+                    Err(anyhow::anyhow!("delete rejected ({code}): {message}"))
+                }
+                WriteOutcome::Unknown { code, message } => {
+                    warn!(request_id = %id, error_code = %code, error = %message, "gateway delete outcome unknown");
+                    Err(anyhow::anyhow!(
+                        "delete outcome unknown ({code}): {message}"
+                    ))
+                }
+            },
+            Ok(Err(_)) => Err(anyhow::anyhow!("required delete ACK channel closed")),
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                Err(anyhow::anyhow!("required delete ACK timed out"))
+            }
+        }
     }
 
     fn use_streaming(&self, _other_bot_present: bool) -> bool {
-        self.streaming
+        self.resolved_capabilities(self.platform_name)
+            .streaming_mode
+            != StreamingMode::Disabled
     }
 
     fn show_streaming_placeholder(&self) -> bool {
-        self.streaming_placeholder
+        self.resolved_capabilities(self.platform_name)
+            .show_streaming_placeholder
     }
 
     fn renders_native_tables(&self, _platform: &str) -> bool {
@@ -759,6 +985,7 @@ pub struct GatewayParams {
     pub streaming: bool,
     pub streaming_placeholder: bool,
     pub telegram_rich_messages: bool,
+    pub gateway_ack_timeout_secs: u64,
     pub stt: crate::config::SttConfig,
 }
 
@@ -776,21 +1003,13 @@ pub async fn run_gateway_adapter(
     let bot_username = params.bot_username;
     let allow_bot_messages = params.allow_bot_messages;
     let trusted_bot_ids: HashSet<String> = params.trusted_bot_ids.into_iter().collect();
-    // Cosmetic streaming edits a placeholder in place. On platforms without an
-    // edit API (e.g. LINE) every edit lands as a new message — growing
-    // duplicates — so force send-once mode there regardless of config.
-    let streaming = if params.streaming && !platform_supports_streaming(platform) {
-        warn!(
-            platform,
-            "streaming is enabled but this platform cannot edit messages; \
-             forcing send-once mode to avoid duplicate messages"
-        );
-        false
-    } else {
-        params.streaming
-    };
+    // The platform-aware capability contract decides whether configured
+    // streaming is usable. Legacy peers resolve through the conservative
+    // fallback; negotiated peers supply this over the hello exchange.
+    let streaming = params.streaming;
     let streaming_placeholder = params.streaming_placeholder;
     let telegram_rich_messages = params.telegram_rich_messages;
+    let gateway_ack_timeout_secs = params.gateway_ack_timeout_secs;
     let stt_config = params.stt;
 
     let connect_url = match &params.token {
@@ -835,13 +1054,23 @@ pub async fn run_gateway_adapter(
         let (ws_tx, mut ws_rx) = ws_stream.split();
         let ws_tx: SharedWsTx = Arc::new(Mutex::new(ws_tx));
         let pending: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
+        let capability_state = Arc::new(GatewayCapabilityState::default());
+        let client_hello = build_client_hello();
+        let hello_json = serde_json::to_string(&client_hello)?;
+        if let Err(error) = ws_tx.lock().await.send(Message::Text(hello_json)).await {
+            warn!(error = %error, "failed to send optional gateway hello; continuing in legacy mode");
+        }
         let adapter: Arc<dyn ChatAdapter> = Arc::new(GatewayAdapter::new(
             ws_tx.clone(),
             pending.clone(),
-            platform,
-            streaming,
-            streaming_placeholder,
-            telegram_rich_messages,
+            capability_state.clone(),
+            GatewayAdapterOptions {
+                platform_name: platform,
+                streaming,
+                streaming_placeholder,
+                telegram_rich_messages,
+                gateway_ack_timeout_secs,
+            },
         ));
         let slash_ws_tx = ws_tx.clone(); // for fire-and-forget slash command responses
         let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
@@ -869,15 +1098,50 @@ pub async fn run_gateway_adapter(
                             Some(Ok(Message::Text(text))) => {
                                 let text_str: &str = &text;
 
+                                if let Ok(envelope) = serde_json::from_str::<GatewayEnvelope>(text_str) {
+                                    if envelope.schema == GATEWAY_HELLO_SCHEMA {
+                                        match serde_json::from_str::<GatewayHello>(text_str) {
+                                            Ok(hello)
+                                                if hello.schema == GATEWAY_HELLO_SCHEMA
+                                                    && hello.protocol_version == GATEWAY_PROTOCOL_VERSION => {
+                                                if !hello.topology.supported {
+                                                    warn!(
+                                                        active_consumers = hello.topology.active_consumers,
+                                                        delivery_mode = %hello.topology.delivery_mode,
+                                                        "gateway reports unsupported multi-consumer topology"
+                                                    );
+                                                }
+                                                info!(
+                                                    protocol_version = hello.protocol_version,
+                                                    capability_count = hello.capabilities.len(),
+                                                    "gateway capabilities negotiated"
+                                                );
+                                                capability_state.update(hello);
+                                            }
+                                            Ok(hello) => {
+                                                warn!(
+                                                    peer_version = hello.protocol_version,
+                                                    supported_version = GATEWAY_PROTOCOL_VERSION,
+                                                    "gateway hello version is unsupported; continuing in legacy mode"
+                                                );
+                                            }
+                                            Err(error) => {
+                                                warn!(error = %error, "invalid gateway hello; continuing in legacy mode");
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                }
+
                                 // Check if it's a response to a pending command
                                 if let Ok(resp) = serde_json::from_str::<GatewayResponse>(text_str) {
-                                if resp.schema == "openab.gateway.response.v1" {
-                                    if let Some(tx) = pending.lock().await.remove(&resp.request_id) {
-                                        let _ = tx.send(resp);
+                                    if resp.schema == "openab.gateway.response.v1" {
+                                        if let Some(tx) = pending.lock().await.remove(&resp.request_id) {
+                                            let _ = tx.send(resp);
+                                        }
+                                        continue;
                                     }
-                                    continue;
                                 }
-                            }
 
                             match serde_json::from_str::<GatewayEvent>(text_str) {
                                 Ok(event) => {
@@ -1664,27 +1928,118 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn line_cannot_stream_and_is_forced_send_once() {
-        // LINE has no message-edit API, so cosmetic streaming is impossible.
-        assert!(!platform_supports_streaming("line"));
+    fn legacy_non_editable_platforms_are_send_once() {
+        for platform in ["line", "lineworks", "acp"] {
+            let capabilities = legacy_gateway_capabilities(platform, true, true);
+            assert!(!capabilities.can_edit, "{platform} must not advertise edit");
+            assert_eq!(capabilities.streaming_mode, StreamingMode::Disabled);
+        }
     }
 
     #[test]
-    fn editable_platforms_still_allow_streaming() {
+    fn legacy_editable_platforms_preserve_configured_streaming() {
         for platform in [
             "telegram",
             "slack",
             "discord",
             "feishu",
-            "teams",
             "googlechat",
             "wecom",
+            "teams",
         ] {
-            assert!(
-                platform_supports_streaming(platform),
-                "{platform} should still support streaming",
-            );
+            let capabilities = legacy_gateway_capabilities(platform, true, true);
+            assert!(capabilities.can_edit, "{platform} should advertise edit");
+            assert_eq!(capabilities.streaming_mode, StreamingMode::Edit);
         }
+        let feishu = legacy_gateway_capabilities("feishu", true, true);
+        assert!(feishu.edit_ack);
+        assert!(!feishu.send_ack, "legacy peers never require send ACK");
+    }
+
+    #[test]
+    fn capability_state_uses_legacy_only_before_successful_negotiation() {
+        let state = GatewayCapabilityState::default();
+        let legacy = legacy_gateway_capabilities("telegram", true, true);
+        let (negotiated, resolved) = state.resolve("telegram", &legacy);
+        assert!(!negotiated);
+        assert_eq!(resolved, legacy);
+
+        let advertised = AdapterCapabilities {
+            send_ack: true,
+            can_edit: true,
+            streaming_mode: StreamingMode::Edit,
+            status_backend: StatusBackend::Reactions,
+            ..AdapterCapabilities::default()
+        };
+        state.update(GatewayHello {
+            schema: GATEWAY_HELLO_SCHEMA.into(),
+            protocol_version: GATEWAY_PROTOCOL_VERSION,
+            capabilities: HashMap::from([("telegram".into(), advertised.clone())]),
+            topology: GatewayTopology {
+                active_consumers: 1,
+                supported: true,
+                delivery_mode: "best_effort_broadcast".into(),
+            },
+        });
+
+        let (negotiated, resolved) = state.resolve("telegram", &legacy);
+        assert!(negotiated);
+        assert_eq!(resolved, advertised);
+
+        // Once a hello was accepted, an omitted platform is not allowed to
+        // inherit optimistic legacy behavior.
+        let (_, missing) = state.resolve("unadvertised", &legacy);
+        assert_eq!(missing, AdapterCapabilities::default());
+        assert_eq!(missing.status_backend, StatusBackend::None);
+    }
+
+    #[test]
+    fn legacy_and_structured_gateway_responses_map_to_write_outcomes() {
+        let legacy: GatewayResponse = serde_json::from_value(serde_json::json!({
+            "schema": "openab.gateway.response.v1",
+            "request_id": "req-legacy",
+            "success": true,
+            "thread_id": null,
+            "message_id": "activity-1",
+            "error": null
+        }))
+        .unwrap();
+        assert_eq!(
+            legacy.write_outcome(),
+            WriteOutcome::Delivered {
+                message_id: Some("activity-1".into())
+            }
+        );
+
+        let unknown: GatewayResponse = serde_json::from_value(serde_json::json!({
+            "schema": "openab.gateway.response.v1",
+            "request_id": "req-new",
+            "success": false,
+            "thread_id": null,
+            "message_id": null,
+            "error": "delivery may have completed",
+            "outcome": "unknown",
+            "error_code": "request_timeout"
+        }))
+        .unwrap();
+        assert_eq!(
+            unknown.write_outcome(),
+            WriteOutcome::Unknown {
+                code: "request_timeout".into(),
+                message: "delivery may have completed".into()
+            }
+        );
+    }
+
+    #[test]
+    fn client_hello_wire_shape_is_additive_and_versioned() {
+        let value = serde_json::to_value(build_client_hello()).unwrap();
+        assert_eq!(value["schema"], CLIENT_HELLO_SCHEMA);
+        assert_eq!(value["protocol_version"], GATEWAY_PROTOCOL_VERSION);
+        assert!(value["client_name"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("openab-core/")));
+        assert_eq!(value["requested_platforms"], serde_json::json!([]));
     }
 
     #[test]

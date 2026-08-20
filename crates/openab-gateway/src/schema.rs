@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 // --- Event schema (ADR openab.gateway.event.v1) ---
 
@@ -98,6 +99,107 @@ impl Attachment {
     }
 }
 
+// --- Gateway protocol negotiation and capability schema ---
+
+pub const CLIENT_HELLO_SCHEMA: &str = "openab.gateway.client_hello.v1";
+pub const GATEWAY_HELLO_SCHEMA: &str = "openab.gateway.hello.v1";
+pub const GATEWAY_PROTOCOL_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct GatewayEnvelope {
+    pub schema: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamingMode {
+    #[default]
+    Disabled,
+    Edit,
+    Native,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "unit", rename_all = "snake_case")]
+pub enum MessageLimit {
+    Characters { max: usize },
+    Bytes { max: usize },
+    Utf16Bytes { max: usize },
+    Unlimited,
+}
+
+impl Default for MessageLimit {
+    fn default() -> Self {
+        Self::Characters { max: 4096 }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusBackend {
+    #[default]
+    None,
+    Reactions,
+    Assistant,
+    Typing,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AdapterCapabilities {
+    pub send_ack: bool,
+    pub edit_ack: bool,
+    pub delete_ack: bool,
+    pub can_edit: bool,
+    pub can_delete: bool,
+    pub streaming_mode: StreamingMode,
+    pub show_streaming_placeholder: bool,
+    pub message_limit: MessageLimit,
+    pub status_backend: StatusBackend,
+}
+
+impl Default for AdapterCapabilities {
+    fn default() -> Self {
+        Self {
+            send_ack: false,
+            edit_ack: false,
+            delete_ack: false,
+            can_edit: false,
+            can_delete: false,
+            streaming_mode: StreamingMode::Disabled,
+            show_streaming_placeholder: true,
+            message_limit: MessageLimit::default(),
+            status_backend: StatusBackend::None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GatewayClientHello {
+    pub schema: String,
+    pub protocol_version: u32,
+    #[serde(default)]
+    pub client_name: Option<String>,
+    #[serde(default)]
+    pub requested_platforms: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GatewayHello {
+    pub schema: String,
+    pub protocol_version: u32,
+    #[serde(default)]
+    pub capabilities: HashMap<String, AdapterCapabilities>,
+    pub topology: GatewayTopology,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GatewayTopology {
+    pub active_consumers: usize,
+    pub supported: bool,
+    pub delivery_mode: String,
+}
+
 // --- Reply schema (ADR openab.gateway.reply.v1) ---
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -125,7 +227,36 @@ pub struct ReplyChannel {
     pub thread_id: Option<String>,
 }
 
-/// Response from gateway back to OAB for commands (e.g. create_topic)
+/// Stable wire discriminator for additive write-outcome fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriteOutcomeKind {
+    Delivered,
+    Rejected,
+    Unknown,
+}
+
+/// Internal result of a platform write. `Unknown` prevents unsafe retries when
+/// a timed-out POST may already have reached the platform.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WriteOutcome {
+    Delivered {
+        message_id: Option<String>,
+    },
+    Rejected {
+        code: String,
+        message: String,
+        retry_after_ms: Option<u64>,
+    },
+    Unknown {
+        code: String,
+        message: String,
+    },
+}
+
+/// Response from gateway back to OAB for commands and acknowledged writes.
+/// The legacy fields remain required; outcome metadata is additive so old peers
+/// can ignore it and new peers can distinguish rejection from uncertainty.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GatewayResponse {
     pub schema: String,
@@ -134,6 +265,91 @@ pub struct GatewayResponse {
     pub thread_id: Option<String>,
     pub message_id: Option<String>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<WriteOutcomeKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
+}
+
+impl GatewayResponse {
+    pub fn from_write_outcome(request_id: impl Into<String>, outcome: WriteOutcome) -> Self {
+        let request_id = request_id.into();
+        match outcome {
+            WriteOutcome::Delivered { message_id } => Self {
+                schema: "openab.gateway.response.v1".into(),
+                request_id,
+                success: true,
+                thread_id: None,
+                message_id,
+                error: None,
+                outcome: Some(WriteOutcomeKind::Delivered),
+                error_code: None,
+                retry_after_ms: None,
+            },
+            WriteOutcome::Rejected {
+                code,
+                message,
+                retry_after_ms,
+            } => Self {
+                schema: "openab.gateway.response.v1".into(),
+                request_id,
+                success: false,
+                thread_id: None,
+                message_id: None,
+                error: Some(message),
+                outcome: Some(WriteOutcomeKind::Rejected),
+                error_code: Some(code),
+                retry_after_ms,
+            },
+            WriteOutcome::Unknown { code, message } => Self {
+                schema: "openab.gateway.response.v1".into(),
+                request_id,
+                success: false,
+                thread_id: None,
+                message_id: None,
+                error: Some(message),
+                outcome: Some(WriteOutcomeKind::Unknown),
+                error_code: Some(code),
+                retry_after_ms: None,
+            },
+        }
+    }
+
+    pub fn write_outcome(&self) -> WriteOutcome {
+        match self.outcome {
+            Some(WriteOutcomeKind::Delivered) => WriteOutcome::Delivered {
+                message_id: self.message_id.clone(),
+            },
+            Some(WriteOutcomeKind::Rejected) => WriteOutcome::Rejected {
+                code: self.error_code.clone().unwrap_or_else(|| "rejected".into()),
+                message: self
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "gateway rejected write".into()),
+                retry_after_ms: self.retry_after_ms,
+            },
+            Some(WriteOutcomeKind::Unknown) => WriteOutcome::Unknown {
+                code: self.error_code.clone().unwrap_or_else(|| "unknown".into()),
+                message: self
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "gateway write outcome is unknown".into()),
+            },
+            None if self.success => WriteOutcome::Delivered {
+                message_id: self.message_id.clone(),
+            },
+            None => WriteOutcome::Rejected {
+                code: "legacy_failure".into(),
+                message: self
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "gateway reported failure".into()),
+                retry_after_ms: None,
+            },
+        }
+    }
 }
 
 impl GatewayEvent {
@@ -161,5 +377,103 @@ impl GatewayEvent {
             mentions,
             message_id: message_id.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_response_deserializes_without_outcome_fields() {
+        let response: GatewayResponse = serde_json::from_value(serde_json::json!({
+            "schema": "openab.gateway.response.v1",
+            "request_id": "req-1",
+            "success": true,
+            "thread_id": null,
+            "message_id": "activity-1",
+            "error": null
+        }))
+        .unwrap();
+
+        assert_eq!(
+            response.write_outcome(),
+            WriteOutcome::Delivered {
+                message_id: Some("activity-1".into())
+            }
+        );
+        let encoded = serde_json::to_value(response).unwrap();
+        assert!(encoded.get("outcome").is_none());
+        assert!(encoded.get("error_code").is_none());
+        assert!(encoded.get("retry_after_ms").is_none());
+    }
+
+    #[test]
+    fn structured_write_outcomes_round_trip() {
+        let outcomes = [
+            WriteOutcome::Delivered {
+                message_id: Some("activity-2".into()),
+            },
+            WriteOutcome::Rejected {
+                code: "rate_limited".into(),
+                message: "retry later".into(),
+                retry_after_ms: Some(750),
+            },
+            WriteOutcome::Unknown {
+                code: "request_timeout".into(),
+                message: "delivery may have completed".into(),
+            },
+        ];
+
+        for (index, expected) in outcomes.into_iter().enumerate() {
+            let response =
+                GatewayResponse::from_write_outcome(format!("req-{index}"), expected.clone());
+            let json = serde_json::to_string(&response).unwrap();
+            let decoded: GatewayResponse = serde_json::from_str(&json).unwrap();
+            assert_eq!(decoded.write_outcome(), expected);
+        }
+    }
+
+    #[test]
+    fn structured_response_remains_decodable_by_legacy_peer() {
+        #[derive(serde::Deserialize)]
+        struct LegacyResponse {
+            schema: String,
+            request_id: String,
+            success: bool,
+            message_id: Option<String>,
+            error: Option<String>,
+        }
+
+        let response = GatewayResponse::from_write_outcome(
+            "req-legacy",
+            WriteOutcome::Unknown {
+                code: "request_timeout".into(),
+                message: "delivery may have completed".into(),
+            },
+        );
+        let legacy: LegacyResponse =
+            serde_json::from_str(&serde_json::to_string(&response).unwrap()).unwrap();
+        assert_eq!(legacy.schema, "openab.gateway.response.v1");
+        assert_eq!(legacy.request_id, "req-legacy");
+        assert!(!legacy.success);
+        assert!(legacy.message_id.is_none());
+        assert_eq!(legacy.error.as_deref(), Some("delivery may have completed"));
+    }
+
+    #[test]
+    fn missing_capability_fields_default_fail_closed() {
+        let capabilities: AdapterCapabilities = serde_json::from_str("{}").unwrap();
+        assert!(!capabilities.send_ack);
+        assert!(!capabilities.edit_ack);
+        assert!(!capabilities.delete_ack);
+        assert!(!capabilities.can_edit);
+        assert!(!capabilities.can_delete);
+        assert_eq!(capabilities.streaming_mode, StreamingMode::Disabled);
+        assert_eq!(capabilities.status_backend, StatusBackend::None);
+        assert_eq!(
+            capabilities.message_limit,
+            MessageLimit::Characters { max: 4096 }
+        );
     }
 }

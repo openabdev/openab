@@ -435,6 +435,9 @@ pub async fn handle_reply(
                         thread_id: tid,
                         message_id: None,
                         error: None,
+                        outcome: Some(crate::schema::WriteOutcomeKind::Delivered),
+                        error_code: None,
+                        retry_after_ms: None,
                     }
                 } else {
                     let err = body["description"]
@@ -449,6 +452,9 @@ pub async fn handle_reply(
                         thread_id: None,
                         message_id: None,
                         error: Some(err),
+                        outcome: Some(crate::schema::WriteOutcomeKind::Rejected),
+                        error_code: Some("platform_rejected".into()),
+                        retry_after_ms: None,
                     }
                 }
             }
@@ -459,6 +465,9 @@ pub async fn handle_reply(
                 thread_id: None,
                 message_id: None,
                 error: Some(e.to_string()),
+                outcome: Some(crate::schema::WriteOutcomeKind::Unknown),
+                error_code: Some("transport_error".into()),
+                retry_after_ms: None,
             },
         };
         let json = serde_json::to_string(&gw_resp).unwrap();

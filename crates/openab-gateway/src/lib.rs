@@ -4,6 +4,7 @@ pub mod schema;
 pub mod store;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{broadcast, Mutex, Semaphore};
@@ -85,6 +86,9 @@ pub struct AppState {
     pub lineworks: Option<Arc<adapters::lineworks::LineWorksAdapter>>,
     pub ws_token: Option<String>,
     pub event_tx: broadcast::Sender<String>,
+    /// Number of active OAB WebSocket consumers. M0 supports one; additional
+    /// consumers are admitted for compatibility but marked unsupported.
+    pub active_oab_consumers: Arc<AtomicUsize>,
     pub reply_token_cache: ReplyTokenCache,
     pub line_webhook_semaphore: Arc<Semaphore>,
     /// Bounds post-ack LINE WORKS webhook processing (mention gate + attachment download).
@@ -96,7 +100,6 @@ pub struct AppState {
     pub trust_probe: Option<IngressTrustProbe>,
     pub client: reqwest::Client,
 }
-
 
 impl AppState {
     /// Create a minimal AppState for testing. Only requires an `event_tx` sender;
@@ -139,11 +142,14 @@ impl AppState {
             lineworks: None,
             ws_token: None,
             event_tx,
+            active_oab_consumers: Arc::new(AtomicUsize::new(0)),
             reply_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             line_webhook_semaphore: Arc::new(Semaphore::new(LINE_WEBHOOK_CONCURRENCY_MAX)),
-        lineworks_webhook_semaphore: Arc::new(Semaphore::new(LINEWORKS_WEBHOOK_CONCURRENCY_MAX)),
-        lineworks_ingress_queue: Arc::new(Semaphore::new(LINEWORKS_INGRESS_QUEUE_MAX)),
-        trust_probe: None,
+            lineworks_webhook_semaphore: Arc::new(Semaphore::new(
+                LINEWORKS_WEBHOOK_CONCURRENCY_MAX,
+            )),
+            lineworks_ingress_queue: Arc::new(Semaphore::new(LINEWORKS_INGRESS_QUEUE_MAX)),
+            trust_probe: None,
             client: reqwest::Client::new(),
         }
     }
@@ -261,6 +267,7 @@ impl AppState {
             lineworks,
             ws_token,
             event_tx,
+            active_oab_consumers: Arc::new(AtomicUsize::new(0)),
             reply_token_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             line_webhook_semaphore: Arc::new(Semaphore::new(LINE_WEBHOOK_CONCURRENCY_MAX)),
         lineworks_webhook_semaphore: Arc::new(Semaphore::new(LINEWORKS_WEBHOOK_CONCURRENCY_MAX)),
@@ -268,6 +275,122 @@ impl AppState {
         trust_probe: None,
             client,
         }
+    }
+
+    /// Capabilities advertised to a new Core during the optional WebSocket
+    /// hello exchange. Only configured adapters are included, and operation ACK
+    /// flags are conservative: a platform is advertised only when its current
+    /// handler emits a GatewayResponse for that operation.
+    pub fn gateway_capabilities(&self) -> HashMap<String, schema::AdapterCapabilities> {
+        use schema::{AdapterCapabilities, MessageLimit, StatusBackend, StreamingMode};
+
+        let mut capabilities = HashMap::new();
+        let mut insert = |platform: &str, value: AdapterCapabilities| {
+            capabilities.insert(platform.to_string(), value);
+        };
+        let characters = |max| MessageLimit::Characters { max };
+
+        if self.telegram_bot_token.is_some() {
+            insert(
+                "telegram",
+                AdapterCapabilities {
+                    can_edit: self.telegram_rich_messages,
+                    streaming_mode: if self.telegram_rich_messages {
+                        StreamingMode::Edit
+                    } else {
+                        StreamingMode::Disabled
+                    },
+                    show_streaming_placeholder: !self.telegram_rich_messages,
+                    message_limit: characters(4096),
+                    status_backend: StatusBackend::Reactions,
+                    ..AdapterCapabilities::default()
+                },
+            );
+        }
+        if self.line_access_token.is_some() {
+            insert(
+                "line",
+                AdapterCapabilities {
+                    message_limit: characters(4096),
+                    ..AdapterCapabilities::default()
+                },
+            );
+        }
+        #[cfg(feature = "teams")]
+        if self.teams.is_some() {
+            insert(
+                "teams",
+                AdapterCapabilities {
+                    show_streaming_placeholder: true,
+                    message_limit: characters(4096),
+                    status_backend: StatusBackend::None,
+                    ..AdapterCapabilities::default()
+                },
+            );
+        }
+        #[cfg(feature = "feishu")]
+        if self.feishu.is_some() {
+            insert(
+                "feishu",
+                AdapterCapabilities {
+                    send_ack: true,
+                    edit_ack: true,
+                    delete_ack: true,
+                    can_edit: true,
+                    can_delete: true,
+                    streaming_mode: StreamingMode::Edit,
+                    message_limit: characters(4096),
+                    status_backend: StatusBackend::Reactions,
+                    ..AdapterCapabilities::default()
+                },
+            );
+        }
+        #[cfg(feature = "googlechat")]
+        if self.google_chat.is_some() {
+            insert(
+                "googlechat",
+                AdapterCapabilities {
+                    send_ack: true,
+                    can_edit: true,
+                    streaming_mode: StreamingMode::Edit,
+                    message_limit: characters(4096),
+                    status_backend: StatusBackend::Reactions,
+                    ..AdapterCapabilities::default()
+                },
+            );
+        }
+        #[cfg(feature = "wecom")]
+        if self.wecom.is_some() {
+            insert(
+                "wecom",
+                AdapterCapabilities {
+                    message_limit: characters(2048),
+                    ..AdapterCapabilities::default()
+                },
+            );
+        }
+        #[cfg(feature = "lineworks")]
+        if self.lineworks.is_some() {
+            insert(
+                "lineworks",
+                AdapterCapabilities {
+                    message_limit: characters(2000),
+                    ..AdapterCapabilities::default()
+                },
+            );
+        }
+        #[cfg(feature = "acp")]
+        if self.acp.is_some() {
+            insert(
+                "acp",
+                AdapterCapabilities {
+                    message_limit: MessageLimit::Unlimited,
+                    show_streaming_placeholder: false,
+                    ..AdapterCapabilities::default()
+                },
+            );
+        }
+        capabilities
     }
 
     /// Phase 1 L1 audit (#1356): warn loudly for each **active** webhook
@@ -843,6 +966,7 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         lineworks,
         ws_token,
         event_tx,
+        active_oab_consumers: Arc::new(AtomicUsize::new(0)),
         reply_token_cache,
         line_webhook_semaphore: Arc::new(Semaphore::new(LINE_WEBHOOK_CONCURRENCY_MAX)),
         lineworks_webhook_semaphore: Arc::new(Semaphore::new(LINEWORKS_WEBHOOK_CONCURRENCY_MAX)),
@@ -954,22 +1078,90 @@ async fn ws_handler(
     ws.on_upgrade(move |socket| handle_oab_connection(state, socket))
 }
 
+struct ActiveConsumerGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl ActiveConsumerGuard {
+    fn enter(counter: Arc<AtomicUsize>) -> (Self, usize) {
+        let active = counter.fetch_add(1, Ordering::AcqRel) + 1;
+        (Self { counter }, active)
+    }
+}
+
+impl Drop for ActiveConsumerGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+fn build_gateway_hello(
+    state: &AppState,
+    client_hello: &schema::GatewayClientHello,
+) -> schema::GatewayHello {
+    let mut capabilities = state.gateway_capabilities();
+    if !client_hello.requested_platforms.is_empty() {
+        capabilities.retain(|platform, _| {
+            client_hello
+                .requested_platforms
+                .iter()
+                .any(|requested| requested == platform)
+        });
+    }
+    let active_consumers = state.active_oab_consumers.load(Ordering::Acquire);
+    schema::GatewayHello {
+        schema: schema::GATEWAY_HELLO_SCHEMA.into(),
+        protocol_version: schema::GATEWAY_PROTOCOL_VERSION,
+        capabilities,
+        topology: schema::GatewayTopology {
+            active_consumers,
+            supported: active_consumers == 1,
+            delivery_mode: "best_effort_broadcast".into(),
+        },
+    }
+}
+
 async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::WebSocket) {
     use axum::extract::ws::Message;
     use futures_util::{SinkExt, StreamExt};
-    use tracing::{info, warn};
+    use tracing::{error, info, warn};
+
+    let (_consumer_guard, active_consumers) =
+        ActiveConsumerGuard::enter(state.active_oab_consumers.clone());
+    if active_consumers > 1 {
+        error!(
+            active_consumers,
+            topology_supported = false,
+            "multiple active OAB consumers detected; M0 broadcast topology is unsupported and may duplicate events"
+        );
+    }
 
     let (mut ws_tx, mut ws_rx) = socket.split();
     let mut event_rx = state.event_tx.subscribe();
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::channel::<String>(4);
 
-    info!("OAB client connected via WebSocket");
+    info!(active_consumers, "OAB client connected via WebSocket");
 
-    let send_task = tokio::spawn(async move {
+    let mut send_task = tokio::spawn(async move {
         loop {
             tokio::select! {
-                Ok(event_json) = event_rx.recv() => {
-                    if ws_tx.send(Message::Text(event_json.into())).await.is_err() {
+                biased;
+                Some(control_json) = control_rx.recv() => {
+                    if ws_tx.send(Message::Text(control_json.into())).await.is_err() {
                         break;
+                    }
+                }
+                event = event_rx.recv() => {
+                    match event {
+                        Ok(event_json) => {
+                            if ws_tx.send(Message::Text(event_json.into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            warn!(skipped, "OAB consumer lagged gateway broadcast; events were lost");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
             }
@@ -979,10 +1171,37 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
     let state_for_recv = state.clone();
     let reaction_state: Arc<Mutex<HashMap<String, Vec<String>>>> =
         Arc::new(Mutex::new(HashMap::new()));
-    let recv_task = tokio::spawn(async move {
+    let mut recv_task = tokio::spawn(async move {
         let client = reqwest::Client::new();
         while let Some(Ok(msg)) = ws_rx.next().await {
             if let Message::Text(text) = msg {
+                if let Ok(envelope) = serde_json::from_str::<schema::GatewayEnvelope>(&text) {
+                    if envelope.schema == schema::CLIENT_HELLO_SCHEMA {
+                        match serde_json::from_str::<schema::GatewayClientHello>(&text) {
+                            Ok(client_hello) => {
+                                if client_hello.protocol_version != schema::GATEWAY_PROTOCOL_VERSION {
+                                    warn!(
+                                        client_version = client_hello.protocol_version,
+                                        gateway_version = schema::GATEWAY_PROTOCOL_VERSION,
+                                        "gateway protocol version differs; responding with supported version"
+                                    );
+                                }
+                                let hello = build_gateway_hello(&state_for_recv, &client_hello);
+                                if let Ok(json) = serde_json::to_string(&hello) {
+                                    if control_tx.send(json).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                continue;
+                            }
+                            Err(error) => {
+                                warn!(error = %error, "invalid gateway client hello");
+                                continue;
+                            }
+                        }
+                    }
+                }
+
                 match serde_json::from_str::<schema::GatewayReply>(&text) {
                     Ok(reply) => {
                         info!(
@@ -1101,8 +1320,8 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
     });
 
     tokio::select! {
-        _ = send_task => {},
-        _ = recv_task => {},
+        _ = &mut send_task => recv_task.abort(),
+        _ = &mut recv_task => send_task.abort(),
     }
     info!("OAB client disconnected");
 }
@@ -1191,7 +1410,11 @@ mod l1_audit_tests {
             pairs: pairs.clone(),
         });
         assert!(s.feishu.is_some());
-        let cfg = &s.feishu.as_ref().unwrap().config;
+        let cfg = &s
+            .feishu
+            .as_ref()
+            .expect("complete Feishu credentials should build an adapter")
+            .config;
         assert_eq!(cfg.app_id, "cli_x");
         assert!(matches!(
             cfg.connection_mode,
@@ -1201,6 +1424,14 @@ mod l1_audit_tests {
         // Config-supplied encrypt_key satisfies the L1 startup check
         // when the webhook route is exposed.
         assert!(s.unenforceable_l1(true).is_empty());
+        let capabilities = s.gateway_capabilities();
+        let feishu = capabilities
+            .get("feishu")
+            .expect("configured Feishu adapter should advertise capabilities");
+        assert!(feishu.send_ack);
+        assert!(feishu.edit_ack);
+        assert!(feishu.delete_ack);
+        assert_eq!(feishu.streaming_mode, super::schema::StreamingMode::Edit);
 
         // Missing secret → adapter disabled.
         pairs.remove("FEISHU_APP_SECRET");
@@ -1224,6 +1455,15 @@ mod l1_audit_tests {
         });
         assert!(s.teams.is_some());
         assert_eq!(s.teams_webhook_path, "/hook/teams");
+        let capabilities = s.gateway_capabilities();
+        let teams = capabilities
+            .get("teams")
+            .expect("configured Teams adapter should advertise capabilities");
+        assert!(!teams.send_ack);
+        assert!(!teams.can_edit);
+        assert_eq!(teams.streaming_mode, super::schema::StreamingMode::Disabled);
+        assert!(teams.show_streaming_placeholder);
+        assert_eq!(teams.status_backend, super::schema::StatusBackend::None);
 
         // Missing secret → adapter disabled (same as env-only semantics).
         s.apply_teams_config(GatewayTeamsConfig {
@@ -1297,6 +1537,151 @@ mod l1_audit_tests {
         assert_eq!(s.line_webhook_path, "/hook/line");
         // Config-supplied secret satisfies the L1 startup check.
         assert!(flagged(&s).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod gateway_protocol_tests {
+    use super::*;
+    use anyhow::Context as _;
+    use axum::{routing::get, Router};
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::time::{sleep, timeout, Duration};
+    use tokio_tungstenite::tungstenite::Message;
+
+    type TestSocket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn start_server(
+        state: AppState,
+    ) -> anyhow::Result<(
+        std::net::SocketAddr,
+        Arc<AppState>,
+        tokio::task::JoinHandle<()>,
+    )> {
+        let state = Arc::new(state);
+        let app = Router::new()
+            .route("/ws", get(ws_handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("loopback test server should run");
+        });
+        Ok((addr, state, task))
+    }
+
+    async fn wait_for_consumers(state: &AppState, expected: usize) -> anyhow::Result<()> {
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if state.active_oab_consumers.load(Ordering::Acquire) == expected {
+                    return;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn next_text(socket: &mut TestSocket) -> anyhow::Result<String> {
+        let message = timeout(Duration::from_secs(1), socket.next())
+            .await?
+            .context("test WebSocket closed before a frame arrived")??;
+        Ok(message.into_text()?)
+    }
+
+    #[tokio::test]
+    async fn hello_advertises_requested_capabilities_and_topology() -> anyhow::Result<()> {
+        let (event_tx, _event_rx) = broadcast::channel(8);
+        let mut app_state = AppState::test_default(event_tx);
+        app_state.telegram_bot_token = Some("bot-token".into());
+        app_state.telegram_rich_messages = true;
+        app_state.line_access_token = Some("line-token".into());
+        let (addr, state, server) = start_server(app_state).await?;
+        let url = format!("ws://{addr}/ws");
+
+        let (mut first, _) = tokio_tungstenite::connect_async(&url).await?;
+        let client_hello = schema::GatewayClientHello {
+            schema: schema::CLIENT_HELLO_SCHEMA.into(),
+            protocol_version: schema::GATEWAY_PROTOCOL_VERSION,
+            client_name: Some("test-core".into()),
+            requested_platforms: vec!["telegram".into()],
+        };
+        first
+            .send(Message::Text(serde_json::to_string(&client_hello)?))
+            .await?;
+        let text = next_text(&mut first).await?;
+        let hello: schema::GatewayHello = serde_json::from_str(&text)?;
+        assert_eq!(hello.protocol_version, schema::GATEWAY_PROTOCOL_VERSION);
+        assert_eq!(hello.capabilities.len(), 1);
+        let telegram = hello
+            .capabilities
+            .get("telegram")
+            .context("telegram capability should be advertised")?;
+        assert_eq!(telegram.streaming_mode, schema::StreamingMode::Edit);
+        assert!(!telegram.show_streaming_placeholder);
+        assert!(hello.topology.supported);
+        assert_eq!(hello.topology.active_consumers, 1);
+
+        let (mut second, _) = tokio_tungstenite::connect_async(&url).await?;
+        second
+            .send(Message::Text(serde_json::to_string(&client_hello)?))
+            .await?;
+        let text = next_text(&mut second).await?;
+        let hello: schema::GatewayHello = serde_json::from_str(&text)?;
+        assert!(!hello.topology.supported);
+        assert_eq!(hello.topology.active_consumers, 2);
+        assert_eq!(hello.topology.delivery_mode, "best_effort_broadcast");
+
+        second.close(None).await?;
+        wait_for_consumers(&state, 1).await?;
+        first.close(None).await?;
+        wait_for_consumers(&state, 0).await?;
+        server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_client_can_send_reply_without_hello() -> anyhow::Result<()> {
+        let (event_tx, _event_rx) = broadcast::channel(8);
+        let app_state = AppState::test_default(event_tx);
+        let (addr, state, server) = start_server(app_state).await?;
+        let url = format!("ws://{addr}/ws");
+        let (mut socket, _) = tokio_tungstenite::connect_async(&url).await?;
+        wait_for_consumers(&state, 1).await?;
+
+        let legacy_reply = schema::GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "evt-1".into(),
+            platform: "unknown".into(),
+            channel: schema::ReplyChannel {
+                id: "channel-1".into(),
+                thread_id: None,
+            },
+            content: schema::Content {
+                content_type: "text".into(),
+                text: "hello".into(),
+                attachments: Vec::new(),
+            },
+            command: None,
+            request_id: None,
+            quote_message_id: None,
+        };
+        socket
+            .send(Message::Text(serde_json::to_string(&legacy_reply)?))
+            .await?;
+
+        state.event_tx.send("legacy-event".into())?;
+        assert_eq!(next_text(&mut socket).await?, "legacy-event");
+
+        socket.close(None).await?;
+        wait_for_consumers(&state, 0).await?;
+        server.abort();
+        Ok(())
     }
 }
 

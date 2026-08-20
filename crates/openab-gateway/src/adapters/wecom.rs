@@ -466,6 +466,9 @@ impl WecomAdapter {
                     thread_id: None,
                     message_id: placeholder_id,
                     error: None,
+                    outcome: None,
+                    error_code: None,
+                    retry_after_ms: None,
                 };
                 if let Ok(json) = serde_json::to_string(&resp) {
                     let _ = event_tx.send(json);
@@ -502,6 +505,9 @@ impl WecomAdapter {
                         thread_id: None,
                         message_id: None,
                         error: None,
+                        outcome: None,
+                        error_code: None,
+                        retry_after_ms: None,
                     };
                     if let Ok(json) = serde_json::to_string(&resp) {
                         let _ = event_tx.send(json);
@@ -536,6 +542,9 @@ impl WecomAdapter {
                 thread_id: None,
                 message_id: msg_id,
                 error: None,
+                outcome: None,
+                error_code: None,
+                retry_after_ms: None,
             };
             if let Ok(json) = serde_json::to_string(&resp) {
                 let _ = event_tx.send(json);

@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use tracing::{debug, error, info, info_span, warn};
 
 use crate::acp::ContentBlock;
-use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef};
+use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, StatusBackend};
 use crate::config::ReactionsConfig;
 use crate::error_display::format_user_error;
 use crate::reactions::StatusReactionController;
@@ -625,11 +625,13 @@ async fn dispatch_batch(
     let batch_size = batch.len();
     let session_key = Dispatcher::session_key(thread_channel);
 
-    // Apply 👀 reaction to every message in the batch before dispatch (§6.7).
-    // Skip when assistant status API is active — uses
-    // assistant.threads.setStatus instead of emoji reactions.
-    let assistant_status = adapter.uses_assistant_status();
-    if !assistant_status {
+    // Apply 👀 only when the platform selected the reactions status backend.
+    // Assistant/typing/none backends must not leak into the emoji lifecycle.
+    let reaction_status = adapter
+        .capabilities(&thread_channel.platform)
+        .status_backend
+        == StatusBackend::Reactions;
+    if reaction_status {
         let queued_emoji = &target.reactions_config().emojis.queued;
         for msg in batch.iter() {
             let _ = adapter.add_reaction(&msg.trigger_msg, queued_emoji).await;
@@ -779,9 +781,9 @@ async fn dispatch_batch(
         )
         .await;
 
-    // In assistant status mode, all status is conveyed via
-    // assistant.threads.setStatus — skip emoji reactions entirely.
-    if !assistant_status {
+    // Finalize only the reactions backend; other status lifecycles are handled
+    // independently by stream_prompt_blocks or their platform adapter.
+    if reaction_status {
         match &result {
             Ok(()) => reactions.set_done().await,
             Err(_) => reactions.set_error().await,

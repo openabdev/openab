@@ -687,6 +687,10 @@ pub struct GatewayConfig {
     /// Show "…" placeholder at streaming start. Default: true. Set false for platforms using drafts.
     #[serde(default = "default_true")]
     pub streaming_placeholder: bool,
+    /// Maximum time to wait for a write acknowledgement advertised by a new
+    /// gateway peer. Legacy peers remain fire-and-forget. Default: 12 seconds.
+    #[serde(default = "default_gateway_ack_timeout_secs")]
+    pub gateway_ack_timeout_secs: u64,
     /// Whether the connected gateway renders tables natively (e.g. Telegram Rich Messages).
     /// Default: true (matches Telegram default). Set false if Rich Messages is disabled
     /// on the gateway daemon to preserve table code-block wrapping.
@@ -705,6 +709,10 @@ pub struct GatewayConfig {
 
 fn default_gateway_platform() -> String {
     "telegram".into()
+}
+
+fn default_gateway_ack_timeout_secs() -> u64 {
+    12
 }
 
 /// First-class `[telegram]` configuration section (see ADR: first-class
@@ -2321,6 +2329,20 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
             g.max_batch_tokens > 0,
             "gateway.max_batch_tokens must be > 0"
         );
+        anyhow::ensure!(
+            g.gateway_ack_timeout_secs > 0,
+            "gateway.gateway_ack_timeout_secs must be > 0"
+        );
+        anyhow::ensure!(
+            g.gateway_ack_timeout_secs < config.pool.prompt_hard_timeout_secs,
+            "gateway.gateway_ack_timeout_secs must be less than pool.prompt_hard_timeout_secs"
+        );
+        if g.platform == "teams" {
+            anyhow::ensure!(
+                g.gateway_ack_timeout_secs > 10,
+                "gateway.gateway_ack_timeout_secs must exceed the 10-second Teams Connector request timeout"
+            );
+        }
     }
     anyhow::ensure!(
         config.pool.liveness_check_secs > 0,
@@ -3545,6 +3567,7 @@ command = "echo"
         let gw = cfg.gateway.unwrap();
         assert_eq!(gw.url, "ws://gw:8080/ws");
         assert_eq!(gw.platform, "telegram");
+        assert_eq!(gw.gateway_ack_timeout_secs, 12);
         assert!(gw.allowed_users.is_empty());
         assert!(gw.allowed_channels.is_empty());
         assert!(gw.allow_all_users.is_none());
@@ -3555,6 +3578,57 @@ command = "echo"
             gw.allow_all_channels,
             &gw.allowed_channels
         ));
+    }
+
+    #[test]
+    fn parse_gateway_ack_timeout_override() {
+        let toml = r#"
+[gateway]
+url = "wss://gw.example/ws"
+gateway_ack_timeout_secs = 30
+
+[agent]
+command = "echo"
+"#;
+        let cfg = parse_config(toml, "test").unwrap();
+        assert_eq!(cfg.gateway.unwrap().gateway_ack_timeout_secs, 30);
+    }
+
+    #[test]
+    fn parse_gateway_ack_timeout_rejects_invalid_budgets() {
+        let zero = r#"
+[gateway]
+url = "wss://gw.example/ws"
+gateway_ack_timeout_secs = 0
+
+[agent]
+command = "echo"
+"#;
+        assert!(parse_config(zero, "test").is_err());
+
+        let teams_too_short = r#"
+[gateway]
+url = "wss://gw.example/ws"
+platform = "teams"
+gateway_ack_timeout_secs = 10
+
+[agent]
+command = "echo"
+"#;
+        assert!(parse_config(teams_too_short, "test").is_err());
+
+        let beyond_turn = r#"
+[gateway]
+url = "wss://gw.example/ws"
+gateway_ack_timeout_secs = 12
+
+[pool]
+prompt_hard_timeout_secs = 12
+
+[agent]
+command = "echo"
+"#;
+        assert!(parse_config(beyond_turn, "test").is_err());
     }
 
     #[test]

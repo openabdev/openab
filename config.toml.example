@@ -61,6 +61,7 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 #                                       #       send-once (streaming is forced off to avoid
 #                                       #       posting duplicate, growing messages)
 # streaming_placeholder = false         # set false for draft-based platforms (e.g. Telegram Rich Messages)
+# gateway_ack_timeout_secs = 12         # only enforced for ACKs advertised by a negotiated gateway
 
 # --- Telegram (first-class section; alternative to TELEGRAM_* env vars) ---
 # Config-authoritative with ${} expansion; each field falls back to its

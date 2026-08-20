@@ -2550,14 +2550,14 @@ pub async fn handle_reply(
                 );
             }
             if let Some(ref req_id) = reply.request_id {
-                let resp = crate::schema::GatewayResponse {
-                    schema: "openab.gateway.response.v1".into(),
-                    request_id: req_id.clone(),
-                    success: false,
-                    thread_id: None,
-                    message_id: None,
-                    error: Some("invalid message_id format".to_string()),
-                };
+                let resp = crate::schema::GatewayResponse::from_write_outcome(
+                    req_id.clone(),
+                    crate::schema::WriteOutcome::Rejected {
+                        code: "invalid_target".into(),
+                        message: "invalid message_id format".into(),
+                        retry_after_ms: None,
+                    },
+                );
                 if let Ok(json) = serde_json::to_string(&resp) {
                     let _ = event_tx.send(json);
                 }
@@ -2617,14 +2617,14 @@ pub async fn handle_reply(
         Err(e) => {
             tracing::error!(err = %e, "feishu: cannot get token for reply");
             if let Some(ref req_id) = reply.request_id {
-                let resp = crate::schema::GatewayResponse {
-                    schema: "openab.gateway.response.v1".into(),
-                    request_id: req_id.clone(),
-                    success: false,
-                    thread_id: None,
-                    message_id: None,
-                    error: Some(format!("token error: {e}")),
-                };
+                let resp = crate::schema::GatewayResponse::from_write_outcome(
+                    req_id.clone(),
+                    crate::schema::WriteOutcome::Rejected {
+                        code: "authentication_failed".into(),
+                        message: format!("token error: {e}"),
+                        retry_after_ms: None,
+                    },
+                );
                 if let Ok(json) = serde_json::to_string(&resp) {
                     let _ = event_tx.send(json);
                 }
@@ -2673,14 +2673,12 @@ pub async fn handle_reply(
                 }
                 // Send response with message_id back to OAB core (for streaming edit)
                 if let Some(ref req_id) = reply.request_id {
-                    let resp = crate::schema::GatewayResponse {
-                        schema: "openab.gateway.response.v1".into(),
-                        request_id: req_id.clone(),
-                        success: true,
-                        thread_id: None,
-                        message_id: Some(msg_id),
-                        error: None,
-                    };
+                    let resp = crate::schema::GatewayResponse::from_write_outcome(
+                        req_id.clone(),
+                        crate::schema::WriteOutcome::Delivered {
+                            message_id: Some(msg_id),
+                        },
+                    );
                     if let Ok(json) = serde_json::to_string(&resp) {
                         let _ = event_tx.send(json);
                     }
@@ -2689,14 +2687,14 @@ pub async fn handle_reply(
             None => {
                 // Send failure response so core doesn't wait 5s for timeout
                 if let Some(ref req_id) = reply.request_id {
-                    let resp = crate::schema::GatewayResponse {
-                        schema: "openab.gateway.response.v1".into(),
-                        request_id: req_id.clone(),
-                        success: false,
-                        thread_id: None,
-                        message_id: None,
-                        error: Some("send_post_message failed".into()),
-                    };
+                    let resp = crate::schema::GatewayResponse::from_write_outcome(
+                        req_id.clone(),
+                        crate::schema::WriteOutcome::Rejected {
+                            code: "send_failed".into(),
+                            message: "send_post_message failed".into(),
+                            retry_after_ms: None,
+                        },
+                    );
                     if let Ok(json) = serde_json::to_string(&resp) {
                         let _ = event_tx.send(json);
                     }
@@ -2747,14 +2745,21 @@ pub async fn handle_reply(
                     "chunked send delivered {succeeded}/{total_chunks} chunks"
                 ))
             };
-            let resp = crate::schema::GatewayResponse {
-                schema: "openab.gateway.response.v1".into(),
-                request_id: req_id.clone(),
-                success,
-                thread_id: None,
-                message_id: last_msg_id,
-                error,
+            let outcome = if success {
+                crate::schema::WriteOutcome::Delivered {
+                    message_id: last_msg_id,
+                }
+            } else {
+                crate::schema::WriteOutcome::Rejected {
+                    code: "partial_delivery".into(),
+                    message: error.unwrap_or_else(|| "chunked send failed".into()),
+                    retry_after_ms: None,
+                }
             };
+            let resp = crate::schema::GatewayResponse::from_write_outcome(
+                req_id.clone(),
+                outcome,
+            );
             if let Ok(json) = serde_json::to_string(&resp) {
                 let _ = event_tx.send(json);
             }
@@ -2776,14 +2781,16 @@ fn emit_response(
     error: Option<String>,
 ) {
     if let Some(req_id) = request_id {
-        let resp = crate::schema::GatewayResponse {
-            schema: "openab.gateway.response.v1".into(),
-            request_id: req_id.clone(),
-            success,
-            thread_id: None,
-            message_id,
-            error,
+        let outcome = if success {
+            crate::schema::WriteOutcome::Delivered { message_id }
+        } else {
+            crate::schema::WriteOutcome::Rejected {
+                code: "operation_failed".into(),
+                message: error.unwrap_or_else(|| "gateway operation failed".into()),
+                retry_after_ms: None,
+            }
         };
+        let resp = crate::schema::GatewayResponse::from_write_outcome(req_id.clone(), outcome);
         if let Ok(json) = serde_json::to_string(&resp) {
             let _ = event_tx.send(json);
         }
@@ -4663,6 +4670,8 @@ mod tests {
         let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(resp["request_id"], "req_seam_1");
         assert_eq!(resp["success"], false);
+        assert_eq!(resp["outcome"], "rejected");
+        assert_eq!(resp["error_code"], "invalid_target");
         assert_eq!(resp["error"], "invalid message_id format");
     }
 

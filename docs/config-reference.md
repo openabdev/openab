@@ -129,6 +129,7 @@ Custom Gateway adapter for platforms like Telegram, LINE, Feishu/Lark, and Googl
 | `trusted_bot_ids` | string[] | `[]` | Bot IDs that bypass the bot filter even when `allow_bot_messages = false`. |
 | `streaming` | bool | `false` | Enable streaming (typewriter) mode — requires the gateway platform to support message editing. |
 | `streaming_placeholder` | bool | `true` | Show "…" placeholder at streaming start. Set `false` for platforms using drafts (e.g. Telegram Rich Messages). |
+| `gateway_ack_timeout_secs` | u64 | `12` | Maximum wait for an operation ACK explicitly advertised by a negotiated gateway. Missing ACKs from legacy peers remain fire-and-forget. Must be greater than 0, less than `pool.prompt_hard_timeout_secs`, and greater than 10 when `platform = "teams"`. |
 | `message_processing_mode` | string | `"per-message"` | Same as Discord. See [Message Dispatch Modes](message-dispatch-modes.md). |
 | `max_buffered_messages` | u32 | `10` | Same as Discord. |
 | `max_batch_tokens` | u32 | `24000` | Same as Discord. |
