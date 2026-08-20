@@ -95,8 +95,32 @@ fn should_skip_event(event: &GatewayEvent, filter: &EventFilterParams) -> bool {
         tracing::info!(sender = %event.sender.id, "gateway: user not in allowed_users, skipping");
         return true;
     }
-    // @mention gating: in groups, only respond if bot is mentioned
-    let is_group = event.channel.channel_type == "group" || event.channel.channel_type == "supergroup";
+    // Teams trusts structured mention entity IDs, never display text. Personal
+    // chat needs no mention; groupChat/channel always require a recipient
+    // mention and do not gain an ambient/thread bypass.
+    if event.platform.eq_ignore_ascii_case("teams") {
+        if let Some(scope) = event.scope.as_ref() {
+            return match scope.conversation_type.as_str() {
+                "personal" => !scope.is_dm,
+                "groupChat" | "channel" if !scope.is_dm => event
+                    .recipient
+                    .as_ref()
+                    .map(|recipient| recipient.id.as_str())
+                    .filter(|id| !id.trim().is_empty())
+                    .is_none_or(|recipient_id| {
+                        !event
+                            .mentions
+                            .iter()
+                            .any(|mention_id| mention_id == recipient_id)
+                    }),
+                _ => true,
+            };
+        }
+    }
+
+    // Legacy/non-Teams @mention gating retains the existing group behavior.
+    let is_group =
+        event.channel.channel_type == "group" || event.channel.channel_type == "supergroup";
     let in_thread = event.channel.thread_id.is_some();
     if is_group && !in_thread {
         if let Some(bot_name) = filter.bot_username {
@@ -122,9 +146,42 @@ struct GatewayEvent {
     sender: GwSender,
     content: GwContent,
     #[serde(default)]
-    #[allow(dead_code)]
     mentions: Vec<String>,
     message_id: String,
+    #[serde(default)]
+    scope: Option<GwScope>,
+    #[serde(default)]
+    recipient: Option<GwRecipient>,
+    #[serde(default)]
+    mention_entities: Vec<GwMention>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+struct GwScope {
+    #[serde(default)]
+    tenant_id: Option<String>,
+    #[serde(default)]
+    team_id: Option<String>,
+    #[serde(default)]
+    channel_id: Option<String>,
+    conversation_type: String,
+    trust_scope_id: String,
+    is_dm: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+struct GwRecipient {
+    id: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+struct GwMention {
+    id: String,
+    #[serde(default)]
+    text: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -169,6 +226,150 @@ struct GwAttachment {
     /// Absent = normal. Present = rejected/truncated; human-readable reason.
     #[serde(default)]
     status: Option<String>,
+}
+
+/// Teams-specific L2 policy for authenticated typed Gateway scope. Identity
+/// remains in the shared trust registry and is evaluated only after this gate.
+#[derive(Clone, Debug)]
+pub struct TeamsScopePolicy {
+    typed_configured: bool,
+    allowed_teams: HashSet<String>,
+    allowed_channels: HashSet<String>,
+    allow_personal: bool,
+    allow_group_chats: bool,
+    legacy_allow_all_channels: bool,
+    legacy_allowed_conversations: HashSet<String>,
+}
+
+fn typed_scope_shape_is_valid(conversation_id: &str, channel_type: &str, scope: &GwScope) -> bool {
+    let present = |value: Option<&str>| value.is_some_and(|value| !value.trim().is_empty());
+    if conversation_id.trim().is_empty()
+        || !present(scope.tenant_id.as_deref())
+        || scope.trust_scope_id.trim().is_empty()
+        || scope.conversation_type != channel_type
+    {
+        return false;
+    }
+
+    match scope.conversation_type.as_str() {
+        "personal" => scope.is_dm,
+        "groupChat" => !scope.is_dm,
+        "channel" => {
+            !scope.is_dm
+                && present(scope.team_id.as_deref())
+                && present(scope.channel_id.as_deref())
+        }
+        _ => false,
+    }
+}
+
+impl TeamsScopePolicy {
+    pub fn new(
+        typed_configured: bool,
+        allowed_teams: impl IntoIterator<Item = String>,
+        allowed_channels: impl IntoIterator<Item = String>,
+        allow_personal: bool,
+        allow_group_chats: bool,
+        legacy_allow_all_channels: bool,
+        legacy_allowed_conversations: impl IntoIterator<Item = String>,
+    ) -> Self {
+        Self {
+            typed_configured,
+            allowed_teams: allowed_teams.into_iter().collect(),
+            allowed_channels: allowed_channels.into_iter().collect(),
+            allow_personal,
+            allow_group_chats,
+            legacy_allow_all_channels,
+            legacy_allowed_conversations: legacy_allowed_conversations.into_iter().collect(),
+        }
+    }
+
+    pub fn uses_legacy_fallback(&self) -> bool {
+        !self.typed_configured
+    }
+
+    pub fn legacy_scope_restricted(&self) -> bool {
+        !self.legacy_allow_all_channels
+    }
+
+    fn surface_allowed(&self, conversation_id: &str, channel_type: &str, scope: &GwScope) -> bool {
+        if !typed_scope_shape_is_valid(conversation_id, channel_type, scope) {
+            return false;
+        }
+
+        if !self.typed_configured {
+            return self.legacy_allow_all_channels
+                || self.legacy_allowed_conversations.contains(conversation_id);
+        }
+
+        match scope.conversation_type.as_str() {
+            "personal" => self.allow_personal,
+            "groupChat" => self.allow_group_chats,
+            "channel" => {
+                (self.allowed_teams.is_empty() && self.allowed_channels.is_empty())
+                    || scope
+                        .team_id
+                        .as_ref()
+                        .is_some_and(|team| self.allowed_teams.contains(team))
+                    || scope
+                        .channel_id
+                        .as_ref()
+                        .is_some_and(|channel| self.allowed_channels.contains(channel))
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Default for TeamsScopePolicy {
+    fn default() -> Self {
+        Self::new(
+            false,
+            Vec::<String>::new(),
+            Vec::<String>::new(),
+            true,
+            true,
+            true,
+            Vec::<String>::new(),
+        )
+    }
+}
+
+fn strip_recipient_mention(event: &GatewayEvent) -> String {
+    if !event.platform.eq_ignore_ascii_case("teams") {
+        return event.content.text.clone();
+    }
+    let Some(recipient_id) = event
+        .recipient
+        .as_ref()
+        .map(|recipient| recipient.id.as_str())
+        .filter(|id| !id.trim().is_empty())
+    else {
+        return event.content.text.clone();
+    };
+
+    let mut ranges = Vec::new();
+    let mut cursor = 0;
+    for mention in &event.mention_entities {
+        if mention.text.is_empty() || cursor > event.content.text.len() {
+            continue;
+        }
+        let Some(relative_start) = event.content.text[cursor..].find(&mention.text) else {
+            continue;
+        };
+        let start = cursor + relative_start;
+        let end = start + mention.text.len();
+        cursor = end;
+        if mention.id == recipient_id {
+            ranges.push(start..end);
+        }
+    }
+
+    let mut prompt = event.content.text.clone();
+    for range in ranges.into_iter().rev() {
+        prompt.replace_range(range, "");
+    }
+    prompt.trim().to_owned()
 }
 
 #[derive(Serialize)]
@@ -1025,6 +1226,7 @@ pub struct GatewayParams {
     pub telegram_rich_messages: bool,
     pub gateway_ack_timeout_secs: u64,
     pub stt: crate::config::SttConfig,
+    pub teams_scope_policy: TeamsScopePolicy,
 }
 
 pub async fn run_gateway_adapter(
@@ -1049,6 +1251,7 @@ pub async fn run_gateway_adapter(
     let telegram_rich_messages = params.telegram_rich_messages;
     let gateway_ack_timeout_secs = params.gateway_ack_timeout_secs;
     let stt_config = params.stt;
+    let teams_scope_policy = params.teams_scope_policy;
 
     let connect_url = match &params.token {
         Some(token) => {
@@ -1197,7 +1400,7 @@ pub async fn run_gateway_adapter(
                                     // that only this loop can dispatch, so an
                                     // inline await would stall all event
                                     // processing for the reply timeout.
-                                    match gate_gateway_event(&router, &event) {
+                                    match gate_gateway_event(&router, &event, &teams_scope_policy) {
                                         GateOutcome::Allow => {}
                                         GateOutcome::Deny { echo } => {
                                             if let Some((echo_channel, msg)) = echo {
@@ -1211,6 +1414,8 @@ pub async fn run_gateway_adapter(
                                             continue;
                                         }
                                     }
+
+                                    let prompt = strip_recipient_mention(&event);
 
                                     info!(
                                         platform = %event.platform,
@@ -1243,7 +1448,7 @@ pub async fn run_gateway_adapter(
                                             event.timestamp.clone()
                                         }),
                                         message_id: if event.message_id.is_empty() { None } else { Some(event.message_id.clone()) },
-                                        receiver_id: None, // gateway does not yet resolve receiver identity
+                                        receiver_id: event.recipient.as_ref().map(|recipient| recipient.id.clone()),
                                     };
                                     let sender_json = serde_json::to_string(&sender_ctx)
                                         .unwrap_or_default();
@@ -1254,7 +1459,6 @@ pub async fn run_gateway_adapter(
                                     };
 
                                     let adapter = adapter.clone();
-                                    let prompt = event.content.text.clone();
                                     let sender_name = event.sender.name.clone();
                                     let sender_id = event.sender.id.clone();
                                     let dispatcher = dispatcher.clone();
@@ -1414,6 +1618,10 @@ pub async fn run_gateway_adapter(
                                         }
                                     }
 
+                                    if prompt.is_empty() && extra_blocks.is_empty() {
+                                        continue;
+                                    }
+
                                     // Slash command interception for gateway platforms
                                     // (Feishu/LINE/Telegram don't have native slash commands)
                                     // Use fire-and-forget send — slash command responses don't
@@ -1545,6 +1753,7 @@ pub struct GatewayEventContext {
     pub trusted_bot_ids: HashSet<String>,
     pub bot_username: Option<String>,
     pub stt_config: crate::config::SttConfig,
+    pub teams_scope_policy: TeamsScopePolicy,
     #[cfg(feature = "filestore")]
     pub filestore: Option<Arc<crate::filestore::Filestore>>,
 }
@@ -1600,14 +1809,39 @@ enum GateOutcome {
 /// `DenyScope` (and any future variant), denies silently — scope is not a
 /// security boundary, so no echo.
 ///
-/// Phase 1: `is_dm = false` preserves today's behavior where gateway DMs are
-/// evaluated against the channel allowlist like any other channel (the
-/// `allow_dm` surface semantics arrive with the per-platform trust flip).
-/// TODO(phase-2): derive is_dm from the event/ChannelRef carrier so the
-/// `allow_dm` L2 surface can be enforced and tested for gateway platforms.
-fn gate_gateway_event(router: &crate::adapter::AdapterRouter, event: &GatewayEvent) -> GateOutcome {
-    let decision =
-        router.gate_incoming(&event.platform, &event.channel.id, false, &event.sender.id);
+/// Teams events carrying authenticated typed scope use the Teams-specific L2
+/// policy and then the shared L3 identity gate. Events from old peers without
+/// `scope` retain the legacy conversation-ID / `is_dm = false` behavior.
+fn gate_gateway_event(
+    router: &crate::adapter::AdapterRouter,
+    event: &GatewayEvent,
+    teams_scope_policy: &TeamsScopePolicy,
+) -> GateOutcome {
+    let decision = if event.platform.eq_ignore_ascii_case("teams") {
+        match event.scope.as_ref() {
+            Some(scope)
+                if teams_scope_policy.surface_allowed(
+                    &event.channel.id,
+                    &event.channel.channel_type,
+                    scope,
+                ) =>
+            {
+                router.gate_identity(&event.platform, &event.sender.id)
+            }
+            Some(_) => crate::trust::Decision::DenyScope,
+            None => {
+                if !teams_scope_policy.uses_legacy_fallback() {
+                    tracing::warn!(
+                        "gateway: Teams event has no typed scope; using legacy conversation-ID \
+                         fallback for rolling compatibility"
+                    );
+                }
+                router.gate_incoming(&event.platform, &event.channel.id, false, &event.sender.id)
+            }
+        }
+    } else {
+        router.gate_incoming(&event.platform, &event.channel.id, false, &event.sender.id)
+    };
     match decision {
         crate::trust::Decision::Allow => GateOutcome::Allow,
         crate::trust::Decision::DenyIdentity => {
@@ -1682,7 +1916,7 @@ pub async fn process_gateway_event(
     // Shared ingress trust gate (L2 scope + L3 identity), keyed by platform.
     // Awaiting echo delivery here is safe: this runs on the axum/bridge task,
     // not inside the WS event loop.
-    match gate_gateway_event(&ctx.router, &event) {
+    match gate_gateway_event(&ctx.router, &event, &ctx.teams_scope_policy) {
         GateOutcome::Allow => {}
         GateOutcome::Deny { echo } => {
             if let Some((echo_channel, msg)) = echo {
@@ -1691,6 +1925,8 @@ pub async fn process_gateway_event(
             return Ok(false);
         }
     }
+
+    let prompt = strip_recipient_mention(&event);
 
     tracing::info!(
         platform = %event.platform,
@@ -1722,7 +1958,10 @@ pub async fn process_gateway_event(
             event.timestamp.clone()
         }),
         message_id: if event.message_id.is_empty() { None } else { Some(event.message_id.clone()) },
-        receiver_id: None,
+        receiver_id: event
+            .recipient
+            .as_ref()
+            .map(|recipient| recipient.id.clone()),
     };
     let sender_json = serde_json::to_string(&sender_ctx).unwrap_or_default();
 
@@ -1862,8 +2101,11 @@ pub async fn process_gateway_event(
         }
     }
 
+    if prompt.is_empty() && extra_blocks.is_empty() {
+        return Ok(false);
+    }
+
     // Slash command interception
-    let prompt = event.content.text.clone();
     let trimmed = prompt.trim();
     if trimmed == "/reset" {
         let thread_id_str = event.channel.thread_id.as_deref().unwrap_or(&event.channel.id);
@@ -2191,6 +2433,65 @@ mod tests {
         })).unwrap()
     }
 
+    fn make_teams_event(conversation_type: &str, is_dm: bool, mentions: Vec<&str>) -> GatewayEvent {
+        let mut event = make_event(
+            false,
+            "29:user",
+            "conversation-1",
+            conversation_type,
+            None,
+            mentions,
+        );
+        event.platform = "teams".into();
+        event.scope = Some(GwScope {
+            tenant_id: Some("tenant-1".into()),
+            team_id: Some("team-1".into()),
+            channel_id: Some("channel-1".into()),
+            conversation_type: conversation_type.into(),
+            trust_scope_id: format!("teams:tenant-1:{conversation_type}:conversation-1"),
+            is_dm,
+        });
+        event.recipient = Some(GwRecipient {
+            id: "28:bot".into(),
+            name: "OpenAB".into(),
+        });
+        event
+    }
+
+    fn teams_scope(event: &GatewayEvent) -> &GwScope {
+        event.scope.as_ref().expect("Teams test event scope")
+    }
+
+    fn teams_router(allowed_users: Vec<String>) -> crate::adapter::AdapterRouter {
+        let pool = Arc::new(crate::acp::SessionPool::new(
+            crate::config::AgentConfig::default(),
+            1,
+            1,
+            HashMap::new(),
+        ));
+        let mut trust = crate::trust::PlatformTrustConfigs::new();
+        trust.insert(
+            "teams",
+            crate::trust::TrustConfig::new(
+                Some(false),
+                ["legacy-conversation".into()],
+                Some(false),
+                Some(false),
+                allowed_users,
+            ),
+        );
+        crate::adapter::AdapterRouter::new(
+            pool,
+            crate::config::ReactionsConfig::default(),
+            crate::markdown::TableMode::Code,
+            60,
+            1,
+            HashMap::new(),
+            std::env::temp_dir(),
+        )
+        .with_trust(trust)
+    }
+
     fn default_filter<'a>(allowed_channels: &'a HashSet<String>, allowed_users: &'a HashSet<String>, trusted_bot_ids: &'a HashSet<String>) -> EventFilterParams<'a> {
         EventFilterParams {
             allow_all_channels: true,
@@ -2298,6 +2599,386 @@ mod tests {
         filter.bot_username = Some("mybot");
         let event = make_event(false, "u1", "ch1", "group", Some("thread1"), vec![]);
         assert!(!should_skip_event(&event, &filter));
+    }
+
+    #[test]
+    fn teams_trigger_matrix_uses_recipient_entity_ids() {
+        let ch = HashSet::new();
+        let us = HashSet::new();
+        let tb = HashSet::new();
+        let filter = default_filter(&ch, &us, &tb);
+
+        let personal = make_teams_event("personal", true, vec![]);
+        assert!(!should_skip_event(&personal, &filter));
+
+        let mut unmentioned_group = make_teams_event("groupChat", false, vec![]);
+        unmentioned_group.content.text = "@OpenAB <at>OpenAB</at> spoof".into();
+        assert!(should_skip_event(&unmentioned_group, &filter));
+        let mentioned_group = make_teams_event("groupChat", false, vec!["28:bot"]);
+        assert!(!should_skip_event(&mentioned_group, &filter));
+        let multi_mention = make_teams_event("groupChat", false, vec!["29:other", "28:bot"]);
+        assert!(!should_skip_event(&multi_mention, &filter));
+        let other_mention = make_teams_event("groupChat", false, vec!["29:other"]);
+        assert!(should_skip_event(&other_mention, &filter));
+        let mut missing_recipient = make_teams_event("groupChat", false, vec!["28:bot"]);
+        missing_recipient.recipient = None;
+        assert!(should_skip_event(&missing_recipient, &filter));
+
+        let mut threaded_channel = make_teams_event("channel", false, vec![]);
+        threaded_channel.channel.thread_id = Some("reply-chain".into());
+        assert!(
+            should_skip_event(&threaded_channel, &filter),
+            "Teams thread presence must not bypass structured mention gating"
+        );
+        threaded_channel.mentions.push("28:bot".into());
+        assert!(
+            !should_skip_event(&threaded_channel, &filter),
+            "a structured recipient mention must trigger in a channel reply"
+        );
+
+        let malformed_personal = make_teams_event("personal", false, vec![]);
+        assert!(should_skip_event(&malformed_personal, &filter));
+        let unknown = make_teams_event("meeting", false, vec!["28:bot"]);
+        assert!(should_skip_event(&unknown, &filter));
+    }
+
+    #[test]
+    fn teams_recipient_mention_cleanup_preserves_other_mentions() {
+        let mut non_teams = make_event(false, "u1", "channel-1", "group", None, vec![]);
+        non_teams.content.text = "  unchanged  ".into();
+        assert_eq!(strip_recipient_mention(&non_teams), "  unchanged  ");
+
+        let mut event = make_teams_event("channel", false, vec!["29:other", "28:bot"]);
+        event.content.text = "<at>Same</at> ask <at>Same</at>  now".into();
+        event.mention_entities = vec![
+            GwMention {
+                id: "29:other".into(),
+                text: "<at>Same</at>".into(),
+            },
+            GwMention {
+                id: "28:bot".into(),
+                text: "<at>Same</at>".into(),
+            },
+        ];
+        assert_eq!(strip_recipient_mention(&event), "<at>Same</at> ask   now");
+
+        event.content.text = "<at>OpenAB</at> /reset".into();
+        event.mention_entities = vec![GwMention {
+            id: "28:bot".into(),
+            text: "<at>OpenAB</at>".into(),
+        }];
+        assert_eq!(strip_recipient_mention(&event), "/reset");
+        event.content.text = "  <at>OpenAB</at>  ".into();
+        assert!(strip_recipient_mention(&event).is_empty());
+
+        event.content.text = "<at>OpenAB</at> spoof".into();
+        event.mention_entities.clear();
+        assert_eq!(
+            strip_recipient_mention(&event),
+            "<at>OpenAB</at> spoof",
+            "markup without an entity must remain ordinary text"
+        );
+
+        event.mention_entities.push(GwMention {
+            id: "28:bot".into(),
+            text: String::new(),
+        });
+        assert_eq!(strip_recipient_mention(&event), "<at>OpenAB</at> spoof");
+
+        event.content.text = "<at>OpenAB</at> one <at>OpenAB</at> two".into();
+        event.mention_entities = vec![
+            GwMention {
+                id: "28:bot".into(),
+                text: "<at>OpenAB</at>".into(),
+            },
+            GwMention {
+                id: "28:bot".into(),
+                text: "<at>OpenAB</at>".into(),
+            },
+        ];
+        assert_eq!(strip_recipient_mention(&event), "one  two");
+
+        event.content.text = "text without matching markup".into();
+        event.mention_entities = vec![GwMention {
+            id: "28:bot".into(),
+            text: "<at>OpenAB</at>".into(),
+        }];
+        assert_eq!(
+            strip_recipient_mention(&event),
+            "text without matching markup"
+        );
+    }
+
+    #[test]
+    fn teams_typed_scope_policy_is_kind_aware_and_legacy_compatible() {
+        let typed = TeamsScopePolicy::new(
+            true,
+            ["team-1".into()],
+            ["channel-2".into()],
+            true,
+            false,
+            false,
+            ["legacy-conversation".into()],
+        );
+        let personal = make_teams_event("personal", true, vec![]);
+        assert!(typed.surface_allowed(
+            &personal.channel.id,
+            &personal.channel.channel_type,
+            teams_scope(&personal)
+        ));
+        let group = make_teams_event("groupChat", false, vec!["28:bot"]);
+        assert!(!typed.surface_allowed(
+            &group.channel.id,
+            &group.channel.channel_type,
+            teams_scope(&group)
+        ));
+        let channel = make_teams_event("channel", false, vec!["28:bot"]);
+        assert!(typed.surface_allowed(
+            &channel.channel.id,
+            &channel.channel.channel_type,
+            teams_scope(&channel)
+        ));
+
+        let mut channel_match = channel.clone();
+        let scope = channel_match
+            .scope
+            .as_mut()
+            .expect("Teams test event scope");
+        scope.team_id = Some("other-team".into());
+        scope.channel_id = Some("channel-2".into());
+        assert!(typed.surface_allowed(
+            &channel_match.channel.id,
+            &channel_match.channel.channel_type,
+            scope
+        ));
+        scope.channel_id = None;
+        assert!(!typed.surface_allowed(
+            &channel_match.channel.id,
+            &channel_match.channel.channel_type,
+            scope
+        ));
+
+        let typed_open = TeamsScopePolicy::new(
+            true,
+            Vec::<String>::new(),
+            Vec::<String>::new(),
+            false,
+            true,
+            false,
+            Vec::<String>::new(),
+        );
+        assert!(typed_open.surface_allowed(
+            &channel.channel.id,
+            &channel.channel.channel_type,
+            teams_scope(&channel)
+        ));
+        assert!(!typed_open.surface_allowed(
+            &personal.channel.id,
+            &personal.channel.channel_type,
+            teams_scope(&personal)
+        ));
+
+        let legacy = TeamsScopePolicy::new(
+            false,
+            Vec::<String>::new(),
+            Vec::<String>::new(),
+            true,
+            true,
+            false,
+            ["conversation-1".into()],
+        );
+        assert!(legacy.surface_allowed(
+            &channel.channel.id,
+            &channel.channel.channel_type,
+            teams_scope(&channel)
+        ));
+        assert!(!legacy.surface_allowed(
+            "other-conversation",
+            &channel.channel.channel_type,
+            teams_scope(&channel)
+        ));
+    }
+
+    #[test]
+    fn teams_scope_shape_validation_fails_closed() {
+        let personal = make_teams_event("personal", true, vec![]);
+        assert!(typed_scope_shape_is_valid(
+            &personal.channel.id,
+            &personal.channel.channel_type,
+            teams_scope(&personal)
+        ));
+
+        let mut malformed = personal.clone();
+        malformed.scope.as_mut().expect("scope").tenant_id = None;
+        assert!(!typed_scope_shape_is_valid(
+            &malformed.channel.id,
+            &malformed.channel.channel_type,
+            teams_scope(&malformed)
+        ));
+
+        let mut malformed = personal.clone();
+        malformed.scope.as_mut().expect("scope").trust_scope_id = "  ".into();
+        assert!(!typed_scope_shape_is_valid(
+            &malformed.channel.id,
+            &malformed.channel.channel_type,
+            teams_scope(&malformed)
+        ));
+
+        let mut malformed = personal.clone();
+        malformed.scope.as_mut().expect("scope").is_dm = false;
+        assert!(!typed_scope_shape_is_valid(
+            &malformed.channel.id,
+            &malformed.channel.channel_type,
+            teams_scope(&malformed)
+        ));
+
+        let mut malformed = personal.clone();
+        malformed.channel.id.clear();
+        assert!(!typed_scope_shape_is_valid(
+            &malformed.channel.id,
+            &malformed.channel.channel_type,
+            teams_scope(&malformed)
+        ));
+
+        let channel = make_teams_event("channel", false, vec!["28:bot"]);
+        assert!(typed_scope_shape_is_valid(
+            &channel.channel.id,
+            &channel.channel.channel_type,
+            teams_scope(&channel)
+        ));
+        let mut missing_team = channel.clone();
+        missing_team.scope.as_mut().expect("scope").team_id = None;
+        assert!(!typed_scope_shape_is_valid(
+            &missing_team.channel.id,
+            &missing_team.channel.channel_type,
+            teams_scope(&missing_team)
+        ));
+        let mut missing_channel = channel.clone();
+        missing_channel.scope.as_mut().expect("scope").channel_id = None;
+        assert!(!typed_scope_shape_is_valid(
+            &missing_channel.channel.id,
+            &missing_channel.channel.channel_type,
+            teams_scope(&missing_channel)
+        ));
+        let mut mismatched_type = channel.clone();
+        mismatched_type
+            .scope
+            .as_mut()
+            .expect("scope")
+            .conversation_type = "groupChat".into();
+        assert!(!typed_scope_shape_is_valid(
+            &mismatched_type.channel.id,
+            &mismatched_type.channel.channel_type,
+            teams_scope(&mismatched_type)
+        ));
+
+        let unknown = make_teams_event("meeting", false, vec!["28:bot"]);
+        assert!(!typed_scope_shape_is_valid(
+            &unknown.channel.id,
+            &unknown.channel.channel_type,
+            teams_scope(&unknown)
+        ));
+    }
+
+    #[test]
+    fn teams_gate_orders_typed_scope_before_l3_and_keeps_legacy_fallback() {
+        let router = teams_router(vec!["29:user".into()]);
+        let typed = TeamsScopePolicy::new(
+            true,
+            ["team-1".into()],
+            Vec::<String>::new(),
+            true,
+            true,
+            false,
+            ["legacy-conversation".into()],
+        );
+        let channel = make_teams_event("channel", false, vec!["28:bot"]);
+        assert!(matches!(
+            gate_gateway_event(&router, &channel, &typed),
+            GateOutcome::Allow
+        ));
+
+        let mut untrusted = channel.clone();
+        untrusted.sender.id = "29:untrusted".into();
+        assert!(matches!(
+            gate_gateway_event(&router, &untrusted, &typed),
+            GateOutcome::Deny { echo: Some(_) }
+        ));
+
+        let mut malformed = untrusted;
+        malformed.scope.as_mut().expect("scope").team_id = None;
+        assert!(matches!(
+            gate_gateway_event(&router, &malformed, &typed),
+            GateOutcome::Deny { echo: None }
+        ));
+
+        let legacy = TeamsScopePolicy::new(
+            false,
+            Vec::<String>::new(),
+            Vec::<String>::new(),
+            true,
+            true,
+            false,
+            ["legacy-conversation".into()],
+        );
+        let mut old_event = make_teams_event("channel", false, vec![]);
+        old_event.scope = None;
+        old_event.channel.id = "legacy-conversation".into();
+        assert!(matches!(
+            gate_gateway_event(&router, &old_event, &legacy),
+            GateOutcome::Allow
+        ));
+        old_event.channel.id = "other-conversation".into();
+        assert!(matches!(
+            gate_gateway_event(&router, &old_event, &legacy),
+            GateOutcome::Deny { echo: None }
+        ));
+    }
+
+    #[test]
+    fn gateway_event_typed_teams_fields_decode_additively() {
+        let legacy = make_event(false, "u1", "conversation-1", "groupChat", None, vec![]);
+        assert!(legacy.scope.is_none());
+        assert!(legacy.recipient.is_none());
+        assert!(legacy.mention_entities.is_empty());
+
+        let modern: GatewayEvent = serde_json::from_value(serde_json::json!({
+            "schema": "openab.gateway.event.v1",
+            "event_id": "evt1",
+            "timestamp": "2024-01-01T00:00:00Z",
+            "platform": "teams",
+            "bot_id": "28:bot",
+            "sender": {
+                "id": "29:user",
+                "name": "user",
+                "display_name": "User",
+                "is_bot": false
+            },
+            "channel": { "id": "conversation-1", "type": "channel" },
+            "content": { "type": "text", "text": "<at>OpenAB</at> hello" },
+            "mentions": ["28:bot"],
+            "message_id": "msg1",
+            "scope": {
+                "tenant_id": "tenant-1",
+                "team_id": "team-1",
+                "channel_id": "channel-1",
+                "conversation_type": "channel",
+                "trust_scope_id": "teams:tenant-1:team:team-1:channel:channel-1",
+                "is_dm": false
+            },
+            "recipient": { "id": "28:bot", "name": "OpenAB" },
+            "mention_entities": [
+                { "id": "28:bot", "text": "<at>OpenAB</at>" }
+            ]
+        }))
+        .expect("typed Teams Gateway event should decode");
+
+        assert_eq!(teams_scope(&modern).team_id.as_deref(), Some("team-1"));
+        assert_eq!(
+            modern.recipient.as_ref().map(|r| r.id.as_str()),
+            Some("28:bot")
+        );
+        assert_eq!(modern.mention_entities.len(), 1);
     }
 }
 

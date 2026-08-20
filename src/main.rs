@@ -254,12 +254,45 @@ fn gateway_section_trust(gw: &config::GatewayConfig) -> openab_core::trust::Trus
             &gw.allowed_channels,
         )),
         gw.allowed_channels.clone(),
-        None, // allow_dm unused in Phase 1 (is_dm passed as false)
+        None, // allow_dm unused in the legacy no-scope path
         Some(config::resolve_allow_all(
             gw.allow_all_users,
             &gw.allowed_users,
         )),
         gw.allowed_users.clone(),
+    )
+}
+
+/// Build the Teams typed-scope L2 policy while retaining the exact legacy
+/// conversation-ID fallback when no Teams scope field or env var is present.
+fn teams_scope_policy(cfg: &config::Config) -> gateway::TeamsScopePolicy {
+    let legacy_allowed: Vec<String> = std::env::var("GATEWAY_ALLOWED_CHANNELS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let legacy_allow_all = std::env::var("GATEWAY_ALLOW_ALL_CHANNELS")
+        .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
+    let (legacy_allow_all, legacy_allowed) = match cfg.gateway.as_ref() {
+        Some(gateway) if gateway.platform.eq_ignore_ascii_case("teams") => (
+            config::resolve_allow_all(gateway.allow_all_channels, &gateway.allowed_channels),
+            gateway.allowed_channels.clone(),
+        ),
+        _ => (legacy_allow_all, legacy_allowed),
+    };
+
+    let resolved = cfg.teams.clone().unwrap_or_default().resolve();
+    gateway::TeamsScopePolicy::new(
+        resolved.scope_policy_configured,
+        resolved.allowed_teams,
+        resolved.allowed_channels,
+        resolved.allow_personal,
+        resolved.allow_group_chats,
+        legacy_allow_all,
+        legacy_allowed,
     )
 }
 
@@ -487,6 +520,28 @@ async fn main() -> anyhow::Result<()> {
         feature = "lineworks",
     ))]
     let unified_platform_enabled = has_unified_platform(&cfg);
+
+    let teams_scope_policy = teams_scope_policy(&cfg);
+    let teams_routing_active = cfg
+        .gateway
+        .as_ref()
+        .is_some_and(|gateway| gateway.platform.eq_ignore_ascii_case("teams"))
+        || cfg.teams.is_some()
+        || std::env::var_os("TEAMS_APP_ID").is_some();
+    if teams_routing_active && teams_scope_policy.uses_legacy_fallback() {
+        if teams_scope_policy.legacy_scope_restricted() {
+            warn!(
+                "Teams typed scope settings are absent; preserving restricted legacy \
+                 conversation-ID L2 behavior. Configure [teams].allowed_teams/allowed_channels \
+                 or allow_personal/allow_group_chats to opt into typed scope policy."
+            );
+        } else {
+            info!(
+                "Teams typed scope settings are absent; preserving open legacy \
+                 conversation-ID L2 behavior"
+            );
+        }
+    }
 
     let shutdown_hook = cfg.hooks.pre_shutdown.clone();
 
@@ -1107,6 +1162,7 @@ async fn main() -> anyhow::Result<()> {
             telegram_rich_messages: gw_cfg.telegram_rich_messages,
             gateway_ack_timeout_secs: gw_cfg.gateway_ack_timeout_secs,
             stt: cfg.stt.clone(),
+            teams_scope_policy: teams_scope_policy.clone(),
         };
         let gw_router = router.clone();
         #[cfg(feature = "filestore")]
@@ -1518,6 +1574,7 @@ async fn main() -> anyhow::Result<()> {
                 trusted_bot_ids: gw_trusted_bot_ids,
                 bot_username: gw_bot_username,
                 stt_config: cfg.stt.clone(),
+                teams_scope_policy: teams_scope_policy.clone(),
                 #[cfg(feature = "filestore")]
                 filestore: filestore.clone(),
             });

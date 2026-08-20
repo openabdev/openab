@@ -1299,8 +1299,9 @@ impl GoogleChatConfig {
     }
 }
 
-/// First-class `[teams]` section — credentials, connection, and L3 identity
-/// trust for the MS Teams adapter. Config-first invariant (#1375): each field
+/// First-class `[teams]` section — credentials, connection, typed L2 scope,
+/// and L3 identity trust for the MS Teams adapter. Config-first invariant
+/// (#1375): each field
 /// resolves `[teams].field` (with `${}` expansion) → `TEAMS_*` env var →
 /// default. Graduates from the shared [`PlatformTrustConfig`] (#1380).
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1335,6 +1336,16 @@ pub struct TeamsConfig {
     /// the reaction status backend. Env fallback: `TEAMS_REACTIONS_ENABLED`.
     /// Defaults to `false` so existing deployments remain side-effect free.
     pub reactions_enabled: Option<bool>,
+    /// Team IDs admitted by typed channel scope. Env fallback:
+    /// `TEAMS_ALLOWED_TEAMS` (comma-separated). Both scope lists empty = open.
+    pub allowed_teams: Option<Vec<String>>,
+    /// Teams channel IDs admitted by typed channel scope. Env fallback:
+    /// `TEAMS_ALLOWED_CHANNELS` (comma-separated). Team OR channel match wins.
+    pub allowed_channels: Option<Vec<String>>,
+    /// Admit Personal chats. Env fallback: `TEAMS_ALLOW_PERSONAL`; default true.
+    pub allow_personal: Option<bool>,
+    /// Admit group chats. Env fallback: `TEAMS_ALLOW_GROUP_CHATS`; default true.
+    pub allow_group_chats: Option<bool>,
     /// Explicit flag: true = allow all users, false = check `allowed_users`.
     /// Defaults to `false` (deny-all). Env fallback: `TEAMS_ALLOW_ALL_USERS`.
     pub allow_all_users: Option<bool>,
@@ -1356,6 +1367,11 @@ pub struct ResolvedTeams {
     pub route_ttl_secs: u64,
     pub max_route_entries: usize,
     pub reactions_enabled: bool,
+    pub allowed_teams: Vec<String>,
+    pub allowed_channels: Vec<String>,
+    pub allow_personal: bool,
+    pub allow_group_chats: bool,
+    pub scope_policy_configured: bool,
     pub allow_all_users: bool,
     pub allowed_users: Vec<String>,
 }
@@ -1400,6 +1416,29 @@ impl TeamsConfig {
                 })
                 .unwrap_or(default)
         };
+        let bool_with_default = |cfg: Option<bool>, env: &str, default: bool| {
+            cfg.or_else(|| {
+                // These booleans admit conversation surfaces. An explicitly
+                // present but malformed value must resolve false rather than
+                // use the permissive backward-compatible default.
+                std::env::var(env)
+                    .ok()
+                    .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            })
+            .unwrap_or(default)
+        };
+        let scope_policy_configured = self.allowed_teams.is_some()
+            || self.allowed_channels.is_some()
+            || self.allow_personal.is_some()
+            || self.allow_group_chats.is_some()
+            || [
+                "TEAMS_ALLOWED_TEAMS",
+                "TEAMS_ALLOWED_CHANNELS",
+                "TEAMS_ALLOW_PERSONAL",
+                "TEAMS_ALLOW_GROUP_CHATS",
+            ]
+            .into_iter()
+            .any(|key| std::env::var_os(key).is_some());
         ResolvedTeams {
             app_id: opt_str(&self.app_id, "TEAMS_APP_ID"),
             app_secret: opt_str(&self.app_secret, "TEAMS_APP_SECRET"),
@@ -1425,6 +1464,15 @@ impl TeamsConfig {
                     .ok()
                     .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             }),
+            allowed_teams: csv(&self.allowed_teams, "TEAMS_ALLOWED_TEAMS"),
+            allowed_channels: csv(&self.allowed_channels, "TEAMS_ALLOWED_CHANNELS"),
+            allow_personal: bool_with_default(self.allow_personal, "TEAMS_ALLOW_PERSONAL", true),
+            allow_group_chats: bool_with_default(
+                self.allow_group_chats,
+                "TEAMS_ALLOW_GROUP_CHATS",
+                true,
+            ),
+            scope_policy_configured,
             allow_all_users: self.allow_all_users.unwrap_or_else(|| {
                 std::env::var("TEAMS_ALLOW_ALL_USERS")
                     .ok()
@@ -3111,6 +3159,10 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
             "TEAMS_ROUTE_TTL_SECS",
             "TEAMS_MAX_ROUTE_ENTRIES",
             "TEAMS_REACTIONS_ENABLED",
+            "TEAMS_ALLOWED_TEAMS",
+            "TEAMS_ALLOWED_CHANNELS",
+            "TEAMS_ALLOW_PERSONAL",
+            "TEAMS_ALLOW_GROUP_CHATS",
         ] {
             std::env::remove_var(k);
         }
@@ -3125,6 +3177,19 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         assert_eq!(r.route_ttl_secs, 3600);
         assert_eq!(r.max_route_entries, 10_000);
         assert!(!r.reactions_enabled);
+        assert!(r.allowed_teams.is_empty());
+        assert!(r.allowed_channels.is_empty());
+        assert!(r.allow_personal);
+        assert!(r.allow_group_chats);
+        assert!(!r.scope_policy_configured);
+        assert!(
+            TeamsConfig {
+                allowed_teams: Some(vec![]),
+                ..Default::default()
+            }
+            .resolve()
+            .scope_policy_configured
+        );
 
         // --- config wins over env ---
         std::env::set_var("TEAMS_APP_ID", "env-app");
@@ -3133,6 +3198,10 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         std::env::set_var("TEAMS_ROUTE_TTL_SECS", "83");
         std::env::set_var("TEAMS_MAX_ROUTE_ENTRIES", "122");
         std::env::set_var("TEAMS_REACTIONS_ENABLED", "false");
+        std::env::set_var("TEAMS_ALLOWED_TEAMS", "env-team");
+        std::env::set_var("TEAMS_ALLOWED_CHANNELS", "env-channel");
+        std::env::set_var("TEAMS_ALLOW_PERSONAL", "false");
+        std::env::set_var("TEAMS_ALLOW_GROUP_CHATS", "false");
         let cfg = TeamsConfig {
             app_id: Some("cfg-app".into()),
             oauth_endpoint: Some("https://cfg.example/token".into()),
@@ -3141,6 +3210,10 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
             route_ttl_secs: Some(84),
             max_route_entries: Some(123),
             reactions_enabled: Some(true),
+            allowed_teams: Some(vec!["cfg-team".into()]),
+            allowed_channels: Some(vec![]),
+            allow_personal: Some(true),
+            allow_group_chats: Some(true),
             ..Default::default()
         };
         let r = cfg.resolve();
@@ -3151,6 +3224,11 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         assert_eq!(r.route_ttl_secs, 84);
         assert_eq!(r.max_route_entries, 123);
         assert!(r.reactions_enabled);
+        assert_eq!(r.allowed_teams, vec!["cfg-team"]);
+        assert!(r.allowed_channels.is_empty());
+        assert!(r.allow_personal);
+        assert!(r.allow_group_chats);
+        assert!(r.scope_policy_configured);
 
         // --- empty-string ${} expansion falls through to env ---
         std::env::set_var("TEAMS_REACTIONS_ENABLED", "true");
@@ -3165,6 +3243,17 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         assert_eq!(r.route_ttl_secs, 83);
         assert_eq!(r.max_route_entries, 122);
         assert!(r.reactions_enabled);
+        assert_eq!(r.allowed_teams, vec!["env-team"]);
+        assert_eq!(r.allowed_channels, vec!["env-channel"]);
+        assert!(!r.allow_personal);
+        assert!(!r.allow_group_chats);
+        assert!(r.scope_policy_configured);
+
+        // --- malformed allow switch fails closed ---
+        std::env::set_var("TEAMS_ALLOW_PERSONAL", "not-a-boolean");
+        let r = TeamsConfig::default().resolve();
+        assert!(!r.allow_personal);
+        assert!(r.scope_policy_configured);
 
         // --- trust_config() view ---
         let cfg = TeamsConfig {
@@ -3186,6 +3275,10 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
             "TEAMS_ROUTE_TTL_SECS",
             "TEAMS_MAX_ROUTE_ENTRIES",
             "TEAMS_REACTIONS_ENABLED",
+            "TEAMS_ALLOWED_TEAMS",
+            "TEAMS_ALLOWED_CHANNELS",
+            "TEAMS_ALLOW_PERSONAL",
+            "TEAMS_ALLOW_GROUP_CHATS",
         ] {
             std::env::remove_var(k);
         }
@@ -3335,6 +3428,10 @@ allowed_users = ["users/123456789"]
 [teams]
 app_id = "app-1"
 allow_all_users = true
+allowed_teams = ["team-1"]
+allowed_channels = ["channel-1"]
+allow_personal = false
+allow_group_chats = true
 
 [lineworks]
 bot_id = "123"
@@ -3358,6 +3455,16 @@ allowed_users = ["uuid-a", "uuid-b"]
         let teams = cfg.teams.expect("teams section");
         assert_eq!(teams.app_id.as_deref(), Some("app-1"));
         assert_eq!(teams.allow_all_users, Some(true));
+        assert_eq!(
+            teams.allowed_teams.as_deref(),
+            Some(&["team-1".to_string()][..])
+        );
+        assert_eq!(
+            teams.allowed_channels.as_deref(),
+            Some(&["channel-1".to_string()][..])
+        );
+        assert_eq!(teams.allow_personal, Some(false));
+        assert_eq!(teams.allow_group_chats, Some(true));
         let lw = cfg.lineworks.expect("lineworks section");
         assert_eq!(lw.bot_id.as_deref(), Some("123"));
         assert_eq!(lw.allow_all_users, None);

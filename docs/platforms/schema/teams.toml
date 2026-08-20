@@ -203,7 +203,7 @@ pr = ""
 [[openab_features]]
 feature = "media_inbound"
 status = "not_implemented"
-note = "Webhook only reads `activity.text`; attachments are neither parsed nor forwarded (`mentions` passed as empty `vec![]`; no attachment extraction). The `ChannelAccount`/`Activity` DTOs don't even model `attachments`."
+note = "Webhook reads text plus structured recipient/mention entities, but attachments are neither parsed nor forwarded. The `Activity` DTO still does not model attachment payloads."
 source = ["crates/openab-gateway/src/adapters/teams.rs#Activity"]
 pr = ""
 
@@ -217,10 +217,11 @@ pr = ""
 [[openab_features]]
 feature = "trust_gate"
 status = "implemented"
-note = "Two layers: platform-level `check_tenant` (optional `allowed_tenants` allowlist) at ingress, plus core's shared `gate_incoming` (L2 scope + L3 identity) applied to all gateway events in `process_gateway_event`."
+note = "Three ordered layers: Gateway tenant validation; Core typed Personal/groupChat/Team-or-channel L2 policy using authenticated additive scope; then the shared per-platform L3 sender-identity gate. Omitting all typed settings preserves the logged legacy conversation-ID L2 fallback for rolling upgrades."
 source = [
   "crates/openab-gateway/src/adapters/teams.rs#check_tenant",
-  "crates/openab-core/src/adapter.rs#gate_incoming",
+  "crates/openab-core/src/gateway.rs#TeamsScopePolicy",
+  "crates/openab-core/src/adapter.rs#gate_identity",
 ]
 pr = ""
 
@@ -233,11 +234,12 @@ pr = ""
 
 [[openab_features]]
 feature = "mention_gating"
-status = "partial"
-note = "Core `should_skip_event` enforces @mention gating in groups when `bot_username` is set — but the Teams webhook forwards `mentions: vec![]` ('@mentions parsing deferred to future PR'), so gating can't match a Teams mention. It also only fires for `channel_type` `group`/`supergroup`; Teams sends `groupChat`/`channel`, which don't match. Teams itself only delivers @mentioned messages in channels, which mitigates this at the platform layer."
+status = "implemented"
+note = "Gateway parses Bot Framework mention entities and publishes entity IDs plus exact text with `recipient.id`. Personal messages need no mention; groupChat and channel roots/replies require a structured entity whose mentioned ID equals the recipient bot. Plain-text lookalikes do not trigger. Core removes only recipient entity occurrences and preserves other mentions/text."
 source = [
+  "crates/openab-gateway/src/adapters/teams.rs#mention_info",
   "crates/openab-core/src/gateway.rs#should_skip_event",
-  "crates/openab-gateway/src/adapters/teams.rs#handle_reply",
+  "crates/openab-core/src/gateway.rs#strip_recipient_mention",
 ]
 pr = ""
 
@@ -261,7 +263,7 @@ pr = ""
 [[openab_features]]
 feature = "group_routing"
 status = "implemented"
-note = "Session remains keyed by `conversation.id` (+ `conversation_type`). Authenticated ingress records a bounded gateway-local route under composite app/tenant/conversation/activity identity plus `event_id`; outbound replies resolve that event route. Confirmed bot sends also enter a bounded app/tenant/conversation/activity ownership index used by edit/delete."
+note = "Authenticated ingress publishes typed Personal/groupChat/channel trust scope, including Team and channel IDs where required. Session and outbound routing deliberately remain keyed by `conversation.id`; bounded routes and bot ownership use composite app/tenant/conversation/activity identity plus `event_id`."
 source = [
   "crates/openab-gateway/src/adapters/teams.rs#accept_message_activity",
   "crates/openab-gateway/src/adapters/teams_ingress.rs",
@@ -401,6 +403,6 @@ source = "crates/openab-gateway/src/adapters/teams.rs"
 [[quirks]]
 date = "2026-08-08"
 title = "Real send acknowledgement is implemented; reply-chain UX remains live-gated"
-note = "Teams resolves `reply_to` only as an `event_id` route index, returns the real outbound activity ID, and reports delivered/rejected/unknown outcomes in Standalone and Unified modes. Normal sends omit `replyToId`; explicit route-scoped quotes may set it. Channel root/reply, personal, and group-chat presentation still require the D3 live-tenant matrix, and inbound attachments/mentions remain future work."
+note = "Teams resolves `reply_to` only as an `event_id` route index, returns the real outbound activity ID, and reports delivered/rejected/unknown outcomes in Standalone and Unified modes. Normal sends omit `replyToId`; explicit route-scoped quotes may set it. Typed scope and mentions are handled separately; inbound attachments remain future work."
 kind = "openab_decision"
 source = "docs/adr/teams-real-send-acknowledgement.md"

@@ -235,13 +235,17 @@ Full first-class Google Chat section (config-first parity, #1379) — credential
 
 ## `[teams]`
 
-Full first-class Teams section (config-first parity, #1380) — credentials, connection, and L3 identity trust. Each field resolves: config → `TEAMS_*` env → default. `app_id` + `app_secret` are mandatory (after env fallback); an incomplete section disables the adapter.
+Full first-class Teams section (config-first parity, #1380) — credentials, connection, typed L2 scope, and L3 identity trust. Each field resolves: config → `TEAMS_*` env → default. `app_id` + `app_secret` are mandatory (after env fallback); an incomplete section disables the embedded adapter.
 
 > ⚠️ **M0 cloud-profile restriction:** Teams transport supports Microsoft commercial public cloud only. The adapter rejects non-HTTPS endpoints, userinfo, non-standard ports, sovereign-cloud hosts, custom proxy hosts, and service URLs outside `smba.trafficmanager.net`. Existing sovereign-cloud or proxy deployments must remain on an earlier release until an explicit cloud profile is available.
 >
 > Teams outbound replies require the bounded authenticated `event_id` route. A restart, route expiry, or capacity eviction causes a fail-closed `route_not_found`; the user must send a new activity. New Standalone peers advertise required send ACK and return the real Bot Framework activity ID, using `[gateway].gateway_ack_timeout_secs` as the Core wait budget. Edit/delete are permitted only for IDs in the process-local bot-owned index; restart or ownership expiry makes an older message immutable through OpenAB.
 >
 > `reactions_enabled` is an explicit opt-in to Microsoft's public-preview Bot Connector reaction endpoints. It requires no Graph/RSC permission, but the bot must be installed in the target scope. Disabled mode preserves the legacy reaction no-op.
+>
+> Teams Personal, group-chat, and channel scope is derived from the authenticated Bot Framework activity. Presence of any of `allowed_teams`, `allowed_channels`, `allow_personal`, or `allow_group_chats` (or its environment variable) opts into typed L2 policy. With neither list populated, all Team channels are admitted; otherwise a Team **or** channel ID match admits the channel. Personal and group chats use their booleans. L3 user trust is still evaluated independently. The two boolean environment variables accept `true`/`false` or `1`/`0`; any other explicitly present value resolves to `false` (fail closed).
+>
+> If none of the typed fields is present, Core preserves the pre-PR-5 `[gateway].allowed_channels` / `GATEWAY_ALLOWED_CHANNELS` conversation-ID behavior for rolling upgrades. This fallback is logged. `ChannelInfo.id` remains the outbound conversation ID; typed scope never changes routing or session keys.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -255,7 +259,11 @@ Full first-class Teams section (config-first parity, #1380) — credentials, con
 | `route_ttl_secs` | u64 | `3600` | Gateway-local authenticated ingress route lifetime. Must be greater than zero. Env: `TEAMS_ROUTE_TTL_SECS`. |
 | `max_route_entries` | usize | `10000` | Capacity bound applied independently to route, dedupe, and bot-owned outbound activity caches. Must be greater than zero. Env: `TEAMS_MAX_ROUTE_ENTRIES`. |
 | `reactions_enabled` | bool | `false` | Enable public-preview add/remove reactions and advertise the reaction status backend. Env: `TEAMS_REACTIONS_ENABLED`. |
-| `allow_all_users` | bool \| omit | `false` (deny-all) | Env: `TEAMS_ALLOW_ALL_USERS`. |
+| `allowed_teams` | string[] \| omit | `[]` (all Team channels when both lists are empty) | Team IDs admitted for channel conversations. If either scope list is non-empty, Team **or** channel match admits. Env: `TEAMS_ALLOWED_TEAMS` (comma-separated). |
+| `allowed_channels` | string[] \| omit | `[]` (all Team channels when both lists are empty) | Teams channel IDs admitted for channel conversations. Env: `TEAMS_ALLOWED_CHANNELS` (comma-separated). |
+| `allow_personal` | bool \| omit | `true` | Admit Personal conversations under typed policy. Env: `TEAMS_ALLOW_PERSONAL`. |
+| `allow_group_chats` | bool \| omit | `true` | Admit group chats under typed policy. Env: `TEAMS_ALLOW_GROUP_CHATS`. |
+| `allow_all_users` | bool \| omit | `false` (deny-all) | Independent L3 identity gate. Env: `TEAMS_ALLOW_ALL_USERS`. |
 | `allowed_users` | string[] | `[]` | `activity.from.id` values (`29:…`). Env: `TEAMS_ALLOWED_USERS`. |
 
 <details><summary>Previous trust-only description</summary>

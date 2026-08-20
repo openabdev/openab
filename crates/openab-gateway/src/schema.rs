@@ -15,6 +15,44 @@ pub struct GatewayEvent {
     pub content: Content,
     pub mentions: Vec<String>,
     pub message_id: String,
+    /// Authenticated platform scope used for trust decisions. Additive and
+    /// optional so old Gateway/Core peers retain their legacy behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<GatewayScope>,
+    /// Receiving bot identity, distinct from the human sender.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient: Option<RecipientInfo>,
+    /// Structured mention entities. `mentions` remains the cross-platform ID
+    /// list; this richer form lets Core remove only the receiving bot's text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mention_entities: Vec<MentionInfo>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GatewayScope {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
+    pub conversation_type: String,
+    pub trust_scope_id: String,
+    pub is_dm: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RecipientInfo {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MentionInfo {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -385,6 +423,9 @@ impl GatewayEvent {
             },
             mentions,
             message_id: message_id.into(),
+            scope: None,
+            recipient: None,
+            mention_entities: Vec::new(),
         }
     }
 }
@@ -513,6 +554,76 @@ mod protocol_tests {
         }))?;
         assert!(decoded_without_target.target_message_id.is_none());
         assert_eq!(decoded_without_target.reply_to, "legacy-activity");
+        Ok(())
+    }
+
+    #[test]
+    fn typed_scope_and_mentions_are_additive_to_gateway_events() -> anyhow::Result<()> {
+        #[derive(serde::Deserialize)]
+        struct LegacyEvent {
+            schema: String,
+            event_id: String,
+            mentions: Vec<String>,
+            message_id: String,
+        }
+
+        let mut event = GatewayEvent::new(
+            "teams",
+            ChannelInfo {
+                id: "conversation-1".into(),
+                channel_type: "channel".into(),
+                thread_id: None,
+            },
+            SenderInfo {
+                id: "user-1".into(),
+                name: "Alice".into(),
+                display_name: "Alice".into(),
+                is_bot: false,
+            },
+            "<at>OpenAB</at> hello",
+            "activity-1",
+            vec!["bot-1".into()],
+        );
+        event.scope = Some(GatewayScope {
+            tenant_id: Some("tenant-1".into()),
+            team_id: Some("team-1".into()),
+            channel_id: Some("channel-1".into()),
+            conversation_type: "channel".into(),
+            trust_scope_id: "teams:tenant-1:team:team-1:channel:channel-1".into(),
+            is_dm: false,
+        });
+        event.recipient = Some(RecipientInfo {
+            id: "bot-1".into(),
+            name: "OpenAB".into(),
+        });
+        event.mention_entities = vec![MentionInfo {
+            id: "bot-1".into(),
+            text: "<at>OpenAB</at>".into(),
+        }];
+
+        let json = serde_json::to_string(&event)?;
+        let legacy: LegacyEvent = serde_json::from_str(&json)?;
+        assert_eq!(legacy.schema, "openab.gateway.event.v1");
+        assert_eq!(legacy.event_id, event.event_id);
+        assert_eq!(legacy.mentions, vec!["bot-1"]);
+        assert_eq!(legacy.message_id, "activity-1");
+
+        let old_wire = serde_json::json!({
+            "schema": "openab.gateway.event.v1",
+            "event_id": "event-legacy",
+            "timestamp": "2026-08-07T00:00:00Z",
+            "platform": "teams",
+            "event_type": "message",
+            "channel": { "id": "conversation-1", "type": "personal", "thread_id": null },
+            "sender": { "id": "user-1", "name": "Alice", "display_name": "Alice", "is_bot": false },
+            "content": { "type": "text", "text": "hello" },
+            "mentions": [],
+            "message_id": "activity-legacy"
+        });
+        let decoded: GatewayEvent = serde_json::from_value(old_wire)?;
+        assert!(decoded.scope.is_none());
+        assert!(decoded.recipient.is_none());
+        assert!(decoded.mention_entities.is_empty());
         Ok(())
     }
 

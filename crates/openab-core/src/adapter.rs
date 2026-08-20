@@ -669,6 +669,17 @@ impl AdapterRouter {
         self.trust.decide(platform, channel_id, is_dm, sender_id)
     }
 
+    /// Evaluate only L3 identity after an adapter-specific typed-scope policy
+    /// has already admitted L2. Teams needs this because Team-or-channel scope
+    /// matching cannot be represented by the legacy flat channel allowlist.
+    pub fn gate_identity(&self, platform: &str, sender_id: &str) -> crate::trust::Decision {
+        if self.trust.get(platform).identity_allowed(sender_id) {
+            crate::trust::Decision::Allow
+        } else {
+            crate::trust::Decision::DenyIdentity
+        }
+    }
+
     /// Access the underlying session pool (e.g. for config option queries).
     pub fn pool(&self) -> &Arc<SessionPool> {
         &self.pool

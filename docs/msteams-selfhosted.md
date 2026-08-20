@@ -30,7 +30,7 @@ tables = "off"
 
 Set `TEAMS_APP_ID` and `TEAMS_APP_SECRET` on the container. No `[gateway]` needed.
 
-### `[teams]` Section (credentials + trust)
+### `[teams]` Section (credentials + typed scope + trust)
 
 Since #1380 the `[teams]` section carries the full adapter configuration — config-first with `TEAMS_*` env fallback:
 
@@ -44,7 +44,17 @@ dedupe_ttl_secs  = 600
 route_ttl_secs   = 3600
 max_route_entries = 10000
 reactions_enabled = false # opt in only for the public-preview reaction API
+
+# Typed L2 scope. Presence of any of these four fields opts in.
+allowed_teams = []       # Team IDs
+allowed_channels = []    # Teams channel IDs; Team OR channel match
+allow_personal = true
+allow_group_chats = true
 ```
+
+With both scope lists empty, all Team channels remain open. Personal chats do not require a mention; group chats and Team channel roots/replies require a Bot Framework mention entity whose `mentioned.id` equals `recipient.id`. Plain text such as `@OpenAB` or `<at>OpenAB</at>` without that entity does not trigger the bot. Core removes only the receiving bot's entity text and preserves other mentions.
+
+If all four typed fields are omitted, Core logs and preserves the legacy conversation-ID L2 allowlist from `[gateway].allowed_channels` / `GATEWAY_ALLOWED_CHANNELS`. This rolling-upgrade fallback does not change the conversation ID used for sessions and replies.
 
 ### User Trust (`[teams]` section)
 
@@ -226,8 +236,8 @@ services:
     volumes:
       - ./config.toml:/etc/openab/config.toml
       - ./data:/home/agent
-    env_file:
-      - .env
+    environment:
+      RUST_LOG: info
     depends_on:
       - gateway
 
@@ -261,6 +271,16 @@ enabled = true
 [gateway]
 url = "ws://gateway:8080/ws"
 platform = "teams"
+
+# Core-side typed L2 and L3 policy (also required with a Standalone Gateway).
+[teams]
+allowed_teams = []
+allowed_channels = [] # both empty = all Team channels
+allow_personal = true
+allow_group_chats = true
+allowed_users = ["29:1abc..."]
+# Or replace allowed_users with the explicit broad opt-in:
+# allow_all_users = true
 ```
 
 ### Start the stack
@@ -313,6 +333,7 @@ Azure Portal → your bot → **Configuration** → **Messaging endpoint**: `htt
 - **JWT validation** — every webhook is verified against Microsoft's public JWKS
 - **Markdown rendering** — replies are sent with `textFormat: "markdown"`
 - **Tenant allowlist** — set `TEAMS_ALLOWED_TENANTS=<tenant-id-1>,<tenant-id-2>` to restrict which tenants can talk to the bot
+- **Typed scope policy** — optionally admit Team IDs, channel IDs, Personal chats, and group chats independently in Core
 
 ## Current Limitations
 
@@ -321,6 +342,8 @@ Azure Portal → your bot → **Configuration** → **Messaging endpoint**: `htt
 - **Streaming edits** — replies are sent as one final message, not progressively edited
 
 ## Environment Variables
+
+Transport variables are read by the embedded adapter or Standalone Gateway. Typed scope and L3 trust variables are read by the Core process; in Standalone mode do not set them only on the Gateway container.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
@@ -334,6 +357,12 @@ Azure Portal → your bot → **Configuration** → **Messaging endpoint**: `htt
 | `TEAMS_ROUTE_TTL_SECS` | No | `3600` | Authenticated ephemeral route lifetime |
 | `TEAMS_MAX_ROUTE_ENTRIES` | No | `10000` | Independent capacity bound for route, dedupe, and bot-owned activity caches |
 | `TEAMS_REACTIONS_ENABLED` | No | `false` | Opt in to public-preview Bot Connector add/remove reactions |
+| `TEAMS_ALLOWED_TEAMS` | No | (empty) | Core typed L2 Team-ID allowlist, comma-separated; Team OR channel match |
+| `TEAMS_ALLOWED_CHANNELS` | No | (empty) | Core typed L2 channel-ID allowlist, comma-separated; both lists empty means all Team channels |
+| `TEAMS_ALLOW_PERSONAL` | No | `true` | Core typed L2 Personal-chat switch |
+| `TEAMS_ALLOW_GROUP_CHATS` | No | `true` | Core typed L2 group-chat switch |
+| `TEAMS_ALLOW_ALL_USERS` | No | `false` | Core L3 broad user opt-in |
+| `TEAMS_ALLOWED_USERS` | No | (empty) | Core L3 Bot Framework sender IDs, comma-separated |
 
 > ⚠️ **M0 supports Microsoft commercial public cloud only.** Sovereign-cloud endpoints and custom OAuth/OpenID proxy hosts are rejected. Bot Connector replies accept only validated HTTPS service URLs on `smba.trafficmanager.net`; redirects cannot cross origin.
 

@@ -230,6 +230,11 @@ agents:
       oauth_endpoint = "${TEAMS_OAUTH_ENDPOINT}"
       allowed_tenants = ["<YOUR_TENANT_ID>"]
       allowed_users = ["29:1abc..."]
+      # Presence of any field below opts into typed L2 scope policy.
+      allowed_teams = ["<YOUR_TEAM_ID>"]
+      allowed_channels = [] # a Team OR channel match admits channel messages
+      allow_personal = true
+      allow_group_chats = false
       # reactions_enabled = true # public-preview live-tenant test only
 
       [agent]
@@ -261,11 +266,13 @@ not automatically add `secretEnv` keys to `[agent].inherit_env`. Do **not** add
 any `TEAMS_*` keys there: the ACP agent does not need these adapter credentials,
 and inheriting them would make the secret accessible to prompts and tools.
 
-### User Trust and Tenant Scope
+### User Trust, Tenant, and Conversation Scope
 
-The recommended configuration restricts both the Azure AD tenant and individual
-Bot Framework sender IDs. Find each user's `29:…` sender ID in OAB logs and add
-it to `allowed_users`.
+The recommended configuration restricts the Azure AD tenant, typed conversation surface, and individual Bot Framework sender IDs. `allowed_tenants` is the Gateway L1 tenant boundary; `allowed_teams` / `allowed_channels` and the Personal/group-chat switches are Core L2 policy; `allowed_users` is the independent Core L3 identity gate. Find each user's `29:…` sender ID in OAB logs and add it to `allowed_users`.
+
+With both typed channel lists empty, all Team channels are in L2 scope. If either list is non-empty, a Team **or** channel ID match admits the conversation. Personal requires no mention; groupChat and channel messages require a structured Bot Framework mention targeting `recipient.id`. Text that merely looks like `@OpenAB` is not authority.
+
+Omitting all four typed scope fields preserves and logs the legacy conversation-ID allowlist for rolling Core/Gateway upgrades. It does not replace the outbound conversation ID with a Team or channel ID.
 
 To allow every user in the configured tenant instead, replace `allowed_users`
 with the explicit broad-access opt-in below. Keep `allowed_tenants`; otherwise,
@@ -504,6 +511,12 @@ agents:
       [gateway]
       url = "ws://openab-gateway:8080/ws"
       platform = "teams"
+
+      [teams]
+      allowed_teams = ["<YOUR_TEAM_ID>"]
+      allowed_channels = []
+      allow_personal = true
+      allow_group_chats = false
       allowed_users = ["29:1abc..."]
 
       [agent]
@@ -517,12 +530,9 @@ agents:
       session_ttl_hours = 24
 ```
 
-The chart mounts `configToml` verbatim. The sample uses an explicit
-`allowed_users` list for least privilege; find each user's `29:…` sender ID in
-OAB logs. Legacy `[gateway]` compatibility defaults to allow-all when both
-`allow_all_users` and `allowed_users` are omitted, so do not omit this trust
-configuration. To admit every user that passed the Gateway's tenant check, use
-the explicit `allow_all_users = true` opt-in instead.
+The chart mounts `configToml` verbatim. The sample uses first-class `[teams]` typed L2 policy plus an explicit L3 `allowed_users` list for least privilege; find each user's `29:…` sender ID in OAB logs. To admit every user that passed the Gateway's tenant and Core scope checks, use the explicit `[teams].allow_all_users = true` opt-in instead.
+
+For a rolling deployment with an older Gateway, absent additive scope falls back to the legacy `[gateway].allowed_channels` conversation-ID policy. Do not put Team IDs into that legacy field: they are not Bot Connector conversation IDs. Upgrade the Gateway before relying exclusively on Team/channel typed allowlists.
 
 Install the chart version validated with Gateway 0.5.4:
 
@@ -605,8 +615,7 @@ sovereign cloud until the runtime makes the issuer and scope cloud-aware.
 
 In Unified Mode, the `[teams]` section resolves these variables from the OAB
 process; inject `TEAMS_APP_SECRET` with `secretEnv`. In Standalone Gateway Mode,
-set them on the Gateway through `openab-gateway-teams`. User trust remains in
-the OAB `configToml` shown for each mode.
+set transport variables on the Gateway through `openab-gateway-teams`. Typed scope and user trust remain in the OAB `configToml` (or Core process environment) shown for each mode; setting them only on a Standalone Gateway does not configure Core routing policy.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
@@ -620,6 +629,12 @@ the OAB `configToml` shown for each mode.
 | `TEAMS_ROUTE_TTL_SECS` | No | `3600` | Authenticated ephemeral route lifetime |
 | `TEAMS_MAX_ROUTE_ENTRIES` | No | `10000` | Independent capacity bound for route, dedupe, and bot-owned activity caches |
 | `TEAMS_REACTIONS_ENABLED` | No | `false` | Opt in to public-preview Bot Connector add/remove reactions; no Graph/RSC grant required |
+| `TEAMS_ALLOWED_TEAMS` | No | (empty) | Core typed L2 Team-ID allowlist, comma-separated; Team OR channel match |
+| `TEAMS_ALLOWED_CHANNELS` | No | (empty) | Core typed L2 channel-ID allowlist, comma-separated; both lists empty means all Team channels |
+| `TEAMS_ALLOW_PERSONAL` | No | `true` | Core typed L2 Personal-chat switch |
+| `TEAMS_ALLOW_GROUP_CHATS` | No | `true` | Core typed L2 group-chat switch |
+| `TEAMS_ALLOW_ALL_USERS` | No | `false` | Core L3 broad user opt-in |
+| `TEAMS_ALLOWED_USERS` | No | (empty) | Core L3 Bot Framework sender IDs, comma-separated |
 
 ## Troubleshooting
 
@@ -655,8 +670,7 @@ kubectl logs deployment/openab-kiro --tail=50
 ```
 
 Confirm that `/webhook/teams` routes to Service `openab-teams`, the Service has
-one ready endpoint, and the sender matches both `[teams].allowed_tenants` and
-`[teams].allowed_users`.
+one ready endpoint, and the activity matches `[teams].allowed_tenants`, the typed Team/channel/Personal/group-chat policy, structured mention rules, and `[teams].allowed_users`.
 
 ### Standalone Gateway receives webhook but no reply in Teams
 
@@ -713,6 +727,7 @@ kubectl run openab-metadata-check --rm -i --restart=Never \
 - **Credentials in Kubernetes Secrets** — never in ConfigMaps or Deployment manifests
 - **Rotate client secrets** before expiration — set a reminder based on the expiration chosen in Step 1
 - **Use a tenant allowlist** in production — configure `[teams].allowed_tenants` in Unified Mode or `TEAMS_ALLOWED_TENANTS` in Standalone Gateway Mode
+- **Bound Core scope and identity independently** — configure the typed Team/channel/Personal/group-chat policy and an explicit `[teams].allowed_users` list; a scope match never bypasses L3 sender trust
 - **Network policies** — start from default-deny and allow cluster DNS plus
   the minimum outbound destinations. The M0 public-cloud profile permits the
   `login.microsoftonline.com` token endpoint, `login.botframework.com` metadata

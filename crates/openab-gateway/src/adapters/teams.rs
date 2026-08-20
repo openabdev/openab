@@ -34,6 +34,8 @@ pub struct Activity {
     pub tenant: Option<TenantInfo>,
     pub channel_data: Option<ChannelData>,
     pub reply_to_id: Option<String>,
+    #[serde(default)]
+    pub entities: Vec<ActivityEntity>,
 }
 
 #[allow(dead_code)]
@@ -43,6 +45,15 @@ pub struct ChannelAccount {
     pub id: Option<String>,
     pub name: Option<String>,
     pub aad_object_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityEntity {
+    #[serde(default, rename = "type")]
+    pub entity_type: String,
+    pub mentioned: Option<ChannelAccount>,
+    pub text: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -121,6 +132,92 @@ impl Activity {
             return Some("serviceUrl");
         }
         None
+    }
+
+    fn recipient_info(&self) -> Option<RecipientInfo> {
+        let recipient = self.recipient.as_ref()?;
+        let id = recipient.id.as_deref().filter(|id| !id.trim().is_empty())?;
+        Some(RecipientInfo {
+            id: id.to_owned(),
+            name: recipient.name.clone().unwrap_or_default(),
+        })
+    }
+
+    fn mention_info(&self) -> (Vec<String>, Vec<MentionInfo>) {
+        let mut mention_ids = Vec::new();
+        let mut mention_entities = Vec::new();
+        for entity in &self.entities {
+            if !entity.entity_type.eq_ignore_ascii_case("mention") {
+                continue;
+            }
+            let Some(id) = entity
+                .mentioned
+                .as_ref()
+                .and_then(|mentioned| mentioned.id.as_deref())
+                .filter(|id| !id.trim().is_empty())
+            else {
+                continue;
+            };
+            if !mention_ids.iter().any(|known| known == id) {
+                mention_ids.push(id.to_owned());
+            }
+            mention_entities.push(MentionInfo {
+                id: id.to_owned(),
+                text: entity.text.clone().unwrap_or_default(),
+            });
+        }
+        (mention_ids, mention_entities)
+    }
+
+    fn gateway_scope(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        conversation_type: &str,
+    ) -> GatewayScope {
+        let team_id = self
+            .channel_data
+            .as_ref()
+            .and_then(|data| data.team.as_ref())
+            .and_then(|team| team.id.clone())
+            .filter(|id| !id.trim().is_empty());
+        let channel_id = self
+            .channel_data
+            .as_ref()
+            .and_then(|data| data.channel.as_ref())
+            .and_then(|channel| channel.id.clone())
+            .filter(|id| !id.trim().is_empty());
+        let trust_scope_id = match conversation_type {
+            "personal" => format!("teams:{tenant_id}:personal:{conversation_id}"),
+            "groupChat" => format!("teams:{tenant_id}:group-chat:{conversation_id}"),
+            "channel" => match (team_id.as_deref(), channel_id.as_deref()) {
+                (Some(team), Some(channel)) => {
+                    format!("teams:{tenant_id}:team:{team}:channel:{channel}")
+                }
+                _ => format!("teams:{tenant_id}:invalid-channel:{conversation_id}"),
+            },
+            other => format!("teams:{tenant_id}:unknown:{other}:{conversation_id}"),
+        };
+        GatewayScope {
+            tenant_id: Some(tenant_id.to_owned()),
+            team_id,
+            channel_id,
+            conversation_type: conversation_type.to_owned(),
+            trust_scope_id,
+            is_dm: conversation_type == "personal",
+        }
+    }
+}
+
+fn canonical_conversation_type(value: &str) -> String {
+    if value.eq_ignore_ascii_case("personal") {
+        "personal".into()
+    } else if value.eq_ignore_ascii_case("groupChat") {
+        "groupChat".into()
+    } else if value.eq_ignore_ascii_case("channel") {
+        "channel".into()
+    } else {
+        value.trim().to_owned()
     }
 }
 
@@ -1672,24 +1769,31 @@ async fn accept_message_activity(state: Arc<crate::AppState>, activity: Activity
             return StatusCode::BAD_REQUEST;
         }
     };
-    let conversation_type = activity
-        .conversation
-        .as_ref()
-        .and_then(|conversation| conversation.conversation_type.as_deref())
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("personal");
+    let conversation_type = canonical_conversation_type(
+        activity
+            .conversation
+            .as_ref()
+            .and_then(|conversation| conversation.conversation_type.as_deref())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("personal"),
+    );
     let sender_name = activity
         .from
         .as_ref()
         .and_then(|sender| sender.name.as_deref())
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("Unknown");
+    let scope = activity.gateway_scope(tenant_id, conversation_id, &conversation_type);
+    let route_team_id = scope.team_id.clone();
+    let route_channel_id = scope.channel_id.clone();
+    let recipient = activity.recipient_info();
+    let (mentions, mention_entities) = activity.mention_info();
 
-    let event = GatewayEvent::new(
+    let mut event = GatewayEvent::new(
         "teams",
         ChannelInfo {
             id: conversation_id.to_owned(),
-            channel_type: conversation_type.to_owned(),
+            channel_type: conversation_type.clone(),
             thread_id: None,
         },
         SenderInfo {
@@ -1700,8 +1804,11 @@ async fn accept_message_activity(state: Arc<crate::AppState>, activity: Activity
         },
         text,
         activity_id,
-        vec![],
+        mentions,
     );
+    event.scope = Some(scope);
+    event.recipient = recipient;
+    event.mention_entities = mention_entities;
     let event_id = event.event_id.clone();
     let route_key = TeamsRouteKey::new(
         teams.config.app_id.clone(),
@@ -1715,22 +1822,12 @@ async fn accept_message_activity(state: Arc<crate::AppState>, activity: Activity
         event_id: event_id.clone(),
         tenant_id: tenant_id.to_owned(),
         conversation_id: conversation_id.to_owned(),
-        conversation_type: conversation_type.to_owned(),
+        conversation_type: conversation_type.clone(),
         inbound_activity_id: activity_id.to_owned(),
         reply_chain_root_id: activity.reply_to_id.clone(),
         service_url: validated_service_url.clone(),
-        team_id: activity
-            .channel_data
-            .as_ref()
-            .and_then(|data| data.team.as_ref())
-            .and_then(|team| team.id.clone())
-            .filter(|id| !id.trim().is_empty()),
-        channel_id: activity
-            .channel_data
-            .as_ref()
-            .and_then(|data| data.channel.as_ref())
-            .and_then(|channel| channel.id.clone())
-            .filter(|id| !id.trim().is_empty()),
+        team_id: route_team_id,
+        channel_id: route_channel_id,
         created_at: now,
     };
     let json = match serde_json::to_string(&event) {
@@ -2327,6 +2424,7 @@ mod tests {
             }),
             channel_data: None,
             reply_to_id: None,
+            entities: vec![],
         }
     }
 
@@ -2367,6 +2465,7 @@ mod tests {
                 }),
             }),
             reply_to_id: Some("root-activity".into()),
+            entities: vec![],
         }
     }
 
@@ -2671,7 +2770,12 @@ mod tests {
             "channelData": {
                 "team": {"id": "team-abc"},
                 "channel": {"id": "channel-abc"}
-            }
+            },
+            "entities": [
+                {"type": "mention", "mentioned": {"id": "bot1", "name": "OpenAB"}, "text": "<at>OpenAB</at>"},
+                {"type": "mention", "mentioned": {"id": "user2", "name": "Bob"}, "text": "<at>Bob</at>"},
+                {"type": "clientInfo"}
+            ]
         }"#;
         let activity: Activity = serde_json::from_str(json)?;
         assert_eq!(activity.activity_type, "message");
@@ -2716,6 +2820,144 @@ mod tests {
                 .and_then(|channel| channel.id.as_deref()),
             Some("channel-abc")
         );
+        let (mention_ids, mention_entities) = activity.mention_info();
+        assert_eq!(mention_ids, vec!["bot1", "user2"]);
+        assert_eq!(
+            mention_entities,
+            vec![
+                MentionInfo {
+                    id: "bot1".into(),
+                    text: "<at>OpenAB</at>".into(),
+                },
+                MentionInfo {
+                    id: "user2".into(),
+                    text: "<at>Bob</at>".into(),
+                },
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accepted_event_carries_typed_scope_recipient_and_mentions() -> anyhow::Result<()> {
+        let (state, mut event_rx) = make_routable_state();
+        let mut activity = make_routable_activity("typed-activity");
+        activity.text = Some("<at>OpenAB</at> ask <at>Bob</at>".into());
+        activity.entities = vec![
+            ActivityEntity {
+                entity_type: "mention".into(),
+                mentioned: Some(ChannelAccount {
+                    id: Some("28:bot".into()),
+                    name: Some("OpenAB".into()),
+                    aad_object_id: None,
+                }),
+                text: Some("<at>OpenAB</at>".into()),
+            },
+            ActivityEntity {
+                entity_type: "mention".into(),
+                mentioned: Some(ChannelAccount {
+                    id: Some("29:bob".into()),
+                    name: Some("Bob".into()),
+                    aad_object_id: None,
+                }),
+                text: Some("<at>Bob</at>".into()),
+            },
+            ActivityEntity {
+                entity_type: "mention".into(),
+                mentioned: Some(ChannelAccount {
+                    id: Some("28:bot".into()),
+                    name: Some("OpenAB".into()),
+                    aad_object_id: None,
+                }),
+                text: Some(String::new()),
+            },
+            ActivityEntity {
+                entity_type: "clientInfo".into(),
+                mentioned: None,
+                text: None,
+            },
+        ];
+
+        assert_eq!(
+            accept_message_activity(state, activity).await,
+            StatusCode::OK
+        );
+        let event: GatewayEvent = serde_json::from_str(&event_rx.recv().await?)?;
+        assert_eq!(event.channel.id, "conversation-1");
+        assert_eq!(event.channel.channel_type, "channel");
+        assert_eq!(event.content.text, "<at>OpenAB</at> ask <at>Bob</at>");
+        assert_eq!(event.mentions, vec!["28:bot", "29:bob"]);
+        assert_eq!(
+            event.recipient,
+            Some(RecipientInfo {
+                id: "28:bot".into(),
+                name: "OpenAB".into(),
+            })
+        );
+        assert_eq!(
+            event.scope,
+            Some(GatewayScope {
+                tenant_id: Some("tenant-1".into()),
+                team_id: Some("team-1".into()),
+                channel_id: Some("channel-1".into()),
+                conversation_type: "channel".into(),
+                trust_scope_id: "teams:tenant-1:team:team-1:channel:channel-1".into(),
+                is_dm: false,
+            })
+        );
+        assert_eq!(
+            event.mention_entities,
+            vec![
+                MentionInfo {
+                    id: "28:bot".into(),
+                    text: "<at>OpenAB</at>".into(),
+                },
+                MentionInfo {
+                    id: "29:bob".into(),
+                    text: "<at>Bob</at>".into(),
+                },
+                MentionInfo {
+                    id: "28:bot".into(),
+                    text: String::new(),
+                },
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scope_derivation_canonicalizes_known_conversation_types() -> anyhow::Result<()> {
+        let mut activity = make_routable_activity("scope-activity");
+        let conversation = activity
+            .conversation
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("test activity must include conversation"))?;
+
+        conversation.conversation_type = Some("GROUPCHAT".into());
+        activity.channel_data = None;
+        let kind = canonical_conversation_type("GROUPCHAT");
+        let group = activity.gateway_scope("tenant-1", "conversation-1", &kind);
+        assert_eq!(group.conversation_type, "groupChat");
+        assert!(!group.is_dm);
+        assert_eq!(
+            group.trust_scope_id,
+            "teams:tenant-1:group-chat:conversation-1"
+        );
+
+        let kind = canonical_conversation_type("Personal");
+        let personal = activity.gateway_scope("tenant-1", "conversation-1", &kind);
+        assert_eq!(personal.conversation_type, "personal");
+        assert!(personal.is_dm);
+        assert_eq!(
+            personal.trust_scope_id,
+            "teams:tenant-1:personal:conversation-1"
+        );
+
+        let kind = canonical_conversation_type("meeting");
+        let unknown = activity.gateway_scope("tenant-1", "conversation-1", &kind);
+        assert_eq!(unknown.conversation_type, "meeting");
+        assert!(!unknown.is_dm);
+        assert!(unknown.trust_scope_id.contains(":unknown:meeting:"));
         Ok(())
     }
 

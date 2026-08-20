@@ -102,6 +102,12 @@ agents:
     #   #   allowed_channels = ["C01234567"]
     #   #   allow_user_messages = "mentions"
     #   #
+    #   #   [teams]
+    #   #   allowed_teams = []       # Team IDs; both lists empty = all Team channels
+    #   #   allowed_channels = []    # a Team OR channel match admits
+    #   #   allow_personal = true
+    #   #   allow_group_chats = true
+    #   #
     #   #   [agent]
     #   #   command = "claude-agent-acp"
     #   #   inherit_env = ["ANTHROPIC_API_KEY"]
@@ -416,7 +422,7 @@ agents:
     gateway:
       enabled: false    # set to true + provide url to enable the [gateway] config block
       deploy: true      # set to false to skip Gateway Deployment/Service (config-only mode)
-      url: ""           # e.g. ws://openab-gateway:8080/ws
+      url: ""           # WebSocket URL, e.g. the in-cluster openab-gateway Service
       platform: "telegram"  # default platform when gateway is enabled
       token: ""         # optional shared secret (injected via GATEWAY_WS_TOKEN env var)
       botUsername: ""   # optional, for @mention gating

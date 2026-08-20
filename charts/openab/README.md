@@ -113,6 +113,18 @@ See [`docs/migrate-to-configtoml.md`](../../docs/migrate-to-configtoml.md) for a
 [`docs/adr/configurl-over-helm-rendering.md`](../../docs/adr/configurl-over-helm-rendering.md) for when to prefer `configUrl` instead
 (platform-agnostic — works identically on Kubernetes, ECS, Zeabur, and AgentCore).
 
+For Teams typed scope, put the policy in that raw TOML rather than under the Gateway transport values:
+
+```toml
+[teams]
+allowed_teams = []
+allowed_channels = [] # both empty = all Team channels; otherwise Team OR channel match
+allow_personal = true
+allow_group_chats = true
+```
+
+Presence of any of these four fields opts into typed L2 policy. In Standalone Gateway mode, the policy still belongs to the OpenAB Core `configToml`; `gateway.teams.*` configures transport credentials and reaction preview on the Gateway container.
+
 ### Discord ID precision warning
 
 Discord IDs must be set with `--set-string`, not `--set`. Otherwise Helm may coerce them into numbers and lose precision.
