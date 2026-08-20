@@ -808,9 +808,11 @@ async fn dispatch_batch(
     }
 
     if let Err(ref e) = result {
-        let _ = adapter
-            .send_message(&dispatch_channel, &format!("⚠️ {e}"))
-            .await;
+        if !crate::progressive::is_ambiguous_delivery(e) {
+            let _ = adapter
+                .send_message(&dispatch_channel, &format!("⚠️ {e}"))
+                .await;
+        }
     }
 
     let agent_dispatch_ms = dispatch_start.elapsed().as_millis();

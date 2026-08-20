@@ -139,11 +139,12 @@ pr = ""
 
 [[openab_features]]
 feature = "streaming"
-status = "workaround"
-note = "Teams now supports guarded bot-owned PUT updates, but `streaming_mode` remains `disabled`; ordinary delivery is still send-once. Progressive placeholder/edit lifecycle, failure thresholds, and final fallback remain PR 7 work rather than being enabled implicitly by mutation support."
+status = "partial"
+note = "Default off. With `[teams].streaming = true`, new Core selects edit streaming only when Standalone hello or Unified Teams proves required real-ID send plus bot-owned edit/delete primitives. Each turn owns at most one placeholder, coalesces changed content every 1.5 seconds, and preserves Rejected versus Unknown outcomes during final recovery. Generic Gateway/Telegram streaming cannot enable Teams. Automated coverage passes; Microsoft 365 live validation is pending."
 source = [
-  "crates/openab-core/src/gateway.rs#use_streaming",
-  "crates/openab-gateway/src/adapters/teams.rs#update_activity_outcome",
+  "crates/openab-core/src/adapter.rs#stream_prompt_blocks",
+  "crates/openab-core/src/progressive.rs",
+  "crates/openab-core/src/gateway.rs#apply_teams_progressive_capabilities",
 ]
 pr = ""
 
@@ -253,7 +254,7 @@ pr = ""
 [[openab_features]]
 feature = "multibot"
 status = "partial"
-note = "Core supports multi-bot suppression of streaming (`use_streaming(other_bot_present)`); moot on Teams because streaming edits don't reach it and Teams doesn't deliver other bots' messages anyway."
+note = "Core preserves per-turn multi-bot suppression for Teams progressive response. Teams itself does not deliver other bots' messages to a bot, so live multi-bot behavior remains unverified."
 source = [
   "crates/openab-core/src/gateway.rs#use_streaming",
   "crates/openab-core/src/adapter.rs#use_streaming",
@@ -280,6 +281,13 @@ pr = ""
 
 
 # ═══ Schema 3 — platform-quirks (freeform, dated findings log) ═══════════════
+
+[[quirks]]
+date = "2026-08-08"
+title = "Progressive content uses one outcome-aware placeholder"
+note = "Default off. `[teams].streaming = true` is selected only after real-ID send and bot-owned edit/delete capabilities are proven. One turn reuses one process-local activity ID; cosmetic edits are changed-content-only and stop after three failures. Final PUT Rejected permits bounded delete-plus-fresh-send recovery, while any Unknown suppresses delete, retry, fresh final, and warning activities. Status messages and queued reactions remain separate lifecycles."
+kind = "openab_decision"
+source = "docs/adr/teams-progressive-response.md"
 
 [[quirks]]
 date = "2026-08-07"

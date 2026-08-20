@@ -1349,6 +1349,9 @@ pub struct TeamsConfig {
     /// Opt in to one turn-local processing message. Env fallback:
     /// `TEAMS_PROCESSING_INDICATOR`; default `off`.
     pub processing_indicator: Option<TeamsProcessingIndicator>,
+    /// Opt in to progressive content through one real bot-owned placeholder.
+    /// Env fallback: `TEAMS_STREAMING`; default `false`.
+    pub streaming: Option<bool>,
     /// Team IDs admitted by typed channel scope. Env fallback:
     /// `TEAMS_ALLOWED_TEAMS` (comma-separated). Both scope lists empty = open.
     pub allowed_teams: Option<Vec<String>>,
@@ -1381,6 +1384,7 @@ pub struct ResolvedTeams {
     pub max_route_entries: usize,
     pub reactions_enabled: bool,
     pub processing_indicator: TeamsProcessingIndicator,
+    pub streaming: bool,
     pub allowed_teams: Vec<String>,
     pub allowed_channels: Vec<String>,
     pub allow_personal: bool,
@@ -1432,9 +1436,8 @@ impl TeamsConfig {
         };
         let bool_with_default = |cfg: Option<bool>, env: &str, default: bool| {
             cfg.or_else(|| {
-                // These booleans admit conversation surfaces. An explicitly
-                // present but malformed value must resolve false rather than
-                // use the permissive backward-compatible default.
+                // An explicitly present but malformed switch resolves false.
+                // This is fail-closed for both admitted surfaces and opt-in UX.
                 std::env::var(env)
                     .ok()
                     .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
@@ -1499,6 +1502,7 @@ impl TeamsConfig {
                     .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             }),
             processing_indicator,
+            streaming: bool_with_default(self.streaming, "TEAMS_STREAMING", false),
             allowed_teams: csv(&self.allowed_teams, "TEAMS_ALLOWED_TEAMS"),
             allowed_channels: csv(&self.allowed_channels, "TEAMS_ALLOWED_CHANNELS"),
             allow_personal: bool_with_default(self.allow_personal, "TEAMS_ALLOW_PERSONAL", true),
@@ -3195,6 +3199,7 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
             "TEAMS_MAX_ROUTE_ENTRIES",
             "TEAMS_REACTIONS_ENABLED",
             "TEAMS_PROCESSING_INDICATOR",
+            "TEAMS_STREAMING",
             "TEAMS_ALLOWED_TEAMS",
             "TEAMS_ALLOWED_CHANNELS",
             "TEAMS_ALLOW_PERSONAL",
@@ -3214,6 +3219,7 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         assert_eq!(r.max_route_entries, 10_000);
         assert!(!r.reactions_enabled);
         assert_eq!(r.processing_indicator, TeamsProcessingIndicator::Off);
+        assert!(!r.streaming);
         assert!(r.allowed_teams.is_empty());
         assert!(r.allowed_channels.is_empty());
         assert!(r.allow_personal);
@@ -3236,6 +3242,7 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         std::env::set_var("TEAMS_MAX_ROUTE_ENTRIES", "122");
         std::env::set_var("TEAMS_REACTIONS_ENABLED", "false");
         std::env::set_var("TEAMS_PROCESSING_INDICATOR", "off");
+        std::env::set_var("TEAMS_STREAMING", "false");
         std::env::set_var("TEAMS_ALLOWED_TEAMS", "env-team");
         std::env::set_var("TEAMS_ALLOWED_CHANNELS", "env-channel");
         std::env::set_var("TEAMS_ALLOW_PERSONAL", "false");
@@ -3249,6 +3256,7 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
             max_route_entries: Some(123),
             reactions_enabled: Some(true),
             processing_indicator: Some(TeamsProcessingIndicator::Message),
+            streaming: Some(true),
             allowed_teams: Some(vec!["cfg-team".into()]),
             allowed_channels: Some(vec![]),
             allow_personal: Some(true),
@@ -3267,6 +3275,7 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
             r.processing_indicator,
             TeamsProcessingIndicator::Message
         );
+        assert!(r.streaming);
         assert_eq!(r.allowed_teams, vec!["cfg-team"]);
         assert!(r.allowed_channels.is_empty());
         assert!(r.allow_personal);
@@ -3276,6 +3285,7 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         // --- empty-string ${} expansion falls through to env ---
         std::env::set_var("TEAMS_REACTIONS_ENABLED", "true");
         std::env::set_var("TEAMS_PROCESSING_INDICATOR", "message");
+        std::env::set_var("TEAMS_STREAMING", "true");
         let cfg = TeamsConfig {
             app_id: Some("".into()),
             ..Default::default()
@@ -3291,18 +3301,27 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
             r.processing_indicator,
             TeamsProcessingIndicator::Message
         );
+        assert!(r.streaming);
         assert_eq!(r.allowed_teams, vec!["env-team"]);
         assert_eq!(r.allowed_channels, vec!["env-channel"]);
         assert!(!r.allow_personal);
         assert!(!r.allow_group_chats);
         assert!(r.scope_policy_configured);
 
+        // --- strict numeric boolean forms ---
+        std::env::set_var("TEAMS_STREAMING", "1");
+        assert!(TeamsConfig::default().resolve().streaming);
+        std::env::set_var("TEAMS_STREAMING", "0");
+        assert!(!TeamsConfig::default().resolve().streaming);
+
         // --- malformed switches fail closed ---
         std::env::set_var("TEAMS_ALLOW_PERSONAL", "not-a-boolean");
         std::env::set_var("TEAMS_PROCESSING_INDICATOR", "typing");
+        std::env::set_var("TEAMS_STREAMING", "not-a-boolean");
         let r = TeamsConfig::default().resolve();
         assert!(!r.allow_personal);
         assert_eq!(r.processing_indicator, TeamsProcessingIndicator::Off);
+        assert!(!r.streaming);
         assert!(r.scope_policy_configured);
 
         // --- trust_config() view ---
@@ -3326,6 +3345,7 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
             "TEAMS_MAX_ROUTE_ENTRIES",
             "TEAMS_REACTIONS_ENABLED",
             "TEAMS_PROCESSING_INDICATOR",
+            "TEAMS_STREAMING",
             "TEAMS_ALLOWED_TEAMS",
             "TEAMS_ALLOWED_CHANNELS",
             "TEAMS_ALLOW_PERSONAL",
@@ -3343,6 +3363,12 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         )
         .unwrap_err();
         assert!(error.to_string().contains("processing_indicator"));
+    }
+
+    #[test]
+    fn teams_streaming_rejects_non_boolean_toml_value() {
+        let error = parse_config("[teams]\nstreaming = \"yes\"\n", "test").unwrap_err();
+        assert!(error.to_string().contains("streaming"));
     }
 
     #[test]

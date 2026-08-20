@@ -3,6 +3,8 @@ gateway/target/
 config.toml
 *.swp
 .DS_Store
+__pycache__/
+*.py[cod]
 .env
 .kiro/
 

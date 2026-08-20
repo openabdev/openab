@@ -1,7 +1,7 @@
 use crate::acp::ContentBlock;
 use crate::adapter::{
     AdapterCapabilities, AdapterRouter, ChannelRef, ChatAdapter, MessageLimit, MessageRef,
-    SenderContext, StatusBackend, StreamingMode, WriteOutcome, WriteOutcomeKind,
+    SenderContext, StatusBackend, StreamingMode, WriteFailure, WriteOutcome, WriteOutcomeKind,
 };
 use anyhow::Result;
 use async_trait::async_trait;
@@ -14,6 +14,17 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
 const LEGACY_GATEWAY_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn write_failure(outcome: WriteOutcome) -> anyhow::Error {
+    WriteFailure::new(outcome).into()
+}
+
+fn unknown_write_failure(code: &str, message: impl Into<String>) -> anyhow::Error {
+    write_failure(WriteOutcome::Unknown {
+        code: code.to_owned(),
+        message: message.into(),
+    })
+}
 
 fn command_target_fields(
     msg: &MessageRef,
@@ -83,6 +94,35 @@ fn teams_message_status_supported(
 fn normalize_reaction_support(capabilities: &mut AdapterCapabilities) {
     capabilities.supports_reactions |=
         capabilities.status_backend == StatusBackend::Reactions;
+}
+
+fn teams_progressive_response_supported(
+    negotiated: bool,
+    capabilities: &AdapterCapabilities,
+) -> bool {
+    negotiated
+        && capabilities.send_ack
+        && capabilities.edit_ack
+        && capabilities.delete_ack
+        && capabilities.supports_target_message_id
+        && capabilities.can_edit
+        && capabilities.can_delete
+        && capabilities.show_streaming_placeholder
+}
+
+/// Apply the same fail-closed Teams progressive-response predicate in
+/// Standalone and Unified deployment modes.
+pub fn apply_teams_progressive_capabilities(
+    available: bool,
+    enabled: bool,
+    capabilities: &mut AdapterCapabilities,
+) {
+    capabilities.streaming_mode =
+        if enabled && teams_progressive_response_supported(available, capabilities) {
+            StreamingMode::Edit
+        } else {
+            StreamingMode::Disabled
+        };
 }
 
 fn apply_teams_processing_indicator(
@@ -593,6 +633,7 @@ struct GatewayAdapterOptions {
     streaming_placeholder: bool,
     telegram_rich_messages: bool,
     teams_processing_indicator: bool,
+    teams_streaming: bool,
     gateway_ack_timeout_secs: u64,
 }
 
@@ -606,6 +647,7 @@ pub struct GatewayAdapter {
     streaming_placeholder: bool,
     telegram_rich_messages: bool,
     teams_processing_indicator: bool,
+    teams_streaming: bool,
     ack_timeout: std::time::Duration,
 }
 
@@ -622,6 +664,7 @@ impl GatewayAdapter {
             streaming_placeholder,
             telegram_rich_messages,
             teams_processing_indicator,
+            teams_streaming,
             gateway_ack_timeout_secs,
         } = options;
         Self {
@@ -638,6 +681,7 @@ impl GatewayAdapter {
             streaming_placeholder,
             telegram_rich_messages,
             teams_processing_indicator,
+            teams_streaming,
             ack_timeout: std::time::Duration::from_secs(gateway_ack_timeout_secs.max(1)),
         }
     }
@@ -646,15 +690,26 @@ impl GatewayAdapter {
         let (negotiated, mut capabilities) = self
             .capability_state
             .resolve(platform, &self.legacy_capabilities);
-        if !self.streaming {
-            capabilities.streaming_mode = StreamingMode::Disabled;
+        let teams = platform.eq_ignore_ascii_case("teams");
+        if teams {
+            // Teams has an independent default-off opt-in. Do not inherit the
+            // generic Gateway streaming or placeholder switches.
+            apply_teams_progressive_capabilities(
+                negotiated,
+                self.teams_streaming,
+                &mut capabilities,
+            );
+        } else {
+            if !self.streaming {
+                capabilities.streaming_mode = StreamingMode::Disabled;
+            }
+            capabilities.show_streaming_placeholder &= self.streaming_placeholder;
         }
-        capabilities.show_streaming_placeholder &= self.streaming_placeholder;
         // Older peers represented reaction availability only through the
         // selected status backend. Normalize that shape before a configured
         // processing message overrides transient progress selection.
         normalize_reaction_support(&mut capabilities);
-        if platform.eq_ignore_ascii_case("teams") {
+        if teams {
             apply_teams_processing_indicator(
                 negotiated,
                 self.teams_processing_indicator,
@@ -710,7 +765,7 @@ impl GatewayAdapter {
             if let Some(ref id) = req_id {
                 self.pending.lock().await.remove(id);
             }
-            return Err(e.into());
+            return Err(unknown_write_failure("gateway_send_failed", e.to_string()));
         }
         let msg_id = if let (Some(rx), Some(ref id)) = (pending_rx, &req_id) {
             let response_timeout = if required_ack {
@@ -723,8 +778,9 @@ impl GatewayAdapter {
                     WriteOutcome::Delivered { message_id } => match message_id {
                         Some(message_id) if !message_id.is_empty() => message_id,
                         _ if required_ack => {
-                            return Err(anyhow::anyhow!(
-                                "gateway delivered send without a message id"
+                            return Err(unknown_write_failure(
+                                "missing_message_id",
+                                "gateway delivered send without a message id",
                             ));
                         }
                         _ => "gw_sent".into(),
@@ -741,9 +797,11 @@ impl GatewayAdapter {
                             error = %message,
                             "gateway rejected write"
                         );
-                        return Err(anyhow::anyhow!(
-                            "gateway rejected write ({code}): {message}"
-                        ));
+                        return Err(write_failure(WriteOutcome::Rejected {
+                            code,
+                            message,
+                            retry_after_ms,
+                        }));
                     }
                     WriteOutcome::Unknown { code, message } => {
                         warn!(
@@ -752,13 +810,14 @@ impl GatewayAdapter {
                             error = %message,
                             "gateway write outcome unknown; not retrying"
                         );
-                        return Err(anyhow::anyhow!(
-                            "gateway write outcome unknown ({code}): {message}"
-                        ));
+                        return Err(write_failure(WriteOutcome::Unknown { code, message }));
                     }
                 },
                 Ok(Err(_)) if required_ack => {
-                    return Err(anyhow::anyhow!("required gateway ACK channel closed"));
+                    return Err(unknown_write_failure(
+                        "send_ack_channel_closed",
+                        "required gateway ACK channel closed",
+                    ));
                 }
                 Ok(Err(_)) => {
                     warn!(request_id = %id, "legacy gateway response channel closed");
@@ -766,7 +825,10 @@ impl GatewayAdapter {
                 }
                 Err(_) if required_ack => {
                     self.pending.lock().await.remove(id);
-                    return Err(anyhow::anyhow!("required gateway ACK timed out"));
+                    return Err(unknown_write_failure(
+                        "send_ack_timeout",
+                        "required gateway ACK timed out",
+                    ));
                 }
                 Err(_) => {
                     warn!(request_id = %id, "legacy gateway reply timed out");
@@ -1126,31 +1188,46 @@ impl ChatAdapter for GatewayAdapter {
             if let Some(ref id) = req_id {
                 self.pending.lock().await.remove(id);
             }
-            return Err(e.into());
+            return Err(unknown_write_failure(
+                "gateway_edit_send_failed",
+                e.to_string(),
+            ));
         }
         if let (Some(rx), Some(ref id)) = (pending_rx, &req_id) {
             match tokio::time::timeout(response_timeout, rx).await {
                 Ok(Ok(resp)) => match resp.write_outcome() {
                     WriteOutcome::Delivered { .. } => Ok(()),
-                    WriteOutcome::Rejected { code, message, .. } => {
+                    WriteOutcome::Rejected {
+                        code,
+                        message,
+                        retry_after_ms,
+                    } => {
                         warn!(request_id = %id, error_code = %code, error = %message, "gateway rejected edit");
-                        Err(anyhow::anyhow!("edit rejected ({code}): {message}"))
+                        Err(write_failure(WriteOutcome::Rejected {
+                            code,
+                            message,
+                            retry_after_ms,
+                        }))
                     }
                     WriteOutcome::Unknown { code, message } => {
                         warn!(request_id = %id, error_code = %code, error = %message, "gateway edit outcome unknown");
-                        Err(anyhow::anyhow!("edit outcome unknown ({code}): {message}"))
+                        Err(write_failure(WriteOutcome::Unknown { code, message }))
                     }
                 },
-                Ok(Err(_)) if required_ack => {
-                    Err(anyhow::anyhow!("required edit ACK channel closed"))
-                }
+                Ok(Err(_)) if required_ack => Err(unknown_write_failure(
+                    "edit_ack_channel_closed",
+                    "required edit ACK channel closed",
+                )),
                 Ok(Err(_)) => {
                     tracing::debug!(request_id = %id, "legacy edit response channel closed");
                     Ok(())
                 }
                 Err(_) if required_ack => {
                     self.pending.lock().await.remove(id);
-                    Err(anyhow::anyhow!("required edit ACK timed out"))
+                    Err(unknown_write_failure(
+                        "edit_ack_timeout",
+                        "required edit ACK timed out",
+                    ))
                 }
                 Err(_) => {
                     // Legacy Feishu used a short best-effort observation window;
@@ -1210,7 +1287,10 @@ impl ChatAdapter for GatewayAdapter {
             if let Some(ref id) = request_id {
                 self.pending.lock().await.remove(id);
             }
-            return Err(error.into());
+            return Err(unknown_write_failure(
+                "gateway_delete_send_failed",
+                error.to_string(),
+            ));
         }
 
         let (Some(rx), Some(id)) = (pending_rx, request_id) else {
@@ -1219,21 +1299,33 @@ impl ChatAdapter for GatewayAdapter {
         match tokio::time::timeout(self.ack_timeout, rx).await {
             Ok(Ok(response)) => match response.write_outcome() {
                 WriteOutcome::Delivered { .. } => Ok(()),
-                WriteOutcome::Rejected { code, message, .. } => {
+                WriteOutcome::Rejected {
+                    code,
+                    message,
+                    retry_after_ms,
+                } => {
                     warn!(request_id = %id, error_code = %code, error = %message, "gateway rejected delete");
-                    Err(anyhow::anyhow!("delete rejected ({code}): {message}"))
+                    Err(write_failure(WriteOutcome::Rejected {
+                        code,
+                        message,
+                        retry_after_ms,
+                    }))
                 }
                 WriteOutcome::Unknown { code, message } => {
                     warn!(request_id = %id, error_code = %code, error = %message, "gateway delete outcome unknown");
-                    Err(anyhow::anyhow!(
-                        "delete outcome unknown ({code}): {message}"
-                    ))
+                    Err(write_failure(WriteOutcome::Unknown { code, message }))
                 }
             },
-            Ok(Err(_)) => Err(anyhow::anyhow!("required delete ACK channel closed")),
+            Ok(Err(_)) => Err(unknown_write_failure(
+                "delete_ack_channel_closed",
+                "required delete ACK channel closed",
+            )),
             Err(_) => {
                 self.pending.lock().await.remove(&id);
-                Err(anyhow::anyhow!("required delete ACK timed out"))
+                Err(unknown_write_failure(
+                    "delete_ack_timeout",
+                    "required delete ACK timed out",
+                ))
             }
         }
     }
@@ -1275,6 +1367,7 @@ pub struct GatewayParams {
     pub streaming_placeholder: bool,
     pub telegram_rich_messages: bool,
     pub teams_processing_indicator: bool,
+    pub teams_streaming: bool,
     pub gateway_ack_timeout_secs: u64,
     pub stt: crate::config::SttConfig,
     pub teams_scope_policy: TeamsScopePolicy,
@@ -1301,6 +1394,7 @@ pub async fn run_gateway_adapter(
     let streaming_placeholder = params.streaming_placeholder;
     let telegram_rich_messages = params.telegram_rich_messages;
     let teams_processing_indicator = params.teams_processing_indicator;
+    let teams_streaming = params.teams_streaming;
     let gateway_ack_timeout_secs = params.gateway_ack_timeout_secs;
     let stt_config = params.stt;
     let teams_scope_policy = params.teams_scope_policy;
@@ -1363,6 +1457,7 @@ pub async fn run_gateway_adapter(
                 streaming_placeholder,
                 telegram_rich_messages,
                 teams_processing_indicator,
+                teams_streaming,
                 gateway_ack_timeout_secs,
             },
         ));
@@ -2278,7 +2373,6 @@ mod tests {
             "feishu",
             "googlechat",
             "wecom",
-            "teams",
         ] {
             let capabilities = legacy_gateway_capabilities(platform, true, true);
             assert!(capabilities.can_edit, "{platform} should advertise edit");
@@ -2338,6 +2432,50 @@ mod tests {
         apply_teams_processing_indicator(true, true, &mut capabilities);
         assert_eq!(capabilities.status_backend, StatusBackend::Message);
         assert!(capabilities.supports_reactions);
+    }
+
+    #[test]
+    fn teams_progressive_response_requires_all_negotiated_write_primitives() {
+        let supported = AdapterCapabilities {
+            send_ack: true,
+            edit_ack: true,
+            delete_ack: true,
+            supports_target_message_id: true,
+            can_edit: true,
+            can_delete: true,
+            show_streaming_placeholder: true,
+            ..AdapterCapabilities::default()
+        };
+
+        let mut before_hello = supported.clone();
+        before_hello.streaming_mode = StreamingMode::Edit;
+        apply_teams_progressive_capabilities(false, true, &mut before_hello);
+        assert_eq!(before_hello.streaming_mode, StreamingMode::Disabled);
+
+        let mut disabled = supported.clone();
+        apply_teams_progressive_capabilities(true, false, &mut disabled);
+        assert_eq!(disabled.streaming_mode, StreamingMode::Disabled);
+
+        for missing in 0..7 {
+            let mut capabilities = supported.clone();
+            match missing {
+                0 => capabilities.send_ack = false,
+                1 => capabilities.edit_ack = false,
+                2 => capabilities.delete_ack = false,
+                3 => capabilities.supports_target_message_id = false,
+                4 => capabilities.can_edit = false,
+                5 => capabilities.can_delete = false,
+                6 => capabilities.show_streaming_placeholder = false,
+                _ => unreachable!(),
+            }
+            apply_teams_progressive_capabilities(true, true, &mut capabilities);
+            assert_eq!(capabilities.streaming_mode, StreamingMode::Disabled);
+        }
+
+        let mut capabilities = supported;
+        apply_teams_progressive_capabilities(true, true, &mut capabilities);
+        assert_eq!(capabilities.streaming_mode, StreamingMode::Edit);
+        assert!(capabilities.show_streaming_placeholder);
     }
 
     #[test]

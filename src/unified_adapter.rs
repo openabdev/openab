@@ -8,6 +8,9 @@ use openab_core::adapter::{
     StreamingMode,
 };
 #[cfg(feature = "teams")]
+use openab_core::adapter::{WriteFailure, WriteOutcome as CoreWriteOutcome};
+use openab_core::gateway::apply_teams_progressive_capabilities;
+#[cfg(feature = "teams")]
 use openab_gateway::schema::WriteOutcome;
 use openab_gateway::schema::{Content, GatewayReply, ReplyChannel};
 use openab_gateway::AppState;
@@ -22,6 +25,8 @@ pub struct UnifiedGatewayAdapter {
     /// Core-side opt-in. Teams processing messages reuse the existing real-ID
     /// send/edit/delete primitives and remain independent from reaction preview.
     teams_processing_indicator: bool,
+    /// Core-side default-off Teams progressive-content policy.
+    teams_streaming: bool,
 }
 
 impl UnifiedGatewayAdapter {
@@ -30,11 +35,17 @@ impl UnifiedGatewayAdapter {
             gw_state,
             telegram_reaction_state: Arc::new(Mutex::new(HashMap::new())),
             teams_processing_indicator: false,
+            teams_streaming: false,
         }
     }
 
     pub fn with_teams_processing_indicator(mut self, enabled: bool) -> Self {
         self.teams_processing_indicator = enabled;
+        self
+    }
+
+    pub fn with_teams_streaming(mut self, enabled: bool) -> Self {
+        self.teams_streaming = enabled;
         self
     }
 
@@ -143,16 +154,27 @@ impl UnifiedGatewayAdapter {
             WriteOutcome::Delivered {
                 message_id: Some(message_id),
             } => Ok(Some(message_id)),
-            WriteOutcome::Delivered { message_id: None } if require_message_id => Err(
-                anyhow::anyhow!("Teams delivered send without an activity id"),
-            ),
-            WriteOutcome::Delivered { message_id: None } => Ok(None),
-            WriteOutcome::Rejected { code, message, .. } => {
-                Err(anyhow::anyhow!("Teams rejected write ({code}): {message}"))
+            WriteOutcome::Delivered { message_id: None } if require_message_id => {
+                Err(WriteFailure::new(CoreWriteOutcome::Unknown {
+                    code: "missing_message_id".into(),
+                    message: "Teams delivered send without an activity id".into(),
+                })
+                .into())
             }
-            WriteOutcome::Unknown { code, message } => Err(anyhow::anyhow!(
-                "Teams write outcome unknown ({code}): {message}"
-            )),
+            WriteOutcome::Delivered { message_id: None } => Ok(None),
+            WriteOutcome::Rejected {
+                code,
+                message,
+                retry_after_ms,
+            } => Err(WriteFailure::new(CoreWriteOutcome::Rejected {
+                code,
+                message,
+                retry_after_ms,
+            })
+            .into()),
+            WriteOutcome::Unknown { code, message } => {
+                Err(WriteFailure::new(CoreWriteOutcome::Unknown { code, message }).into())
+            }
         }
     }
 
@@ -222,6 +244,10 @@ impl ChatAdapter for UnifiedGatewayAdapter {
             .telegram_streaming
             .unwrap_or(self.gw_state.telegram_rich_messages);
         #[cfg(feature = "teams")]
+        let teams_available = self.gw_state.teams.is_some();
+        #[cfg(not(feature = "teams"))]
+        let teams_available = false;
+        #[cfg(feature = "teams")]
         let teams_reactions = self
             .gw_state
             .teams
@@ -242,9 +268,9 @@ impl ChatAdapter for UnifiedGatewayAdapter {
                     true,
                     StatusBackend::Reactions,
                 ),
-            // Unified mode currently has no per-platform streaming switch for
-            // these adapters. Keep them send-once rather than inheriting the
-            // unrelated Telegram setting.
+                // Unified mode currently has no per-platform streaming switch for
+                // these adapters. Keep them send-once rather than inheriting the
+                // unrelated Telegram setting.
                 "feishu" => (
                     true,
                     true,
@@ -271,7 +297,7 @@ impl ChatAdapter for UnifiedGatewayAdapter {
                     cfg!(feature = "teams"),
                     StreamingMode::Disabled,
                     teams_reactions,
-                    if self.teams_processing_indicator && self.gw_state.teams.is_some() {
+                    if self.teams_processing_indicator && teams_available {
                         StatusBackend::Message
                     } else if teams_reactions {
                         StatusBackend::Reactions
@@ -294,7 +320,7 @@ impl ChatAdapter for UnifiedGatewayAdapter {
                     StatusBackend::Reactions,
                 ),
             };
-        AdapterCapabilities {
+        let mut capabilities = AdapterCapabilities {
             send_ack: cfg!(feature = "teams") && platform == "teams",
             edit_ack: cfg!(feature = "teams") && platform == "teams",
             delete_ack: cfg!(feature = "teams") && platform == "teams",
@@ -312,7 +338,15 @@ impl ChatAdapter for UnifiedGatewayAdapter {
                 _ => MessageLimit::Characters { max: 4096 },
             },
             status_backend,
+        };
+        if platform == "teams" {
+            apply_teams_progressive_capabilities(
+                teams_available,
+                self.teams_streaming,
+                &mut capabilities,
+            );
         }
+        capabilities
     }
 
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
@@ -438,6 +472,14 @@ mod tests {
         assert!(capabilities.delete_ack);
         assert!(capabilities.supports_target_message_id);
         assert_eq!(capabilities.streaming_mode, StreamingMode::Disabled);
+        assert_eq!(
+            adapter
+                .with_teams_streaming(true)
+                .capabilities("teams")
+                .streaming_mode,
+            StreamingMode::Disabled,
+            "an opt-in without an embedded Teams adapter must fail closed"
+        );
         assert!(capabilities.can_edit);
         assert!(capabilities.can_delete);
         assert!(!capabilities.supports_reactions);
@@ -467,13 +509,14 @@ mod tests {
             StatusBackend::Reactions
         );
 
-        let message_adapter = adapter.with_teams_processing_indicator(true);
+        let message_adapter = adapter
+            .with_teams_processing_indicator(true)
+            .with_teams_streaming(true);
         let message_capabilities = message_adapter.capabilities("teams");
         assert!(message_capabilities.supports_reactions);
-        assert_eq!(
-            message_capabilities.status_backend,
-            StatusBackend::Message
-        );
+        assert_eq!(message_capabilities.status_backend, StatusBackend::Message);
+        assert_eq!(message_capabilities.streaming_mode, StreamingMode::Edit);
+        assert!(message_capabilities.show_streaming_placeholder);
     }
 
     #[cfg(feature = "teams")]
@@ -500,7 +543,7 @@ mod tests {
             )?,
             None
         );
-        assert!(UnifiedGatewayAdapter::teams_outcome_result(
+        let rejected = UnifiedGatewayAdapter::teams_outcome_result(
             WriteOutcome::Rejected {
                 code: "route_not_found".into(),
                 message: "missing".into(),
@@ -508,15 +551,24 @@ mod tests {
             },
             true,
         )
-        .is_err());
-        assert!(UnifiedGatewayAdapter::teams_outcome_result(
+        .unwrap_err();
+        assert!(matches!(
+            &rejected.downcast_ref::<WriteFailure>().unwrap().outcome,
+            CoreWriteOutcome::Rejected { code, .. } if code == "route_not_found"
+        ));
+
+        let unknown = UnifiedGatewayAdapter::teams_outcome_result(
             WriteOutcome::Unknown {
                 code: "request_timeout".into(),
                 message: "ambiguous".into(),
             },
             true,
         )
-        .is_err());
+        .unwrap_err();
+        assert!(matches!(
+            &unknown.downcast_ref::<WriteFailure>().unwrap().outcome,
+            CoreWriteOutcome::Unknown { code, .. } if code == "request_timeout"
+        ));
         Ok(())
     }
 

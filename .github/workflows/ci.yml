@@ -6,6 +6,9 @@ on:
       - "src/**"
       - "crates/**"
       - "operator/**"
+      - "scripts/teams-ack-drop-proxy.py"
+      - "scripts/test-teams-ack-drop-proxy.py"
+      - ".github/workflows/ci.yml"
       - "Cargo.toml"
       - "Cargo.lock"
       - "Dockerfile*"
@@ -13,31 +16,41 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   changes:
     runs-on: ubuntu-latest
     outputs:
       core: ${{ steps.filter.outputs.core }}
       operator: ${{ steps.filter.outputs.operator }}
+      teams_ack_proxy: ${{ steps.filter.outputs.teams_ack_proxy }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           fetch-depth: 0
+          persist-credentials: false
       - id: filter
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
           HEAD: ${{ github.event.pull_request.head.sha }}
         run: |
           CHANGED=$(git diff --name-only "$BASE" "$HEAD")
-          echo "core=$(echo "$CHANGED" | grep -qE '^(src/|crates/|Cargo\.(toml|lock))' && echo true || echo false)" >> "$GITHUB_OUTPUT"
-          echo "operator=$(echo "$CHANGED" | grep -q '^operator/' && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          {
+            echo "core=$(echo "$CHANGED" | grep -qE '^(src/|crates/|Cargo\.(toml|lock)|\.github/workflows/ci\.yml$)' && echo true || echo false)"
+            echo "operator=$(echo "$CHANGED" | grep -q '^operator/' && echo true || echo false)"
+            echo "teams_ack_proxy=$(echo "$CHANGED" | grep -qE '^(scripts/(teams-ack-drop-proxy|test-teams-ack-drop-proxy)\.py|\.github/workflows/ci\.yml)$' && echo true || echo false)"
+          } >> "$GITHUB_OUTPUT"
 
   check:
     needs: changes
     if: needs.changes.outputs.core == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable (2026-07-13)
         with:
           components: clippy
@@ -94,6 +107,20 @@ jobs:
       - name: cargo build (unified)
         run: cargo build --features unified
 
+  teams-ack-proxy:
+    needs: changes
+    if: needs.changes.outputs.teams_ack_proxy == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Test bounded Teams ACK-drop proxy
+        run: |
+          set -euo pipefail
+          python3 -m py_compile scripts/teams-ack-drop-proxy.py scripts/test-teams-ack-drop-proxy.py
+          python3 -W error::ResourceWarning scripts/test-teams-ack-drop-proxy.py
+
   operator:
     needs: changes
     if: needs.changes.outputs.operator == 'true'
@@ -102,7 +129,9 @@ jobs:
       run:
         working-directory: operator
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable (2026-07-13)
         with:
           components: clippy

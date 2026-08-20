@@ -237,6 +237,7 @@ agents:
       allow_group_chats = false
       # reactions_enabled = true # public-preview live-tenant test only
       # processing_indicator = "message" # default off; no Graph/RSC
+      # streaming = true # default off; progressive bot-owned content edits
 
       [agent]
       command = "kiro-cli"
@@ -519,6 +520,7 @@ agents:
       allow_personal = true
       allow_group_chats = false
       processing_indicator = "off" # set "message" after Gateway capability validation
+      streaming = false # enable only after Gateway capability validation
       allowed_users = ["29:1abc..."]
 
       [agent]
@@ -632,6 +634,7 @@ set transport variables on the Gateway through `openab-gateway-teams`. Typed sco
 | `TEAMS_MAX_ROUTE_ENTRIES` | No | `10000` | Independent capacity bound for route, dedupe, and bot-owned activity caches |
 | `TEAMS_REACTIONS_ENABLED` | No | `false` | Opt in to public-preview Bot Connector add/remove reactions; no Graph/RSC grant required |
 | `TEAMS_PROCESSING_INDICATOR` | No | `off` | Core processing UX: `off` or `message`; malformed values fail closed to `off` |
+| `TEAMS_STREAMING` | No | `false` | Core progressive-content opt-in; accepts only `true`/`false` or `1`/`0`, malformed values fail closed |
 | `TEAMS_ALLOWED_TEAMS` | No | (empty) | Core typed L2 Team-ID allowlist, comma-separated; Team OR channel match |
 | `TEAMS_ALLOWED_CHANNELS` | No | (empty) | Core typed L2 channel-ID allowlist, comma-separated; both lists empty means all Team channels |
 | `TEAMS_ALLOW_PERSONAL` | No | `true` | Core typed L2 Personal-chat switch |
@@ -714,6 +717,14 @@ send plus bot-owned edit/delete ACK support. Each turn creates at most one
 status activity, marks it terminal before final delivery, and deletes it after
 all final chunks succeed. Do not count a request-access echo as a processing
 indicator; L3 `[teams].allowed_users` remains an independent prerequisite.
+
+For the progressive-content path, set `[teams].streaming = true` on Core. It is
+independent of the processing indicator and reaction preview, and remains off
+unless Standalone hello (or Unified Teams) proves required send/edit/delete ACK,
+real target IDs, and placeholder support. One admitted turn owns at most one
+content placeholder. Unknown write outcomes are intentionally not retried and
+do not trigger a fresh warning/final activity. The implementation uses only Bot
+Connector POST/PUT/DELETE; Microsoft 365 live validation remains pending.
 
 > **Release validation:** Before marking Teams PR 3／PR 4 complete, record
 > personal, group-chat, channel-root, channel-reply, explicit-quote, and

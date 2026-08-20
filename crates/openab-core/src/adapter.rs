@@ -9,6 +9,12 @@ use crate::config::{ReactionsConfig, ToolDisplay};
 use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
 use crate::markdown::{self, TableMode};
+use crate::progressive::{
+    classify_placeholder, deliver_explicit_reply_chunks, deliver_fresh_chunks,
+    finalize_edit_after_cosmetic, finalize_explicit_reply, is_ambiguous_delivery,
+    AmbiguousProgressiveDelivery, CosmeticEditOutcome, CosmeticEditState, PlaceholderStart,
+    COSMETIC_EDIT_INTERVAL,
+};
 use crate::reactions::StatusReactionController;
 use crate::status::{StatusMessageController, StatusTerminal};
 
@@ -424,6 +430,46 @@ pub enum WriteOutcome {
     },
 }
 
+/// Preserve a structured platform write outcome through legacy `Result` trait
+/// methods. Progressive finalization downcasts this error instead of treating
+/// every failure as safe for delete-and-fresh-send recovery.
+#[derive(Clone, Debug)]
+pub struct WriteFailure {
+    pub outcome: WriteOutcome,
+}
+
+impl WriteFailure {
+    pub fn new(outcome: WriteOutcome) -> Self {
+        Self { outcome }
+    }
+}
+
+impl std::fmt::Display for WriteFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.outcome {
+            WriteOutcome::Delivered { .. } => write!(f, "unexpected delivered write failure"),
+            WriteOutcome::Rejected { code, message, .. } => {
+                write!(f, "write rejected ({code}): {message}")
+            }
+            WriteOutcome::Unknown { code, message } => {
+                write!(f, "write outcome unknown ({code}): {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for WriteFailure {}
+
+fn failed_write_outcome(operation: &str, error: &anyhow::Error) -> WriteOutcome {
+    error
+        .downcast_ref::<WriteFailure>()
+        .map(|failure| failure.outcome.clone())
+        .unwrap_or_else(|| WriteOutcome::Unknown {
+            code: format!("{operation}_adapter_error"),
+            message: error.to_string(),
+        })
+}
+
 /// Stable wire discriminator carried by additive GatewayResponse fields.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -483,6 +529,16 @@ pub trait ChatAdapter: Send + Sync + 'static {
     /// Send a new message, returns a reference to the sent message.
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef>;
 
+    /// Outcome-preserving send used by duplicate-safe progressive delivery.
+    async fn send_message_outcome(&self, channel: &ChannelRef, content: &str) -> WriteOutcome {
+        match self.send_message(channel, content).await {
+            Ok(message) => WriteOutcome::Delivered {
+                message_id: Some(message.message_id),
+            },
+            Err(error) => failed_write_outcome("send", &error),
+        }
+    }
+
     /// Create a thread from a trigger message, returns the thread channel ref.
     async fn create_thread(
         &self,
@@ -503,6 +559,14 @@ pub trait ChatAdapter: Send + Sync + 'static {
         Err(anyhow::anyhow!("edit_message not supported"))
     }
 
+    /// Outcome-preserving edit used by authoritative finalization.
+    async fn edit_message_outcome(&self, msg: &MessageRef, content: &str) -> WriteOutcome {
+        match self.edit_message(msg, content).await {
+            Ok(()) => WriteOutcome::Delivered { message_id: None },
+            Err(error) => failed_write_outcome("edit", &error),
+        }
+    }
+
     /// Send a message as a reply to a specific message (Discord: message_reference).
     /// Default: falls back to plain send_message (ignores reply_to).
     async fn send_message_with_reply(
@@ -515,6 +579,24 @@ pub trait ChatAdapter: Send + Sync + 'static {
         self.send_message(channel, content).await
     }
 
+    /// Outcome-preserving explicit reply send.
+    async fn send_message_with_reply_outcome(
+        &self,
+        channel: &ChannelRef,
+        content: &str,
+        reply_to_message_id: &str,
+    ) -> WriteOutcome {
+        match self
+            .send_message_with_reply(channel, content, reply_to_message_id)
+            .await
+        {
+            Ok(message) => WriteOutcome::Delivered {
+                message_id: Some(message.message_id),
+            },
+            Err(error) => failed_write_outcome("reply_send", &error),
+        }
+    }
+
     /// Rename the thread/channel title. Default: no-op (not all platforms support it).
     async fn rename_thread(&self, _channel: &ChannelRef, _title: &str) -> Result<()> {
         Ok(())
@@ -524,6 +606,14 @@ pub trait ChatAdapter: Send + Sync + 'static {
     /// Default: edits to zero-width space (fallback for platforms without delete support).
     async fn delete_message(&self, msg: &MessageRef) -> Result<()> {
         self.edit_message(msg, "\u{200b}").await
+    }
+
+    /// Outcome-preserving delete used by progressive recovery.
+    async fn delete_message_outcome(&self, msg: &MessageRef) -> WriteOutcome {
+        match self.delete_message(msg).await {
+            Ok(()) => WriteOutcome::Delivered { message_id: None },
+            Err(error) => failed_write_outcome("delete", &error),
+        }
     }
 
     /// Whether this adapter streams via a native streaming API (Slack
@@ -622,6 +712,24 @@ pub struct AdapterRouter {
     /// [`AdapterRouter::with_trust`]; empty default = deny-all per platform
     /// (only consulted by paths wired to the gate — currently the gateway path).
     trust: crate::trust::PlatformTrustConfigs,
+}
+
+fn use_structured_progressive(
+    platform: &str,
+    streaming: bool,
+    native: bool,
+    capabilities: &AdapterCapabilities,
+) -> bool {
+    platform == "teams"
+        && streaming
+        && !native
+        && capabilities.send_ack
+        && capabilities.edit_ack
+        && capabilities.delete_ack
+        && capabilities.supports_target_message_id
+        && capabilities.can_edit
+        && capabilities.can_delete
+        && capabilities.show_streaming_placeholder
 }
 
 impl AdapterRouter {
@@ -825,9 +933,11 @@ impl AdapterRouter {
         }
 
         if let Err(ref e) = result {
-            let _ = adapter
-                .send_message(&ctx.thread_channel, &format!("⚠️ {e}"))
-                .await;
+            if !is_ambiguous_delivery(e) {
+                let _ = adapter
+                    .send_message(&ctx.thread_channel, &format!("⚠️ {e}"))
+                    .await;
+            }
         }
 
         result
@@ -887,8 +997,11 @@ impl AdapterRouter {
         // Platform-agnostic — read from the shared reactions config, alongside
         // `tool_display`. `streaming` still drives the placeholder / native-stream
         // paths below; only the final-text selection uses `keep_full_text`.
-        let keep_full_text = streaming || self.reactions_config.narration_display;
+        let narration_display = self.reactions_config.narration_display;
+        let keep_full_text = streaming || narration_display;
         let native = streaming && capabilities.streaming_mode == StreamingMode::Native;
+        let structured_progressive =
+            use_structured_progressive(&thread_channel.platform, streaming, native, &capabilities);
         let assistant_status = capabilities.status_backend == StatusBackend::Assistant;
         let reaction_status = capabilities.status_backend == StatusBackend::Reactions;
         let message_status_enabled = capabilities.status_backend == StatusBackend::Message;
@@ -953,91 +1066,145 @@ impl AdapterRouter {
                     let mut native_last_flush = tokio::time::Instant::now();
                     const NATIVE_FLUSH_MS: u128 = 400;
 
-                    // Streaming edit: send placeholder, spawn edit loop
-                    let (buf_tx, placeholder_msg, edit_handle) = if streaming && !native {
-                        let initial = if reset {
-                            "⚠️ _Session expired, starting fresh..._\n\n…".to_string()
-                        } else {
-                            "…".to_string()
-                        };
-                        let msg = if capabilities.show_streaming_placeholder {
-                            adapter.send_message(&thread_channel, &initial).await?
-                        } else {
-                            // Dummy ref for edit loop — gateway uses drafts, doesn't need real msg_id
-                            MessageRef {
-                                message_id: "draft".to_string(),
-                                channel: thread_channel.clone(),
-                            }
-                        };
-                        let (tx, rx) = tokio::sync::watch::channel(initial);
-                        let edit_adapter = adapter.clone();
-                        let edit_msg = msg.clone();
-                        let limit = message_limit;
-                        let mut buf_rx = rx;
-                        let edit_handle = tokio::spawn(async move {
-                            let mut last = String::new();
-                            // Track consecutive edit failures so we can abort cosmetic
-                            // streaming when the platform stops accepting edits (e.g.
-                            // Feishu's 20-edits-per-message hard cap, errcode 230072).
-                            // Once aborted, the final delivery path still runs and the
-                            // user sees the complete content at turn end.
-                            let mut consecutive_failures: u32 = 0;
-                            const MAX_CONSECUTIVE_FAILURES: u32 = 3;
-                            loop {
-                                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-                                if buf_rx.has_changed().unwrap_or(false) {
-                                    let content = buf_rx.borrow_and_update().clone();
-                                    if content != last {
-                                        let display = if content.chars().count() > limit - 100 {
-                                            format!(
-                                                "…{}",
-                                                format::truncate_chars_tail(&content, limit - 100)
-                                            )
-                                        } else {
-                                            content.clone()
-                                        };
-                                        match edit_adapter
-                                            .edit_message(&edit_msg, &display)
-                                            .await
-                                        {
-                                            Ok(_) => {
-                                                consecutive_failures = 0;
-                                                last = content;
-                                            }
-                                            Err(e) => {
-                                                consecutive_failures += 1;
-                                                tracing::debug!(
-                                                    message_id = %edit_msg.message_id,
-                                                    platform = %edit_msg.channel.platform,
-                                                    error = ?e,
-                                                    consecutive_failures,
-                                                    "mid-stream cosmetic edit failed"
-                                                );
-                                                if consecutive_failures
-                                                    >= MAX_CONSECUTIVE_FAILURES
-                                                {
-                                                    tracing::warn!(
+                    // Streaming edit: create one real placeholder when structured
+                    // outcomes are available, then spawn the cosmetic edit loop.
+                    let mut placeholder_create_unknown = false;
+                    let mut placeholder_create_rejected = false;
+                    let (buf_tx, placeholder_msg, edit_handle, cosmetic_edit_state) =
+                        if streaming && !native {
+                            let initial = if reset {
+                                "⚠️ _Session expired, starting fresh..._\n\n…".to_string()
+                            } else {
+                                "…".to_string()
+                            };
+                            let msg = if capabilities.show_streaming_placeholder {
+                                if structured_progressive {
+                                    match classify_placeholder(
+                                        &thread_channel,
+                                        adapter
+                                            .send_message_outcome(&thread_channel, &initial)
+                                            .await,
+                                    ) {
+                                        PlaceholderStart::Ready(message) => Some(message),
+                                        PlaceholderStart::Rejected => {
+                                            placeholder_create_rejected = true;
+                                            None
+                                        }
+                                        PlaceholderStart::Unknown => {
+                                            placeholder_create_unknown = true;
+                                            None
+                                        }
+                                    }
+                                } else {
+                                    Some(adapter.send_message(&thread_channel, &initial).await?)
+                                }
+                            } else {
+                                // Dummy ref for edit loop — gateway drafts do not need a real ID.
+                                Some(MessageRef {
+                                    message_id: "draft".to_string(),
+                                    channel: thread_channel.clone(),
+                                })
+                            };
+
+                            if let Some(msg) = msg {
+                                let (tx, rx) = tokio::sync::watch::channel(initial);
+                                let edit_adapter = adapter.clone();
+                                let edit_msg = msg.clone();
+                                let edit_state = Arc::new(std::sync::Mutex::new(
+                                    CosmeticEditState::default(),
+                                ));
+                                let task_edit_state = edit_state.clone();
+                                let limit = message_limit;
+                                let mut buf_rx = rx;
+                                let edit_handle = tokio::spawn(async move {
+                                    // Only newer changed display content can supersede a failed
+                                    // PUT. Reserve it as Unknown before awaiting so cancellation
+                                    // cannot turn an in-flight write into a duplicate final PUT.
+                                    loop {
+                                        tokio::time::sleep(COSMETIC_EDIT_INTERVAL).await;
+                                        if buf_rx.has_changed().unwrap_or(false) {
+                                            let content = buf_rx.borrow_and_update().clone();
+                                            let display =
+                                                if content.chars().count() > limit - 100 {
+                                                    format!(
+                                                        "…{}",
+                                                        format::truncate_chars_tail(
+                                                            &content,
+                                                            limit - 100,
+                                                        )
+                                                    )
+                                                } else {
+                                                    content
+                                                };
+                                            let should_attempt = {
+                                                let mut state = task_edit_state
+                                                    .lock()
+                                                    .unwrap_or_else(|poisoned| {
+                                                        poisoned.into_inner()
+                                                    });
+                                                state.begin_attempt(display.clone())
+                                            };
+                                            if should_attempt {
+                                                let result = edit_adapter
+                                                    .edit_message(&edit_msg, &display)
+                                                    .await;
+                                                let outcome = match &result {
+                                                    Ok(()) => CosmeticEditOutcome::Delivered,
+                                                    Err(error) => match failed_write_outcome(
+                                                        "edit",
+                                                        error,
+                                                    ) {
+                                                        WriteOutcome::Rejected { .. } => {
+                                                            CosmeticEditOutcome::Rejected
+                                                        }
+                                                        WriteOutcome::Delivered { .. }
+                                                        | WriteOutcome::Unknown { .. } => {
+                                                            CosmeticEditOutcome::Unknown
+                                                        }
+                                                    },
+                                                };
+                                                let (stop, consecutive_failures) = {
+                                                    let mut state = task_edit_state
+                                                        .lock()
+                                                        .unwrap_or_else(|poisoned| {
+                                                            poisoned.into_inner()
+                                                        });
+                                                    let stop = state.complete_attempt(outcome);
+                                                    (stop, state.consecutive_failures())
+                                                };
+                                                if let Err(e) = result {
+                                                    tracing::debug!(
                                                         message_id = %edit_msg.message_id,
                                                         platform = %edit_msg.channel.platform,
+                                                        error = ?e,
                                                         consecutive_failures,
-                                                        "mid-stream cosmetic edit aborted; \
-                                                         final content will be delivered at turn end"
+                                                        "mid-stream cosmetic edit failed"
                                                     );
-                                                    break;
+                                                    if stop {
+                                                        tracing::warn!(
+                                                            message_id = %edit_msg.message_id,
+                                                            platform = %edit_msg.channel.platform,
+                                                            consecutive_failures,
+                                                            "mid-stream cosmetic edit aborted; \
+                                                             final content will be delivered at turn end"
+                                                        );
+                                                        break;
+                                                    }
                                                 }
                                             }
                                         }
+                                        if buf_rx.has_changed().is_err() {
+                                            break;
+                                        }
                                     }
-                                }
-                                if buf_rx.has_changed().is_err() {
-                                    break;
-                                }
+                                });
+                                (Some(tx), Some(msg), Some(edit_handle), Some(edit_state))
+                            } else {
+                                (None, None, None, None)
                             }
-                        });
-                        (Some(tx), Some(msg), Some(edit_handle))
-                    } else {
-                        (None, None, None)
-                    };
+                        } else {
+                            (None, None, None, None)
+                        };
 
                     // (#732) Liveness-aware recv loop. Filters stale id-bearing
                     // messages and abandons cleanly on dead agent / hard ceiling
@@ -1279,12 +1446,20 @@ impl AdapterRouter {
                     // and if finalize's PUT travels a different pooled connection the
                     // server-side arrival order is not strictly guaranteed. That
                     // residual window is display-only (stale tail briefly shown) and
-                    // far narrower than before this join existed.
+                    // far narrower than before this join existed. Structured Teams
+                    // also reserves an in-flight display as Unknown before awaiting;
+                    // finalization will not repeat that exact content blindly.
                     drop(buf_tx);
                     if let Some(handle) = edit_handle {
                         handle.abort();
                         let _ = handle.await;
                     }
+                    let cosmetic_edit_snapshot = cosmetic_edit_state.as_ref().map(|state| {
+                        state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone()
+                    });
 
                     // In send-once mode, deliver only the final answer block —
                     // the text after the last tool call — so inter-tool narration
@@ -1294,6 +1469,11 @@ impl AdapterRouter {
                     // FULL buffer (they sit at output start, which the slice may
                     // drop) so a leading [[reply_to:...]] survives the narration
                     // it was emitted alongside.
+                    let keep_full_text = if placeholder_create_rejected {
+                        narration_display
+                    } else {
+                        keep_full_text
+                    };
                     let (directives, text_buf) =
                         split_delivery(&text_buf, answer_start, keep_full_text);
                     // The session-reset notice lives at the head of the buffer; a
@@ -1347,7 +1527,8 @@ impl AdapterRouter {
                     // here means the user's view is incomplete; we propagate Err at the
                     // end of the closure so dispatch surfaces set_error (❌) instead of
                     // silently calling set_done (🆗) over a half-delivered turn.
-                    let mut delivery_failed = false;
+                    let mut delivery_failed = placeholder_create_unknown;
+                    let mut delivery_ambiguous = placeholder_create_unknown;
                     // Terminate status before delivering final content. A successful final
                     // delivery clears the processing message below; a failed delete can
                     // therefore leave only recognizable terminal text.
@@ -1417,34 +1598,47 @@ impl AdapterRouter {
                         }
                     } else if let Some(msg) = placeholder_msg {
                         if let Some(ref reply_id) = directives.reply_to {
-                            // reply_to directive: send reply first, then delete placeholder.
-                            // Only delete if send succeeds — preserves placeholder on failure.
-                            let mut send_ok = false;
-                            let mut first = true;
-                            for chunk in &chunks {
-                                if first {
-                                    match adapter.send_message_with_reply(
-                                        &thread_channel,
-                                        chunk,
-                                        reply_id,
-                                    ).await {
-                                        Ok(_) => { send_ok = true; }
-                                        Err(e) => {
-                                            tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "reply_to send failed; preserving placeholder");
-                                            delivery_failed = true;
+                            if structured_progressive {
+                                let health = finalize_explicit_reply(
+                                    &adapter,
+                                    &thread_channel,
+                                    &msg,
+                                    reply_id,
+                                    &chunks,
+                                )
+                                .await;
+                                delivery_failed |= health.failed;
+                                delivery_ambiguous |= health.ambiguous;
+                            } else {
+                                // reply_to directive: send reply first, then delete placeholder.
+                                // Only delete if send succeeds — preserves placeholder on failure.
+                                let mut send_ok = false;
+                                let mut first = true;
+                                for chunk in &chunks {
+                                    if first {
+                                        match adapter.send_message_with_reply(
+                                            &thread_channel,
+                                            chunk,
+                                            reply_id,
+                                        ).await {
+                                            Ok(_) => { send_ok = true; }
+                                            Err(e) => {
+                                                tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "reply_to send failed; preserving placeholder");
+                                                delivery_failed = true;
+                                            }
                                         }
+                                    } else if let Err(e) =
+                                        adapter.send_message(&thread_channel, chunk).await
+                                    {
+                                        tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "reply_to overflow chunk send failed");
+                                        delivery_failed = true;
                                     }
-                                } else if let Err(e) =
-                                    adapter.send_message(&thread_channel, chunk).await
-                                {
-                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "reply_to overflow chunk send failed");
-                                    delivery_failed = true;
+                                    first = false;
                                 }
-                                first = false;
-                            }
-                            if send_ok {
-                                if let Err(e) = adapter.delete_message(&msg).await {
-                                    tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "delete placeholder failed; placeholder will remain visible");
+                                if send_ok {
+                                    if let Err(e) = adapter.delete_message(&msg).await {
+                                        tracing::warn!(error = ?e, platform = %thread_channel.platform, message_id = %msg.message_id, "delete placeholder failed; placeholder will remain visible");
+                                    }
                                 }
                             }
                         } else if adapter.platform() == "discord"
@@ -1475,6 +1669,17 @@ impl AdapterRouter {
                             if send_ok {
                                 let _ = adapter.delete_message(&msg).await;
                             }
+                        } else if structured_progressive {
+                            let health = finalize_edit_after_cosmetic(
+                                &adapter,
+                                &thread_channel,
+                                &msg,
+                                &chunks,
+                                cosmetic_edit_snapshot.as_ref(),
+                            )
+                            .await;
+                            delivery_failed |= health.failed;
+                            delivery_ambiguous |= health.ambiguous;
                         } else {
                             // Normal streaming: edit first chunk into placeholder, send rest.
                             // If placeholder is a dummy "draft" ref (no real message), send as
@@ -1520,6 +1725,23 @@ impl AdapterRouter {
                                 }
                             }
                         }
+                    } else if placeholder_create_unknown {
+                        // The placeholder POST may have committed without returning its
+                        // real activity ID. Do not create any additional Teams activity.
+                    } else if structured_progressive && placeholder_create_rejected {
+                        let health = if let Some(ref reply_id) = directives.reply_to {
+                            deliver_explicit_reply_chunks(
+                                &adapter,
+                                &thread_channel,
+                                reply_id,
+                                &chunks,
+                            )
+                            .await
+                        } else {
+                            deliver_fresh_chunks(&adapter, &thread_channel, &chunks).await
+                        };
+                        delivery_failed |= health.failed;
+                        delivery_ambiguous |= health.ambiguous;
                     } else {
                         // Send-once: all chunks as new messages
                         // First chunk uses reply_to directive if present
@@ -1557,9 +1779,13 @@ impl AdapterRouter {
                                 .mark_terminal(StatusTerminal::DeliveryFailed)
                                 .await;
                         }
-                        Err(anyhow::anyhow!(
-                            "streaming finalization had delivery failures; user view is incomplete"
-                        ))
+                        if delivery_ambiguous {
+                            Err(AmbiguousProgressiveDelivery.into())
+                        } else {
+                            Err(anyhow::anyhow!(
+                                "streaming finalization had delivery failures; user view is incomplete"
+                            ))
+                        }
                     } else {
                         if message_status_enabled {
                             message_status.clear().await;
@@ -1984,6 +2210,69 @@ mod tests {
             AdapterCapabilities::default().status_backend,
             StatusBackend::None
         );
+    }
+
+    #[test]
+    fn structured_progressive_is_teams_only_and_requires_every_primitive() {
+        let complete = AdapterCapabilities {
+            send_ack: true,
+            edit_ack: true,
+            delete_ack: true,
+            supports_target_message_id: true,
+            can_edit: true,
+            can_delete: true,
+            show_streaming_placeholder: true,
+            ..AdapterCapabilities::default()
+        };
+        assert!(use_structured_progressive("teams", true, false, &complete));
+        assert!(!use_structured_progressive(
+            "feishu", true, false, &complete
+        ));
+        assert!(!use_structured_progressive(
+            "teams", false, false, &complete
+        ));
+        assert!(!use_structured_progressive("teams", true, true, &complete));
+
+        for missing in 0..7 {
+            let mut capabilities = complete.clone();
+            match missing {
+                0 => capabilities.send_ack = false,
+                1 => capabilities.edit_ack = false,
+                2 => capabilities.delete_ack = false,
+                3 => capabilities.supports_target_message_id = false,
+                4 => capabilities.can_edit = false,
+                5 => capabilities.can_delete = false,
+                _ => capabilities.show_streaming_placeholder = false,
+            }
+            assert!(!use_structured_progressive(
+                "teams",
+                true,
+                false,
+                &capabilities
+            ));
+        }
+    }
+
+    #[test]
+    fn typed_write_failures_survive_legacy_result_methods() {
+        let rejected = anyhow::Error::new(WriteFailure::new(WriteOutcome::Rejected {
+            code: "explicit_rejection".into(),
+            message: "not applied".into(),
+            retry_after_ms: Some(250),
+        }));
+        assert!(matches!(
+            failed_write_outcome("edit", &rejected),
+            WriteOutcome::Rejected {
+                retry_after_ms: Some(250),
+                ..
+            }
+        ));
+
+        let generic = anyhow::anyhow!("transport failed");
+        assert!(matches!(
+            failed_write_outcome("edit", &generic),
+            WriteOutcome::Unknown { code, .. } if code == "edit_adapter_error"
+        ));
     }
 
     #[test]

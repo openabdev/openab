@@ -45,6 +45,7 @@ route_ttl_secs   = 3600
 max_route_entries = 10000
 reactions_enabled = false # opt in only for the public-preview reaction API
 processing_indicator = "off" # set "message" for one turn-local status activity
+streaming = false # opt in to one progressive content placeholder per turn
 
 # Typed L2 scope. Presence of any of these four fields opts in.
 allowed_teams = []       # Team IDs
@@ -58,6 +59,8 @@ With both scope lists empty, all Team channels remain open. Personal chats do no
 If all four typed fields are omitted, Core logs and preserves the legacy conversation-ID L2 allowlist from `[gateway].allowed_channels` / `GATEWAY_ALLOWED_CHANNELS`. This rolling-upgrade fallback does not change the conversation ID used for sessions and replies.
 
 `processing_indicator = "message"` is a separate, default-off UX opt-in. It creates at most one processing activity per admitted turn, updates that same real activity ID for tool/terminal states, and deletes it only after complete final delivery. It neither enables streaming nor requires Graph/RSC. In Standalone mode, Core enables it only after Gateway advertises the required send/edit/delete ACK and command-target capabilities.
+
+`streaming = true` is an independent, default-off content opt-in. Core creates at most one real placeholder and coalesces bot-owned PUT updates every 1.5 seconds. Standalone requires a valid hello with required send/edit/delete ACKs, real target IDs, and placeholder support; otherwise it remains send-once. Generic Gateway or Telegram streaming settings do not enable Teams. Unknown POST/PUT/DELETE outcomes are never retried or converted into a fresh final activity. No Graph/RSC grant is required. Microsoft 365 live validation remains pending.
 
 ### User Trust (`[teams]` section)
 
@@ -342,7 +345,7 @@ Azure Portal → your bot → **Configuration** → **Messaging endpoint**: `htt
 
 - **Reactions** — outbound status reactions are disabled by default and must be explicitly enabled; inbound `messageReaction` events are still ignored
 - **Thread replies** — all messages in a personal chat or channel share one agent session
-- **Streaming edits** — replies are sent as one final message, not progressively edited
+- **Progressive edits** — implemented behind default-off `[teams].streaming`; Microsoft 365 live validation remains pending
 
 ## Environment Variables
 
@@ -361,6 +364,7 @@ Transport variables are read by the embedded adapter or Standalone Gateway. Type
 | `TEAMS_MAX_ROUTE_ENTRIES` | No | `10000` | Independent capacity bound for route, dedupe, and bot-owned activity caches |
 | `TEAMS_REACTIONS_ENABLED` | No | `false` | Opt in to public-preview Bot Connector add/remove reactions |
 | `TEAMS_PROCESSING_INDICATOR` | No | `off` | Core processing UX: `off` or `message`; malformed values fail closed to `off` |
+| `TEAMS_STREAMING` | No | `false` | Core progressive-content opt-in; accepts only `true`/`false` or `1`/`0`, malformed values fail closed |
 | `TEAMS_ALLOWED_TEAMS` | No | (empty) | Core typed L2 Team-ID allowlist, comma-separated; Team OR channel match |
 | `TEAMS_ALLOWED_CHANNELS` | No | (empty) | Core typed L2 channel-ID allowlist, comma-separated; both lists empty means all Team channels |
 | `TEAMS_ALLOW_PERSONAL` | No | `true` | Core typed L2 Personal-chat switch |
@@ -381,6 +385,10 @@ Expected Gateway logs include `gateway → teams reaction`. A missing reaction w
 ### Test the processing-message indicator
 
 Set `[teams].processing_indicator = "message"` on Core and keep streaming disabled. Send one admitted message. Teams should show one `Processing…` activity, update that same activity during tool use, mark it terminal before the final answer, then delete it after complete delivery. With reaction preview also enabled, queued `👀` remains on every batched event while only the final event owns the processing message.
+
+### Test progressive response
+
+Set `[teams].streaming = true` on Core. In Standalone mode, restart both peers and first confirm a single active WebSocket consumer plus a valid capability hello. One admitted long-running turn should create one content placeholder, visibly replace it no faster than every 1.5 seconds, and leave the complete final answer in that same activity. Test this independently and together with `processing_indicator = "message"` and reaction preview: the status activity, content placeholder, and permanent queued `👀` receipt must remain distinct. Treat a missing scope as `SKIPPED`, an unobserved `429` as `NOT OBSERVED`, and any ambiguous write as intentionally non-retried.
 
 ## Troubleshooting
 

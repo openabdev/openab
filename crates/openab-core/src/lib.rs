@@ -20,6 +20,7 @@ pub mod pre_seed;
 #[cfg(feature = "filestore")]
 pub mod filestore;
 pub mod reactions;
+mod progressive;
 #[cfg(feature = "discord")]
 pub mod remind;
 pub mod secrets;
