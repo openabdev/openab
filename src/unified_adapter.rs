@@ -7,6 +7,8 @@ use openab_core::adapter::{
     AdapterCapabilities, ChannelRef, ChatAdapter, MessageLimit, MessageRef, StatusBackend,
     StreamingMode,
 };
+#[cfg(feature = "teams")]
+use openab_gateway::schema::WriteOutcome;
 use openab_gateway::schema::{Content, GatewayReply, ReplyChannel};
 use openab_gateway::AppState;
 use std::collections::HashMap;
@@ -28,7 +30,7 @@ impl UnifiedGatewayAdapter {
     }
 
     /// Dispatch a GatewayReply to the correct platform adapter.
-    async fn dispatch_reply(&self, reply: &GatewayReply) {
+    async fn dispatch_reply(&self, reply: &GatewayReply) -> Result<Option<String>> {
         let client = &self.gw_state.client;
         match reply.platform.as_str() {
             #[cfg(feature = "telegram")]
@@ -99,21 +101,13 @@ impl UnifiedGatewayAdapter {
             }
             #[cfg(feature = "teams")]
             "teams" => {
-                if let Some(ref teams) = self.gw_state.teams {
-                    if let Err(e) = openab_gateway::adapters::teams::handle_reply(
-                        reply,
-                        teams,
-                        &self.gw_state.teams_service_urls,
-                    )
-                    .await
-                    {
-                        tracing::error!(
-                            error = %e,
-                            command = ?reply.command.as_deref(),
-                            "teams reply rejected"
-                        );
-                    }
-                }
+                let teams = self
+                    .gw_state
+                    .teams
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("Teams adapter is not configured"))?;
+                let outcome = openab_gateway::adapters::teams::handle_reply(reply, teams).await;
+                return Self::teams_outcome_result(outcome, reply.command.is_none());
             }
             #[cfg(feature = "acp")]
             "acp" => {
@@ -122,9 +116,45 @@ impl UnifiedGatewayAdapter {
                 }
             }
             other => {
-                tracing::warn!(platform = other, "unified adapter: unknown platform, cannot route reply");
+                tracing::warn!(
+                    platform = other,
+                    "unified adapter: unknown platform, cannot route reply"
+                );
             }
         }
+        Ok(None)
+    }
+
+    #[cfg(feature = "teams")]
+    fn teams_outcome_result(
+        outcome: WriteOutcome,
+        require_message_id: bool,
+    ) -> Result<Option<String>> {
+        match outcome {
+            WriteOutcome::Delivered {
+                message_id: Some(message_id),
+            } => Ok(Some(message_id)),
+            WriteOutcome::Delivered { message_id: None } if require_message_id => Err(
+                anyhow::anyhow!("Teams delivered send without an activity id"),
+            ),
+            WriteOutcome::Delivered { message_id: None } => Ok(None),
+            WriteOutcome::Rejected { code, message, .. } => {
+                Err(anyhow::anyhow!("Teams rejected write ({code}): {message}"))
+            }
+            WriteOutcome::Unknown { code, message } => Err(anyhow::anyhow!(
+                "Teams write outcome unknown ({code}): {message}"
+            )),
+        }
+    }
+
+    fn synthetic_message_id() -> String {
+        format!(
+            "unified_{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        )
     }
 
     /// Build a GatewayReply from ChatAdapter parameters.
@@ -208,7 +238,7 @@ impl ChatAdapter for UnifiedGatewayAdapter {
             ),
         };
         AdapterCapabilities {
-            send_ack: false,
+            send_ack: cfg!(feature = "teams") && platform == "teams",
             edit_ack: false,
             delete_ack: false,
             can_edit,
@@ -228,11 +258,13 @@ impl ChatAdapter for UnifiedGatewayAdapter {
 
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
         let reply = self.build_reply(channel, content, None, None);
-        self.dispatch_reply(&reply).await;
+        let message_id = self
+            .dispatch_reply(&reply)
+            .await?
+            .unwrap_or_else(Self::synthetic_message_id);
         Ok(MessageRef {
             channel: channel.clone(),
-            message_id: format!("unified_{:x}", std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()),
+            message_id,
         })
     }
 
@@ -243,7 +275,7 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         title: &str,
     ) -> Result<ChannelRef> {
         let reply = self.build_reply(channel, title, Some("create_topic"), None);
-        self.dispatch_reply(&reply).await;
+        self.dispatch_reply(&reply).await?;
         // Return a thread channel ref with the trigger message as thread_id
         Ok(ChannelRef {
             platform: channel.platform.clone(),
@@ -258,7 +290,7 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         let mut reply = self.build_reply(&msg.channel, emoji, Some("add_reaction"), None);
         // Use the actual platform message_id (not origin_event_id which is a UUID)
         reply.reply_to = msg.message_id.clone();
-        self.dispatch_reply(&reply).await;
+        self.dispatch_reply(&reply).await?;
         Ok(())
     }
 
@@ -266,7 +298,7 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         let mut reply = self.build_reply(&msg.channel, emoji, Some("remove_reaction"), None);
         // Use the actual platform message_id (not origin_event_id which is a UUID)
         reply.reply_to = msg.message_id.clone();
-        self.dispatch_reply(&reply).await;
+        self.dispatch_reply(&reply).await?;
         Ok(())
     }
 
@@ -274,7 +306,7 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         let mut reply = self.build_reply(&msg.channel, content, Some("edit_message"), None);
         // Use the actual platform message_id (e.g. "draft" for streaming, or numeric for edits)
         reply.reply_to = msg.message_id.clone();
-        self.dispatch_reply(&reply).await;
+        self.dispatch_reply(&reply).await?;
         Ok(())
     }
 
@@ -285,11 +317,13 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         reply_to_message_id: &str,
     ) -> Result<MessageRef> {
         let reply = self.build_reply(channel, content, None, Some(reply_to_message_id));
-        self.dispatch_reply(&reply).await;
+        let message_id = self
+            .dispatch_reply(&reply)
+            .await?
+            .unwrap_or_else(Self::synthetic_message_id);
         Ok(MessageRef {
             channel: channel.clone(),
-            message_id: format!("unified_{:x}", std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()),
+            message_id,
         })
     }
 
@@ -331,13 +365,52 @@ mod tests {
         UnifiedGatewayAdapter::new(Arc::new(state))
     }
 
+    #[cfg(feature = "teams")]
     #[test]
     fn teams_capabilities_do_not_inherit_telegram_streaming() {
         let adapter = adapter_with_telegram_streaming(true);
         let capabilities = adapter.capabilities("teams");
+        assert!(capabilities.send_ack);
         assert_eq!(capabilities.streaming_mode, StreamingMode::Disabled);
         assert!(!capabilities.can_edit);
         assert_eq!(capabilities.status_backend, StatusBackend::None);
+    }
+
+    #[cfg(feature = "teams")]
+    #[test]
+    fn teams_outcomes_return_real_activity_id_and_propagate_failure() -> Result<()> {
+        assert_eq!(
+            UnifiedGatewayAdapter::teams_outcome_result(
+                WriteOutcome::Delivered {
+                    message_id: Some("activity-1".into())
+                },
+                true,
+            )?,
+            Some("activity-1".into())
+        );
+        assert!(UnifiedGatewayAdapter::teams_outcome_result(
+            WriteOutcome::Delivered { message_id: None },
+            true,
+        )
+        .is_err());
+        assert!(UnifiedGatewayAdapter::teams_outcome_result(
+            WriteOutcome::Rejected {
+                code: "route_not_found".into(),
+                message: "missing".into(),
+                retry_after_ms: None,
+            },
+            true,
+        )
+        .is_err());
+        assert!(UnifiedGatewayAdapter::teams_outcome_result(
+            WriteOutcome::Unknown {
+                code: "request_timeout".into(),
+                message: "ambiguous".into(),
+            },
+            true,
+        )
+        .is_err());
+        Ok(())
     }
 
     #[test]

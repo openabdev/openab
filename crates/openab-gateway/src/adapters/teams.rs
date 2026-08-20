@@ -1,5 +1,5 @@
 use super::teams_ingress::{
-    wait_for_publish, PublishReservation, PublishState, TeamsIngressCleanupStats,
+    wait_for_publish, PublishReservation, PublishState, RouteLookupError, TeamsIngressCleanupStats,
     TeamsIngressRegistry, TeamsIngressRoute, TeamsRouteKey, DEFAULT_DEDUPE_TTL_SECS,
     DEFAULT_MAX_ROUTE_ENTRIES, DEFAULT_ROUTE_TTL_SECS,
 };
@@ -26,6 +26,7 @@ pub struct Activity {
     pub service_url: Option<String>,
     pub channel_id: Option<String>,
     pub from: Option<ChannelAccount>,
+    pub recipient: Option<ChannelAccount>,
     pub conversation: Option<ConversationAccount>,
     pub text: Option<String>,
     pub tenant: Option<TenantInfo>,
@@ -313,7 +314,7 @@ impl TeamsAdapter {
     }
 
     #[cfg(test)]
-    fn new_for_test(config: TeamsConfig) -> Self {
+    pub(crate) fn new_for_test(config: TeamsConfig) -> Self {
         Self::with_client(config, build_http_client(TEAMS_REQUEST_TIMEOUT), true)
     }
 
@@ -322,16 +323,47 @@ impl TeamsAdapter {
         Self::with_client(config, build_http_client(request_timeout), true)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn accept_route_for_test(
+        &self,
+        service_url: &str,
+        event_id: &str,
+        tenant_id: &str,
+        conversation_id: &str,
+        activity_id: &str,
+        reply_chain_root_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let now = Instant::now();
+        let route_key = TeamsRouteKey::new(
+            self.config.app_id.clone(),
+            tenant_id,
+            conversation_id,
+            activity_id,
+        );
+        let route = TeamsIngressRoute {
+            key: route_key.clone(),
+            event_id: event_id.into(),
+            tenant_id: tenant_id.into(),
+            conversation_id: conversation_id.into(),
+            conversation_type: "personal".into(),
+            inbound_activity_id: activity_id.into(),
+            reply_chain_root_id: reply_chain_root_id.map(str::to_owned),
+            service_url: reqwest::Url::parse(service_url)?,
+            team_id: None,
+            channel_id: None,
+            created_at: now,
+        };
+        let mut ingress = self.ingress.lock().await;
+        assert!(matches!(
+            ingress.reserve(route_key.clone(), event_id.into(), now),
+            PublishReservation::Owner
+        ));
+        assert!(ingress.accept(&route_key, event_id, route, now));
+        Ok(())
+    }
+
     pub(crate) async fn cleanup_ingress(&self) -> TeamsIngressCleanupStats {
         self.ingress.lock().await.cleanup(Instant::now())
-    }
-
-    pub(crate) fn route_ttl(&self) -> Duration {
-        Duration::from_secs(self.config.route_ttl_secs)
-    }
-
-    pub(crate) fn max_route_entries(&self) -> usize {
-        self.config.max_route_entries
     }
 
     async fn cached_token(&self) -> Option<String> {
@@ -623,16 +655,39 @@ impl TeamsAdapter {
         )
     }
 
-    /// Send a reply via Bot Framework REST API.
-    pub async fn send_activity(
+    /// Send a reply via Bot Framework REST API and preserve whether a failed
+    /// POST was rejected or may already have reached Teams.
+    pub async fn send_activity_outcome(
         &self,
         service_url: &str,
         conversation_id: &str,
         text: &str,
         reply_to_id: Option<&str>,
-    ) -> anyhow::Result<String> {
-        let url = self.connector_url(service_url, conversation_id, None)?;
-        let token = self.get_token().await?;
+    ) -> WriteOutcome {
+        // Bot Connector distinguishes a plain conversation send from a reply
+        // by endpoint. A route-scoped quote must use ReplyToActivity; setting
+        // only Activity.replyToId on SendToConversation is not sufficient for
+        // Teams clients to render the reply relationship.
+        let url = match self.connector_url(service_url, conversation_id, reply_to_id) {
+            Ok(url) => url,
+            Err(error) => {
+                return WriteOutcome::Rejected {
+                    code: "invalid_route".into(),
+                    message: error.to_string(),
+                    retry_after_ms: None,
+                };
+            }
+        };
+        let token = match self.get_token().await {
+            Ok(token) => token,
+            Err(error) => {
+                return WriteOutcome::Rejected {
+                    code: "connector_auth_failed".into(),
+                    message: error.to_string(),
+                    retry_after_ms: None,
+                };
+            }
+        };
 
         let mut body = serde_json::json!({
             "type": "message",
@@ -644,26 +699,103 @@ impl TeamsAdapter {
             body["replyToId"] = serde_json::Value::String(id.to_string());
         }
 
-        let response = self
+        let response = match self
             .client
             .post(url)
             .bearer_auth(&token)
             .json(&body)
             .send()
             .await
-            .map_err(|error| safe_request_error("Bot Framework send", &error))?;
-        let response =
-            require_http_success(response, "Bot Framework send", &[token.as_str()]).await?;
-        let result: serde_json::Value = response
-            .json()
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let code = if error.is_timeout() {
+                    "request_timeout"
+                } else {
+                    "transport_error"
+                };
+                return WriteOutcome::Unknown {
+                    code: code.into(),
+                    message: safe_request_error("Bot Framework send", &error).to_string(),
+                };
+            }
+        };
+
+        let status = response.status();
+        if status.is_success() {
+            let result: serde_json::Value = match response.json().await {
+                Ok(result) => result,
+                Err(_) => {
+                    return WriteOutcome::Unknown {
+                        code: "invalid_success_response".into(),
+                        message: "Bot Framework send succeeded without a valid JSON response"
+                            .into(),
+                    };
+                }
+            };
+            return match result
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|id| !id.is_empty())
+            {
+                Some(activity_id) => WriteOutcome::Delivered {
+                    message_id: Some(activity_id.to_owned()),
+                },
+                None => WriteOutcome::Unknown {
+                    code: "missing_activity_id".into(),
+                    message: "Bot Framework send response missing activity id".into(),
+                },
+            };
+        }
+
+        let retry_after_ms = (status == StatusCode::TOO_MANY_REQUESTS)
+            .then(|| parse_retry_after_ms(response.headers()))
+            .flatten();
+        let body = read_bounded_error_body(response, &[token.as_str()]).await;
+        let message = format!("Bot Framework send failed with HTTP {status}: {body}");
+        if status.is_server_error() {
+            WriteOutcome::Unknown {
+                code: "connector_server_error".into(),
+                message,
+            }
+        } else {
+            let code = match status.as_u16() {
+                401 | 403 => "authorization_rejected",
+                413 => "message_too_large",
+                429 => "rate_limited",
+                300..=399 => "redirect_rejected",
+                _ => "connector_rejected",
+            };
+            WriteOutcome::Rejected {
+                code: code.into(),
+                message,
+                retry_after_ms,
+            }
+        }
+    }
+
+    /// Compatibility wrapper for callers that predate structured outcomes.
+    pub async fn send_activity(
+        &self,
+        service_url: &str,
+        conversation_id: &str,
+        text: &str,
+        reply_to_id: Option<&str>,
+    ) -> anyhow::Result<String> {
+        match self
+            .send_activity_outcome(service_url, conversation_id, text, reply_to_id)
             .await
-            .map_err(|_| anyhow::anyhow!("Bot Framework send response was not valid JSON"))?;
-        result
-            .get("id")
-            .and_then(serde_json::Value::as_str)
-            .filter(|id| !id.is_empty())
-            .map(str::to_owned)
-            .ok_or_else(|| anyhow::anyhow!("Bot Framework send response missing activity id"))
+        {
+            WriteOutcome::Delivered {
+                message_id: Some(message_id),
+            } => Ok(message_id),
+            WriteOutcome::Delivered { message_id: None } => {
+                anyhow::bail!("Bot Framework send response missing activity id")
+            }
+            WriteOutcome::Rejected { message, .. } | WriteOutcome::Unknown { message, .. } => {
+                Err(anyhow::anyhow!(message))
+            }
+        }
     }
 
     /// Edit an existing activity (for streaming updates).
@@ -819,6 +951,19 @@ fn safe_request_error(operation: &str, error: &reqwest::Error) -> anyhow::Error 
         "request failed"
     };
     anyhow::anyhow!("{operation} {kind}")
+}
+
+fn parse_retry_after_ms(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let value = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(seconds.saturating_mul(1000));
+    }
+
+    let retry_at = httpdate::parse_http_date(value).ok()?;
+    let delay = retry_at
+        .duration_since(std::time::SystemTime::now())
+        .unwrap_or_default();
+    Some(delay.as_millis().min(u128::from(u64::MAX)) as u64)
 }
 
 async fn require_http_success(
@@ -1242,18 +1387,6 @@ async fn accept_message_activity(state: Arc<crate::AppState>, activity: Activity
         }
     };
 
-    // Preserve the existing reply path until PR 3 switches outbound routing to
-    // `event_id`. Cache before the publication transaction so a fast Core
-    // response cannot race this compatibility lookup.
-    let service_cache_token = cache_legacy_service_url(
-        &state,
-        conversation_id,
-        validated_service_url.as_str(),
-        teams.route_ttl(),
-        teams.max_route_entries(),
-    )
-    .await;
-
     // Reserve, commit the route, and enqueue while holding one state lock. No
     // await point exists after Publishing begins, so cancellation cannot leave
     // an owner stranded between local enqueue and Accepted/Failed resolution.
@@ -1301,80 +1434,27 @@ async fn accept_message_activity(state: Arc<crate::AppState>, activity: Activity
         LocalPublishOutcome::PublishingDuplicate(completion) => {
             match wait_for_publish(completion).await {
                 PublishState::Accepted => StatusCode::OK,
-                PublishState::Publishing | PublishState::Failed => {
-                    remove_legacy_service_url(&state, conversation_id, service_cache_token).await;
-                    StatusCode::SERVICE_UNAVAILABLE
-                }
+                PublishState::Publishing | PublishState::Failed => StatusCode::SERVICE_UNAVAILABLE,
             }
         }
         LocalPublishOutcome::AtCapacity => {
-            remove_legacy_service_url(&state, conversation_id, service_cache_token).await;
             warn!("teams: ingress dedupe cache is saturated by active publications");
             StatusCode::SERVICE_UNAVAILABLE
         }
         LocalPublishOutcome::NoConsumer => {
-            remove_legacy_service_url(&state, conversation_id, service_cache_token).await;
             warn!("teams: no event consumer accepted the activity; returning retryable failure");
             StatusCode::SERVICE_UNAVAILABLE
         }
         LocalPublishOutcome::StateCommitFailed => {
-            remove_legacy_service_url(&state, conversation_id, service_cache_token).await;
             error!("teams: failed to commit ingress state before local enqueue");
             StatusCode::INTERNAL_SERVER_ERROR
         }
     }
 }
 
-async fn cache_legacy_service_url(
-    state: &crate::AppState,
-    conversation_id: &str,
-    service_url: &str,
-    route_ttl: Duration,
-    max_entries: usize,
-) -> Instant {
-    let now = Instant::now();
-    let mut urls = state.teams_service_urls.lock().await;
-    urls.retain(|_, (_, inserted_at)| now.saturating_duration_since(*inserted_at) < route_ttl);
-    if !urls.contains_key(conversation_id) && urls.len() >= max_entries {
-        if let Some(oldest_conversation) = urls
-            .iter()
-            .min_by_key(|(_, (_, inserted_at))| *inserted_at)
-            .map(|(conversation, _)| conversation.clone())
-        {
-            urls.remove(&oldest_conversation);
-            warn!(
-                max_entries,
-                "teams compatibility route cache evicted its oldest entry at capacity"
-            );
-        }
-    }
-    urls.insert(conversation_id.to_owned(), (service_url.to_owned(), now));
-    now
-}
-
-async fn remove_legacy_service_url(
-    state: &crate::AppState,
-    conversation_id: &str,
-    inserted_at: Instant,
-) {
-    let mut urls = state.teams_service_urls.lock().await;
-    let should_remove = urls
-        .get(conversation_id)
-        .is_some_and(|(_, current_inserted_at)| *current_inserted_at == inserted_at);
-    if should_remove {
-        urls.remove(conversation_id);
-    }
-}
-
 // --- Reply handler ---
 
-pub async fn handle_reply(
-    reply: &GatewayReply,
-    teams: &TeamsAdapter,
-    service_urls: &tokio::sync::Mutex<
-        std::collections::HashMap<String, (String, std::time::Instant)>,
-    >,
-) -> anyhow::Result<Option<String>> {
+pub async fn handle_reply(reply: &GatewayReply, teams: &TeamsAdapter) -> WriteOutcome {
     // Fail closed for commands the Teams adapter does not implement. Falling
     // through to `send_activity` would turn edit/delete/topic commands into new
     // messages, producing duplicate or misleading output. Reaction commands
@@ -1383,50 +1463,74 @@ pub async fn handle_reply(
         None => {}
         Some("add_reaction" | "remove_reaction") => {
             debug!(command = ?reply.command.as_deref(), "teams: ignoring unsupported reaction command");
-            return Ok(None);
+            return WriteOutcome::Delivered { message_id: None };
         }
-        Some(command) => anyhow::bail!("unsupported Teams command: {command}"),
+        Some(command) => {
+            return WriteOutcome::Rejected {
+                code: "unsupported_command".into(),
+                message: format!("unsupported Teams command: {command}"),
+                retry_after_ms: None,
+            };
+        }
     }
 
-    let service_url = {
-        let mut urls = service_urls.lock().await;
-        match urls.get_mut(&reply.channel.id) {
-            Some((url, ts)) => {
-                // Refresh timestamp on reply to prevent TTL expiry during active conversations
-                *ts = std::time::Instant::now();
-                url.clone()
-            }
-            None => anyhow::bail!(
-                "no Teams service_url for conversation {}",
-                reply.channel.id
-            ),
+    let route = {
+        let mut ingress = teams.ingress.lock().await;
+        ingress.route_for_reply(
+            &reply.reply_to,
+            &reply.channel.id,
+            reply.quote_message_id.as_deref(),
+            Instant::now(),
+        )
+    };
+    let (route, quote_activity_id) = match route {
+        Ok(route) => route,
+        Err(RouteLookupError::NotFound) => {
+            return WriteOutcome::Rejected {
+                code: "route_not_found".into(),
+                message: "Teams ingress route is missing or expired".into(),
+                retry_after_ms: None,
+            };
+        }
+        Err(RouteLookupError::ConversationMismatch) => {
+            return WriteOutcome::Rejected {
+                code: "route_mismatch".into(),
+                message: "Teams reply conversation does not match its ingress route".into(),
+                retry_after_ms: None,
+            };
         }
     };
 
-    let reply_to_id = if reply.reply_to.is_empty() {
-        None
-    } else {
-        Some(reply.reply_to.as_str())
-    };
+    if reply.quote_message_id.is_some() && quote_activity_id.is_none() {
+        warn!(
+            conversation = %route.conversation_id,
+            "teams: quote target is not known in the ingress route scope; sending without quote"
+        );
+    }
 
-    info!(conversation = %reply.channel.id, "gateway → teams");
-    let id = teams
-        .send_activity(
-            &service_url,
-            &reply.channel.id,
+    info!(conversation = %route.conversation_id, "gateway → teams");
+    let outcome = teams
+        .send_activity_outcome(
+            route.service_url.as_str(),
+            &route.conversation_id,
             &reply.content.text,
-            reply_to_id,
+            quote_activity_id.as_deref(),
         )
-        .await?;
-    debug!(activity_id = %id, "teams activity sent");
-    Ok(Some(id))
+        .await;
+    if let WriteOutcome::Delivered {
+        message_id: Some(activity_id),
+    } = &outcome
+    {
+        debug!(activity_id, "teams activity sent");
+    }
+    outcome
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use wiremock::{
-        matchers::{method, path},
+        matchers::{body_json, method, path},
         Mock, MockServer, ResponseTemplate,
     };
 
@@ -1590,6 +1694,25 @@ mod tests {
         }
     }
 
+    async fn accept_test_route(
+        adapter: &TeamsAdapter,
+        service_url: &str,
+        event_id: &str,
+        activity_id: &str,
+        reply_chain_root_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        adapter
+            .accept_route_for_test(
+                service_url,
+                event_id,
+                "tenant-1",
+                "conversation-1",
+                activity_id,
+                reply_chain_root_id,
+            )
+            .await
+    }
+
     fn make_activity_with_tenant(tenant_id: Option<&str>) -> Activity {
         Activity {
             activity_type: "message".into(),
@@ -1598,6 +1721,7 @@ mod tests {
             service_url: Some("https://smba.trafficmanager.net/".into()),
             channel_id: Some("msteams".into()),
             from: None,
+            recipient: None,
             conversation: None,
             text: Some("hello".into()),
             tenant: tenant_id.map(|id| TenantInfo {
@@ -1618,6 +1742,11 @@ mod tests {
             from: Some(ChannelAccount {
                 id: Some("29:user".into()),
                 name: Some("Alice".into()),
+                aad_object_id: None,
+            }),
+            recipient: Some(ChannelAccount {
+                id: Some("28:bot".into()),
+                name: Some("OpenAB".into()),
                 aad_object_id: None,
             }),
             conversation: Some(ConversationAccount {
@@ -1724,8 +1853,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_consumer_returns_503_without_leaving_a_dedupe_tombstone(
-    ) -> anyhow::Result<()> {
+    async fn no_consumer_returns_503_without_leaving_a_dedupe_tombstone() -> anyhow::Result<()> {
         let (event_tx, event_rx) = tokio::sync::broadcast::channel(16);
         drop(event_rx);
         let state = Arc::new(crate::AppState {
@@ -1738,8 +1866,6 @@ mod tests {
             accept_message_activity(state.clone(), activity.clone()).await,
             StatusCode::SERVICE_UNAVAILABLE
         );
-        assert!(state.teams_service_urls.lock().await.is_empty());
-
         let mut event_rx = state.event_tx.subscribe();
         assert_eq!(
             accept_message_activity(state.clone(), activity).await,
@@ -1913,7 +2039,9 @@ mod tests {
     async fn jwt_rejects_garbage_token() {
         let adapter = TeamsAdapter::new(make_config(vec![]));
         let activity = make_activity_with_tenant(Some("t1"));
-        let result = adapter.validate_jwt("Bearer not.a.valid.jwt", &activity).await;
+        let result = adapter
+            .validate_jwt("Bearer not.a.valid.jwt", &activity)
+            .await;
         assert!(result.is_err());
     }
 
@@ -1937,6 +2065,7 @@ mod tests {
             "serviceUrl": "https://smba.trafficmanager.net/",
             "channelId": "msteams",
             "from": {"id": "user1", "name": "Alice", "aadObjectId": "aad-123"},
+            "recipient": {"id": "bot1", "name": "OpenAB"},
             "conversation": {"id": "conv1", "conversationType": "personal", "isGroup": false},
             "text": "hello bot",
             "tenant": {"id": "tenant-abc"},
@@ -1964,6 +2093,13 @@ mod tests {
             Some("tenant-abc")
         );
         assert_eq!(activity.reply_to_id.as_deref(), Some("root-activity"));
+        assert_eq!(
+            activity
+                .recipient
+                .as_ref()
+                .and_then(|recipient| recipient.id.as_deref()),
+            Some("bot1")
+        );
         let channel_data = activity
             .channel_data
             .as_ref()
@@ -2102,7 +2238,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connector_success_without_activity_id_is_rejected() {
+    async fn connector_success_without_activity_id_is_unknown() {
         let server = MockServer::start().await;
         let _token = Mock::given(method("POST"))
             .and(path("/token"))
@@ -2121,12 +2257,16 @@ mod tests {
             .await;
         let adapter = TeamsAdapter::new_for_test(make_http_test_config(&server));
 
-        let error = adapter
-            .send_activity(&server.uri(), "conversation-1", "hello", None)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("missing activity id"));
+        let outcome = adapter
+            .send_activity_outcome(&server.uri(), "conversation-1", "hello", None)
+            .await;
+        assert_eq!(
+            outcome,
+            WriteOutcome::Unknown {
+                code: "missing_activity_id".into(),
+                message: "Bot Framework send response missing activity id".into(),
+            }
+        );
     }
 
     #[tokio::test]
@@ -2189,17 +2329,19 @@ mod tests {
             .await;
         let adapter = TeamsAdapter::new_for_test(make_http_test_config(&server));
 
-        let error = adapter
-            .send_activity(&server.uri(), "conversation-1", "hello", None)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("500"));
-        assert!(error.contains("[truncated]"));
-        assert!(!error.contains("leaked-token"));
-        assert!(!error.contains("test-token"));
-        assert!(!error.contains("sensitive.example"));
-        assert!(error.len() <= TEAMS_ERROR_BODY_LIMIT + 256);
+        let outcome = adapter
+            .send_activity_outcome(&server.uri(), "conversation-1", "hello", None)
+            .await;
+        let WriteOutcome::Unknown { code, message } = outcome else {
+            panic!("HTTP 500 must preserve ambiguous delivery")
+        };
+        assert_eq!(code, "connector_server_error");
+        assert!(message.contains("500"));
+        assert!(message.contains("[truncated]"));
+        assert!(!message.contains("leaked-token"));
+        assert!(!message.contains("test-token"));
+        assert!(!message.contains("sensitive.example"));
+        assert!(message.len() <= TEAMS_ERROR_BODY_LIMIT + 256);
     }
 
     #[tokio::test]
@@ -2225,13 +2367,71 @@ mod tests {
             Duration::from_millis(75),
         );
 
-        let error = adapter
-            .send_activity(&server.uri(), "conversation-1", "hello", None)
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("timed out"));
-        assert!(!error.contains(&server.uri()));
+        let outcome = adapter
+            .send_activity_outcome(&server.uri(), "conversation-1", "hello", None)
+            .await;
+        let WriteOutcome::Unknown { code, message } = outcome else {
+            panic!("POST timeout must preserve ambiguous delivery")
+        };
+        assert_eq!(code, "request_timeout");
+        assert!(message.contains("timed out"));
+        assert!(!message.contains(&server.uri()));
+    }
+
+    #[tokio::test]
+    async fn connector_classifies_rejection_and_retry_after() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        let _token = Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "test-token",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let _rejected = Mock::given(method("POST"))
+            .and(path("/v3/conversations/rejected/activities"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad activity"))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let _rate_limited = Mock::given(method("POST"))
+            .and(path("/v3/conversations/rate-limited/activities"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "2")
+                    .set_body_string("slow down"),
+            )
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let adapter = TeamsAdapter::new_for_test(make_http_test_config(&server));
+
+        let rejected = adapter
+            .send_activity_outcome(&server.uri(), "rejected", "hello", None)
+            .await;
+        assert!(matches!(
+            rejected,
+            WriteOutcome::Rejected {
+                ref code,
+                retry_after_ms: None,
+                ..
+            } if code == "connector_rejected"
+        ));
+
+        let rate_limited = adapter
+            .send_activity_outcome(&server.uri(), "rate-limited", "hello", None)
+            .await;
+        assert!(matches!(
+            rate_limited,
+            WriteOutcome::Rejected {
+                ref code,
+                retry_after_ms: Some(2000),
+                ..
+            } if code == "rate_limited"
+        ));
+        Ok(())
     }
 
     // --- reply command dispatch ---
@@ -2248,14 +2448,14 @@ mod tests {
         let mut config = make_config(vec![]);
         config.oauth_endpoint = format!("{}/token", server.uri());
         let adapter = TeamsAdapter::new_for_test(config);
-        let service_urls = tokio::sync::Mutex::new(std::collections::HashMap::from([(
-            "conversation-1".to_string(),
-            (server.uri(), std::time::Instant::now()),
-        )]));
 
         for command in ["add_reaction", "remove_reaction"] {
-            let outcome = handle_reply(&make_reply(Some(command)), &adapter, &service_urls).await?;
-            assert_eq!(outcome, None, "reaction command {command} should be a no-op");
+            let outcome = handle_reply(&make_reply(Some(command)), &adapter).await;
+            assert_eq!(
+                outcome,
+                WriteOutcome::Delivered { message_id: None },
+                "reaction command {command} should be a no-op"
+            );
         }
 
         for command in [
@@ -2264,12 +2464,14 @@ mod tests {
             "delete_message",
             "future_unknown_command",
         ] {
-            let error = handle_reply(&make_reply(Some(command)), &adapter, &service_urls)
-                .await
-                .unwrap_err();
+            let outcome = handle_reply(&make_reply(Some(command)), &adapter).await;
             assert!(
-                error.to_string().contains(command),
-                "error should identify unsupported command {command}"
+                matches!(
+                    outcome,
+                    WriteOutcome::Rejected { ref code, ref message, .. }
+                        if code == "unsupported_command" && message.contains(command)
+                ),
+                "outcome should identify unsupported command {command}: {outcome:?}"
             );
         }
         Ok(())
@@ -2289,6 +2491,12 @@ mod tests {
             .await;
         let _activity = Mock::given(method("POST"))
             .and(path("/v3/conversations/conversation-1/activities"))
+            .and(body_json(serde_json::json!({
+                "type": "message",
+                "from": { "id": "test-app" },
+                "text": "reply text",
+                "textFormat": "markdown"
+            })))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "activity-1"})),
             )
@@ -2299,13 +2507,115 @@ mod tests {
         let mut config = make_config(vec![]);
         config.oauth_endpoint = format!("{}/token", server.uri());
         let adapter = TeamsAdapter::new_for_test(config);
-        let service_urls = tokio::sync::Mutex::new(std::collections::HashMap::from([(
-            "conversation-1".to_string(),
-            (server.uri(), std::time::Instant::now()),
-        )]));
+        accept_test_route(&adapter, &server.uri(), "evt-1", "inbound-1", None).await?;
 
-        let message_id = handle_reply(&make_reply(None), &adapter, &service_urls).await?;
-        assert_eq!(message_id.as_deref(), Some("activity-1"));
+        let outcome = handle_reply(&make_reply(None), &adapter).await;
+        assert_eq!(
+            outcome,
+            WriteOutcome::Delivered {
+                message_id: Some("activity-1".into())
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_quote_is_scoped_and_unknown_target_falls_back_to_plain_send(
+    ) -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        let _token = Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "test-token",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let _quoted = Mock::given(method("POST"))
+            .and(path(
+                "/v3/conversations/conversation-1/activities/inbound-1",
+            ))
+            .and(body_json(serde_json::json!({
+                "type": "message",
+                "from": { "id": "test-app" },
+                "text": "reply text",
+                "textFormat": "markdown",
+                "replyToId": "inbound-1"
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "quoted-1"})),
+            )
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let _plain = Mock::given(method("POST"))
+            .and(path("/v3/conversations/conversation-1/activities"))
+            .and(body_json(serde_json::json!({
+                "type": "message",
+                "from": { "id": "test-app" },
+                "text": "reply text",
+                "textFormat": "markdown"
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "plain-1"})),
+            )
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let adapter = TeamsAdapter::new_for_test(make_http_test_config(&server));
+        accept_test_route(
+            &adapter,
+            &server.uri(),
+            "evt-1",
+            "inbound-1",
+            Some("root-1"),
+        )
+        .await?;
+
+        let mut quoted_reply = make_reply(None);
+        quoted_reply.quote_message_id = Some("inbound-1".into());
+        assert_eq!(
+            handle_reply(&quoted_reply, &adapter).await,
+            WriteOutcome::Delivered {
+                message_id: Some("quoted-1".into())
+            }
+        );
+
+        let mut unknown_quote = make_reply(None);
+        unknown_quote.quote_message_id = Some("activity-from-another-scope".into());
+        assert_eq!(
+            handle_reply(&unknown_quote, &adapter).await,
+            WriteOutcome::Delivered {
+                message_id: Some("plain-1".into())
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_or_cross_conversation_route_is_rejected_before_http() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        let _no_http = Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount_as_scoped(&server)
+            .await;
+        let adapter = TeamsAdapter::new_for_test(make_http_test_config(&server));
+
+        assert!(matches!(
+            handle_reply(&make_reply(None), &adapter).await,
+            WriteOutcome::Rejected { ref code, .. } if code == "route_not_found"
+        ));
+
+        accept_test_route(&adapter, &server.uri(), "evt-1", "inbound-1", None).await?;
+        let mut mismatched = make_reply(None);
+        mismatched.channel.id = "conversation-2".into();
+        assert!(matches!(
+            handle_reply(&mismatched, &adapter).await,
+            WriteOutcome::Rejected { ref code, .. } if code == "route_mismatch"
+        ));
         Ok(())
     }
 

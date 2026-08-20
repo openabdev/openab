@@ -340,10 +340,11 @@ Azure Portal → your bot → **Configuration** → **Messaging endpoint**: `htt
 - Single tenant bot → set `TEAMS_OAUTH_ENDPOINT=https://login.microsoftonline.com/<YOUR_TENANT_ID>/oauth2/v2.0/token`
 - Multi tenant bot → leave default, but verify `TEAMS_APP_ID` and `TEAMS_APP_SECRET` are correct.
 
-**`teams: no service_url for conversation` in gateway logs**
+**`route_not_found` or `Teams ingress route is missing or expired`**
 
-- Gateway was restarted and the in-memory cache was cleared. Have the user send another message.
-- Or the webhook never arrived — check Bot Framework webhook URL points at the right gateway.
+- Gateway was restarted, the bounded route was evicted, or `TEAMS_ROUTE_TTL_SECS` elapsed before the response. Have the user send another message.
+- Or the webhook never reached this Gateway process — check the Bot Framework webhook URL and deployment replica count.
+- Do not bypass the route by caching or manually injecting a `serviceUrl`; it is authenticated gateway-local state.
 
 **`teams JWT validation failed` in gateway logs**
 
@@ -358,9 +359,16 @@ Check `docker compose logs gateway openab` and look for the trace:
 2. `processing message channel_platform=teams` (OAB picked up the event)
 3. `sending reply to gateway platform=teams` (OAB sent the reply over WS)
 4. `gateway → teams` (gateway calling Bot Framework REST API)
-5. `teams activity sent` (success) or `teams reply rejected` (failure)
+5. `teams activity sent` (success), `teams reply rejected` (definite failure), or `teams reply delivery is unknown; not retrying` (the POST may have completed)
 
-Whichever step is missing tells you where the break is.
+Whichever step is missing tells you where the break is. New Core↔Gateway peers
+require a structured send ACK and return the real Teams activity ID; legacy
+peers keep fire-and-forget missing-ACK behavior after an incomplete hello.
+
+> **Release validation:** HTTP mocks do not prove Teams reply-chain presentation.
+> Before marking PR 3 complete, record the personal, group-chat, channel-root,
+> channel-reply, and explicit-quote cases in the
+> [D3 live-tenant matrix](msteams-discord-parity-requirements.md#202-live-microsoft-365-tenant-matrix).
 
 **Bot doesn't appear when @mentioning in a channel**
 

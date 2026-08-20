@@ -33,14 +33,23 @@ impl TeamsRouteKey {
             activity_id: activity_id.into(),
         }
     }
+
+    fn with_activity_id(&self, activity_id: impl Into<String>) -> Self {
+        Self {
+            app_id: self.app_id.clone(),
+            tenant_id: self.tenant_id.clone(),
+            conversation_id: self.conversation_id.clone(),
+            activity_id: activity_id.into(),
+        }
+    }
 }
 
 /// Gateway-local routing material for one authenticated Teams activity.
 ///
 /// The service URL is intentionally kept out of the wire schema and logging.
-/// PR 3 consumes this route by `event_id`; PR 2 owns validation, bounds, expiry,
-/// and duplicate-safe publication.
-#[allow(dead_code)]
+/// Outbound Teams sends consume this route by `event_id`; ingress owns its
+/// validation, bounds, expiry, and duplicate-safe publication.
+#[allow(dead_code)] // authenticated scope fields are retained for later typed routing/ownership
 #[derive(Clone)]
 pub(super) struct TeamsIngressRoute {
     pub(super) key: TeamsRouteKey,
@@ -75,6 +84,12 @@ pub(super) enum PublishReservation {
     AcceptedDuplicate,
     PublishingDuplicate(watch::Receiver<PublishState>),
     AtCapacity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RouteLookupError {
+    NotFound,
+    ConversationMismatch,
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -226,6 +241,43 @@ impl TeamsIngressRegistry {
             dedupe_entries_removed: expired_dedupe_keys.len(),
             stale_publications_removed,
         }
+    }
+
+    pub(super) fn route_for_reply(
+        &mut self,
+        event_id: &str,
+        conversation_id: &str,
+        requested_quote: Option<&str>,
+        now: Instant,
+    ) -> Result<(TeamsIngressRoute, Option<String>), RouteLookupError> {
+        self.cleanup(now);
+        let route = self
+            .routes_by_event
+            .get(event_id)
+            .cloned()
+            .ok_or(RouteLookupError::NotFound)?;
+        if route.conversation_id != conversation_id {
+            return Err(RouteLookupError::ConversationMismatch);
+        }
+
+        // A quote is safe only when its activity was authenticated in the same
+        // app/tenant/conversation scope. The current activity and its declared
+        // reply-chain root are already authenticated routing material; older
+        // activities must still exist in the bounded route index.
+        let quote_activity_id = requested_quote
+            .filter(|activity_id| !activity_id.trim().is_empty())
+            .filter(|activity_id| {
+                route.inbound_activity_id == **activity_id
+                    || route.reply_chain_root_id.as_deref() == Some(*activity_id)
+                    || self
+                        .event_by_key
+                        .get(&route.key.with_activity_id(*activity_id))
+                        .and_then(|known_event_id| self.routes_by_event.get(known_event_id))
+                        .is_some()
+            })
+            .map(str::to_owned);
+
+        Ok((route, quote_activity_id))
     }
 
     #[cfg(test)]
@@ -498,6 +550,113 @@ mod tests {
                 PublishReservation::Owner
             ));
         }
+    }
+
+    #[test]
+    fn reply_lookup_uses_event_scope_and_validates_quote_activity() -> anyhow::Result<()> {
+        let now = Instant::now();
+        let mut registry =
+            TeamsIngressRegistry::new(Duration::from_secs(60), Duration::from_secs(60), 10);
+
+        for index in 0..2 {
+            let route_key = key(index);
+            let event_id = format!("event-{index}");
+            assert!(matches!(
+                registry.reserve(route_key.clone(), event_id.clone(), now),
+                PublishReservation::Owner
+            ));
+            let mut accepted_route = route(route_key.clone(), &event_id, now)?;
+            if index == 1 {
+                accepted_route.reply_chain_root_id = Some("root-activity".into());
+            }
+            assert!(registry.accept(&route_key, &event_id, accepted_route, now));
+        }
+
+        for (route_key, event_id, tenant_id, conversation_id) in [
+            (
+                TeamsRouteKey::new("app", "other-tenant", "conversation", "cross-tenant"),
+                "event-cross-tenant",
+                "other-tenant",
+                "conversation",
+            ),
+            (
+                TeamsRouteKey::new("app", "tenant", "other-conversation", "cross-conversation"),
+                "event-cross-conversation",
+                "tenant",
+                "other-conversation",
+            ),
+        ] {
+            assert!(matches!(
+                registry.reserve(route_key.clone(), event_id.into(), now),
+                PublishReservation::Owner
+            ));
+            let mut accepted_route = route(route_key.clone(), event_id, now)?;
+            accepted_route.tenant_id = tenant_id.into();
+            accepted_route.conversation_id = conversation_id.into();
+            assert!(registry.accept(&route_key, event_id, accepted_route, now));
+        }
+
+        let (_, current_quote) = registry
+            .route_for_reply("event-1", "conversation", Some("activity-1"), now)
+            .map_err(|error| anyhow::anyhow!("unexpected route error: {error:?}"))?;
+        assert_eq!(current_quote.as_deref(), Some("activity-1"));
+
+        let (_, root_quote) = registry
+            .route_for_reply("event-1", "conversation", Some("root-activity"), now)
+            .map_err(|error| anyhow::anyhow!("unexpected route error: {error:?}"))?;
+        assert_eq!(root_quote.as_deref(), Some("root-activity"));
+
+        let (_, prior_quote) = registry
+            .route_for_reply("event-1", "conversation", Some("activity-0"), now)
+            .map_err(|error| anyhow::anyhow!("unexpected route error: {error:?}"))?;
+        assert_eq!(prior_quote.as_deref(), Some("activity-0"));
+
+        for unknown_target in ["unknown", "cross-tenant", "cross-conversation"] {
+            let (_, unknown_quote) = registry
+                .route_for_reply("event-1", "conversation", Some(unknown_target), now)
+                .map_err(|error| anyhow::anyhow!("unexpected route error: {error:?}"))?;
+            assert!(
+                unknown_quote.is_none(),
+                "quote target {unknown_target} must not cross route scope"
+            );
+        }
+        assert!(matches!(
+            registry.route_for_reply("event-1", "other-conversation", None, now),
+            Err(RouteLookupError::ConversationMismatch)
+        ));
+        assert!(matches!(
+            registry.route_for_reply("missing-event", "conversation", None, now),
+            Err(RouteLookupError::NotFound)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn expired_route_cannot_be_used_for_reply() -> anyhow::Result<()> {
+        let now = Instant::now();
+        let mut registry =
+            TeamsIngressRegistry::new(Duration::from_secs(60), Duration::from_secs(10), 10);
+        let route_key = key(1);
+        assert!(matches!(
+            registry.reserve(route_key.clone(), "event-1".into(), now),
+            PublishReservation::Owner
+        ));
+        assert!(registry.accept(
+            &route_key,
+            "event-1",
+            route(route_key.clone(), "event-1", now)?,
+            now
+        ));
+        assert!(matches!(
+            registry.route_for_reply(
+                "event-1",
+                "conversation",
+                None,
+                now + Duration::from_secs(10)
+            ),
+            Err(RouteLookupError::NotFound)
+        ));
+        Ok(())
     }
 
     #[test]

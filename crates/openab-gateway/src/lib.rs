@@ -66,7 +66,6 @@ pub struct AppState {
     /// Webhook mount path for Teams (env: `TEAMS_WEBHOOK_PATH`; config-first
     /// via `apply_teams_config`, default `/webhook/teams`).
     pub teams_webhook_path: String,
-    pub teams_service_urls: Mutex<HashMap<String, (String, Instant)>>,
     #[cfg(feature = "feishu")]
     pub feishu: Option<adapters::feishu::FeishuAdapter>,
     #[cfg(feature = "googlechat")]
@@ -124,7 +123,6 @@ impl AppState {
             #[cfg(feature = "teams")]
             teams: None,
             teams_webhook_path: "/webhook/teams".into(),
-            teams_service_urls: Mutex::new(HashMap::new()),
             #[cfg(feature = "feishu")]
             feishu: None,
             #[cfg(feature = "googlechat")]
@@ -249,7 +247,6 @@ impl AppState {
             #[cfg(feature = "teams")]
             teams,
             teams_webhook_path,
-            teams_service_urls: Mutex::new(HashMap::new()),
             #[cfg(feature = "feishu")]
             feishu,
             #[cfg(feature = "googlechat")]
@@ -321,6 +318,7 @@ impl AppState {
             insert(
                 "teams",
                 AdapterCapabilities {
+                    send_ack: true,
                     show_streaming_placeholder: true,
                     message_limit: characters(4096),
                     status_backend: StatusBackend::None,
@@ -714,25 +712,14 @@ pub fn spawn_teams_ingress_cleanup(state: Arc<AppState>) {
             };
 
             let stats = teams.cleanup_ingress().await;
-            let now = Instant::now();
-            let route_ttl = teams.route_ttl();
-            let mut service_urls = state.teams_service_urls.lock().await;
-            let service_urls_before = service_urls.len();
-            service_urls.retain(|_, (_, inserted_at)| {
-                now.saturating_duration_since(*inserted_at) < route_ttl
-            });
-            let service_urls_removed = service_urls_before - service_urls.len();
-
             if stats.routes_removed > 0
                 || stats.dedupe_entries_removed > 0
                 || stats.stale_publications_removed > 0
-                || service_urls_removed > 0
             {
                 tracing::info!(
                     routes_removed = stats.routes_removed,
                     dedupe_entries_removed = stats.dedupe_entries_removed,
                     stale_publications_removed = stats.stale_publications_removed,
-                    service_urls_removed,
                     "teams ingress state cleanup"
                 );
             }
@@ -996,7 +983,6 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         #[cfg(feature = "teams")]
         teams,
         teams_webhook_path,
-        teams_service_urls: Mutex::new(HashMap::new()),
         #[cfg(feature = "feishu")]
         feishu,
         #[cfg(feature = "googlechat")]
@@ -1057,7 +1043,7 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
         });
     }
 
-    // Background: sweep bounded Teams route, dedupe, and compatibility state.
+    // Background: sweep bounded Teams route and dedupe state.
     #[cfg(feature = "teams")]
     spawn_teams_ingress_cleanup(state.clone());
 
@@ -1153,6 +1139,32 @@ fn build_gateway_hello(
             supported: active_consumers == 1,
             delivery_mode: "best_effort_broadcast".into(),
         },
+    }
+}
+
+#[cfg(feature = "teams")]
+fn publish_teams_write_outcome(
+    reply: &schema::GatewayReply,
+    outcome: schema::WriteOutcome,
+    event_tx: &broadcast::Sender<String>,
+) {
+    let Some(request_id) = reply.request_id.as_ref() else {
+        // A legacy peer may omit request IDs entirely. Preserve that
+        // fire-and-forget wire behavior instead of sending an unsolicited
+        // response; legacy requests that do carry an ID receive compatible
+        // legacy fields plus additive outcome metadata.
+        return;
+    };
+    let response = schema::GatewayResponse::from_write_outcome(request_id, outcome);
+    match serde_json::to_string(&response) {
+        Ok(json) => {
+            if event_tx.send(json).is_err() {
+                tracing::warn!(request_id, "teams: no consumer received write outcome");
+            }
+        }
+        Err(error) => {
+            tracing::error!(request_id, error = %error, "teams: failed to serialize write outcome");
+        }
     }
 }
 
@@ -1279,23 +1291,39 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                             }
                             #[cfg(feature = "teams")]
                             "teams" => {
-                                if let Some(ref teams) = state_for_recv.teams {
-                                    if let Err(e) = adapters::teams::handle_reply(
-                                        &reply,
-                                        teams,
-                                        &state_for_recv.teams_service_urls,
-                                    )
-                                    .await
-                                    {
-                                        tracing::error!(
-                                            error = %e,
+                                let outcome = if let Some(ref teams) = state_for_recv.teams {
+                                    adapters::teams::handle_reply(&reply, teams).await
+                                } else {
+                                    warn!("reply for teams but adapter not configured");
+                                    schema::WriteOutcome::Rejected {
+                                        code: "adapter_not_configured".into(),
+                                        message: "Teams adapter is not configured".into(),
+                                        retry_after_ms: None,
+                                    }
+                                };
+                                match &outcome {
+                                    schema::WriteOutcome::Rejected { code, message, .. } => {
+                                        error!(
+                                            error_code = %code,
+                                            error = %message,
                                             command = ?reply.command.as_deref(),
                                             "teams reply rejected"
                                         );
                                     }
-                                } else {
-                                    warn!("reply for teams but adapter not configured");
+                                    schema::WriteOutcome::Unknown { code, message } => {
+                                        warn!(
+                                            error_code = %code,
+                                            error = %message,
+                                            "teams reply delivery is unknown; not retrying"
+                                        );
+                                    }
+                                    schema::WriteOutcome::Delivered { .. } => {}
                                 }
+                                publish_teams_write_outcome(
+                                    &reply,
+                                    outcome,
+                                    &state_for_recv.event_tx,
+                                );
                             }
                             #[cfg(feature = "feishu")]
                             "feishu" => {
@@ -1504,7 +1532,7 @@ mod l1_audit_tests {
         let teams = capabilities
             .get("teams")
             .expect("configured Teams adapter should advertise capabilities");
-        assert!(!teams.send_ack);
+        assert!(teams.send_ack);
         assert!(!teams.can_edit);
         assert_eq!(teams.streaming_mode, super::schema::StreamingMode::Disabled);
         assert!(teams.show_streaming_placeholder);
@@ -1596,6 +1624,11 @@ mod gateway_protocol_tests {
     use futures_util::{SinkExt, StreamExt};
     use tokio::time::{sleep, timeout, Duration};
     use tokio_tungstenite::tungstenite::Message;
+    #[cfg(feature = "teams")]
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
 
     type TestSocket = tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -1640,6 +1673,20 @@ mod gateway_protocol_tests {
             .await?
             .context("test WebSocket closed before a frame arrived")??;
         Ok(message.into_text()?)
+    }
+
+    #[cfg(feature = "teams")]
+    fn teams_test_config(server: &MockServer) -> adapters::teams::TeamsConfig {
+        adapters::teams::TeamsConfig {
+            app_id: "test-app".into(),
+            app_secret: "test-secret".into(),
+            oauth_endpoint: format!("{}/token", server.uri()),
+            openid_metadata: format!("{}/openid", server.uri()),
+            allowed_tenants: Vec::new(),
+            dedupe_ttl_secs: 600,
+            route_ttl_secs: 3600,
+            max_route_entries: 10_000,
+        }
     }
 
     #[tokio::test]
@@ -1690,6 +1737,273 @@ mod gateway_protocol_tests {
         first.close(None).await?;
         wait_for_consumers(&state, 0).await?;
         server.abort();
+        Ok(())
+    }
+
+    #[cfg(feature = "teams")]
+    #[tokio::test]
+    async fn negotiated_teams_send_returns_real_activity_id_over_websocket() -> anyhow::Result<()> {
+        let connector = MockServer::start().await;
+        let _token = Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "test-token",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount_as_scoped(&connector)
+            .await;
+        let _activity = Mock::given(method("POST"))
+            .and(path("/v3/conversations/conversation-1/activities"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "teams-activity-1"})),
+            )
+            .expect(1)
+            .mount_as_scoped(&connector)
+            .await;
+        let teams = adapters::teams::TeamsAdapter::new_for_test(teams_test_config(&connector));
+        teams
+            .accept_route_for_test(
+                &connector.uri(),
+                "event-1",
+                "tenant-1",
+                "conversation-1",
+                "inbound-1",
+                None,
+            )
+            .await?;
+
+        let (event_tx, _event_rx) = broadcast::channel(8);
+        let mut app_state = AppState::test_default(event_tx);
+        app_state.teams = Some(teams);
+        let (addr, state, server) = start_server(app_state).await?;
+        let url = format!("{}://{addr}/ws", "ws");
+        let (mut socket, _) = tokio_tungstenite::connect_async(&url).await?;
+        wait_for_consumers(&state, 1).await?;
+
+        socket
+            .send(Message::Text(serde_json::to_string(
+                &schema::GatewayClientHello {
+                    schema: schema::CLIENT_HELLO_SCHEMA.into(),
+                    protocol_version: schema::GATEWAY_PROTOCOL_VERSION,
+                    client_name: Some("test-core".into()),
+                    requested_platforms: vec!["teams".into()],
+                },
+            )?))
+            .await?;
+        let hello: schema::GatewayHello = serde_json::from_str(&next_text(&mut socket).await?)?;
+        assert!(
+            hello
+                .capabilities
+                .get("teams")
+                .context("Teams capability should be advertised")?
+                .send_ack
+        );
+
+        socket
+            .send(Message::Text(serde_json::to_string(
+                &schema::GatewayReply {
+                    schema: "openab.gateway.reply.v1".into(),
+                    reply_to: "event-1".into(),
+                    platform: "teams".into(),
+                    channel: schema::ReplyChannel {
+                        id: "conversation-1".into(),
+                        thread_id: None,
+                    },
+                    content: schema::Content {
+                        content_type: "text".into(),
+                        text: "hello".into(),
+                        attachments: Vec::new(),
+                    },
+                    command: None,
+                    request_id: Some("request-1".into()),
+                    quote_message_id: None,
+                },
+            )?))
+            .await?;
+        let response: schema::GatewayResponse =
+            serde_json::from_str(&next_text(&mut socket).await?)?;
+        assert_eq!(response.request_id, "request-1");
+        assert_eq!(
+            response.write_outcome(),
+            schema::WriteOutcome::Delivered {
+                message_id: Some("teams-activity-1".into())
+            }
+        );
+
+        socket.close(None).await?;
+        wait_for_consumers(&state, 0).await?;
+        server.abort();
+        Ok(())
+    }
+
+    #[cfg(feature = "teams")]
+    #[tokio::test]
+    async fn legacy_teams_send_emits_no_unsolicited_ack() -> anyhow::Result<()> {
+        let connector = MockServer::start().await;
+        let _token = Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "test-token",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount_as_scoped(&connector)
+            .await;
+        let _activity = Mock::given(method("POST"))
+            .and(path("/v3/conversations/conversation-1/activities"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"id": "legacy-activity"})),
+            )
+            .expect(1)
+            .mount_as_scoped(&connector)
+            .await;
+        let teams = adapters::teams::TeamsAdapter::new_for_test(teams_test_config(&connector));
+        teams
+            .accept_route_for_test(
+                &connector.uri(),
+                "legacy-event",
+                "tenant-1",
+                "conversation-1",
+                "inbound-1",
+                None,
+            )
+            .await?;
+
+        let (event_tx, _event_rx) = broadcast::channel(8);
+        let mut app_state = AppState::test_default(event_tx);
+        app_state.teams = Some(teams);
+        let (addr, state, server) = start_server(app_state).await?;
+        let url = format!("{}://{addr}/ws", "ws");
+        let (mut socket, _) = tokio_tungstenite::connect_async(&url).await?;
+        wait_for_consumers(&state, 1).await?;
+
+        socket
+            .send(Message::Text(serde_json::to_string(
+                &schema::GatewayReply {
+                    schema: "openab.gateway.reply.v1".into(),
+                    reply_to: "legacy-event".into(),
+                    platform: "teams".into(),
+                    channel: schema::ReplyChannel {
+                        id: "conversation-1".into(),
+                        thread_id: None,
+                    },
+                    content: schema::Content {
+                        content_type: "text".into(),
+                        text: "legacy".into(),
+                        attachments: Vec::new(),
+                    },
+                    command: None,
+                    request_id: None,
+                    quote_message_id: None,
+                },
+            )?))
+            .await?;
+        sleep(Duration::from_millis(50)).await;
+        state.event_tx.send("after-legacy-send".into())?;
+        assert_eq!(next_text(&mut socket).await?, "after-legacy-send");
+
+        socket.close(None).await?;
+        wait_for_consumers(&state, 0).await?;
+        server.abort();
+        Ok(())
+    }
+
+    #[cfg(feature = "teams")]
+    #[test]
+    fn teams_hello_advertises_required_send_ack() {
+        let (event_tx, _event_rx) = broadcast::channel(8);
+        let mut state = AppState::test_default(event_tx);
+        state.apply_teams_config(GatewayTeamsConfig {
+            app_id: Some("app".into()),
+            app_secret: Some("secret".into()),
+            allowed_tenants: vec![],
+            oauth_endpoint: "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token"
+                .into(),
+            openid_metadata: "https://login.botframework.com/v1/.well-known/openidconfiguration"
+                .into(),
+            webhook_path: "/webhook/teams".into(),
+            dedupe_ttl_secs: 600,
+            route_ttl_secs: 3600,
+            max_route_entries: 10_000,
+        });
+        let hello = build_gateway_hello(
+            &state,
+            &schema::GatewayClientHello {
+                schema: schema::CLIENT_HELLO_SCHEMA.into(),
+                protocol_version: schema::GATEWAY_PROTOCOL_VERSION,
+                client_name: Some("test-core".into()),
+                requested_platforms: vec!["teams".into()],
+            },
+        );
+        let teams = hello
+            .capabilities
+            .get("teams")
+            .expect("configured Teams adapter must be advertised");
+        assert!(teams.send_ack);
+        assert!(!teams.edit_ack);
+        assert!(!teams.delete_ack);
+    }
+
+    #[cfg(feature = "teams")]
+    #[tokio::test]
+    async fn teams_structured_outcome_is_emitted_only_when_requested() -> anyhow::Result<()> {
+        let (event_tx, mut event_rx) = broadcast::channel(8);
+        let mut reply = schema::GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "event-1".into(),
+            platform: "teams".into(),
+            channel: schema::ReplyChannel {
+                id: "conversation-1".into(),
+                thread_id: None,
+            },
+            content: schema::Content {
+                content_type: "text".into(),
+                text: "hello".into(),
+                attachments: Vec::new(),
+            },
+            command: None,
+            request_id: Some("request-1".into()),
+            quote_message_id: None,
+        };
+        let expected_outcomes = [
+            schema::WriteOutcome::Delivered {
+                message_id: Some("activity-1".into()),
+            },
+            schema::WriteOutcome::Rejected {
+                code: "rate_limited".into(),
+                message: "retry later".into(),
+                retry_after_ms: Some(2000),
+            },
+            schema::WriteOutcome::Unknown {
+                code: "request_timeout".into(),
+                message: "delivery may have completed".into(),
+            },
+        ];
+        for (index, expected) in expected_outcomes.into_iter().enumerate() {
+            reply.request_id = Some(format!("request-{index}"));
+            publish_teams_write_outcome(&reply, expected.clone(), &event_tx);
+            let response: schema::GatewayResponse = serde_json::from_str(&event_rx.recv().await?)?;
+            assert_eq!(response.request_id, format!("request-{index}"));
+            assert_eq!(response.write_outcome(), expected);
+        }
+
+        reply.request_id = None;
+        publish_teams_write_outcome(
+            &reply,
+            schema::WriteOutcome::Rejected {
+                code: "route_not_found".into(),
+                message: "missing".into(),
+                retry_after_ms: None,
+            },
+            &event_tx,
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "legacy reply must not receive an ACK"
+        );
         Ok(())
     }
 

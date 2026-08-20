@@ -30,6 +30,7 @@ quick-xml = "0.37"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 parking_lot = "0.12"
 urlencoding = "2"
+httpdate = "1"
 
 [dev-dependencies]
 wiremock = "0.6"

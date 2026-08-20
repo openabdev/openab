@@ -238,6 +238,8 @@ Full first-class Google Chat section (config-first parity, #1379) — credential
 Full first-class Teams section (config-first parity, #1380) — credentials, connection, and L3 identity trust. Each field resolves: config → `TEAMS_*` env → default. `app_id` + `app_secret` are mandatory (after env fallback); an incomplete section disables the adapter.
 
 > ⚠️ **M0 cloud-profile restriction:** Teams transport supports Microsoft commercial public cloud only. The adapter rejects non-HTTPS endpoints, userinfo, non-standard ports, sovereign-cloud hosts, custom proxy hosts, and service URLs outside `smba.trafficmanager.net`. Existing sovereign-cloud or proxy deployments must remain on an earlier release until an explicit cloud profile is available.
+>
+> Teams outbound replies require the bounded authenticated `event_id` route. A restart, route expiry, or capacity eviction causes a fail-closed `route_not_found`; the user must send a new activity. New Standalone peers advertise required send ACK and return the real Bot Framework activity ID, using `[gateway].gateway_ack_timeout_secs` as the Core wait budget.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|

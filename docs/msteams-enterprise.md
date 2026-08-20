@@ -664,7 +664,22 @@ Check Gateway pod logs:
 kubectl logs deployment/openab-gateway --tail=50
 ```
 
-Look for: `teams → gateway` (received) → `gateway → teams` (sent) → `teams activity sent` (success) or `teams reply rejected` (failure).
+Look for: `teams → gateway` (received) → `gateway → teams` (sent) →
+`teams activity sent` (success), `teams reply rejected` (definite failure), or
+`teams reply delivery is unknown; not retrying` (the POST may have completed).
+New Core↔Gateway peers require a structured send ACK and return the real Teams
+activity ID; legacy peers retain fire-and-forget missing-ACK behavior when no
+valid hello is negotiated.
+
+If logs report `route_not_found` or `Teams ingress route is missing or expired`,
+the Gateway restarted, the bounded route was evicted, or the route TTL elapsed
+before the response. Have the user send a new activity; never bypass the route
+with a manually supplied `serviceUrl`.
+
+> **Release validation:** Before marking Teams PR 3 complete, record personal,
+> group-chat, channel-root, channel-reply, and explicit-quote behavior in the
+> [D3 live-tenant matrix](msteams-discord-parity-requirements.md#202-live-microsoft-365-tenant-matrix).
+> HTTP mocks and a successful Connector activity ID do not close this UX gate.
 
 ### JWT validation failed
 

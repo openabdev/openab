@@ -2607,6 +2607,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "hmac 0.12.1",
+ "httpdate",
  "image",
  "jsonwebtoken",
  "parking_lot",

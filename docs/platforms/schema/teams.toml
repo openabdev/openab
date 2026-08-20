@@ -119,10 +119,11 @@ source = "https://learn.microsoft.com/en-us/azure/bot-service/rest-api/bot-frame
 [[openab_features]]
 feature = "send_message"
 status = "implemented"
-note = "Core `GatewayAdapter::send_message` → `send_gateway_reply` → gateway `handle_reply` → `send_activity` POSTs a `message` activity with `textFormat: markdown`."
+note = "Core preserves the origin `event_id`; Teams resolves it to a bounded authenticated ingress route, POSTs a `message` activity with `textFormat: markdown`, and returns the real Bot Framework activity ID. New Standalone peers advertise required send ACK; Unified returns the same ID directly."
 source = [
   "crates/openab-core/src/gateway.rs#send_message",
-  "crates/openab-gateway/src/adapters/teams.rs#send_activity",
+  "crates/openab-gateway/src/adapters/teams.rs#handle_reply",
+  "crates/openab-gateway/src/adapters/teams.rs#send_activity_outcome",
 ]
 pr = ""
 
@@ -148,8 +149,8 @@ pr = ""
 
 [[openab_features]]
 feature = "reply_quote"
-status = "not_implemented"
-note = "`GatewayAdapter::send_message_with_reply` puts the target id into `quote_message_id` (the visual-quote field via `send_gateway_reply`), not `reply_to`. The Teams adapter reads only `reply.reply_to` (the triggering-event/origin id) → `replyToId`, and ignores `quote_message_id` entirely — so the intended visual quote never reaches Teams. `replyToId` is a reply-target/context id, not a visual quote."
+status = "partial"
+note = "`GatewayAdapter::send_message_with_reply` carries an explicit target in `quote_message_id`. Teams maps it to Bot Connector `replyToId` only when the activity is known in the same app/tenant/conversation ingress scope; an unknown target falls back to plain send. Personal/group/channel visual UX remains gated by the D3 Microsoft 365 live-tenant matrix."
 source = [
   "crates/openab-core/src/gateway.rs#send_message_with_reply",
   "crates/openab-gateway/src/adapters/teams.rs#handle_reply",
@@ -254,7 +255,7 @@ pr = ""
 [[openab_features]]
 feature = "group_routing"
 status = "implemented"
-note = "Session remains keyed by `conversation.id` (+ `conversation_type`). Authenticated ingress now records a bounded gateway-local route under composite app/tenant/conversation/activity identity plus `event_id`; the conversation-only `serviceUrl` cache remains temporarily for the PR 1 outbound path and shares the configured route TTL/capacity."
+note = "Session remains keyed by `conversation.id` (+ `conversation_type`). Authenticated ingress records a bounded gateway-local route under composite app/tenant/conversation/activity identity plus `event_id`; outbound replies resolve only that event route and verify the reply channel matches its conversation."
 source = [
   "crates/openab-gateway/src/adapters/teams.rs#accept_message_activity",
   "crates/openab-gateway/src/adapters/teams_ingress.rs",
@@ -275,7 +276,7 @@ pr = ""
 [[quirks]]
 date = "2026-08-07"
 title = "serviceUrl remains gateway-local in bounded ephemeral route state"
-note = "For message activities, Teams requires non-empty Bot Framework channel, tenant, conversation, activity, sender, and service URL fields. The validated service URL is stored only in a process-local route keyed by app/tenant/conversation/activity and indexed by `event_id`; default route TTL is 3600 s with 10000 entries. The conversation-only compatibility cache remains until PR 3, with the same TTL/capacity. Missing required fields return 400."
+note = "For message activities, Teams requires non-empty Bot Framework channel, tenant, conversation, activity, sender, and service URL fields. The validated service URL is stored only in a process-local route keyed by app/tenant/conversation/activity and indexed by `event_id`; default route TTL is 3600 s with 10000 entries. Outbound replies use this route directly; missing required fields return 400."
 kind = "openab_decision"
 source = "docs/adr/teams-ephemeral-ingress-state.md"
 
@@ -287,11 +288,11 @@ kind = "openab_decision"
 source = "crates/openab-gateway/src/adapters/teams.rs#handle_reply"
 
 [[quirks]]
-date = "2026-07-04"
-title = "The reply/quote target is dropped"
-note = "`GatewayAdapter::send_message_with_reply` carries the visual-quote target in `quote_message_id` (set from `reply_to_message_id`), but the Teams adapter only reads `reply.reply_to` (the origin/triggering-event id) and maps it to `replyToId`. It never reads `quote_message_id`, so a caller asking for a visual reply/quote gets a plain reply-target `replyToId` at best and no visual quote. This is a distinct gap from the write-side commands."
+date = "2026-08-08"
+title = "Reply correlation and explicit quote targets have separate identifiers"
+note = "`reply_to` remains the OpenAB origin event ID and is used only to find authenticated route state. Normal sends do not copy it into Bot Connector `replyToId`. An explicit `quote_message_id` is emitted as `replyToId` only when known in the same app/tenant/conversation scope; otherwise Teams receives a plain send. The resulting visual UX is still unverified in a live tenant."
 kind = "openab_decision"
-source = "crates/openab-gateway/src/adapters/teams.rs#handle_reply"
+source = "docs/adr/teams-real-send-acknowledgement.md"
 
 [[quirks]]
 date = "2026-07-04"
@@ -317,7 +318,7 @@ source = "crates/openab-gateway/src/adapters/teams.rs"
 [[quirks]]
 date = "2026-08-06"
 title = "Unsupported write-side commands fail closed"
-note = "Teams `handle_reply` sends only commandless replies. Reactions are an explicit no-op; `edit_message`, `delete_message`, `create_topic`, and unknown commands return unsupported before route lookup or network I/O, preventing duplicate or misleading plain messages until native handlers are implemented."
+note = "Teams `handle_reply` sends only commandless replies. Reactions are an explicit no-op; `edit_message`, `delete_message`, `create_topic`, and unknown commands return a structured `unsupported_command` rejection before route lookup or network I/O, preventing duplicate or misleading plain messages until native handlers are implemented."
 kind = "openab_decision"
 source = "crates/openab-gateway/src/adapters/teams.rs#handle_reply"
 
@@ -385,8 +386,8 @@ kind = "openab_decision"
 source = "crates/openab-gateway/src/adapters/teams.rs"
 
 [[quirks]]
-date = "2026-08-06"
-title = "Reply correlation and inbound rich content remain incomplete"
-note = "Teams `handle_reply` supports hardened plain sends and rejects unsupported commands, but still maps the OpenAB event ID from `reply_to` to Bot Connector `replyToId`, ignores `quote_message_id`, and does not parse inbound attachments or mentions. Real activity correlation remains a separate implementation and live-tenant validation step."
+date = "2026-08-08"
+title = "Real send acknowledgement is implemented; reply-chain UX remains live-gated"
+note = "Teams resolves `reply_to` only as an `event_id` route index, returns the real outbound activity ID, and reports delivered/rejected/unknown outcomes in Standalone and Unified modes. Normal sends omit `replyToId`; explicit route-scoped quotes may set it. Channel root/reply, personal, and group-chat presentation still require the D3 live-tenant matrix, and inbound attachments/mentions remain future work."
 kind = "openab_decision"
-source = "crates/openab-gateway/src/adapters/teams.rs"
+source = "docs/adr/teams-real-send-acknowledgement.md"
