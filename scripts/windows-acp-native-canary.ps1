@@ -332,9 +332,16 @@ max_sessions = 2
         params = @{ sessionId = $sessionId; prompt = @(@{ type = "text"; text = "NO_NETWORK_CANARY" }) }
     }
     $promptResult = Receive-WebSocketResponse $socket 3 45
-    $promptSettled = ($promptResult.PSObject.Properties.Name -contains "result") -or
-        ($promptResult.PSObject.Properties.Name -contains "error")
-    Assert-Canary -Condition $promptSettled -Message "root prompt did not settle"
+    # NO_NETWORK_CANARY runs with a non-secret key and a proxy pointed at a
+    # dead loopback port (127.0.0.1:9). There is no provider backend reachable,
+    # so a successful prompt result is a canary failure: the agent must not be
+    # able to fabricate a turn without credentials/network. Assert the
+    # no-provider/no-credentials failure shape instead of treating
+    # result-or-error as success.
+    $promptHasError = $promptResult.PSObject.Properties.Name -contains "error"
+    $promptHasResult = $promptResult.PSObject.Properties.Name -contains "result"
+    Assert-Canary -Condition $promptHasError -Message "root no-network prompt did not return an error (no-provider/no-credentials failure shape)"
+    Assert-Canary -Condition (-not $promptHasResult) -Message "root no-network prompt returned a successful result, but no provider/credentials were configured"
 
     $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $($root.Id)" |
         Where-Object { $_.Name -ieq "openab-agent.exe" })

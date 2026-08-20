@@ -3,6 +3,7 @@ use process_wrap::tokio::{CommandWrap, KillOnDrop};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -74,26 +75,21 @@ fn build_env(allow_list: &[String]) -> HashMap<String, String> {
     #[cfg(unix)]
     let baseline = ["PATH", "HOME", "USER", "LANG", "TERM", "SHELL"];
     #[cfg(windows)]
-    let baseline = [
-        "PATH",
-        "SystemRoot",
-        "WINDIR",
-        "ComSpec",
-        "PATHEXT",
-        "TEMP",
-        "TMP",
-        "USERPROFILE",
-        "HOMEDRIVE",
-        "HOMEPATH",
-        "HOME",
-        "USERNAME",
-        "ProgramData",
-        "ProgramFiles",
-        "ProgramFiles(x86)",
-        "ProgramW6432",
-        "PSModulePath",
-        "LANG",
-    ];
+    let baseline: Vec<&str> = {
+        // General + identity keys stay local; the shared Windows runtime keys
+        // come from `openab-core` so this allow-list cannot silently diverge
+        // from the ACP spawn environment.
+        let mut keys = vec![
+            "PATH",
+            "HOME",
+            "LANG",
+            "SystemRoot",
+            "USERPROFILE",
+            "USERNAME",
+        ];
+        keys.extend_from_slice(openab_core::acp::WINDOWS_RUNTIME_ENV_KEYS);
+        keys
+    };
 
     for key in baseline {
         if let Ok(val) = std::env::var(key) {
@@ -335,48 +331,81 @@ impl Drop for ShellCommandController {
     }
 }
 
-async fn read_shell_pipe<R>(mut pipe: R) -> std::io::Result<Vec<u8>>
+async fn read_shell_pipe_into<R>(mut pipe: R, sink: Arc<Mutex<Vec<u8>>>) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
 {
-    let mut output = Vec::new();
-    pipe.read_to_end(&mut output).await?;
-    Ok(output)
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = pipe.read(&mut chunk).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        sink.lock().expect("shell pipe buffer lock").extend_from_slice(&chunk[..n]);
+    }
 }
 
 const POST_KILL_PIPE_JOIN: Duration = Duration::from_secs(3);
 const POST_EXIT_PIPE_JOIN: Duration = Duration::from_secs(6);
 const POST_TIMEOUT_CLEANUP: Duration = Duration::from_secs(5);
 
+const PIPE_TRUNCATION_MARKER: &[u8] =
+    b"\n[output truncated: pipe held open past deadline]\n";
+
 async fn join_shell_pipe(
     name: &str,
-    task: JoinHandle<std::io::Result<Vec<u8>>>,
-) -> Result<Vec<u8>> {
+    task: JoinHandle<std::io::Result<()>>,
+) -> Result<()> {
     task.await
         .map_err(|e| anyhow!("bash: {name} reader task failed: {e}"))?
         .map_err(|e| anyhow!("bash: {name} read failed: {e}"))
 }
 
+fn take_pipe_buffer(sink: &Arc<Mutex<Vec<u8>>>, truncated: bool) -> Vec<u8> {
+    let mut output = sink.lock().expect("shell pipe buffer lock").clone();
+    if truncated {
+        output.extend_from_slice(PIPE_TRUNCATION_MARKER);
+    }
+    output
+}
+
 async fn join_shell_pipes(
-    stdout_task: JoinHandle<std::io::Result<Vec<u8>>>,
-    stderr_task: JoinHandle<std::io::Result<Vec<u8>>>,
+    stdout_task: JoinHandle<std::io::Result<()>>,
+    stderr_task: JoinHandle<std::io::Result<()>>,
     stdout_abort: AbortHandle,
     stderr_abort: AbortHandle,
+    stdout_buf: Arc<Mutex<Vec<u8>>>,
+    stderr_buf: Arc<Mutex<Vec<u8>>>,
     limit: Option<Duration>,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
     let join_both = async {
-        let stdout = join_shell_pipe("stdout", stdout_task).await?;
-        let stderr = join_shell_pipe("stderr", stderr_task).await?;
-        Ok((stdout, stderr))
+        join_shell_pipe("stdout", stdout_task).await?;
+        join_shell_pipe("stderr", stderr_task).await?;
+        Ok::<(), anyhow::Error>(())
     };
     match limit {
-        None => join_both.await,
+        None => {
+            join_both.await?;
+            Ok((
+                take_pipe_buffer(&stdout_buf, false),
+                take_pipe_buffer(&stderr_buf, false),
+            ))
+        }
         Some(deadline) => match tokio::time::timeout(deadline, join_both).await {
-            Ok(result) => result,
+            Ok(result) => {
+                result?;
+                Ok((
+                    take_pipe_buffer(&stdout_buf, false),
+                    take_pipe_buffer(&stderr_buf, false),
+                ))
+            }
             Err(_) => {
                 stdout_abort.abort();
                 stderr_abort.abort();
-                Ok((Vec::new(), Vec::new()))
+                Ok((
+                    take_pipe_buffer(&stdout_buf, true),
+                    take_pipe_buffer(&stderr_buf, true),
+                ))
             }
         },
     }
@@ -384,8 +413,10 @@ async fn join_shell_pipes(
 
 async fn supervise_shell_process(
     mut child: Box<dyn process_wrap::tokio::ChildWrapper>,
-    stdout_task: JoinHandle<std::io::Result<Vec<u8>>>,
-    stderr_task: JoinHandle<std::io::Result<Vec<u8>>>,
+    stdout_task: JoinHandle<std::io::Result<()>>,
+    stderr_task: JoinHandle<std::io::Result<()>>,
+    stdout_buf: Arc<Mutex<Vec<u8>>>,
+    stderr_buf: Arc<Mutex<Vec<u8>>>,
     mut cancel_rx: oneshot::Receiver<()>,
 ) -> Result<ShellSupervisorOutcome> {
     enum ProcessOutcome {
@@ -425,6 +456,8 @@ async fn supervise_shell_process(
         stderr_task,
         stdout_abort,
         stderr_abort,
+        stdout_buf,
+        stderr_buf,
         pipe_limit,
     )
     .await?;
@@ -473,12 +506,22 @@ fn spawn_shell_command(
         .take()
         .ok_or_else(|| anyhow!("bash: stderr pipe unavailable"))?;
 
-    let stdout_task = tokio::spawn(read_shell_pipe(stdout));
-    let stderr_task = tokio::spawn(read_shell_pipe(stderr));
+    let stdout_buf = Arc::new(Mutex::new(Vec::new()));
+    let stderr_buf = Arc::new(Mutex::new(Vec::new()));
+    let stdout_task = tokio::spawn(read_shell_pipe_into(stdout, Arc::clone(&stdout_buf)));
+    let stderr_task = tokio::spawn(read_shell_pipe_into(stderr, Arc::clone(&stderr_buf)));
     let (cancel_tx, cancel_rx) = oneshot::channel();
     let (outcome_tx, outcome_rx) = oneshot::channel();
     tokio::spawn(async move {
-        let outcome = supervise_shell_process(child, stdout_task, stderr_task, cancel_rx).await;
+        let outcome = supervise_shell_process(
+            child,
+            stdout_task,
+            stderr_task,
+            stdout_buf,
+            stderr_buf,
+            cancel_rx,
+        )
+        .await;
         let _ = outcome_tx.send(outcome);
     });
 

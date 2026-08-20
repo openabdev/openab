@@ -409,28 +409,13 @@ impl AcpConnection {
             if let Ok(v) = std::env::var("SystemRoot") {
                 cmd.env("SystemRoot", v);
             }
-            if let Ok(v) = std::env::var("SystemDrive") {
-                cmd.env("SystemDrive", v);
-            }
             // PowerShell fixtures and normal Windows CLI tools need the standard
             // runtime locations after env_clear(). Per-user application-data
             // paths are intentionally excluded: npmrc/pip.ini and similar files
             // may contain credentials and must not become an implicit agent read
-            // surface after prompt injection.
-            for key in [
-                "WINDIR",
-                "ComSpec",
-                "PATHEXT",
-                "TEMP",
-                "TMP",
-                "ProgramData",
-                "ProgramFiles",
-                "ProgramFiles(x86)",
-                "ProgramW6432",
-                "HOMEDRIVE",
-                "HOMEPATH",
-                "PSModulePath",
-            ] {
+            // surface after prompt injection. The key list is shared with
+            // `openab-agent` via `crate::acp::WINDOWS_RUNTIME_ENV_KEYS`.
+            for key in crate::acp::WINDOWS_RUNTIME_ENV_KEYS {
                 if let Ok(v) = std::env::var(key) {
                     cmd.env(key, v);
                 }

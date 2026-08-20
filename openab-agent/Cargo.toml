@@ -10,6 +10,7 @@ description = "Native Rust coding agent with built-in ACP support"
 # extracted so the broker can host the OAB MCP Facade in-process (ADR §6.2).
 # This crate re-exports them as `crate::{mcp,auth}` and from `crate::{llm,acp}`.
 openab-mcp = { path = "../crates/openab-mcp" }
+openab-core = { path = "../crates/openab-core", default-features = false }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
