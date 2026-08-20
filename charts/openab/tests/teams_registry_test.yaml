@@ -1,0 +1,57 @@
+suite: Teams persistent conversation registry rendering
+templates:
+  - templates/gateway.yaml
+
+set:
+  agents.kiro.gateway.enabled: true
+  agents.kiro.gateway.teams.appId: test-app
+  agents.kiro.gateway.teams.appSecret: test-secret
+
+tests:
+  - it: keeps registry disabled and adds no volume by default
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: TEAMS_CONVERSATION_REGISTRY_PATH
+      - notExists:
+          path: spec.template.spec.volumes
+
+  - it: renders integer defaults after an explicit path
+    set:
+      agents.kiro.gateway.teams.conversationRegistryPath: /var/lib/openab/teams/conversations.json
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: TEAMS_CONVERSATION_REGISTRY_MAX_ENTRIES
+            value: "1000"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: TEAMS_CONVERSATION_REGISTRY_TTL_SECS
+            value: "31536000"
+
+  - it: renders bounded registry settings only after an explicit path
+    set:
+      agents.kiro.gateway.teams.conversationRegistryPath: /var/lib/openab/teams/conversations.json
+      agents.kiro.gateway.teams.conversationRegistryMaxEntries: 123
+      agents.kiro.gateway.teams.conversationRegistryTtlSecs: 456
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: TEAMS_CONVERSATION_REGISTRY_PATH
+            value: /var/lib/openab/teams/conversations.json
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: TEAMS_CONVERSATION_REGISTRY_MAX_ENTRIES
+            value: "123"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: TEAMS_CONVERSATION_REGISTRY_TTL_SECS
+            value: "456"
+      - notExists:
+          path: spec.template.spec.volumes

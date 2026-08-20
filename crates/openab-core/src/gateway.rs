@@ -67,6 +67,7 @@ fn legacy_gateway_capabilities(
         supports_target_message_id: false,
         supports_reactions: true,
         supports_attachment_materialization: false,
+        supports_conversation_registry: false,
         can_edit,
         can_delete: platform == "feishu",
         streaming_mode: if streaming && can_edit {
@@ -487,6 +488,55 @@ fn spawn_gateway_command(
     ));
 }
 
+fn trusted_conversation_registration_allowed(event: &GatewayEvent) -> bool {
+    event.platform.eq_ignore_ascii_case("teams")
+        && event.scope.as_ref().is_some_and(|scope| {
+            typed_scope_shape_is_valid(&event.channel.id, &event.channel.channel_type, scope)
+        })
+}
+
+async fn register_trusted_gateway_conversation(
+    adapter: Arc<dyn ChatAdapter>,
+    channel: ChannelRef,
+    typed_scope_allowed: bool,
+) {
+    if !typed_scope_allowed
+        || !channel.platform.eq_ignore_ascii_case("teams")
+        || !adapter
+            .capabilities(&channel.platform)
+            .supports_conversation_registry
+    {
+        return;
+    }
+    if adapter.register_conversation(&channel).await.is_err() {
+        warn!(
+            platform = "teams",
+            outcome = "not_completed",
+            "trusted conversation registration did not complete"
+        );
+    }
+}
+
+fn spawn_teams_gateway_event(
+    tasks: &mut tokio::task::JoinSet<()>,
+    event_json: String,
+    event_context: Arc<GatewayEventContext>,
+    event_order: Arc<Mutex<()>>,
+    serialize: bool,
+) {
+    tasks.spawn(async move {
+        let result = if serialize {
+            let _guard = event_order.lock().await;
+            process_gateway_event(&event_json, &event_context).await
+        } else {
+            process_gateway_event(&event_json, &event_context).await
+        };
+        if let Err(error) = result {
+            warn!(error = %error, "teams event processing failed");
+        }
+    });
+}
+
 async fn execute_gateway_command(
     command: Command,
     context: CommandContext,
@@ -698,12 +748,12 @@ type PendingRequests = Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<Ga
 /// Removes a pending attachment request when its future is cancelled by the
 /// whole-batch deadline. Normal responses remove the same key in the reader,
 /// so this cleanup is a no-op on the success path.
-struct PendingAttachmentRequest {
+struct PendingGatewayRequest {
     pending: PendingRequests,
     request_id: String,
 }
 
-impl Drop for PendingAttachmentRequest {
+impl Drop for PendingGatewayRequest {
     fn drop(&mut self) {
         let pending = self.pending.clone();
         let request_id = self.request_id.clone();
@@ -799,6 +849,8 @@ impl GatewayAdapter {
             capabilities.supports_attachment_materialization &= self.teams_inbound_attachments
                 && negotiated
                 && self.capability_state.topology_supported();
+            capabilities.supports_conversation_registry &=
+                negotiated && self.capability_state.topology_supported();
             // Teams has an independent default-off opt-in. Do not inherit the
             // generic Gateway streaming or placeholder switches.
             apply_teams_progressive_capabilities(
@@ -967,7 +1019,7 @@ impl GatewayAdapter {
             }
             pending.insert(request_id.clone(), pending_tx);
         }
-        let _pending_cleanup = PendingAttachmentRequest {
+        let _pending_cleanup = PendingGatewayRequest {
             pending: self.pending.clone(),
             request_id: request_id.clone(),
         };
@@ -1053,6 +1105,70 @@ impl GatewayAdapter {
             status: attachment.status,
         })
     }
+
+    async fn request_conversation_registration(&self, channel: &ChannelRef) -> Result<()> {
+        let request_id = format!("req_{}", uuid::Uuid::new_v4());
+        let (pending_tx, pending_rx) = tokio::sync::oneshot::channel();
+        {
+            let mut pending = self.pending.lock().await;
+            if !self.connection_active.load(AtomicOrdering::Acquire) {
+                anyhow::bail!("conversation registration connection is unavailable");
+            }
+            pending.insert(request_id.clone(), pending_tx);
+        }
+        let _pending_cleanup = PendingGatewayRequest {
+            pending: self.pending.clone(),
+            request_id: request_id.clone(),
+        };
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: channel.origin_event_id.clone().unwrap_or_default(),
+            platform: channel.platform.clone(),
+            channel: ReplyChannel {
+                id: channel.channel_id.clone(),
+                thread_id: channel.thread_id.clone(),
+            },
+            content: ReplyContent {
+                content_type: "text".into(),
+                text: String::new(),
+            },
+            command: Some("register_conversation".into()),
+            request_id: Some(request_id.clone()),
+            quote_message_id: None,
+            target_message_id: None,
+            attachment_ref: None,
+        };
+        let json = serde_json::to_string(&reply)?;
+        if let Err(error) = self.ws_tx.lock().await.send(Message::Text(json)).await {
+            self.pending.lock().await.remove(&request_id);
+            return Err(unknown_write_failure(
+                "conversation_registration_send_failed",
+                error.to_string(),
+            ));
+        }
+        let response = match tokio::time::timeout(self.ack_timeout, pending_rx).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => {
+                return Err(unknown_write_failure(
+                    "conversation_registration_ack_closed",
+                    "conversation registration ACK channel closed",
+                ))
+            }
+            Err(_) => {
+                self.pending.lock().await.remove(&request_id);
+                return Err(unknown_write_failure(
+                    "conversation_registration_ack_timeout",
+                    "conversation registration ACK timed out",
+                ));
+            }
+        };
+        match response.write_outcome() {
+            WriteOutcome::Delivered { .. } => Ok(()),
+            outcome @ (WriteOutcome::Rejected { .. } | WriteOutcome::Unknown { .. }) => {
+                Err(write_failure(outcome))
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -1095,6 +1211,24 @@ impl ChatAdapter for GatewayAdapter {
         }
         self.request_attachment_materialization(channel, reference)
             .await
+    }
+
+    async fn register_conversation(&self, channel: &ChannelRef) -> Result<()> {
+        let (negotiated, capabilities) = self.resolved_capabilities_with_mode(&channel.platform);
+        if !negotiated
+            || !self.capability_state.topology_supported()
+            || !capabilities.supports_conversation_registry
+        {
+            anyhow::bail!("conversation registry capability is unavailable");
+        }
+        if channel
+            .origin_event_id
+            .as_deref()
+            .is_none_or(|event_id| event_id.trim().is_empty())
+        {
+            anyhow::bail!("conversation registration requires an origin event");
+        }
+        self.request_conversation_registration(channel).await
     }
 
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
@@ -1650,20 +1784,19 @@ pub async fn run_gateway_adapter(
 
                             match serde_json::from_str::<GatewayEvent>(text_str) {
                                 Ok(event) => {
-                                    if event.platform.eq_ignore_ascii_case("teams")
-                                        && !event.content.attachments.is_empty()
-                                    {
-                                        let event_json = text_str.to_owned();
-                                        let event_context = teams_event_context.clone();
-                                        let event_order = teams_event_order.clone();
-                                        tasks.spawn(async move {
-                                            let _guard = event_order.lock().await;
-                                            if let Err(error) =
-                                                process_gateway_event(&event_json, &event_context).await
-                                            {
-                                                warn!(error = %error, "teams attachment event processing failed");
-                                            }
-                                        });
+                                    if event.platform.eq_ignore_ascii_case("teams") {
+                                        // Teams registration waits for a correlated GatewayResponse,
+                                        // so the whole event must run outside this WebSocket reader.
+                                        // This also guarantees registration completes before command,
+                                        // attachment, session, or agent side effects begin.
+                                        let serialize = !event.content.attachments.is_empty();
+                                        spawn_teams_gateway_event(
+                                            &mut tasks,
+                                            text_str.to_owned(),
+                                            teams_event_context.clone(),
+                                            teams_event_order.clone(),
+                                            serialize,
+                                        );
                                         continue;
                                     }
                                     if should_skip_event(&event, &filter) {
@@ -1981,6 +2114,11 @@ pub async fn run_gateway_adapter(
                         _ => {}
                     }
                 }
+                completed = tasks.join_next(), if !tasks.is_empty() => {
+                    if let Some(Err(error)) = completed {
+                        warn!(error = %error, "gateway event task failed");
+                    }
+                }
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
                         connection_active.store(false, AtomicOrdering::Release);
@@ -2209,6 +2347,13 @@ pub async fn process_gateway_event(
         parent_id: None,
         origin_event_id: Some(event.event_id.clone()),
     };
+
+    register_trusted_gateway_conversation(
+        ctx.adapter.clone(),
+        channel.clone(),
+        trusted_conversation_registration_allowed(&event),
+    )
+    .await;
 
     if let Some(command) = parse_command(&prompt) {
         let context = gateway_command_context(&event);
@@ -2538,14 +2683,23 @@ mod tests {
 
     #[derive(Default)]
     struct AttachmentProbeAdapter {
+        registrations: AtomicUsize,
         materializations: AtomicUsize,
         sends: AtomicUsize,
+        registration_fails: AtomicBool,
+        operations: std::sync::Mutex<Vec<&'static str>>,
         messages: std::sync::Mutex<Vec<String>>,
     }
 
     impl AttachmentProbeAdapter {
         fn messages(&self) -> std::sync::MutexGuard<'_, Vec<String>> {
             self.messages
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        fn operations(&self) -> std::sync::MutexGuard<'_, Vec<&'static str>> {
+            self.operations
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
         }
@@ -2564,6 +2718,7 @@ mod tests {
         fn capabilities(&self, platform: &str) -> AdapterCapabilities {
             AdapterCapabilities {
                 supports_attachment_materialization: platform == "teams",
+                supports_conversation_registry: platform == "teams",
                 ..AdapterCapabilities::default()
             }
         }
@@ -2572,12 +2727,22 @@ mod tests {
             false
         }
 
+        async fn register_conversation(&self, _channel: &ChannelRef) -> Result<()> {
+            self.registrations.fetch_add(1, Ordering::SeqCst);
+            self.operations().push("register");
+            if self.registration_fails.load(Ordering::SeqCst) {
+                anyhow::bail!("synthetic registration failure");
+            }
+            Ok(())
+        }
+
         async fn materialize_attachment(
             &self,
             _channel: &ChannelRef,
             _reference: &str,
         ) -> Result<MaterializedAttachment> {
             self.materializations.fetch_add(1, Ordering::SeqCst);
+            self.operations().push("materialize");
             Ok(MaterializedAttachment {
                 attachment_type: "text_file".into(),
                 filename: "notes.txt".into(),
@@ -2590,6 +2755,7 @@ mod tests {
 
         async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
             self.sends.fetch_add(1, Ordering::SeqCst);
+            self.operations().push("send");
             self.messages().push(content.to_string());
             Ok(MessageRef {
                 channel: channel.clone(),
@@ -2669,6 +2835,8 @@ mod tests {
         sends: AtomicUsize,
         started: tokio::sync::Semaphore,
         release: tokio::sync::Semaphore,
+        registration_started: tokio::sync::Semaphore,
+        registration_release: tokio::sync::Semaphore,
     }
 
     impl Default for BlockingOutcomeAdapter {
@@ -2677,6 +2845,8 @@ mod tests {
                 sends: AtomicUsize::new(0),
                 started: tokio::sync::Semaphore::new(0),
                 release: tokio::sync::Semaphore::new(0),
+                registration_started: tokio::sync::Semaphore::new(0),
+                registration_release: tokio::sync::Semaphore::new(0),
             }
         }
     }
@@ -2691,8 +2861,26 @@ mod tests {
             4_096
         }
 
+        fn capabilities(&self, platform: &str) -> AdapterCapabilities {
+            AdapterCapabilities {
+                supports_conversation_registry: platform == "teams",
+                ..AdapterCapabilities::default()
+            }
+        }
+
         fn use_streaming(&self, _other_bot_present: bool) -> bool {
             false
+        }
+
+        async fn register_conversation(&self, _channel: &ChannelRef) -> Result<()> {
+            self.registration_started.add_permits(1);
+            let permit = self
+                .registration_release
+                .acquire()
+                .await
+                .expect("semaphore open");
+            permit.forget();
+            Ok(())
         }
 
         async fn send_message(&self, _channel: &ChannelRef, _content: &str) -> Result<MessageRef> {
@@ -2812,9 +3000,27 @@ mod tests {
         event["content"]["text"] = "/cancel".into();
 
         assert!(!process_gateway_event(&event.to_string(), &context).await?);
+        assert_eq!(probe.registrations.load(Ordering::SeqCst), 1);
         assert_eq!(probe.materializations.load(Ordering::SeqCst), 0);
         assert_eq!(probe.sends.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.operations().as_slice(), ["register", "send"]);
         assert!(probe.messages()[0].contains("Nothing to cancel"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registration_failure_does_not_block_a_trusted_command() -> anyhow::Result<()> {
+        let probe = Arc::new(AttachmentProbeAdapter::default());
+        probe.registration_fails.store(true, Ordering::SeqCst);
+        let context = trusted_probe_context(probe.clone());
+        let mut event: serde_json::Value =
+            serde_json::from_str(&attachment_event_json("trusted-user"))?;
+        event["content"]["text"] = "/cancel".into();
+
+        assert!(!process_gateway_event(&event.to_string(), &context).await?);
+        assert_eq!(probe.registrations.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.sends.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.operations().as_slice(), ["register", "send"]);
         Ok(())
     }
 
@@ -2827,6 +3033,7 @@ mod tests {
         personal["content"]["text"] = "/usage".into();
         personal["content"]["attachments"] = serde_json::json!([]);
         assert!(!process_gateway_event(&personal.to_string(), &personal_context).await?);
+        assert_eq!(personal_probe.registrations.load(Ordering::SeqCst), 1);
         assert!(personal_probe.messages()[0].contains("No active session"));
 
         let legacy_probe = Arc::new(AttachmentProbeAdapter::default());
@@ -2835,6 +3042,7 @@ mod tests {
         legacy["channel"]["id"] = "legacy-conversation".into();
         legacy["scope"] = serde_json::Value::Null;
         assert!(!process_gateway_event(&legacy.to_string(), &legacy_context).await?);
+        assert_eq!(legacy_probe.registrations.load(Ordering::SeqCst), 0);
         assert!(legacy_probe.messages()[0].contains("only available in a private chat"));
         Ok(())
     }
@@ -2856,8 +3064,74 @@ mod tests {
         event["content"]["text"] = "<at>OpenAB</at> /cancel".into();
 
         assert!(!process_gateway_event(&event.to_string(), &context).await?);
+        assert_eq!(probe.registrations.load(Ordering::SeqCst), 1);
         assert_eq!(probe.materializations.load(Ordering::SeqCst), 0);
         assert_eq!(probe.sends.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn trusted_mention_only_event_registers_without_agent_dispatch() -> anyhow::Result<()> {
+        let probe = Arc::new(AttachmentProbeAdapter::default());
+        let context = trusted_probe_context(probe.clone());
+        let mut event: serde_json::Value =
+            serde_json::from_str(&attachment_event_json("trusted-user"))?;
+        event["channel"]["type"] = "groupChat".into();
+        event["scope"]["conversation_type"] = "groupChat".into();
+        event["scope"]["trust_scope_id"] = "teams:tenant-1:groupChat:conversation-1".into();
+        event["scope"]["is_dm"] = false.into();
+        event["recipient"] = serde_json::json!({"id": "bot-id", "name": "OpenAB"});
+        event["mentions"] = serde_json::json!(["bot-id"]);
+        event["mention_entities"] =
+            serde_json::json!([{"id": "bot-id", "text": "<at>OpenAB</at>"}]);
+        event["content"]["text"] = "<at>OpenAB</at>".into();
+        event["content"]["attachments"] = serde_json::json!([]);
+
+        assert!(!process_gateway_event(&event.to_string(), &context).await?);
+        assert_eq!(probe.registrations.load(Ordering::SeqCst), 1);
+        assert_eq!(probe.materializations.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.sends.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.operations().as_slice(), ["register"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn structural_and_typed_scope_denials_never_register() -> anyhow::Result<()> {
+        let structural_probe = Arc::new(AttachmentProbeAdapter::default());
+        let structural_context = trusted_probe_context(structural_probe.clone());
+        let mut group: serde_json::Value =
+            serde_json::from_str(&attachment_event_json("trusted-user"))?;
+        group["channel"]["type"] = "groupChat".into();
+        group["scope"]["conversation_type"] = "groupChat".into();
+        group["scope"]["trust_scope_id"] = "teams:tenant-1:groupChat:conversation-1".into();
+        group["scope"]["is_dm"] = false.into();
+        assert!(!process_gateway_event(&group.to_string(), &structural_context).await?);
+        assert_eq!(structural_probe.registrations.load(Ordering::SeqCst), 0);
+
+        let malformed_probe = Arc::new(AttachmentProbeAdapter::default());
+        let malformed_context = trusted_probe_context(malformed_probe.clone());
+        let mut malformed: serde_json::Value =
+            serde_json::from_str(&attachment_event_json("trusted-user"))?;
+        malformed["scope"]["conversation_type"] = "groupChat".into();
+        malformed["scope"]["is_dm"] = false.into();
+        assert!(!process_gateway_event(&malformed.to_string(), &malformed_context).await?);
+        assert_eq!(malformed_probe.registrations.load(Ordering::SeqCst), 0);
+
+        let l2_probe = Arc::new(AttachmentProbeAdapter::default());
+        let mut l2_context = trusted_probe_context(l2_probe.clone());
+        l2_context.teams_scope_policy = TeamsScopePolicy::new(
+            true,
+            Vec::<String>::new(),
+            Vec::<String>::new(),
+            false,
+            true,
+            true,
+            Vec::<String>::new(),
+        );
+        assert!(
+            !process_gateway_event(&attachment_event_json("trusted-user"), &l2_context,).await?
+        );
+        assert_eq!(l2_probe.registrations.load(Ordering::SeqCst), 0);
         Ok(())
     }
 
@@ -2945,6 +3219,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn standalone_teams_task_orders_registration_before_command() -> anyhow::Result<()> {
+        let probe = Arc::new(BlockingOutcomeAdapter::default());
+        let context = Arc::new(trusted_probe_context(probe.clone()));
+        let mut event: serde_json::Value =
+            serde_json::from_str(&attachment_event_json("trusted-user"))?;
+        event["content"]["text"] = "/cancel".into();
+        event["content"]["attachments"] = serde_json::json!([]);
+        let mut tasks = tokio::task::JoinSet::new();
+        spawn_teams_gateway_event(
+            &mut tasks,
+            event.to_string(),
+            context,
+            Arc::new(Mutex::new(())),
+            false,
+        );
+
+        let registration_started = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            probe.registration_started.acquire(),
+        )
+        .await
+        .expect("detached Teams task reached registration")
+        .expect("semaphore open");
+        registration_started.forget();
+        assert_eq!(probe.sends.load(Ordering::SeqCst), 0);
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            probe.started.acquire(),
+        )
+        .await
+        .is_err());
+
+        probe.registration_release.add_permits(1);
+        let command_started = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            probe.started.acquire(),
+        )
+        .await
+        .expect("command started after registration")
+        .expect("semaphore open");
+        command_started.forget();
+        assert_eq!(probe.sends.load(Ordering::SeqCst), 1);
+        probe.release.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_millis(100), tasks.join_next())
+            .await
+            .expect("Teams event task completed")
+            .expect("Teams event task present")
+            .expect("Teams event task succeeded");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn identity_denial_precedes_attachment_materialization() -> anyhow::Result<()> {
         let pool = Arc::new(crate::acp::SessionPool::new(
             crate::config::AgentConfig::default(),
@@ -2985,6 +3311,7 @@ mod tests {
         };
         let event_json = attachment_event_json("untrusted-user");
         assert!(!process_gateway_event(&event_json, &context).await?);
+        assert_eq!(probe.registrations.load(Ordering::SeqCst), 0);
         assert_eq!(probe.materializations.load(Ordering::SeqCst), 0);
         assert_eq!(probe.sends.load(Ordering::SeqCst), 1);
         Ok(())
@@ -3020,8 +3347,10 @@ mod tests {
             &context,
         )
         .await?);
+        assert_eq!(probe.registrations.load(Ordering::SeqCst), 1);
         assert_eq!(probe.materializations.load(Ordering::SeqCst), 1);
         assert_eq!(probe.sends.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.operations().as_slice(), ["register", "materialize"]);
 
         let mut injected: serde_json::Value =
             serde_json::from_str(&attachment_event_json("trusted-user"))?;
@@ -3320,6 +3649,30 @@ mod tests {
         assert_eq!(
             command_target_fields(&message, true, &AdapterCapabilities::default()),
             ("activity-1".into(), None)
+        );
+    }
+
+    #[test]
+    fn old_gateway_hello_defaults_conversation_registry_fail_closed() {
+        let hello: GatewayHello = serde_json::from_value(serde_json::json!({
+            "schema": GATEWAY_HELLO_SCHEMA,
+            "protocol_version": GATEWAY_PROTOCOL_VERSION,
+            "capabilities": {
+                "teams": { "send_ack": true }
+            },
+            "topology": {
+                "active_consumers": 1,
+                "supported": true,
+                "delivery_mode": "best_effort_broadcast"
+            }
+        }))
+        .expect("old hello should remain decodable");
+        assert!(
+            !hello
+                .capabilities
+                .get("teams")
+                .expect("Teams capability")
+                .supports_conversation_registry
         );
     }
 

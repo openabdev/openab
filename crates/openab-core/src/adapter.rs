@@ -397,6 +397,8 @@ pub struct AdapterCapabilities {
     /// Gateway can resolve one opaque inbound attachment reference after Core
     /// trust admission and return bounded normalized bytes.
     pub supports_attachment_materialization: bool,
+    /// Gateway can durably register an authenticated route after Core trust.
+    pub supports_conversation_registry: bool,
     pub can_edit: bool,
     pub can_delete: bool,
     pub streaming_mode: StreamingMode,
@@ -414,6 +416,7 @@ impl Default for AdapterCapabilities {
             supports_target_message_id: false,
             supports_reactions: false,
             supports_attachment_materialization: false,
+            supports_conversation_registry: false,
             can_edit: false,
             can_delete: false,
             streaming_mode: StreamingMode::Disabled,
@@ -557,6 +560,11 @@ pub trait ChatAdapter: Send + Sync + 'static {
         _reference: &str,
     ) -> Result<MaterializedAttachment> {
         Err(anyhow::anyhow!("attachment materialization not supported"))
+    }
+
+    /// Register a trusted Gateway-local conversation route for later use.
+    async fn register_conversation(&self, _channel: &ChannelRef) -> Result<()> {
+        Err(anyhow::anyhow!("conversation registry not supported"))
     }
 
     /// Send a new message, returns a reference to the sent message.

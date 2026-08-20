@@ -471,6 +471,11 @@ agents:
         # Default-off metadata-first image/text ingress. Sets the same env on
         # Core and Gateway; no Microsoft URL or token crosses into Core.
         inboundAttachments: false # → TEAMS_INBOUND_ATTACHMENTS
+        # Optional PR 11 persistent route registry. The chart does not create a
+        # Gateway PVC; mount this path with gateway.extraVolumeMounts/extraVolumes.
+        conversationRegistryPath: "" # disabled → TEAMS_CONVERSATION_REGISTRY_PATH
+        conversationRegistryMaxEntries: 1000 # → TEAMS_CONVERSATION_REGISTRY_MAX_ENTRIES
+        conversationRegistryTtlSecs: 31536000 # → TEAMS_CONVERSATION_REGISTRY_TTL_SECS
       # Feishu/Lark adapter config (gateway-side env vars)
       # See docs/feishu.md for full setup guide
       feishu:

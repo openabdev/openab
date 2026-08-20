@@ -212,6 +212,9 @@ pub struct AdapterCapabilities {
     /// Resolve opaque inbound attachment references after Core admission.
     #[serde(default)]
     pub supports_attachment_materialization: bool,
+    /// Persist an authenticated Teams route only after Core trust admission.
+    #[serde(default)]
+    pub supports_conversation_registry: bool,
     pub can_edit: bool,
     pub can_delete: bool,
     pub streaming_mode: StreamingMode,
@@ -229,6 +232,7 @@ impl Default for AdapterCapabilities {
             supports_target_message_id: false,
             supports_reactions: false,
             supports_attachment_materialization: false,
+            supports_conversation_registry: false,
             can_edit: false,
             can_delete: false,
             streaming_mode: StreamingMode::Disabled,
@@ -626,7 +630,8 @@ mod protocol_tests {
     }
 
     #[test]
-    fn attachment_materialization_fields_are_additive_and_bounded_envelopes() -> anyhow::Result<()> {
+    fn attachment_materialization_fields_are_additive_and_bounded_envelopes() -> anyhow::Result<()>
+    {
         #[derive(serde::Deserialize)]
         struct LegacyAttachment {
             filename: String,
@@ -659,8 +664,7 @@ mod protocol_tests {
             ..metadata
         };
         let response = GatewayResponse::from_attachment("request-1", materialized);
-        let decoded: GatewayResponse =
-            serde_json::from_str(&serde_json::to_string(&response)?)?;
+        let decoded: GatewayResponse = serde_json::from_str(&serde_json::to_string(&response)?)?;
         let attachment = decoded
             .attachment
             .ok_or_else(|| anyhow::anyhow!("materialized attachment is missing"))?;
@@ -772,6 +776,27 @@ mod protocol_tests {
     }
 
     #[test]
+    fn conversation_registry_capability_is_additive_and_fail_closed() {
+        #[derive(serde::Deserialize)]
+        struct LegacyCapabilities {
+            send_ack: bool,
+        }
+
+        let modern = AdapterCapabilities {
+            send_ack: true,
+            supports_conversation_registry: true,
+            ..AdapterCapabilities::default()
+        };
+        let json = serde_json::to_string(&modern).unwrap();
+        let legacy: LegacyCapabilities = serde_json::from_str(&json).unwrap();
+        assert!(legacy.send_ack);
+
+        let old_wire = serde_json::json!({ "send_ack": true });
+        let decoded: AdapterCapabilities = serde_json::from_value(old_wire).unwrap();
+        assert!(!decoded.supports_conversation_registry);
+    }
+
+    #[test]
     fn utf16_message_limit_round_trips_without_protocol_change() -> anyhow::Result<()> {
         let value = MessageLimit::Utf16Bytes {
             max: TEAMS_TEXT_UTF16_BUDGET_BYTES,
@@ -797,6 +822,7 @@ mod protocol_tests {
         assert!(!capabilities.supports_target_message_id);
         assert!(!capabilities.supports_reactions);
         assert!(!capabilities.supports_attachment_materialization);
+        assert!(!capabilities.supports_conversation_registry);
         assert!(!capabilities.can_edit);
         assert!(!capabilities.can_delete);
         assert_eq!(capabilities.streaming_mode, StreamingMode::Disabled);

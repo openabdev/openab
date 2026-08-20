@@ -50,6 +50,9 @@ Each agent lives under `agents.<name>`.
 | `gateway.deploy` | Deploy the gateway Deployment and Service. | `true` |
 | `gateway.teams.reactionsEnabled` | Opt in to Microsoft public-preview Bot Connector reactions. | `false` |
 | `gateway.teams.inboundAttachments` | Enable metadata-first Teams image/text ingress on both Core and Gateway. | `false` |
+| `gateway.teams.conversationRegistryPath` | Opt in to the Gateway-local persistent Teams conversation registry. Mount the path separately. | `""` |
+| `gateway.teams.conversationRegistryMaxEntries` | Persistent Teams registry entry cap. | `1000` |
+| `gateway.teams.conversationRegistryTtlSecs` | Active/disabled registry retention window. | `31536000` |
 | `cron.usercronEnabled` | Enable user-provided cron configuration. | `false` |
 | `cronjobs` | Config-driven scheduled messages for an agent. | `[]` |
 | `persistence.enabled` | Enable persistent storage for auth and settings. | `true` |
@@ -127,6 +130,8 @@ allow_group_chats = true
 Presence of any of these four fields opts into typed L2 policy. In Standalone Gateway mode, the policy still belongs to the OpenAB Core `configToml`; `gateway.teams.*` configures transport credentials and reaction preview on the Gateway container.
 
 `gateway.teams.inboundAttachments=true` is the exception that must stay aligned across processes: the chart emits `TEAMS_INBOUND_ATTACHMENTS=true` into both Core and Gateway. It enables bounded metadata-first image/text materialization only after Core trust admission. When `gateway.deploy=false`, configure the same environment variable on the external Gateway yourself.
+
+`gateway.teams.conversationRegistryPath` is a separate Gateway-only opt-in. The chart does not silently provision or attach a Gateway PVC; use `gateway.extraVolumeMounts` and `gateway.extraVolumes` (prefer an externally managed PVC with `"helm.sh/resource-policy": keep`) so the configured file survives pod replacement. An empty path preserves the previous process-local behavior and emits no registry environment variables.
 
 ### Discord ID precision warning
 

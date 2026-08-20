@@ -296,6 +296,13 @@ pr = ""
 # ═══ Schema 3 — platform-quirks (freeform, dated findings log) ═══════════════
 
 [[quirks]]
+date = "2026-08-19"
+title = "Persistent conversation authority requires post-trust promotion"
+note = "PR 11 adds an explicit-path opt-in, versioned Gateway-local registry. New Core requests `register_conversation` only after structural, typed L2, and L3 Allow; Gateway resolves the origin event to its authenticated ephemeral route and persists app/tenant/Bot-Framework-channel/conversation identity plus validated service URL. The wire carries no service URL or serialized reference. Active/disabled records expire after the configured TTL; authenticated installation removal records revocation. This registry does not implement proactive send or cron."
+kind = "openab_decision"
+source = "docs/adr/teams-trusted-persistent-conversation-registry.md"
+
+[[quirks]]
 date = "2026-08-08"
 title = "Progressive content uses one outcome-aware placeholder"
 note = "Default off. `[teams].streaming = true` is selected only after real-ID send and bot-owned edit/delete capabilities are proven. One turn reuses one process-local activity ID; cosmetic edits are changed-content-only and stop after three failures. Final PUT Rejected permits bounded delete-plus-fresh-send recovery, while any Unknown suppresses delete, retry, fresh final, and warning activities. Status messages and queued reactions remain separate lifecycles."

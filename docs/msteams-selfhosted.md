@@ -50,6 +50,11 @@ max_route_entries = 10000
 reactions_enabled = false # opt in only for the public-preview reaction API
 processing_indicator = "off" # set "message" for one turn-local status activity
 streaming = false # opt in to one progressive content placeholder per turn
+# Optional PR 11 registry; relative paths resolve under $HOME/.openab/.
+# No file is read or written when omitted.
+conversation_registry_path = "teams/conversations.json"
+conversation_registry_max_entries = 1000
+conversation_registry_ttl_secs = 31536000
 
 # Typed L2 scope. Presence of any of these four fields opts in.
 allowed_teams = []       # Team IDs
@@ -65,6 +70,8 @@ If all four typed fields are omitted, Core logs and preserves the legacy convers
 `processing_indicator = "message"` is a separate, default-off UX opt-in. It creates at most one processing activity per admitted turn, updates that same real activity ID for tool/terminal states, and deletes it only after complete final delivery. It neither enables streaming nor requires Graph/RSC. In Standalone mode, Core enables it only after Gateway advertises the required send/edit/delete ACK and command-target capabilities.
 
 `streaming = true` is an independent, default-off content opt-in. Core creates at most one real placeholder and coalesces bot-owned PUT updates every 1.5 seconds. Standalone requires a valid hello with required send/edit/delete ACKs, real target IDs, and placeholder support; otherwise it remains send-once. Generic Gateway or Telegram streaming settings do not enable Teams. Unknown POST/PUT/DELETE outcomes are never retried or converted into a fresh final activity. No Graph/RSC grant is required. Microsoft 365 live validation remains pending.
+
+`conversation_registry_path` opts in to PR 11 restart-persistent routing state. Core requests promotion only after structural, typed L2, and L3 Allow; the Gateway derives the record from its authenticated route, and the Bot Framework `serviceUrl` never enters Core or ACP. The file is versioned, bounded to 16 MiB, atomically replaced, and mode `0600` on Unix. In Standalone mode the path belongs to the Gateway container and must be mounted on durable storage explicitly. This registry alone does not send proactive messages or enable Teams cron.
 
 ### User Trust (`[teams]` section)
 
@@ -418,6 +425,9 @@ Transport variables are read by the embedded adapter or Standalone Gateway. Type
 | `TEAMS_REACTIONS_ENABLED` | No | `false` | Opt in to public-preview Bot Connector add/remove reactions |
 | `TEAMS_PROCESSING_INDICATOR` | No | `off` | Core processing UX: `off` or `message`; malformed values fail closed to `off` |
 | `TEAMS_STREAMING` | No | `false` | Core progressive-content opt-in; accepts only `true`/`false` or `1`/`0`, malformed values fail closed |
+| `TEAMS_CONVERSATION_REGISTRY_PATH` | No | (disabled) | Gateway-local registry file; relative paths resolve beneath `$HOME/.openab/` |
+| `TEAMS_CONVERSATION_REGISTRY_MAX_ENTRIES` | No | `1000` | Persistent record cap, range `1..=10000` |
+| `TEAMS_CONVERSATION_REGISTRY_TTL_SECS` | No | `31536000` | Active/disabled record retention window |
 | `TEAMS_ALLOWED_TEAMS` | No | (empty) | Core typed L2 Team-ID allowlist, comma-separated; Team OR channel match |
 | `TEAMS_ALLOWED_CHANNELS` | No | (empty) | Core typed L2 channel-ID allowlist, comma-separated; both lists empty means all Team channels |
 | `TEAMS_ALLOW_PERSONAL` | No | `true` | Core typed L2 Personal-chat switch |

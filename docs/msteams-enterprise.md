@@ -581,6 +581,8 @@ For a rolling deployment with an older Gateway, absent additive scope falls back
 
 Attachment ingress must be explicitly enabled on both processes. Core downloads nothing unless a valid Gateway hello advertises `supports_attachment_materialization`; Gateway stores only bounded metadata until Core has admitted structural, typed L2, and L3 trust. Do not pass Microsoft download URLs or bot credentials through Core configuration.
 
+PR 11 conversation persistence is a Gateway-side opt-in. For a separate Standalone Gateway, set `TEAMS_CONVERSATION_REGISTRY_PATH` on that Gateway process—not only in Core `configToml`—and mount its parent directory on durable storage. Core receives only an additive capability and sends origin correlation after typed L2/L3 Allow; the persisted `serviceUrl` never crosses the WebSocket. The registry does not enable proactive sends or cron until PR 12.
+
 Install the chart version validated with Gateway 0.5.4:
 
 ```bash
@@ -679,6 +681,9 @@ set transport variables on the Gateway through `openab-gateway-teams`. Typed sco
 | `TEAMS_PROCESSING_INDICATOR` | No | `off` | Core processing UX: `off` or `message`; malformed values fail closed to `off` |
 | `TEAMS_STREAMING` | No | `false` | Core progressive-content opt-in; accepts only `true`/`false` or `1`/`0`, malformed values fail closed |
 | `TEAMS_INBOUND_ATTACHMENTS` | No | `false` | Core/Gateway metadata-first image/text opt-in; set identically on both Standalone processes. Only `true`/`false` or `1`/`0`; malformed values fail closed. |
+| `TEAMS_CONVERSATION_REGISTRY_PATH` | No | (disabled) | Gateway-local registry file. Relative paths resolve beneath `$HOME/.openab/`; Standalone requires an explicit durable mount. |
+| `TEAMS_CONVERSATION_REGISTRY_MAX_ENTRIES` | No | `1000` | Persistent record cap, accepted range `1..=10000`. |
+| `TEAMS_CONVERSATION_REGISTRY_TTL_SECS` | No | `31536000` | Active/disabled record retention window. |
 | `TEAMS_ALLOWED_TEAMS` | No | (empty) | Core typed L2 Team-ID allowlist, comma-separated; Team OR channel match |
 | `TEAMS_ALLOWED_CHANNELS` | No | (empty) | Core typed L2 channel-ID allowlist, comma-separated; both lists empty means all Team channels |
 | `TEAMS_ALLOW_PERSONAL` | No | `true` | Core typed L2 Personal-chat switch |

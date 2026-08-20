@@ -14,7 +14,7 @@ const PUBLISH_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct TeamsRouteKey {
-    app_id: String,
+    pub(super) app_id: String,
     tenant_id: String,
     conversation_id: String,
     activity_id: String,
@@ -87,6 +87,7 @@ pub(super) struct TeamsIngressRoute {
     pub(super) key: TeamsRouteKey,
     pub(super) event_id: String,
     pub(super) tenant_id: String,
+    pub(super) bot_framework_channel_id: String,
     pub(super) conversation_id: String,
     pub(super) conversation_type: String,
     pub(super) inbound_activity_id: String,
@@ -559,6 +560,23 @@ impl TeamsIngressRegistry {
             .is_some()
     }
 
+    pub(super) fn route_for_registration(
+        &mut self,
+        event_id: &str,
+        conversation_id: &str,
+        now: Instant,
+    ) -> Result<TeamsIngressRoute, RouteLookupError> {
+        self.cleanup(now);
+        let route = self
+            .routes_by_event
+            .get(event_id)
+            .ok_or(RouteLookupError::NotFound)?;
+        if route.conversation_id != conversation_id {
+            return Err(RouteLookupError::ConversationMismatch);
+        }
+        Ok(route.clone())
+    }
+
     #[cfg(test)]
     pub(super) fn route_for_event(
         &mut self,
@@ -667,6 +685,7 @@ mod tests {
     ) -> anyhow::Result<TeamsIngressRoute> {
         Ok(TeamsIngressRoute {
             tenant_id: "tenant".into(),
+            bot_framework_channel_id: "msteams".into(),
             conversation_id: "conversation".into(),
             conversation_type: "personal".into(),
             inbound_activity_id: key.activity_id.clone(),
@@ -1173,6 +1192,18 @@ mod tests {
             "event-1",
             route(route_key.clone(), "event-1", now)?,
             now
+        ));
+        assert!(matches!(
+            registry.route_for_registration("event-1", "other", now),
+            Err(RouteLookupError::ConversationMismatch)
+        ));
+        assert!(matches!(
+            registry.route_for_registration(
+                "event-1",
+                "conversation",
+                now + Duration::from_secs(10)
+            ),
+            Err(RouteLookupError::NotFound)
         ));
         assert!(matches!(
             registry.route_for_reply(

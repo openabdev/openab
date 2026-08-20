@@ -116,6 +116,14 @@ spec:
             - name: TEAMS_INBOUND_ATTACHMENTS
               value: {{ ($cfg.gateway).teams.inboundAttachments | quote }}
             {{- end }}
+            {{- if ($cfg.gateway).teams.conversationRegistryPath }}
+            - name: TEAMS_CONVERSATION_REGISTRY_PATH
+              value: {{ ($cfg.gateway).teams.conversationRegistryPath | quote }}
+            - name: TEAMS_CONVERSATION_REGISTRY_MAX_ENTRIES
+              value: {{ ($cfg.gateway).teams.conversationRegistryMaxEntries | int64 | quote }}
+            - name: TEAMS_CONVERSATION_REGISTRY_TTL_SECS
+              value: {{ ($cfg.gateway).teams.conversationRegistryTtlSecs | int64 | quote }}
+            {{- end }}
             {{- end }}
             {{- $hasFeishu := and (($cfg.gateway).feishu).appId (($cfg.gateway).feishu).appSecret }}
             {{- if $hasFeishu }}

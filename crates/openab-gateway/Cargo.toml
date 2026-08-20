@@ -32,6 +32,12 @@ parking_lot = "0.12"
 urlencoding = "2"
 httpdate = "1"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 wiremock = "0.6"
 

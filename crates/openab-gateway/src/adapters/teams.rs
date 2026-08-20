@@ -4,6 +4,12 @@ use super::teams_ingress::{
     TeamsAttachmentSourceKind, TeamsIngressCleanupStats, TeamsIngressRegistry, TeamsIngressRoute,
     TeamsRouteKey, DEFAULT_DEDUPE_TTL_SECS, DEFAULT_MAX_ROUTE_ENTRIES, DEFAULT_ROUTE_TTL_SECS,
 };
+#[cfg(test)]
+use super::teams_registry::RegistryCounts;
+use super::teams_registry::{
+    key_from_parts, PromotionKind, TeamsConversationRegistry,
+    DEFAULT_CONVERSATION_REGISTRY_MAX_ENTRIES, DEFAULT_CONVERSATION_REGISTRY_TTL_SECS,
+};
 use crate::schema::*;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -13,7 +19,7 @@ use serde::Deserialize;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, error, info, warn};
@@ -37,6 +43,7 @@ pub struct Activity {
     pub tenant: Option<TenantInfo>,
     pub channel_data: Option<ChannelData>,
     pub reply_to_id: Option<String>,
+    pub action: Option<String>,
     #[serde(default)]
     pub entities: Vec<ActivityEntity>,
     #[serde(default)]
@@ -285,6 +292,7 @@ struct CachedJwks {
 
 // --- Teams adapter config ---
 
+#[derive(Clone)]
 pub struct TeamsConfig {
     pub app_id: String,
     pub app_secret: String,
@@ -296,6 +304,9 @@ pub struct TeamsConfig {
     pub max_route_entries: usize,
     pub reactions_enabled: bool,
     pub inbound_attachments: bool,
+    pub conversation_registry_path: Option<String>,
+    pub conversation_registry_max_entries: usize,
+    pub conversation_registry_ttl_secs: u64,
 }
 
 impl TeamsConfig {
@@ -346,6 +357,19 @@ impl TeamsConfig {
             inbound_attachments: parse_opt_in_bool(
                 read("TEAMS_INBOUND_ATTACHMENTS"),
                 "TEAMS_INBOUND_ATTACHMENTS",
+            ),
+            conversation_registry_path: read("TEAMS_CONVERSATION_REGISTRY_PATH")
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty()),
+            conversation_registry_max_entries: parse_positive_usize(
+                read("TEAMS_CONVERSATION_REGISTRY_MAX_ENTRIES"),
+                "TEAMS_CONVERSATION_REGISTRY_MAX_ENTRIES",
+                DEFAULT_CONVERSATION_REGISTRY_MAX_ENTRIES,
+            ),
+            conversation_registry_ttl_secs: parse_positive_u64(
+                read("TEAMS_CONVERSATION_REGISTRY_TTL_SECS"),
+                "TEAMS_CONVERSATION_REGISTRY_TTL_SECS",
+                DEFAULT_CONVERSATION_REGISTRY_TTL_SECS,
             ),
         })
     }
@@ -409,6 +433,7 @@ pub struct TeamsAdapter {
     jwks_cache: RwLock<Option<CachedJwks>>,
     jwks_refresh_lock: Mutex<()>,
     ingress: Mutex<TeamsIngressRegistry>,
+    conversation_registry: Option<Arc<StdMutex<TeamsConversationRegistry>>>,
     conversation_writes: Vec<Mutex<()>>,
     allow_non_public_endpoints: bool,
 }
@@ -461,6 +486,31 @@ impl TeamsAdapter {
             Duration::from_secs(config.route_ttl_secs),
             config.max_route_entries,
         );
+        let conversation_registry = config
+            .conversation_registry_path
+            .as_deref()
+            .and_then(|path| {
+                match TeamsConversationRegistry::open(
+                    path,
+                    config.conversation_registry_max_entries,
+                    config.conversation_registry_ttl_secs,
+                ) {
+                    Ok(registry) => {
+                        let counts = registry.counts();
+                        info!(
+                            active = counts.active,
+                            disabled = counts.disabled,
+                            revoked = counts.revoked,
+                            "teams conversation registry loaded"
+                        );
+                        Some(Arc::new(StdMutex::new(registry)))
+                    }
+                    Err(error) => {
+                        error!(error = %error, "teams conversation registry unavailable");
+                        None
+                    }
+                }
+            });
         Self {
             config,
             client,
@@ -472,6 +522,7 @@ impl TeamsAdapter {
             jwks_cache: RwLock::new(None),
             jwks_refresh_lock: Mutex::new(()),
             ingress: Mutex::new(ingress),
+            conversation_registry,
             conversation_writes: (0..TEAMS_WRITE_SHARDS).map(|_| Mutex::new(())).collect(),
             allow_non_public_endpoints,
         }
@@ -518,6 +569,7 @@ impl TeamsAdapter {
             key: route_key.clone(),
             event_id: event_id.into(),
             tenant_id: tenant_id.into(),
+            bot_framework_channel_id: "msteams".into(),
             conversation_id: conversation_id.into(),
             conversation_type: "personal".into(),
             inbound_activity_id: activity_id.into(),
@@ -573,6 +625,7 @@ impl TeamsAdapter {
             key: route_key.clone(),
             event_id: event_id.into(),
             tenant_id: "tenant-1".into(),
+            bot_framework_channel_id: "msteams".into(),
             conversation_id: conversation_id.into(),
             conversation_type: "personal".into(),
             inbound_activity_id: activity_id.into(),
@@ -603,6 +656,122 @@ impl TeamsAdapter {
 
     pub fn inbound_attachments_enabled(&self) -> bool {
         self.config.inbound_attachments
+    }
+
+    pub fn conversation_registry_available(&self) -> bool {
+        self.conversation_registry.is_some()
+    }
+
+    async fn register_conversation(&self, event_id: &str, conversation_id: &str) -> WriteOutcome {
+        let route =
+            {
+                let mut ingress = self.ingress.lock().await;
+                match ingress.route_for_registration(event_id, conversation_id, Instant::now()) {
+                    Ok(route) => route,
+                    Err(RouteLookupError::NotFound) => {
+                        return rejected_outcome(
+                            "origin_route_not_found",
+                            "conversation registration route is missing or expired",
+                        )
+                    }
+                    Err(RouteLookupError::ConversationMismatch) => return rejected_outcome(
+                        "conversation_mismatch",
+                        "conversation registration scope does not match the authenticated route",
+                    ),
+                }
+            };
+        let Some(registry) = self.conversation_registry.clone() else {
+            return rejected_outcome(
+                "conversation_registry_unavailable",
+                "Teams conversation registry is unavailable",
+            );
+        };
+
+        match tokio::task::spawn_blocking(move || {
+            let mut registry = registry
+                .lock()
+                .map_err(|_| anyhow::anyhow!("conversation registry lock is poisoned"))?;
+            let promotion = registry.promote(&route, chrono::Utc::now())?;
+            Ok::<_, anyhow::Error>((promotion, registry.counts()))
+        })
+        .await
+        {
+            Ok(Ok((promotion, counts))) => {
+                info!(
+                    operation = match promotion {
+                        PromotionKind::Inserted => "inserted",
+                        PromotionKind::Refreshed => "refreshed",
+                        PromotionKind::Reactivated => "reactivated",
+                    },
+                    active = counts.active,
+                    disabled = counts.disabled,
+                    revoked = counts.revoked,
+                    "teams conversation registration committed"
+                );
+                WriteOutcome::Delivered { message_id: None }
+            }
+            Ok(Err(error)) => {
+                error!(error = %error, "teams conversation registration outcome is unknown");
+                WriteOutcome::Unknown {
+                    code: "conversation_registry_write_unknown".into(),
+                    message: "Teams conversation registration outcome is unknown".into(),
+                }
+            }
+            Err(error) => {
+                error!(error = %error, "teams conversation registration task failed");
+                WriteOutcome::Unknown {
+                    code: "conversation_registry_task_failed".into(),
+                    message: "Teams conversation registration task failed".into(),
+                }
+            }
+        }
+    }
+
+    async fn revoke_installed_conversation(
+        &self,
+        tenant_id: &str,
+        bot_framework_channel_id: &str,
+        conversation_id: &str,
+        team_id: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let Some(registry) = self.conversation_registry.clone() else {
+            return Ok(false);
+        };
+        let key = key_from_parts(
+            &self.config.app_id,
+            tenant_id,
+            bot_framework_channel_id,
+            conversation_id,
+        )?;
+        let team_id = team_id.map(str::to_owned);
+        tokio::task::spawn_blocking(move || {
+            let mut registry = registry
+                .lock()
+                .map_err(|_| anyhow::anyhow!("conversation registry lock is poisoned"))?;
+            match team_id.as_deref() {
+                Some(team_id) => registry
+                    .revoke_scope(
+                        &key,
+                        Some(team_id),
+                        "installation_remove",
+                        chrono::Utc::now(),
+                    )
+                    .map(|changed| changed > 0),
+                None => registry.revoke(&key, "installation_remove", chrono::Utc::now()),
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("conversation registry revocation task failed"))?
+    }
+
+    #[cfg(test)]
+    pub(crate) fn conversation_registry_counts(&self) -> Option<RegistryCounts> {
+        self.conversation_registry.as_ref().map(|registry| {
+            registry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .counts()
+        })
     }
 
     fn conversation_write_shard(route: &TeamsIngressRoute) -> usize {
@@ -2451,7 +2620,15 @@ pub async fn webhook(
         return StatusCode::UNAUTHORIZED;
     }
 
-    // Only handle message activities
+    if activity.activity_type == "installationUpdate" {
+        if !teams.check_tenant(&activity) {
+            warn!("teams: installation update tenant is not allowed");
+            return StatusCode::FORBIDDEN;
+        }
+        return handle_installation_update(teams, &activity).await;
+    }
+
+    // Preserve the existing ignore behavior for other non-message activities.
     if activity.activity_type != "message" {
         debug!(activity_type = %activity.activity_type, "teams: ignoring non-message activity");
         return StatusCode::OK;
@@ -2465,6 +2642,64 @@ pub async fn webhook(
     }
 
     accept_message_activity(state, activity).await
+}
+
+async fn handle_installation_update(teams: &TeamsAdapter, activity: &Activity) -> StatusCode {
+    let action = activity.action.as_deref().unwrap_or_default();
+    if !action.eq_ignore_ascii_case("remove") && !action.eq_ignore_ascii_case("remove-upgrade") {
+        return StatusCode::OK;
+    }
+    let Some(tenant_id) = activity
+        .resolved_tenant_id()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        warn!("teams: installation removal is missing tenant identity");
+        return StatusCode::BAD_REQUEST;
+    };
+    let Some(bot_framework_channel_id) = activity
+        .channel_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        warn!("teams: installation removal is missing Bot Framework channel identity");
+        return StatusCode::BAD_REQUEST;
+    };
+    let Some(conversation_id) = activity
+        .conversation
+        .as_ref()
+        .and_then(|conversation| conversation.id.as_deref())
+        .filter(|value| !value.trim().is_empty())
+    else {
+        warn!("teams: installation removal is missing conversation identity");
+        return StatusCode::BAD_REQUEST;
+    };
+
+    match teams
+        .revoke_installed_conversation(
+            tenant_id,
+            bot_framework_channel_id,
+            conversation_id,
+            activity
+                .channel_data
+                .as_ref()
+                .and_then(|data| data.team.as_ref())
+                .and_then(|team| team.id.as_deref())
+                .filter(|value| !value.trim().is_empty()),
+        )
+        .await
+    {
+        Ok(changed) => {
+            info!(
+                changed,
+                "teams conversation installation revocation processed"
+            );
+            StatusCode::OK
+        }
+        Err(error) => {
+            error!(error = %error, "teams conversation installation revocation failed");
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+    }
 }
 
 enum LocalPublishOutcome {
@@ -2499,6 +2734,14 @@ async fn accept_message_activity(state: Arc<crate::AppState>, activity: Activity
         .filter(|value| !value.trim().is_empty())
     else {
         warn!("teams: message missing required tenant id");
+        return StatusCode::BAD_REQUEST;
+    };
+    let Some(bot_framework_channel_id) = activity
+        .channel_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        warn!("teams: message missing required Bot Framework channel id");
         return StatusCode::BAD_REQUEST;
     };
     let Some(conversation_id) = activity
@@ -2606,6 +2849,7 @@ async fn accept_message_activity(state: Arc<crate::AppState>, activity: Activity
         key: route_key.clone(),
         event_id: event_id.clone(),
         tenant_id: tenant_id.to_owned(),
+        bot_framework_channel_id: bot_framework_channel_id.to_owned(),
         conversation_id: conversation_id.to_owned(),
         conversation_type: conversation_type.clone(),
         inbound_activity_id: activity_id.to_owned(),
@@ -2957,6 +3201,11 @@ async fn handle_reaction(
 pub async fn handle_reply(reply: &GatewayReply, teams: &TeamsAdapter) -> WriteOutcome {
     match reply.command.as_deref() {
         None => handle_send_reply(reply, teams).await,
+        Some("register_conversation") => {
+            teams
+                .register_conversation(&reply.reply_to, &reply.channel.id)
+                .await
+        }
         Some(command @ ("edit_message" | "delete_message")) => {
             handle_owned_mutation(reply, teams, command).await
         }
@@ -3125,7 +3374,21 @@ mod tests {
             max_route_entries: DEFAULT_MAX_ROUTE_ENTRIES,
             reactions_enabled: false,
             inbound_attachments: false,
+            conversation_registry_path: None,
+            conversation_registry_max_entries: DEFAULT_CONVERSATION_REGISTRY_MAX_ENTRIES,
+            conversation_registry_ttl_secs: DEFAULT_CONVERSATION_REGISTRY_TTL_SECS,
         }
+    }
+
+    fn registry_test_path(label: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = std::fs::canonicalize(std::env::temp_dir()).expect("temp root");
+        let directory = root.join(format!(
+            "openab-teams-adapter-registry-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&directory).expect("registry test directory");
+        let path = directory.join("registry.json");
+        (directory, path)
     }
 
     fn make_http_test_config(server: &MockServer) -> TeamsConfig {
@@ -3178,6 +3441,137 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unsafe_registry_path_disables_only_the_persistent_capability() {
+        let mut config = make_config(vec![]);
+        config.conversation_registry_path = Some("../unsafe-registry.json".into());
+        let adapter = TeamsAdapter::new_for_test(config);
+        assert!(!adapter.conversation_registry_available());
+        assert!(!adapter.reactions_enabled());
+    }
+
+    #[tokio::test]
+    async fn trusted_registration_is_scoped_persisted_and_restart_safe() -> anyhow::Result<()> {
+        let (directory, path) = registry_test_path("roundtrip");
+        let mut config = make_config(vec![]);
+        config.conversation_registry_path = Some(path.to_string_lossy().into_owned());
+        let adapter = TeamsAdapter::new_for_test(config.clone());
+        assert!(adapter.conversation_registry_available());
+        adapter
+            .accept_route_for_test(
+                "https://smba.trafficmanager.net/teams",
+                "evt-1",
+                "tenant-1",
+                "conversation-1",
+                "inbound-secret",
+                None,
+            )
+            .await?;
+
+        assert!(matches!(
+            handle_reply(&make_reply(Some("register_conversation")), &adapter).await,
+            WriteOutcome::Delivered { message_id: None }
+        ));
+        assert_eq!(
+            adapter.conversation_registry_counts(),
+            Some(RegistryCounts {
+                active: 1,
+                disabled: 0,
+                revoked: 0,
+            })
+        );
+        assert!(matches!(
+            handle_reply(&make_reply(Some("register_conversation")), &adapter).await,
+            WriteOutcome::Delivered { message_id: None }
+        ));
+
+        let mut cross_conversation = make_reply(Some("register_conversation"));
+        cross_conversation.channel.id = "other-conversation".into();
+        assert!(matches!(
+            handle_reply(&cross_conversation, &adapter).await,
+            WriteOutcome::Rejected { code, .. } if code == "conversation_mismatch"
+        ));
+        let raw = std::fs::read_to_string(&path)?;
+        assert!(!raw.contains("evt-1"));
+        assert!(!raw.contains("inbound-secret"));
+        drop(adapter);
+
+        let reopened = TeamsAdapter::new_for_test(config);
+        assert_eq!(reopened.conversation_registry_counts().unwrap().active, 1);
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn authenticated_installation_removal_revokes_without_creating() -> anyhow::Result<()> {
+        let (directory, path) = registry_test_path("revoke");
+        let mut config = make_config(vec![]);
+        config.conversation_registry_path = Some(path.to_string_lossy().into_owned());
+        let adapter = TeamsAdapter::new_for_test(config);
+        adapter
+            .accept_route_for_test(
+                "https://smba.trafficmanager.net/teams",
+                "evt-1",
+                "tenant-1",
+                "conversation-1",
+                "inbound-1",
+                None,
+            )
+            .await?;
+        assert!(matches!(
+            handle_reply(&make_reply(Some("register_conversation")), &adapter).await,
+            WriteOutcome::Delivered { .. }
+        ));
+
+        let removal = Activity {
+            activity_type: "installationUpdate".into(),
+            id: Some("installation-event".into()),
+            timestamp: None,
+            service_url: Some("https://smba.trafficmanager.net/teams".into()),
+            channel_id: Some("msteams".into()),
+            from: None,
+            recipient: None,
+            conversation: Some(ConversationAccount {
+                id: Some("conversation-1".into()),
+                conversation_type: Some("personal".into()),
+                is_group: Some(false),
+                tenant_id: None,
+            }),
+            text: None,
+            tenant: Some(TenantInfo {
+                id: Some("tenant-1".into()),
+            }),
+            channel_data: None,
+            reply_to_id: None,
+            action: Some("remove".into()),
+            entities: vec![],
+            attachments: vec![],
+        };
+        assert_eq!(
+            handle_installation_update(&adapter, &removal).await,
+            StatusCode::OK
+        );
+        assert_eq!(adapter.conversation_registry_counts().unwrap().revoked, 1);
+
+        let mut add = removal.clone();
+        add.action = Some("add".into());
+        assert_eq!(
+            handle_installation_update(&adapter, &add).await,
+            StatusCode::OK
+        );
+        assert_eq!(adapter.conversation_registry_counts().unwrap().revoked, 1);
+
+        let mut unknown = removal;
+        unknown.conversation.as_mut().unwrap().id = Some("unknown".into());
+        assert_eq!(
+            handle_installation_update(&adapter, &unknown).await,
+            StatusCode::OK
+        );
+        assert_eq!(adapter.conversation_registry_counts().unwrap().revoked, 1);
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
     async fn accept_test_route(
         adapter: &TeamsAdapter,
         service_url: &str,
@@ -3213,6 +3607,7 @@ mod tests {
             }),
             channel_data: None,
             reply_to_id: None,
+            action: None,
             entities: vec![],
             attachments: vec![],
         }
@@ -3269,6 +3664,7 @@ mod tests {
                 }),
             }),
             reply_to_id: Some("root-activity".into()),
+            action: None,
             entities: vec![],
             attachments: vec![],
         }
@@ -3845,6 +4241,7 @@ mod tests {
             .route_for_event(&event.event_id, Instant::now())
             .ok_or_else(|| anyhow::anyhow!("successful retry should commit an ingress route"))?;
         assert_eq!(route.tenant_id, "tenant-1");
+        assert_eq!(route.bot_framework_channel_id, "msteams");
         assert_eq!(route.conversation_id, "conversation-1");
         assert_eq!(route.inbound_activity_id, "retryable-activity");
         assert_eq!(route.reply_chain_root_id.as_deref(), Some("root-activity"));
@@ -4580,6 +4977,13 @@ mod tests {
             );
         }
 
+        let registration = handle_reply(&make_reply(Some("register_conversation")), &adapter).await;
+        assert!(matches!(
+            registration,
+            WriteOutcome::Rejected { ref code, .. }
+                if code == "origin_route_not_found"
+        ));
+
         for command in ["create_topic", "future_unknown_command"] {
             let outcome = handle_reply(&make_reply(Some(command)), &adapter).await;
             assert!(
@@ -5221,12 +5625,21 @@ mod tests {
             ("TEAMS_DEDUPE_TTL_SECS", "42"),
             ("TEAMS_ROUTE_TTL_SECS", "84"),
             ("TEAMS_MAX_ROUTE_ENTRIES", "123"),
+            ("TEAMS_CONVERSATION_REGISTRY_PATH", "teams/registry.json"),
+            ("TEAMS_CONVERSATION_REGISTRY_MAX_ENTRIES", "321"),
+            ("TEAMS_CONVERSATION_REGISTRY_TTL_SECS", "987"),
         ]);
         let config = TeamsConfig::from_reader(|key| values.get(key).map(ToString::to_string))
             .ok_or_else(|| anyhow::anyhow!("complete credentials should resolve"))?;
         assert_eq!(config.dedupe_ttl_secs, 42);
         assert_eq!(config.route_ttl_secs, 84);
         assert_eq!(config.max_route_entries, 123);
+        assert_eq!(
+            config.conversation_registry_path.as_deref(),
+            Some("teams/registry.json")
+        );
+        assert_eq!(config.conversation_registry_max_entries, 321);
+        assert_eq!(config.conversation_registry_ttl_secs, 987);
         assert!(!config.reactions_enabled);
         assert!(!config.inbound_attachments);
 
@@ -5240,6 +5653,8 @@ mod tests {
         values.insert("TEAMS_DEDUPE_TTL_SECS", "0");
         values.insert("TEAMS_ROUTE_TTL_SECS", "invalid");
         values.insert("TEAMS_MAX_ROUTE_ENTRIES", "0");
+        values.insert("TEAMS_CONVERSATION_REGISTRY_MAX_ENTRIES", "0");
+        values.insert("TEAMS_CONVERSATION_REGISTRY_TTL_SECS", "invalid");
         values.insert("TEAMS_REACTIONS_ENABLED", "invalid");
         values.insert("TEAMS_INBOUND_ATTACHMENTS", "invalid");
         let config = TeamsConfig::from_reader(|key| values.get(key).map(ToString::to_string))
@@ -5247,6 +5662,14 @@ mod tests {
         assert_eq!(config.dedupe_ttl_secs, DEFAULT_DEDUPE_TTL_SECS);
         assert_eq!(config.route_ttl_secs, DEFAULT_ROUTE_TTL_SECS);
         assert_eq!(config.max_route_entries, DEFAULT_MAX_ROUTE_ENTRIES);
+        assert_eq!(
+            config.conversation_registry_max_entries,
+            DEFAULT_CONVERSATION_REGISTRY_MAX_ENTRIES
+        );
+        assert_eq!(
+            config.conversation_registry_ttl_secs,
+            DEFAULT_CONVERSATION_REGISTRY_TTL_SECS
+        );
         assert!(!config.reactions_enabled);
         assert!(!config.inbound_attachments);
         Ok(())

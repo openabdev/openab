@@ -333,6 +333,7 @@ impl AppState {
                     },
                     supports_reactions: teams.reactions_enabled(),
                     supports_attachment_materialization: teams.inbound_attachments_enabled(),
+                    supports_conversation_registry: teams.conversation_registry_available(),
                     status_backend: if teams.reactions_enabled() {
                         StatusBackend::Reactions
                     } else {
@@ -612,6 +613,8 @@ impl AppState {
         let max_route_entries = cfg.max_route_entries.to_string();
         let reactions_enabled = cfg.reactions_enabled.to_string();
         let inbound_attachments = cfg.inbound_attachments.to_string();
+        let conversation_registry_max_entries = cfg.conversation_registry_max_entries.to_string();
+        let conversation_registry_ttl_secs = cfg.conversation_registry_ttl_secs.to_string();
         self.teams = adapters::teams::TeamsConfig::from_reader(|k| match k {
             "TEAMS_APP_ID" => cfg.app_id.clone(),
             "TEAMS_APP_SECRET" => cfg.app_secret.clone(),
@@ -623,6 +626,11 @@ impl AppState {
             "TEAMS_MAX_ROUTE_ENTRIES" => Some(max_route_entries.clone()),
             "TEAMS_REACTIONS_ENABLED" => Some(reactions_enabled.clone()),
             "TEAMS_INBOUND_ATTACHMENTS" => Some(inbound_attachments.clone()),
+            "TEAMS_CONVERSATION_REGISTRY_PATH" => cfg.conversation_registry_path.clone(),
+            "TEAMS_CONVERSATION_REGISTRY_MAX_ENTRIES" => {
+                Some(conversation_registry_max_entries.clone())
+            }
+            "TEAMS_CONVERSATION_REGISTRY_TTL_SECS" => Some(conversation_registry_ttl_secs.clone()),
             _ => None,
         })
         .map(adapters::teams::TeamsAdapter::new);
@@ -721,6 +729,9 @@ pub struct GatewayTeamsConfig {
     pub max_route_entries: usize,
     pub reactions_enabled: bool,
     pub inbound_attachments: bool,
+    pub conversation_registry_path: Option<String>,
+    pub conversation_registry_max_entries: usize,
+    pub conversation_registry_ttl_secs: u64,
 }
 
 /// Start the shared Teams state sweeper for Standalone or Unified mode.
@@ -1252,6 +1263,8 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
         let client = reqwest::Client::new();
         #[cfg(feature = "teams")]
         let mut attachment_materialization_negotiated = false;
+        #[cfg(feature = "teams")]
+        let mut conversation_registry_negotiated = false;
         while let Some(Ok(msg)) = ws_rx.next().await {
             if let Message::Text(text) = msg {
                 if let Ok(envelope) = serde_json::from_str::<schema::GatewayEnvelope>(&text) {
@@ -1271,9 +1284,18 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                                     attachment_materialization_negotiated = client_hello
                                         .protocol_version
                                         == schema::GATEWAY_PROTOCOL_VERSION
-                                        && hello.capabilities.get("teams").is_some_and(|capability| {
-                                            capability.supports_attachment_materialization
-                                        });
+                                        && hello.capabilities.get("teams").is_some_and(
+                                            |capability| {
+                                                capability.supports_attachment_materialization
+                                            },
+                                        );
+                                    conversation_registry_negotiated = client_hello
+                                        .protocol_version
+                                        == schema::GATEWAY_PROTOCOL_VERSION
+                                        && hello.topology.supported
+                                        && hello.capabilities.get("teams").is_some_and(
+                                            |capability| capability.supports_conversation_registry,
+                                        );
                                 }
                                 if let Ok(json) = serde_json::to_string(&hello) {
                                     if control_tx.send(json).await.is_err() {
@@ -1332,6 +1354,49 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                             }
                             #[cfg(feature = "teams")]
                             "teams" => {
+                                if reply.command.as_deref() == Some("register_conversation") {
+                                    let Some(_request_id) = reply
+                                        .request_id
+                                        .as_deref()
+                                        .filter(|value| !value.trim().is_empty())
+                                    else {
+                                        warn!("teams: conversation registration has no request id");
+                                        continue;
+                                    };
+                                    let outcome = match (
+                                        conversation_registry_negotiated,
+                                        state_for_recv
+                                            .active_oab_consumers
+                                            .load(Ordering::Acquire)
+                                            == 1,
+                                        state_for_recv.teams.as_ref(),
+                                    ) {
+                                        (false, _, _) => schema::WriteOutcome::Rejected {
+                                            code: "capability_not_negotiated".into(),
+                                            message: "conversation registry capability was not negotiated".into(),
+                                            retry_after_ms: None,
+                                        },
+                                        (true, false, _) => schema::WriteOutcome::Rejected {
+                                            code: "unsupported_topology".into(),
+                                            message: "conversation registration requires one active Core consumer".into(),
+                                            retry_after_ms: None,
+                                        },
+                                        (true, true, Some(teams)) => {
+                                            adapters::teams::handle_reply(&reply, teams).await
+                                        }
+                                        (true, true, None) => schema::WriteOutcome::Rejected {
+                                            code: "adapter_not_configured".into(),
+                                            message: "Teams adapter is not configured".into(),
+                                            retry_after_ms: None,
+                                        },
+                                    };
+                                    publish_teams_write_outcome(
+                                        &reply,
+                                        outcome,
+                                        &state_for_recv.event_tx,
+                                    );
+                                    continue;
+                                }
                                 if reply.command.as_deref() == Some("materialize_attachment") {
                                     let Some(request_id) = reply
                                         .request_id
@@ -1653,6 +1718,9 @@ mod l1_audit_tests {
             max_route_entries: 10_000,
             reactions_enabled: true,
             inbound_attachments: true,
+            conversation_registry_path: None,
+            conversation_registry_max_entries: 1_000,
+            conversation_registry_ttl_secs: 365 * 24 * 60 * 60,
         });
         assert!(s.teams.is_some());
         assert_eq!(s.teams_webhook_path, "/hook/teams");
@@ -1665,6 +1733,7 @@ mod l1_audit_tests {
         assert!(teams.delete_ack);
         assert!(teams.supports_target_message_id);
         assert!(teams.supports_attachment_materialization);
+        assert!(!teams.supports_conversation_registry);
         assert!(teams.can_edit);
         assert!(teams.can_delete);
         assert_eq!(teams.streaming_mode, super::schema::StreamingMode::Disabled);
@@ -1687,6 +1756,9 @@ mod l1_audit_tests {
             max_route_entries: 10_000,
             reactions_enabled: false,
             inbound_attachments: false,
+            conversation_registry_path: None,
+            conversation_registry_max_entries: 1_000,
+            conversation_registry_ttl_secs: 365 * 24 * 60 * 60,
         });
         assert!(s.teams.is_none());
     }
@@ -1826,6 +1898,9 @@ mod gateway_protocol_tests {
             max_route_entries: 10_000,
             reactions_enabled: false,
             inbound_attachments: false,
+            conversation_registry_path: None,
+            conversation_registry_max_entries: 1_000,
+            conversation_registry_ttl_secs: 365 * 24 * 60 * 60,
         }
     }
 
@@ -2129,6 +2204,9 @@ mod gateway_protocol_tests {
             max_route_entries: 10_000,
             reactions_enabled: false,
             inbound_attachments: true,
+            conversation_registry_path: None,
+            conversation_registry_max_entries: 1_000,
+            conversation_registry_ttl_secs: 365 * 24 * 60 * 60,
         });
         let hello = build_gateway_hello(
             &state,
@@ -2148,6 +2226,7 @@ mod gateway_protocol_tests {
         assert!(teams.delete_ack);
         assert!(teams.supports_target_message_id);
         assert!(teams.supports_attachment_materialization);
+        assert!(!teams.supports_conversation_registry);
         assert!(!teams.supports_reactions);
         assert_eq!(
             teams.message_limit,
@@ -2155,6 +2234,154 @@ mod gateway_protocol_tests {
                 max: schema::TEAMS_TEXT_UTF16_BUDGET_BYTES,
             }
         );
+    }
+
+    #[cfg(feature = "teams")]
+    #[tokio::test]
+    async fn teams_conversation_registration_is_negotiated_scoped_and_acknowledged(
+    ) -> anyhow::Result<()> {
+        let connector = MockServer::start().await;
+        let root = std::fs::canonicalize(std::env::temp_dir())?;
+        let directory = root.join(format!(
+            "openab-gateway-registration-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&directory)?;
+        let registry_path = directory.join("registry.json");
+        let mut config = teams_test_config(&connector);
+        config.conversation_registry_path = Some(registry_path.to_string_lossy().into_owned());
+        let teams = adapters::teams::TeamsAdapter::new_for_test(config);
+        teams
+            .accept_route_for_test(
+                "https://smba.trafficmanager.net/teams",
+                "event-registration",
+                "tenant-1",
+                "conversation-1",
+                "activity-secret",
+                None,
+            )
+            .await?;
+
+        let (event_tx, _event_rx) = broadcast::channel(8);
+        let mut app_state = AppState::test_default(event_tx);
+        app_state.teams = Some(teams);
+        let (addr, state, server) = start_server(app_state).await?;
+        let url = format!("{}://{addr}/ws", "ws");
+        let (mut socket, _) = tokio_tungstenite::connect_async(&url).await?;
+        wait_for_consumers(&state, 1).await?;
+        let registration_command = |request_id: &str, conversation_id: &str| schema::GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "event-registration".into(),
+            platform: "teams".into(),
+            channel: schema::ReplyChannel {
+                id: conversation_id.into(),
+                thread_id: None,
+            },
+            content: schema::Content {
+                content_type: "text".into(),
+                text: String::new(),
+                attachments: Vec::new(),
+            },
+            command: Some("register_conversation".into()),
+            request_id: Some(request_id.into()),
+            quote_message_id: None,
+            target_message_id: None,
+            attachment_ref: None,
+        };
+
+        socket
+            .send(Message::Text(serde_json::to_string(
+                &registration_command("registration-before-hello", "conversation-1"),
+            )?))
+            .await?;
+        let before_hello: schema::GatewayResponse =
+            serde_json::from_str(&next_text(&mut socket).await?)?;
+        assert_eq!(
+            before_hello.error_code.as_deref(),
+            Some("capability_not_negotiated")
+        );
+        assert_eq!(
+            state
+                .teams
+                .as_ref()
+                .and_then(|teams| teams.conversation_registry_counts())
+                .map(|counts| counts.active),
+            Some(0)
+        );
+
+        socket
+            .send(Message::Text(serde_json::to_string(
+                &schema::GatewayClientHello {
+                    schema: schema::CLIENT_HELLO_SCHEMA.into(),
+                    protocol_version: schema::GATEWAY_PROTOCOL_VERSION,
+                    client_name: Some("test-core".into()),
+                    requested_platforms: vec!["teams".into()],
+                },
+            )?))
+            .await?;
+        let hello: schema::GatewayHello = serde_json::from_str(&next_text(&mut socket).await?)?;
+        assert!(hello
+            .capabilities
+            .get("teams")
+            .is_some_and(|capability| capability.supports_conversation_registry));
+
+        let (mut second_socket, _) = tokio_tungstenite::connect_async(&url).await?;
+        wait_for_consumers(&state, 2).await?;
+        socket
+            .send(Message::Text(serde_json::to_string(
+                &registration_command("registration-unsupported-topology", "conversation-1"),
+            )?))
+            .await?;
+        let unsupported_topology: schema::GatewayResponse =
+            serde_json::from_str(&next_text(&mut socket).await?)?;
+        assert_eq!(
+            unsupported_topology.error_code.as_deref(),
+            Some("unsupported_topology")
+        );
+        second_socket.close(None).await?;
+        wait_for_consumers(&state, 1).await?;
+
+        socket
+            .send(Message::Text(serde_json::to_string(
+                &registration_command("registration-success", "conversation-1"),
+            )?))
+            .await?;
+        let delivered: schema::GatewayResponse =
+            serde_json::from_str(&next_text(&mut socket).await?)?;
+        assert_eq!(delivered.request_id, "registration-success");
+        assert!(delivered.success);
+        assert_eq!(delivered.outcome, Some(schema::WriteOutcomeKind::Delivered));
+        assert!(delivered.message_id.is_none());
+        assert_eq!(
+            state
+                .teams
+                .as_ref()
+                .and_then(|teams| teams.conversation_registry_counts())
+                .map(|counts| counts.active),
+            Some(1)
+        );
+
+        socket
+            .send(Message::Text(serde_json::to_string(
+                &registration_command("registration-cross-conversation", "other-conversation"),
+            )?))
+            .await?;
+        let cross_conversation: schema::GatewayResponse =
+            serde_json::from_str(&next_text(&mut socket).await?)?;
+        assert_eq!(
+            cross_conversation.error_code.as_deref(),
+            Some("conversation_mismatch")
+        );
+        let raw = std::fs::read_to_string(&registry_path)?;
+        assert!(!raw.contains("event-registration"));
+        assert!(!raw.contains("activity-secret"));
+
+        socket.close(None).await?;
+        wait_for_consumers(&state, 0).await?;
+        server.abort();
+        drop(state);
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
     }
 
     #[cfg(feature = "teams")]
@@ -2186,7 +2413,7 @@ mod gateway_protocol_tests {
         let mut app_state = AppState::test_default(event_tx);
         app_state.teams = Some(teams);
         let (addr, state, server) = start_server(app_state).await?;
-        let url = format!("ws://{addr}/ws");
+        let url = format!("{}://{addr}/ws", "ws");
         let (mut socket, _) = tokio_tungstenite::connect_async(&url).await?;
         wait_for_consumers(&state, 1).await?;
         let materialization_command = |request_id: &str| schema::GatewayReply {

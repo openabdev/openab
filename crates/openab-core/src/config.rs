@@ -1355,6 +1355,15 @@ pub struct TeamsConfig {
     /// Permit post-admission materialization of bounded inbound image/text
     /// attachments. Env fallback: `TEAMS_INBOUND_ATTACHMENTS`; default `false`.
     pub inbound_attachments: Option<bool>,
+    /// Opt-in persistent conversation registry file. Relative paths resolve
+    /// beneath `$HOME/.openab/`. Env: `TEAMS_CONVERSATION_REGISTRY_PATH`.
+    pub conversation_registry_path: Option<String>,
+    /// Persistent registry entry cap. Env fallback:
+    /// `TEAMS_CONVERSATION_REGISTRY_MAX_ENTRIES`; default 1000.
+    pub conversation_registry_max_entries: Option<usize>,
+    /// Active/disabled registry retention. Env fallback:
+    /// `TEAMS_CONVERSATION_REGISTRY_TTL_SECS`; default one year.
+    pub conversation_registry_ttl_secs: Option<u64>,
     /// Team IDs admitted by typed channel scope. Env fallback:
     /// `TEAMS_ALLOWED_TEAMS` (comma-separated). Both scope lists empty = open.
     pub allowed_teams: Option<Vec<String>>,
@@ -1389,6 +1398,9 @@ pub struct ResolvedTeams {
     pub processing_indicator: TeamsProcessingIndicator,
     pub streaming: bool,
     pub inbound_attachments: bool,
+    pub conversation_registry_path: Option<String>,
+    pub conversation_registry_max_entries: usize,
+    pub conversation_registry_ttl_secs: u64,
     pub allowed_teams: Vec<String>,
     pub allowed_channels: Vec<String>,
     pub allow_personal: bool,
@@ -1511,6 +1523,20 @@ impl TeamsConfig {
                 self.inbound_attachments,
                 "TEAMS_INBOUND_ATTACHMENTS",
                 false,
+            ),
+            conversation_registry_path: opt_str(
+                &self.conversation_registry_path,
+                "TEAMS_CONVERSATION_REGISTRY_PATH",
+            ),
+            conversation_registry_max_entries: positive_usize(
+                self.conversation_registry_max_entries,
+                "TEAMS_CONVERSATION_REGISTRY_MAX_ENTRIES",
+                1_000,
+            ),
+            conversation_registry_ttl_secs: positive_u64(
+                self.conversation_registry_ttl_secs,
+                "TEAMS_CONVERSATION_REGISTRY_TTL_SECS",
+                365 * 24 * 60 * 60,
             ),
             allowed_teams: csv(&self.allowed_teams, "TEAMS_ALLOWED_TEAMS"),
             allowed_channels: csv(&self.allowed_channels, "TEAMS_ALLOWED_CHANNELS"),
@@ -2475,6 +2501,18 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
         if let Some(value) = teams.max_route_entries {
             anyhow::ensure!(value > 0, "teams.max_route_entries must be > 0");
         }
+        if let Some(value) = teams.conversation_registry_max_entries {
+            anyhow::ensure!(
+                (1..=10_000).contains(&value),
+                "teams.conversation_registry_max_entries must be between 1 and 10000"
+            );
+        }
+        if let Some(value) = teams.conversation_registry_ttl_secs {
+            anyhow::ensure!(
+                value > 0 && i64::try_from(value).is_ok(),
+                "teams.conversation_registry_ttl_secs is out of range"
+            );
+        }
     }
     if let Some(ref g) = config.gateway {
         anyhow::ensure!(
@@ -3210,6 +3248,9 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
             "TEAMS_PROCESSING_INDICATOR",
             "TEAMS_STREAMING",
             "TEAMS_INBOUND_ATTACHMENTS",
+            "TEAMS_CONVERSATION_REGISTRY_PATH",
+            "TEAMS_CONVERSATION_REGISTRY_MAX_ENTRIES",
+            "TEAMS_CONVERSATION_REGISTRY_TTL_SECS",
             "TEAMS_ALLOWED_TEAMS",
             "TEAMS_ALLOWED_CHANNELS",
             "TEAMS_ALLOW_PERSONAL",
@@ -3231,6 +3272,9 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         assert_eq!(r.processing_indicator, TeamsProcessingIndicator::Off);
         assert!(!r.streaming);
         assert!(!r.inbound_attachments);
+        assert!(r.conversation_registry_path.is_none());
+        assert_eq!(r.conversation_registry_max_entries, 1_000);
+        assert_eq!(r.conversation_registry_ttl_secs, 365 * 24 * 60 * 60);
         assert!(r.allowed_teams.is_empty());
         assert!(r.allowed_channels.is_empty());
         assert!(r.allow_personal);
@@ -3255,6 +3299,9 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         std::env::set_var("TEAMS_PROCESSING_INDICATOR", "off");
         std::env::set_var("TEAMS_STREAMING", "false");
         std::env::set_var("TEAMS_INBOUND_ATTACHMENTS", "false");
+        std::env::set_var("TEAMS_CONVERSATION_REGISTRY_PATH", "env-registry.json");
+        std::env::set_var("TEAMS_CONVERSATION_REGISTRY_MAX_ENTRIES", "121");
+        std::env::set_var("TEAMS_CONVERSATION_REGISTRY_TTL_SECS", "82");
         std::env::set_var("TEAMS_ALLOWED_TEAMS", "env-team");
         std::env::set_var("TEAMS_ALLOWED_CHANNELS", "env-channel");
         std::env::set_var("TEAMS_ALLOW_PERSONAL", "false");
@@ -3270,6 +3317,9 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
             processing_indicator: Some(TeamsProcessingIndicator::Message),
             streaming: Some(true),
             inbound_attachments: Some(true),
+            conversation_registry_path: Some("cfg-registry.json".into()),
+            conversation_registry_max_entries: Some(124),
+            conversation_registry_ttl_secs: Some(85),
             allowed_teams: Some(vec!["cfg-team".into()]),
             allowed_channels: Some(vec![]),
             allow_personal: Some(true),
@@ -3290,6 +3340,12 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         );
         assert!(r.streaming);
         assert!(r.inbound_attachments);
+        assert_eq!(
+            r.conversation_registry_path.as_deref(),
+            Some("cfg-registry.json")
+        );
+        assert_eq!(r.conversation_registry_max_entries, 124);
+        assert_eq!(r.conversation_registry_ttl_secs, 85);
         assert_eq!(r.allowed_teams, vec!["cfg-team"]);
         assert!(r.allowed_channels.is_empty());
         assert!(r.allow_personal);
@@ -3318,6 +3374,12 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         );
         assert!(r.streaming);
         assert!(r.inbound_attachments);
+        assert_eq!(
+            r.conversation_registry_path.as_deref(),
+            Some("env-registry.json")
+        );
+        assert_eq!(r.conversation_registry_max_entries, 121);
+        assert_eq!(r.conversation_registry_ttl_secs, 82);
         assert_eq!(r.allowed_teams, vec!["env-team"]);
         assert_eq!(r.allowed_channels, vec!["env-channel"]);
         assert!(!r.allow_personal);
@@ -3369,6 +3431,9 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
             "TEAMS_PROCESSING_INDICATOR",
             "TEAMS_STREAMING",
             "TEAMS_INBOUND_ATTACHMENTS",
+            "TEAMS_CONVERSATION_REGISTRY_PATH",
+            "TEAMS_CONVERSATION_REGISTRY_MAX_ENTRIES",
+            "TEAMS_CONVERSATION_REGISTRY_TTL_SECS",
             "TEAMS_ALLOWED_TEAMS",
             "TEAMS_ALLOWED_CHANNELS",
             "TEAMS_ALLOW_PERSONAL",
@@ -3412,6 +3477,20 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
                 "unexpected error for {key}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn teams_conversation_registry_bounds_are_closed() {
+        for value in [0, 10_001] {
+            let raw = format!("[teams]\nconversation_registry_max_entries = {value}\n");
+            let error = parse_config(&raw, "test").unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("conversation_registry_max_entries"));
+        }
+        let error =
+            parse_config("[teams]\nconversation_registry_ttl_secs = 0\n", "test").unwrap_err();
+        assert!(error.to_string().contains("conversation_registry_ttl_secs"));
     }
 
     /// All `FEISHU_*` env scenarios in ONE test (env is process-global).

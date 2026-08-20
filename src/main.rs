@@ -1390,6 +1390,9 @@ async fn main() -> anyhow::Result<()> {
                     max_route_entries: r.max_route_entries,
                     reactions_enabled: r.reactions_enabled,
                     inbound_attachments: r.inbound_attachments,
+                    conversation_registry_path: r.conversation_registry_path,
+                    conversation_registry_max_entries: r.conversation_registry_max_entries,
+                    conversation_registry_ttl_secs: r.conversation_registry_ttl_secs,
                 });
             }
             // First-class `[feishu]` config overrides env-derived values

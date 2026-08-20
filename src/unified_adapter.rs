@@ -272,6 +272,14 @@ impl ChatAdapter for UnifiedGatewayAdapter {
             .is_some_and(|teams| teams.inbound_attachments_enabled());
         #[cfg(not(feature = "teams"))]
         let teams_materialization = false;
+        #[cfg(feature = "teams")]
+        let teams_conversation_registry = self
+            .gw_state
+            .teams
+            .as_ref()
+            .is_some_and(|teams| teams.conversation_registry_available());
+        #[cfg(not(feature = "teams"))]
+        let teams_conversation_registry = false;
         let (can_edit, can_delete, streaming_mode, supports_reactions, status_backend) =
             match platform {
                 "telegram" => (
@@ -346,6 +354,9 @@ impl ChatAdapter for UnifiedGatewayAdapter {
                 && teams_available
                 && teams_materialization
                 && self.teams_inbound_attachments,
+            supports_conversation_registry: platform == "teams"
+                && teams_available
+                && teams_conversation_registry,
             can_edit,
             can_delete,
             streaming_mode,
@@ -437,6 +448,25 @@ impl ChatAdapter for UnifiedGatewayAdapter {
             let _ = (channel, reference);
             anyhow::bail!("Teams attachment materialization is not compiled")
         }
+    }
+
+    async fn register_conversation(&self, channel: &ChannelRef) -> Result<()> {
+        if !self
+            .capabilities(&channel.platform)
+            .supports_conversation_registry
+        {
+            anyhow::bail!("conversation registry is unavailable");
+        }
+        if channel
+            .origin_event_id
+            .as_deref()
+            .is_none_or(|event_id| event_id.trim().is_empty())
+        {
+            anyhow::bail!("conversation registration requires an origin event");
+        }
+        let reply = self.build_reply(channel, "", Some("register_conversation"), None);
+        self.dispatch_reply(&reply).await?;
+        Ok(())
     }
 
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
@@ -562,6 +592,7 @@ mod tests {
         assert!(capabilities.delete_ack);
         assert!(capabilities.supports_target_message_id);
         assert!(!capabilities.supports_attachment_materialization);
+        assert!(!capabilities.supports_conversation_registry);
         assert_eq!(capabilities.streaming_mode, StreamingMode::Disabled);
         assert_eq!(
             adapter
@@ -597,12 +628,16 @@ mod tests {
             max_route_entries: 10_000,
             reactions_enabled: true,
             inbound_attachments: true,
+            conversation_registry_path: None,
+            conversation_registry_max_entries: 1_000,
+            conversation_registry_ttl_secs: 365 * 24 * 60 * 60,
         });
         let state = Arc::new(state);
         let adapter = UnifiedGatewayAdapter::new(state.clone());
         let reaction_capabilities = adapter.capabilities("teams");
         assert!(reaction_capabilities.supports_reactions);
         assert!(!reaction_capabilities.supports_attachment_materialization);
+        assert!(!reaction_capabilities.supports_conversation_registry);
         assert_eq!(
             reaction_capabilities.status_backend,
             StatusBackend::Reactions
@@ -624,6 +659,59 @@ mod tests {
         assert_eq!(message_capabilities.status_backend, StatusBackend::Message);
         assert_eq!(message_capabilities.streaming_mode, StreamingMode::Edit);
         assert!(message_capabilities.show_streaming_placeholder);
+    }
+
+    #[cfg(feature = "teams")]
+    #[tokio::test]
+    async fn teams_registry_capability_and_command_are_gateway_local() -> Result<()> {
+        let root = std::fs::canonicalize(std::env::temp_dir())?;
+        let directory = root.join(format!(
+            "openab-unified-registry-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory)?;
+        let registry_path = directory.join("registry.json");
+        let (event_tx, _event_rx) = tokio::sync::broadcast::channel(4);
+        let mut state = AppState::test_default(event_tx);
+        state.apply_teams_config(openab_gateway::GatewayTeamsConfig {
+            app_id: Some("app".into()),
+            app_secret: Some("secret".into()),
+            allowed_tenants: Vec::new(),
+            oauth_endpoint: "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token"
+                .into(),
+            openid_metadata: "https://login.botframework.com/v1/.well-known/openidconfiguration"
+                .into(),
+            webhook_path: "/webhook/teams".into(),
+            dedupe_ttl_secs: 600,
+            route_ttl_secs: 3600,
+            max_route_entries: 10_000,
+            reactions_enabled: false,
+            inbound_attachments: false,
+            conversation_registry_path: Some(registry_path.to_string_lossy().into_owned()),
+            conversation_registry_max_entries: 1_000,
+            conversation_registry_ttl_secs: 365 * 24 * 60 * 60,
+        });
+        let adapter = UnifiedGatewayAdapter::new(Arc::new(state));
+        assert!(adapter.capabilities("teams").supports_conversation_registry);
+        let channel = ChannelRef {
+            platform: "teams".into(),
+            channel_id: "conversation-1".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: Some("event-1".into()),
+        };
+        let reply = adapter.build_reply(&channel, "", Some("register_conversation"), None);
+        let wire = serde_json::to_string(&reply)?;
+        assert!(!wire.contains("service_url"));
+        assert!(!wire.contains("serviceUrl"));
+        assert!(adapter.register_conversation(&channel).await.is_err());
+        assert!(!registry_path.exists());
+        std::fs::remove_dir_all(directory)?;
+        Ok(())
     }
 
     #[cfg(feature = "teams")]
