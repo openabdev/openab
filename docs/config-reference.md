@@ -237,13 +237,15 @@ Full first-class Google Chat section (config-first parity, #1379) — credential
 
 Full first-class Teams section (config-first parity, #1380) — credentials, connection, and L3 identity trust. Each field resolves: config → `TEAMS_*` env → default. `app_id` + `app_secret` are mandatory (after env fallback); an incomplete section disables the adapter.
 
+> ⚠️ **M0 cloud-profile restriction:** Teams transport supports Microsoft commercial public cloud only. The adapter rejects non-HTTPS endpoints, userinfo, non-standard ports, sovereign-cloud hosts, custom proxy hosts, and service URLs outside `smba.trafficmanager.net`. Existing sovereign-cloud or proxy deployments must remain on an earlier release until an explicit cloud profile is available.
+
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `app_id` | string | — | Azure AD app (bot) ID. Env: `TEAMS_APP_ID`. |
 | `app_secret` | string | — | App client secret. Env: `TEAMS_APP_SECRET`. |
 | `allowed_tenants` | string[] | `[]` (all) | Restrict to tenant IDs. Env: `TEAMS_ALLOWED_TENANTS`. |
-| `oauth_endpoint` | string | Bot Framework | Env: `TEAMS_OAUTH_ENDPOINT`. |
-| `openid_metadata` | string | Bot Framework | Env: `TEAMS_OPENID_METADATA`. |
+| `oauth_endpoint` | string | Bot Framework | HTTPS endpoint on `login.microsoftonline.com`; use a tenant-specific path for single-tenant bots. Env: `TEAMS_OAUTH_ENDPOINT`. |
+| `openid_metadata` | string | Bot Framework | HTTPS metadata endpoint on `login.botframework.com`. Env: `TEAMS_OPENID_METADATA`. |
 | `webhook_path` | string | `/webhook/teams` | Env: `TEAMS_WEBHOOK_PATH`. |
 | `allow_all_users` | bool \| omit | `false` (deny-all) | Env: `TEAMS_ALLOW_ALL_USERS`. |
 | `allowed_users` | string[] | `[]` | `activity.from.id` values (`29:…`). Env: `TEAMS_ALLOWED_USERS`. |
@@ -526,6 +528,7 @@ Secret references. Each key maps to a provider URI. Resolved values are availabl
 | `<name>` | string | — | URI referencing an external secret. Supported schemes: `aws-sm://`, `exec://`. |
 
 **URI formats:**
+
 - `aws-sm://<secret-id>#<json-key>` — fetch from AWS Secrets Manager, extract JSON field
 - `exec://<absolute-script-path> <key> <attribute>` — run script with two arguments, read stdout
 
@@ -615,6 +618,7 @@ Keys can be unicode emoji or Discord/GitHub shortcodes (e.g. `:thumbsup:`). Shor
 ```
 
 **Requirements:**
+
 - Enable the `GUILD_MESSAGE_REACTIONS` intent in the Discord Developer Portal.
 - Only unicode emoji are supported (custom server emoji are ignored).
 - The bot's own reactions are always ignored (prevents feedback loops).
@@ -652,6 +656,7 @@ web    = "~/projects/frontend"
 | `aliases` | map | `{}` | Key-value map of alias name → path. Users reference with `@` prefix: `[[ws:@openab]]`. Paths starting with `~` expand to `$HOME`. All paths must be within the bot's home directory (security boundary). |
 
 **Security:**
+
 - Relative paths are rejected
 - `~` expands to bot home (`$HOME`)
 - Paths are canonicalized and must be within bot home subtree
@@ -855,6 +860,7 @@ disable_on_success_working_dir = "/workspace/my-project"
 ```
 
 **Behaviors:**
+
 - Scheduler evaluates expressions once per minute
 - If a previous execution is still running, the next tick is skipped (no overlap)
 - Failed executions are logged but do not block other jobs or chat traffic
@@ -914,6 +920,7 @@ Key mapping (`values.yaml` → `config.toml`):
 | `agents.<name>.cronjobs[].threadId` | `[[cron.jobs]] thread_id` |
 
 > ⚠️ Use `--set-string` (not `--set`) for Discord/Slack IDs to avoid float64 precision loss:
+>
 > ```bash
 > helm upgrade --install mybot charts/openab \
 >   --set-string agents.kiro.discord.allowedChannels[0]="1234567890"
@@ -950,12 +957,12 @@ When running with `BUILD_MODE=unified`, the binary embeds a webhook server for g
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `GATEWAY_ALLOW_ALL_CHANNELS` | `true` | Accept events from any channel. **Set to `false` in production** and use `GATEWAY_ALLOWED_CHANNELS`. |
-| `GATEWAY_ALLOWED_CHANNELS` | _(empty)_ | Comma-separated channel IDs to allow (when `GATEWAY_ALLOW_ALL_CHANNELS=false`) |
+| `GATEWAY_ALLOWED_CHANNELS` | *(empty)* | Comma-separated channel IDs to allow (when `GATEWAY_ALLOW_ALL_CHANNELS=false`) |
 | `GATEWAY_ALLOW_ALL_USERS` | `true` | Accept events from any user. **Set to `false` in production** and use `GATEWAY_ALLOWED_USERS`. |
-| `GATEWAY_ALLOWED_USERS` | _(empty)_ | Comma-separated user IDs to allow (when `GATEWAY_ALLOW_ALL_USERS=false`) |
+| `GATEWAY_ALLOWED_USERS` | *(empty)* | Comma-separated user IDs to allow (when `GATEWAY_ALLOW_ALL_USERS=false`) |
 | `GATEWAY_ALLOW_BOT_MESSAGES` | `false` | Allow messages from all bots (for multi-agent scenarios) |
-| `GATEWAY_TRUSTED_BOT_IDS` | _(empty)_ | Comma-separated bot IDs to allow even when `GATEWAY_ALLOW_BOT_MESSAGES=false` |
-| `GATEWAY_BOT_USERNAME` | _(empty)_ | Bot's username for @mention detection in groups |
+| `GATEWAY_TRUSTED_BOT_IDS` | *(empty)* | Comma-separated bot IDs to allow even when `GATEWAY_ALLOW_BOT_MESSAGES=false` |
+| `GATEWAY_BOT_USERNAME` | *(empty)* | Bot's username for @mention detection in groups |
 
 ### Platform Adapters
 
@@ -967,7 +974,7 @@ Each platform is auto-enabled when its env vars are present:
 | LINE | `LINE_CHANNEL_SECRET` | `LINE_CHANNEL_ACCESS_TOKEN` |
 | Feishu | `FEISHU_APP_ID` | `FEISHU_WEBHOOK_PATH` |
 | Google Chat | `GOOGLE_CHAT_ENABLED=true` | `GOOGLE_CHAT_SA_KEY_JSON`, `GOOGLE_CHAT_SA_KEY_FILE`, `GOOGLE_CHAT_ACCESS_TOKEN`, `GOOGLE_CHAT_AUDIENCE`, `GOOGLE_CHAT_WEBHOOK_PATH` |
-| WeCom | `WECOM_CORP_ID` | _(see wecom config)_ |
+| WeCom | `WECOM_CORP_ID` | *(see wecom config)* |
 | Teams | `TEAMS_APP_ID` | `TEAMS_WEBHOOK_PATH` |
 
 > ⚠️ **Production checklist**: Set `GATEWAY_ALLOW_ALL_CHANNELS=false` and `GATEWAY_ALLOW_ALL_USERS=false` with explicit allowlists. The defaults are permissive for development convenience.

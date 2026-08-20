@@ -1,6 +1,5 @@
 # Microsoft Teams Setup (Self-Hosted)
 
-
 > **Unified Mode (v0.9.0+):** The OAB binary now embeds the Teams adapter directly. Set `TEAMS_APP_ID` as an env var — no separate gateway container or `[gateway]` config needed. See [Telegram docs](telegram.md#unified-mode-recommended) for the pattern.
 
 ### Unified Config (Kiro + Teams)
@@ -320,10 +319,12 @@ Azure Portal → your bot → **Configuration** → **Messaging endpoint**: `htt
 |---|---|---|---|
 | `TEAMS_APP_ID` | Yes | — | Azure AD application (client) ID |
 | `TEAMS_APP_SECRET` | Yes | — | Azure AD client secret value |
-| `TEAMS_OAUTH_ENDPOINT` | Single tenant: Yes | `https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token` | Override for single tenant bots |
-| `TEAMS_OPENID_METADATA` | No | `https://login.botframework.com/v1/.well-known/openidconfiguration` | OpenID metadata for JWT validation |
+| `TEAMS_OAUTH_ENDPOINT` | Single tenant: Yes | `https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token` | HTTPS endpoint on `login.microsoftonline.com`; override the tenant path for single-tenant bots |
+| `TEAMS_OPENID_METADATA` | No | `https://login.botframework.com/v1/.well-known/openidconfiguration` | HTTPS metadata endpoint on `login.botframework.com` |
 | `TEAMS_ALLOWED_TENANTS` | No | (allow all) | Comma-separated tenant IDs |
 | `TEAMS_WEBHOOK_PATH` | No | `/webhook/teams` | URL path the gateway listens on |
+
+> ⚠️ **M0 supports Microsoft commercial public cloud only.** Sovereign-cloud endpoints and custom OAuth/OpenID proxy hosts are rejected. Bot Connector replies accept only validated HTTPS service URLs on `smba.trafficmanager.net`; redirects cannot cross origin.
 
 ## Troubleshooting
 
@@ -346,11 +347,12 @@ Azure Portal → your bot → **Configuration** → **Messaging endpoint**: `htt
 **Webhook returns 200 but no agent response**
 
 Check `docker compose logs gateway openab` and look for the trace:
+
 1. `teams → gateway` (gateway received webhook)
 2. `processing message channel_platform=teams` (OAB picked up the event)
 3. `sending reply to gateway platform=teams` (OAB sent the reply over WS)
 4. `gateway → teams` (gateway calling Bot Framework REST API)
-5. `teams activity sent` (success) or `teams send error` (failure)
+5. `teams activity sent` (success) or `teams reply rejected` (failure)
 
 Whichever step is missing tells you where the break is.
 

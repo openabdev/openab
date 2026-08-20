@@ -63,6 +63,7 @@ After creation, note from the **Overview** page:
 
 1. Go to the Bot resource → **Configuration**
 2. Set **Messaging endpoint** to your Kubernetes Ingress URL:
+
    ```
    https://<YOUR_INGRESS_HOST>/webhook/teams
    ```
@@ -338,10 +339,12 @@ kubectl apply -f openab-teams-networking.yaml
 ### Verify Unified Mode
 
 1. Confirm exactly one pod matches the Service selector:
+
    ```bash
    kubectl get pods \
      -l app.kubernetes.io/name=openab,app.kubernetes.io/instance=openab,app.kubernetes.io/component=kiro
    ```
+
 2. Check startup logs with `kubectl logs deployment/openab-kiro` and verify the
    Teams adapter is listening on `0.0.0.0:8080`.
 3. Send a message from an allowed Teams user and confirm a reply. A user or
@@ -632,6 +635,7 @@ Web Chat uses Direct Line (`webchat.botframework.com`), which has different auth
 IT admin has not approved the custom app, or permission policy hasn't propagated.
 
 **Fix**:
+
 1. Verify the app is uploaded in Teams Admin Center → Manage apps
 2. Check Permission policies allow the custom app
 3. Wait up to 24 hours for policy propagation
@@ -652,11 +656,12 @@ one ready endpoint, and the sender matches both `[teams].allowed_tenants` and
 ### Standalone Gateway receives webhook but no reply in Teams
 
 Check Gateway pod logs:
+
 ```bash
 kubectl logs deployment/openab-gateway --tail=50
 ```
 
-Look for: `teams → gateway` (received) → `gateway → teams` (sent) → `teams activity sent` (success) or `teams send error` (failure).
+Look for: `teams → gateway` (received) → `gateway → teams` (sent) → `teams activity sent` (success) or `teams reply rejected` (failure).
 
 ### JWT validation failed
 
@@ -676,15 +681,15 @@ kubectl run openab-metadata-check --rm -i --restart=Never \
 - **Rotate client secrets** before expiration — set a reminder based on the expiration chosen in Step 1
 - **Use a tenant allowlist** in production — configure `[teams].allowed_tenants` in Unified Mode or `TEAMS_ALLOWED_TENANTS` in Standalone Gateway Mode
 - **Network policies** — start from default-deny and allow cluster DNS plus
-  the minimum outbound destinations. The Teams adapter needs the configured
+  the minimum outbound destinations. The M0 public-cloud profile permits the
   `login.microsoftonline.com` token endpoint, `login.botframework.com` metadata
-  and its returned JWKS host, and the HTTPS `serviceUrl` host supplied by each
-  validated Bot Framework activity (commonly `smba.trafficmanager.net`; the
-  host can vary by region). The OAB/ACP pod also needs the authentication/API
-  endpoints for the selected agent backend and any model or tool services it
-  uses. In Unified Mode these rules apply to the OAB pod. In Standalone Gateway
-  Mode, give the Gateway the Microsoft egress, allow OAB to reach
-  `openab-gateway:8080`, and give only OAB the agent/model/tool egress.
+  and JWKS, and validated HTTPS Bot Connector service URLs on
+  `smba.trafficmanager.net`. Sovereign-cloud and custom proxy hosts are rejected.
+  The OAB/ACP pod also needs the authentication/API endpoints for the selected
+  agent backend and any model or tool services it uses. In Unified Mode these
+  rules apply to the OAB pod. In Standalone Gateway Mode, give the Gateway the
+  Microsoft egress, allow OAB to reach `openab-gateway:8080`, and give only OAB
+  the agent/model/tool egress.
 - **Minimize inbound exposure** — Unified Mode should expose only `/webhook/teams` through the TLS Ingress; in Standalone Gateway Mode, the OAB pod remains private and connects outbound to the Gateway only
 
 ## References

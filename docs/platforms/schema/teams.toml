@@ -300,9 +300,16 @@ kind = "intrinsic"
 source = "https://learn.microsoft.com/en-us/azure/bot-service/rest-api/bot-framework-rest-connector-authentication?view=azure-bot-service-4.0"
 
 [[quirks]]
-date = "2026-07-04"
-title = "Write-side commands are largely unimplemented"
-note = "`edit_message`, `delete_message`, `create_topic`, and reactions are all issued by core but the Teams `handle_reply` only special-cases reactions (drop) — everything non-reaction is treated as a plain send. This means streaming (post+edit), thread creation, and message edit/delete are effectively no-ops or mis-sends on Teams today, despite the platform supporting all of them (and despite `update_activity` existing as dead code). This is the main gap for a future PR."
+date = "2026-08-06"
+title = "Bot Connector transport is pinned to public cloud and fails closed"
+note = "M0 accepts HTTPS Bot Connector service URLs only on `smba.trafficmanager.net`, public-cloud OAuth/OpenID hosts only, no userinfo/query/fragment/non-standard ports, and no cross-origin redirects. Conversation/activity IDs are encoded as URL path segments. Connect/request timeouts are 5 s/10 s; error bodies are read up to 4 KiB and redacted. OAuth, OpenID metadata, and JWKS refreshes are single-flight."
+kind = "openab_decision"
+source = "crates/openab-gateway/src/adapters/teams.rs"
+
+[[quirks]]
+date = "2026-08-06"
+title = "Unsupported write-side commands fail closed"
+note = "Teams `handle_reply` sends only commandless replies. Reactions are an explicit no-op; `edit_message`, `delete_message`, `create_topic`, and unknown commands return unsupported before route lookup or network I/O, preventing duplicate or misleading plain messages until native handlers are implemented."
 kind = "openab_decision"
 source = "crates/openab-gateway/src/adapters/teams.rs#handle_reply"
 
@@ -370,8 +377,8 @@ kind = "openab_decision"
 source = "crates/openab-gateway/src/adapters/teams.rs"
 
 [[quirks]]
-date = "2026-07-04"
-title = "handle_reply only plain sends + drops reactions"
-note = "Teams `handle_reply` only handles plain sends + drops reactions; `edit_message`/`delete_message`/`create_topic` are undispatched (fall through to `send_activity`), `quote_message_id` is ignored, and inbound attachments/mentions are not parsed — main gaps for a follow-up PR."
+date = "2026-08-06"
+title = "Reply correlation and inbound rich content remain incomplete"
+note = "Teams `handle_reply` supports hardened plain sends and rejects unsupported commands, but still maps the OpenAB event ID from `reply_to` to Bot Connector `replyToId`, ignores `quote_message_id`, and does not parse inbound attachments or mentions. Real activity correlation remains a separate implementation and live-tenant validation step."
 kind = "openab_decision"
 source = "crates/openab-gateway/src/adapters/teams.rs"
