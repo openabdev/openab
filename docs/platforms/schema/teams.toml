@@ -139,7 +139,7 @@ pr = ""
 [[openab_features]]
 feature = "streaming"
 status = "workaround"
-note = "Gateway platforms use core's post+edit cosmetic streaming (`use_streaming` just returns the configured `streaming` flag; no native streaming API). But the Teams gateway never dispatches `edit_message`, so streaming edits don't actually reach Teams — effectively send-once. `update_activity` (PUT) exists in the adapter but is unwired dead code."
+note = "Gateway platforms use core's post+edit cosmetic streaming (`use_streaming` just returns the configured `streaming` flag; no native streaming API). The Teams gateway fail-closed rejects `edit_message`, so streaming edits don't reach Teams and cannot create duplicate messages; delivery is effectively send-once. `update_activity` (PUT) exists in the adapter but is unwired dead code."
 source = [
   "crates/openab-core/src/gateway.rs#use_streaming",
   "crates/openab-gateway/src/adapters/teams.rs#update_activity",
@@ -159,7 +159,7 @@ pr = ""
 [[openab_features]]
 feature = "edit_message"
 status = "not_implemented"
-note = "Core default/`GatewayAdapter::edit_message` emits an `edit_message` command, but Teams is not in `EDIT_RESPONSE_PLATFORMS` (fire-and-forget) AND `handle_reply` has no `edit_message` branch — it falls through to `send_activity`, posting the new text as a fresh message."
+note = "Core default/`GatewayAdapter::edit_message` emits an `edit_message` command, but Teams is not in `EDIT_RESPONSE_PLATFORMS` (fire-and-forget) and `handle_reply` fail-closed rejects the unsupported command. No edit occurs, but it also cannot fall through to `send_activity` and post duplicate text."
 source = [
   "crates/openab-core/src/gateway.rs#edit_message",
   "crates/openab-gateway/src/adapters/teams.rs#handle_reply",
@@ -169,7 +169,7 @@ pr = ""
 [[openab_features]]
 feature = "delete_message"
 status = "not_implemented"
-note = "The `delete_message` command is not handled in `handle_reply`; it falls through to `send_activity`. Platform supports DELETE, but the adapter never calls it."
+note = "The `delete_message` command is fail-closed rejected by `handle_reply`. Platform supports DELETE, but the adapter does not call it yet; importantly, the command cannot fall through to `send_activity`."
 source = [
   "crates/openab-core/src/gateway.rs#delete_message",
   "crates/openab-gateway/src/adapters/teams.rs#handle_reply",
@@ -186,7 +186,7 @@ pr = ""
 [[openab_features]]
 feature = "threads_topics"
 status = "not_implemented"
-note = "The `create_topic` command from `GatewayAdapter::create_thread` is not handled by Teams `handle_reply` (falls through to plain send). Inbound events set `thread_id: None` ('Teams conversations don't have sub-threads in the same way'). Core `create_thread` falls back to the same channel on timeout anyway."
+note = "The `create_topic` command from `GatewayAdapter::create_thread` is fail-closed rejected by Teams `handle_reply` and cannot fall through to plain send. Inbound events set `thread_id: None` ('Teams conversations don't have sub-threads in the same way'). Core `create_thread` falls back to the same channel on timeout anyway."
 source = [
   "crates/openab-core/src/gateway.rs#create_thread",
   "crates/openab-gateway/src/adapters/teams.rs#handle_reply",

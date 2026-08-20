@@ -100,12 +100,19 @@ impl UnifiedGatewayAdapter {
             #[cfg(feature = "teams")]
             "teams" => {
                 if let Some(ref teams) = self.gw_state.teams {
-                    openab_gateway::adapters::teams::handle_reply(
+                    if let Err(e) = openab_gateway::adapters::teams::handle_reply(
                         reply,
                         teams,
                         &self.gw_state.teams_service_urls,
                     )
-                    .await;
+                    .await
+                    {
+                        tracing::error!(
+                            error = %e,
+                            command = ?reply.command.as_deref(),
+                            "teams reply rejected"
+                        );
+                    }
                 }
             }
             #[cfg(feature = "acp")]

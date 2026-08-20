@@ -5,7 +5,7 @@ use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 // --- Bot Framework activity types ---
 
@@ -572,12 +572,18 @@ pub async fn handle_reply(
     service_urls: &tokio::sync::Mutex<
         std::collections::HashMap<String, (String, std::time::Instant)>,
     >,
-) {
-    // Reactions are not supported on Teams — silently ignore
-    if reply.command.as_deref() == Some("add_reaction")
-        || reply.command.as_deref() == Some("remove_reaction")
-    {
-        return;
+) -> anyhow::Result<Option<String>> {
+    // Fail closed for commands the Teams adapter does not implement. Falling
+    // through to `send_activity` would turn edit/delete/topic commands into new
+    // messages, producing duplicate or misleading output. Reaction commands
+    // remain an intentional no-op until a Teams status backend is implemented.
+    match reply.command.as_deref() {
+        None => {}
+        Some("add_reaction" | "remove_reaction") => {
+            debug!(command = ?reply.command.as_deref(), "teams: ignoring unsupported reaction command");
+            return Ok(None);
+        }
+        Some(command) => anyhow::bail!("unsupported Teams command: {command}"),
     }
 
     let service_url = {
@@ -588,10 +594,10 @@ pub async fn handle_reply(
                 *ts = std::time::Instant::now();
                 url.clone()
             }
-            None => {
-                error!(conversation = %reply.channel.id, "teams: no service_url for conversation");
-                return;
-            }
+            None => anyhow::bail!(
+                "no Teams service_url for conversation {}",
+                reply.channel.id
+            ),
         }
     };
 
@@ -602,23 +608,25 @@ pub async fn handle_reply(
     };
 
     info!(conversation = %reply.channel.id, "gateway → teams");
-    match teams
+    let id = teams
         .send_activity(
             &service_url,
             &reply.channel.id,
             &reply.content.text,
             reply_to_id,
         )
-        .await
-    {
-        Ok(id) => debug!(activity_id = %id, "teams activity sent"),
-        Err(e) => error!(error = %e, "teams send error"),
-    }
+        .await?;
+    debug!(activity_id = %id, "teams activity sent");
+    Ok(Some(id))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
 
     // --- ensure_trailing_slash ---
 
@@ -662,6 +670,26 @@ mod tests {
             teams: Some(TeamsAdapter::new(make_config(vec![]))),
             ..crate::AppState::test_default(event_tx)
         })
+    }
+
+    fn make_reply(command: Option<&str>) -> GatewayReply {
+        GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "evt-1".into(),
+            platform: "teams".into(),
+            channel: ReplyChannel {
+                id: "conversation-1".into(),
+                thread_id: None,
+            },
+            content: Content {
+                content_type: "text".into(),
+                text: "reply text".into(),
+                attachments: vec![],
+            },
+            command: command.map(str::to_owned),
+            request_id: None,
+            quote_message_id: None,
+        }
     }
 
     fn make_activity_with_tenant(tenant_id: Option<&str>) -> Activity {
@@ -857,6 +885,83 @@ mod tests {
     fn deserialize_invalid_json_fails() {
         let result = serde_json::from_str::<Activity>("not json");
         assert!(result.is_err());
+    }
+
+    // --- reply command dispatch ---
+
+    #[tokio::test]
+    async fn unsupported_commands_never_fall_through_to_send_activity() {
+        let server = MockServer::start().await;
+        let _no_post = Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount_as_scoped(&server)
+            .await;
+
+        let mut config = make_config(vec![]);
+        config.oauth_endpoint = format!("{}/token", server.uri());
+        let adapter = TeamsAdapter::new(config);
+        let service_urls = tokio::sync::Mutex::new(std::collections::HashMap::from([(
+            "conversation-1".to_string(),
+            (server.uri(), std::time::Instant::now()),
+        )]));
+
+        for command in ["add_reaction", "remove_reaction"] {
+            let outcome = handle_reply(&make_reply(Some(command)), &adapter, &service_urls)
+                .await
+                .unwrap();
+            assert_eq!(outcome, None, "reaction command {command} should be a no-op");
+        }
+
+        for command in [
+            "create_topic",
+            "edit_message",
+            "delete_message",
+            "future_unknown_command",
+        ] {
+            let error = handle_reply(&make_reply(Some(command)), &adapter, &service_urls)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains(command),
+                "error should identify unsupported command {command}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn commandless_reply_still_sends_one_activity() {
+        let server = MockServer::start().await;
+        let _token = Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "test-token",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+        let _activity = Mock::given(method("POST"))
+            .and(path("/v3/conversations/conversation-1/activities"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "activity-1"})),
+            )
+            .expect(1)
+            .mount_as_scoped(&server)
+            .await;
+
+        let mut config = make_config(vec![]);
+        config.oauth_endpoint = format!("{}/token", server.uri());
+        let adapter = TeamsAdapter::new(config);
+        let service_urls = tokio::sync::Mutex::new(std::collections::HashMap::from([(
+            "conversation-1".to_string(),
+            (server.uri(), std::time::Instant::now()),
+        )]));
+
+        let message_id = handle_reply(&make_reply(None), &adapter, &service_urls)
+            .await
+            .unwrap();
+        assert_eq!(message_id.as_deref(), Some("activity-1"));
     }
 
     // --- TeamsConfig::from_env ---

@@ -1245,12 +1245,19 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                             #[cfg(feature = "teams")]
                             "teams" => {
                                 if let Some(ref teams) = state_for_recv.teams {
-                                    adapters::teams::handle_reply(
+                                    if let Err(e) = adapters::teams::handle_reply(
                                         &reply,
                                         teams,
                                         &state_for_recv.teams_service_urls,
                                     )
-                                    .await;
+                                    .await
+                                    {
+                                        tracing::error!(
+                                            error = %e,
+                                            command = ?reply.command.as_deref(),
+                                            "teams reply rejected"
+                                        );
+                                    }
                                 } else {
                                     warn!("reply for teams but adapter not configured");
                                 }
