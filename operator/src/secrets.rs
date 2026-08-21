@@ -165,20 +165,20 @@ mod tests {
         // (which used to hand this straight to GetSecretValue and fail,
         // since that API has no knowledge of the trailing ECS suffix).
         let (base, key) = split_ecs_json_key_suffix(
-            "arn:aws:secretsmanager:us-east-1:903779448426:secret:oab/telegram/pahudxbot-AC80TP:TELEGRAM_BOT_TOKEN::",
+            "arn:aws:secretsmanager:us-east-1:123456789012:secret:example/telegram/bot-AbCdEf:TELEGRAM_BOT_TOKEN::",
         )
         .unwrap();
-        assert_eq!(base, "arn:aws:secretsmanager:us-east-1:903779448426:secret:oab/telegram/pahudxbot-AC80TP");
+        assert_eq!(base, "arn:aws:secretsmanager:us-east-1:123456789012:secret:example/telegram/bot-AbCdEf");
         assert_eq!(key, Some("TELEGRAM_BOT_TOKEN"));
     }
 
     #[test]
     fn split_ecs_json_key_suffix_unchanged_for_plain_arn() {
         let (base, key) = split_ecs_json_key_suffix(
-            "arn:aws:secretsmanager:us-east-1:903779448426:secret:oab/telegram/pahudxbot-AC80TP",
+            "arn:aws:secretsmanager:us-east-1:123456789012:secret:example/telegram/bot-AbCdEf",
         )
         .unwrap();
-        assert_eq!(base, "arn:aws:secretsmanager:us-east-1:903779448426:secret:oab/telegram/pahudxbot-AC80TP");
+        assert_eq!(base, "arn:aws:secretsmanager:us-east-1:123456789012:secret:example/telegram/bot-AbCdEf");
         assert_eq!(key, None);
     }
 
@@ -196,8 +196,8 @@ mod tests {
         // json-key="mysecret" — "mysecret" here is part of the secret
         // name/base ARN, not a suffix field.
         let (base, key) =
-            split_ecs_json_key_suffix("arn:aws:secretsmanager:us-east-1:903779448426:secret:mysecret::").unwrap();
-        assert_eq!(base, "arn:aws:secretsmanager:us-east-1:903779448426:secret:mysecret");
+            split_ecs_json_key_suffix("arn:aws:secretsmanager:us-east-1:123456789012:secret:mysecret::").unwrap();
+        assert_eq!(base, "arn:aws:secretsmanager:us-east-1:123456789012:secret:mysecret");
         assert_eq!(key, None);
     }
 
@@ -207,7 +207,7 @@ mod tests {
         // scope for in-process resolution — fail closed with a clear error
         // instead of silently mishandling it.
         let err = split_ecs_json_key_suffix(
-            "arn:aws:secretsmanager:us-east-1:903779448426:secret:appauthexample-AbCdEf::AWSPREVIOUS:",
+            "arn:aws:secretsmanager:us-east-1:123456789012:secret:appauthexample-AbCdEf::AWSPREVIOUS:",
         )
         .unwrap_err();
         assert!(err.to_string().contains("version"));
@@ -216,7 +216,7 @@ mod tests {
     #[test]
     fn split_ecs_json_key_suffix_rejects_version_id() {
         let err = split_ecs_json_key_suffix(
-            "arn:aws:secretsmanager:us-east-1:903779448426:secret:appauthexample-AbCdEf:::9d4cb84b-ad69-40c0-a0ab-cead3EXAMPLE",
+            "arn:aws:secretsmanager:us-east-1:123456789012:secret:appauthexample-AbCdEf:::9d4cb84b-ad69-40c0-a0ab-cead3EXAMPLE",
         )
         .unwrap_err();
         assert!(err.to_string().contains("version"));
@@ -225,7 +225,7 @@ mod tests {
     #[test]
     fn split_ecs_json_key_suffix_rejects_key_and_version_stage_together() {
         let err = split_ecs_json_key_suffix(
-            "arn:aws:secretsmanager:us-east-1:903779448426:secret:appauthexample-AbCdEf:username1:AWSPREVIOUS:",
+            "arn:aws:secretsmanager:us-east-1:123456789012:secret:appauthexample-AbCdEf:username1:AWSPREVIOUS:",
         )
         .unwrap_err();
         assert!(err.to_string().contains("version"));
@@ -233,16 +233,16 @@ mod tests {
 
     #[test]
     fn parse_aws_sm_uri_extracts_id_and_key() {
-        let (id, key) = parse_aws_sm_uri("aws-sm://oab/telegram/pahudxbot#TELEGRAM_BOT_TOKEN")
+        let (id, key) = parse_aws_sm_uri("aws-sm://example/telegram/bot#TELEGRAM_BOT_TOKEN")
             .unwrap()
             .unwrap();
-        assert_eq!(id, "oab/telegram/pahudxbot");
+        assert_eq!(id, "example/telegram/bot");
         assert_eq!(key, "TELEGRAM_BOT_TOKEN");
     }
 
     #[test]
     fn parse_aws_sm_uri_rejects_missing_hash() {
-        assert!(parse_aws_sm_uri("aws-sm://oab/telegram/pahudxbot").unwrap().is_err());
+        assert!(parse_aws_sm_uri("aws-sm://example/telegram/bot").unwrap().is_err());
     }
 
     #[test]
