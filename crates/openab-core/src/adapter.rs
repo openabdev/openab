@@ -805,8 +805,16 @@ impl AdapterRouter {
                             // user sees the complete content at turn end.
                             let mut consecutive_failures: u32 = 0;
                             const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+                            // Default 1500ms respects real platforms' edit rate limits;
+                            // in-process consumers (e.g. the ACP server) can lower it via
+                            // OPENAB_STREAM_EDIT_INTERVAL_MS for tighter live deltas.
+                            let interval_ms = std::env::var("OPENAB_STREAM_EDIT_INTERVAL_MS")
+                                .ok()
+                                .and_then(|v| v.parse::<u64>().ok())
+                                .filter(|ms| (50..=60_000).contains(ms))
+                                .unwrap_or(1500);
                             loop {
-                                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                                tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
                                 if buf_rx.has_changed().unwrap_or(false) {
                                     let content = buf_rx.borrow_and_update().clone();
                                     if content != last {
