@@ -703,10 +703,12 @@ impl AdapterRouter {
         let message_limit = reply_message_limit(&thread_channel.platform, adapter.message_limit());
         // ACP must not inherit the unified adapter's Telegram streaming flag (wrong
         // coupling): it streams append-only `agent_message_chunk` deltas built from the
-        // post+edit (`edit_message` snapshot) path, i.e. streaming=false. Decide it
-        // explicitly by platform rather than by whatever Telegram happens to be set to.
+        // post+edit (`edit_message` snapshot) path. Default stays send-once; opt in to
+        // live deltas explicitly with OPENAB_ACP_STREAMING=true|1.
         let streaming = if thread_channel.platform == "acp" {
-            false
+            std::env::var("OPENAB_ACP_STREAMING")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false)
         } else {
             adapter.use_streaming(other_bot_present)
         };
