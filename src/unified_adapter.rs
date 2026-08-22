@@ -199,6 +199,16 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         Ok(())
     }
 
+    async fn forward_agent_update(
+        &self,
+        channel: &ChannelRef,
+        update: serde_json::Value,
+    ) -> Result<()> {
+        let reply = self.build_reply(channel, &update.to_string(), Some("agent_update"), None);
+        self.dispatch_reply(&reply).await;
+        Ok(())
+    }
+
     async fn edit_message(&self, msg: &MessageRef, content: &str) -> Result<()> {
         let mut reply = self.build_reply(&msg.channel, content, Some("edit_message"), None);
         // Use the actual platform message_id (e.g. "draft" for streaming, or numeric for edits)

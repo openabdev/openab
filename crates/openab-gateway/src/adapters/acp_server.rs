@@ -396,6 +396,9 @@ fn accept_acp_servers(servers: Vec<AcpMcpServer>) -> Result<Vec<AcpMcpServer>, S
 pub enum ReplyChunk {
     /// Incremental text snapshot (full text so far)
     Text(String),
+    /// Raw agent-side `session/update` payload (thought chunk, tool_call, …)
+    /// relayed verbatim to the ACP client.
+    Update(serde_json::Value),
     /// Agent finished responding
     Done,
 }
@@ -2388,6 +2391,20 @@ async fn handle_session_prompt(
                         };
                         let _ = out_tx.send(serde_json::to_string(&notification).unwrap());
                     }
+                    Ok(Some(ReplyChunk::Update(update))) => {
+                        // Relay agent-side thought/tool updates verbatim under the
+                        // outer session id. Does not touch `sent_len` — the text
+                        // delta stream stays append-only and unaffected.
+                        let notification = JsonRpcNotification {
+                            jsonrpc: "2.0",
+                            method: "session/update".into(),
+                            params: json!({
+                                "sessionId": session_id,
+                                "update": update
+                            }),
+                        };
+                        let _ = out_tx.send(serde_json::to_string(&notification).unwrap());
+                    }
                     Ok(Some(ReplyChunk::Done)) | Ok(None) => break,
                     Err(_) => {
                         warn!(session = %redact_id(&session_id), "ACP: prompt timed out waiting for reply");
@@ -2547,6 +2564,12 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
             if tx.send(ReplyChunk::Text(full_text)).is_err() {
                 debug!(channel = key, "ACP reply send failed (client likely disconnected)");
                 registry.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
+            }
+        }
+        Some("agent_update") => {
+            // Raw agent-side session/update payload (JSON in the text field).
+            if let Ok(update) = serde_json::from_str::<serde_json::Value>(&full_text) {
+                let _ = tx.send(ReplyChunk::Update(update));
             }
         }
         None | Some("send_message") => {

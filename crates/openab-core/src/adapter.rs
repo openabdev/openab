@@ -415,6 +415,17 @@ pub trait ChatAdapter: Send + Sync + 'static {
         Ok(())
     }
 
+    /// Forward a raw agent-side ACP `session/update` payload (thought chunks,
+    /// tool_call / tool_call_update) to platforms that can relay it natively —
+    /// today only the ACP server path. Default: drop.
+    async fn forward_agent_update(
+        &self,
+        _channel: &ChannelRef,
+        _update: serde_json::Value,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Whether this platform renders Markdown tables natively. When `true`, the
     /// router skips the `convert_tables` pre-pass (which rewrites tables into
     /// code blocks / bullet lists for platforms that cannot render them) and
@@ -940,6 +951,22 @@ impl AdapterRouter {
                             break;
                         }
 
+                        // ACP relays thought/tool updates natively — forward the raw
+                        // payload before the lossy classify/status mapping below.
+                        if platform_is_acp {
+                            if let Some(update) =
+                                notification.params.as_ref().and_then(|p| p.get("update"))
+                            {
+                                if matches!(
+                                    update.get("sessionUpdate").and_then(|v| v.as_str()),
+                                    Some("agent_thought_chunk" | "tool_call" | "tool_call_update")
+                                ) {
+                                    let _ = adapter
+                                        .forward_agent_update(&thread_channel, update.clone())
+                                        .await;
+                                }
+                            }
+                        }
                         if let Some(event) = classify_notification(&notification) {
                             match event {
                                 AcpEvent::Text(t) => {
