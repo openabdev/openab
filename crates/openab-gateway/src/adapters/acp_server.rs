@@ -2522,8 +2522,15 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
             // Fence stale replies: after a timeout/cancel the channel_id is reused by the
             // next turn. A late reply carries the previous turn's `evt_<uuid>` in
             // `reply_to`; deliver only when it matches the active turn. Empty `reply_to`
-            // (no origin id) fails open so legit traffic is never dropped.
-            Some(sink) if reply.reply_to.is_empty() || reply.reply_to == sink.turn_id => {
+            // (no origin id) fails open so legit traffic is never dropped. `"draft"` is
+            // the streaming edit loop's placeholder MessageRef id (ACP shows no
+            // placeholder message), so mid-turn `edit_message` snapshots carry it —
+            // fail open for it too or streaming deltas are all dropped as stale.
+            Some(sink)
+                if reply.reply_to.is_empty()
+                    || reply.reply_to == "draft"
+                    || reply.reply_to == sink.turn_id =>
+            {
                 sink.tx.clone()
             }
             Some(_) => {
