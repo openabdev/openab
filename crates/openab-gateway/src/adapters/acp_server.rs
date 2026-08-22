@@ -1358,6 +1358,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
     let connection_closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     info!(connection = %connection_id, "ACP client connected");
+    ACP_ACTIVE_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
 
     // Frame tracing (OPENAB_ACP_TRACE) — read once per connection.
     let trace = acp_trace_enabled();
@@ -1907,8 +1908,13 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
     );
 
     send_task.abort();
+    ACP_ACTIVE_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
     info!(connection = %connection_id, "ACP client disconnected");
 }
+
+/// Live ACP WebSocket connection count, for the unified binary's /statusz.
+pub static ACP_ACTIVE_CONNECTIONS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
 
 // ---------------------------------------------------------------------------
 // Method handlers

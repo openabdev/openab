@@ -320,8 +320,11 @@ fn platform_trust_override(
     }
 }
 
+static PROCESS_STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = PROCESS_STARTED.set(std::time::Instant::now());
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -1324,8 +1327,9 @@ async fn main() -> anyhow::Result<()> {
             gw_state.warn_unenforceable_l1(true);
 
             // Build axum router with platform webhook routes
-            let mut app =
-                axum::Router::new().route("/health", axum::routing::get(|| async { "ok" }));
+            let mut app = axum::Router::new()
+                .route("/health", axum::routing::get(|| async { "ok" }))
+                .route("/statusz", axum::routing::get(statusz));
 
             #[cfg(feature = "telegram")]
             if gw_state.telegram_bot_token.is_some() {
@@ -2084,4 +2088,35 @@ agent_id = "1000002"
 
         assert_eq!(has_unified_wecom_config(&cfg), cfg!(feature = "wecom"));
     }
+}
+
+
+/// Minimal machine-readable status for the ACP sandbox consumer (uptime,
+/// live ACP connections, running claude-agent-acp child processes). Read-only
+/// and unauthenticated like /health — expose it only on trusted networks.
+async fn statusz() -> axum::Json<serde_json::Value> {
+    let started = *PROCESS_STARTED.get_or_init(std::time::Instant::now);
+
+    let mut agent_processes = 0u32;
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(pid) = name.to_str().filter(|n| n.chars().all(|c| c.is_ascii_digit())) else {
+                continue;
+            };
+            if let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) {
+                if String::from_utf8_lossy(&cmdline).contains("claude-agent-acp") {
+                    agent_processes += 1;
+                }
+            }
+        }
+    }
+
+    axum::Json(serde_json::json!({
+        "status": "ok",
+        "uptime_seconds": started.elapsed().as_secs(),
+        "acp_connections": openab_gateway::adapters::acp_server::ACP_ACTIVE_CONNECTIONS
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "agent_processes": agent_processes,
+    }))
 }
