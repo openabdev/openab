@@ -604,6 +604,7 @@ mod event_types {
                 channel_type: channel_type.to_string(),
                 thread_id,
                 mcp_servers: Vec::new(),
+                session_meta: None,
             },
             SenderInfo {
                 id: sender_open_id.to_string(),

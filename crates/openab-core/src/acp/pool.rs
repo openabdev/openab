@@ -53,6 +53,9 @@ struct PoolState {
     /// Kept here so an evicted-then-recreated session re-declares the same
     /// servers on its next spawn.
     session_mcp_servers: HashMap<String, Vec<serde_json::Value>>,
+    /// Client-supplied session `_meta` per session (ACP passthrough), kept for
+    /// the same reason as `session_mcp_servers`.
+    session_meta: HashMap<String, serde_json::Value>,
 }
 
 pub struct SessionPool {
@@ -189,6 +192,7 @@ fn purge_session_entries(state: &mut PoolState, key: &str) {
     // the same key.
     state.session_workdirs.remove(key);
     state.session_mcp_servers.remove(key);
+    state.session_meta.remove(key);
 }
 
 /// Escalating kill for a hung agent's process group: wait 10s after the
@@ -305,6 +309,7 @@ impl SessionPool {
                 creating: HashMap::new(),
                 session_workdirs,
                 session_mcp_servers: HashMap::new(),
+                session_meta: HashMap::new(),
             }),
             config,
             max_sessions,
@@ -404,6 +409,7 @@ impl SessionPool {
         thread_id: &str,
         working_dir_override: Option<&str>,
         mcp_servers: &[serde_json::Value],
+        session_meta: Option<&serde_json::Value>,
     ) -> Result<bool> {
         let create_gate = {
             let mut state = self.state.write().await;
@@ -416,6 +422,11 @@ impl SessionPool {
                 state
                     .session_mcp_servers
                     .insert(thread_id.to_string(), mcp_servers.to_vec());
+            }
+            if let Some(meta) = session_meta {
+                if state.session_meta.get(thread_id) != Some(meta) {
+                    state.session_meta.insert(thread_id.to_string(), meta.clone());
+                }
             }
             get_or_insert_gate(&mut state.creating, thread_id)
         };
@@ -485,7 +496,7 @@ impl SessionPool {
 
         // Resolve effective working directory: stored per-session > explicit override > global config.
         // Stored value has highest priority to enforce immutability (ADR §4.5).
-        let (stored_workdir, session_mcp_servers) = {
+        let (stored_workdir, session_mcp_servers, session_meta) = {
             let state = self.state.read().await;
             (
                 state.session_workdirs.get(thread_id).cloned(),
@@ -494,6 +505,7 @@ impl SessionPool {
                     .get(thread_id)
                     .cloned()
                     .unwrap_or_default(),
+                state.session_meta.get(thread_id).cloned(),
             )
         };
 
@@ -580,7 +592,12 @@ impl SessionPool {
         if let Some(ref sid) = saved_session_id {
             if new_conn.supports_load_session {
                 match new_conn
-                    .session_load(sid, &effective_workdir, &session_mcp_servers)
+                    .session_load(
+                        sid,
+                        &effective_workdir,
+                        &session_mcp_servers,
+                        session_meta.as_ref(),
+                    )
                     .await
                 {
                     Ok(()) => {
@@ -620,7 +637,11 @@ impl SessionPool {
 
         if !resumed {
             new_conn
-                .session_new(&effective_workdir, &session_mcp_servers)
+                .session_new(
+                    &effective_workdir,
+                    &session_mcp_servers,
+                    session_meta.as_ref(),
+                )
                 .await?;
 
             // Apply default config options (e.g. mode=bypass, model=swe-1-6)
@@ -1099,6 +1120,7 @@ mod tests {
             creating: HashMap::new(),
             session_workdirs: HashMap::new(),
             session_mcp_servers: HashMap::new(),
+            session_meta: HashMap::new(),
         }
     }
 
@@ -1382,6 +1404,10 @@ mod tests {
                 "hung".to_string(),
                 vec![serde_json::json!({"type": "http", "name": "x", "url": "http://x"})],
             )]),
+            session_meta: HashMap::from([(
+                "hung".to_string(),
+                serde_json::json!({"systemPrompt": "x"}),
+            )]),
         };
 
         purge_session_entries(&mut state, "hung");
@@ -1394,6 +1420,7 @@ mod tests {
         assert!(!state.persisted.contains_key("hung"));
         assert!(!state.session_workdirs.contains_key("hung"));
         assert!(!state.session_mcp_servers.contains_key("hung"));
+        assert!(!state.session_meta.contains_key("hung"));
         // The creating gate is concurrency control, not session state: it must
         // survive so an in-flight get_or_create holder stays serialized.
         assert!(state.creating.contains_key("hung"));

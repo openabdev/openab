@@ -135,6 +135,9 @@ struct GwChannel {
     /// Client-declared http-type MCP servers (ACP passthrough). Absent → empty.
     #[serde(default)]
     mcp_servers: Vec<serde_json::Value>,
+    /// Client-supplied session `_meta` (ACP passthrough). Absent → `None`.
+    #[serde(default)]
+    session_meta: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1190,6 +1193,7 @@ pub async fn run_gateway_adapter(
                                             other_bot_present: false,
                                             recipient: None, // Slack-only (assistant mode); N/A for gateway
                                             mcp_servers: event.channel.mcp_servers.clone(),
+                                            session_meta: event.channel.session_meta.clone(),
                                         };
                                         if let Err(e) = dispatcher
                                             .submit(thread_key, thread_channel, adapter, buf_msg)
@@ -1641,6 +1645,7 @@ pub async fn process_gateway_event(
             other_bot_present: false,
             recipient: None,
             mcp_servers: event.channel.mcp_servers.clone(),
+                                            session_meta: event.channel.session_meta.clone(),
         };
         if let Err(e) = dispatcher
             .submit(thread_key, thread_channel, adapter, buf_msg)

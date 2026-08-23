@@ -1064,6 +1064,7 @@ pub async fn webhook(
             channel_type: "direct".into(),
             thread_id: None,
             mcp_servers: Vec::new(),
+            session_meta: None,
         },
         crate::schema::SenderInfo {
             id: msg.from_user.clone(),

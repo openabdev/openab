@@ -156,7 +156,7 @@ async fn setup(platform: &str, thread_key: &str) -> Fixture {
         command_explicit: true,
     };
     let pool = Arc::new(SessionPool::new(agent_cfg, 1, 60, HashMap::new()));
-    pool.get_or_create(thread_key, None, &[])
+    pool.get_or_create(thread_key, None, &[], None)
         .await
         .expect("session spawn against fake agent");
 

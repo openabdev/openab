@@ -578,9 +578,17 @@ impl AcpConnection {
         Ok(())
     }
 
-    pub async fn session_new(&mut self, cwd: &str, mcp_servers: &[serde_json::Value]) -> Result<String> {
+    pub async fn session_new(
+        &mut self,
+        cwd: &str,
+        mcp_servers: &[serde_json::Value],
+        session_meta: Option<&serde_json::Value>,
+    ) -> Result<String> {
         let resp = self
-            .send_request("session/new", Some(session_new_params(cwd, mcp_servers)))
+            .send_request(
+                "session/new",
+                Some(session_new_params(cwd, mcp_servers, session_meta)),
+            )
             .await?;
 
         let session_id = resp
@@ -798,11 +806,12 @@ impl AcpConnection {
         session_id: &str,
         cwd: &str,
         mcp_servers: &[serde_json::Value],
+        session_meta: Option<&serde_json::Value>,
     ) -> Result<()> {
         let resp = self
             .send_request(
                 "session/load",
-                Some(session_load_params(session_id, cwd, mcp_servers)),
+                Some(session_load_params(session_id, cwd, mcp_servers, session_meta)),
             )
             .await?;
         // Accept any non-error response as success
@@ -848,17 +857,32 @@ impl AcpConnection {
 
 /// `session/new` params. `mcp_servers` are client-declared http-type entries
 /// forwarded verbatim (ACP passthrough); empty for every other caller.
-fn session_new_params(cwd: &str, mcp_servers: &[serde_json::Value]) -> serde_json::Value {
-    json!({"cwd": cwd, "mcpServers": mcp_servers})
+/// `session_meta` is the client's `_meta` object, forwarded verbatim when
+/// present (claude-agent-acp reads e.g. `_meta.systemPrompt`); `None` omits the key.
+fn session_new_params(
+    cwd: &str,
+    mcp_servers: &[serde_json::Value],
+    session_meta: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let mut params = json!({"cwd": cwd, "mcpServers": mcp_servers});
+    if let Some(meta) = session_meta {
+        params["_meta"] = meta.clone();
+    }
+    params
 }
 
-/// `session/load` params — same `mcpServers` passthrough as `session_new_params`.
+/// `session/load` params — same `mcpServers` / `_meta` passthrough as `session_new_params`.
 fn session_load_params(
     session_id: &str,
     cwd: &str,
     mcp_servers: &[serde_json::Value],
+    session_meta: Option<&serde_json::Value>,
 ) -> serde_json::Value {
-    json!({"sessionId": session_id, "cwd": cwd, "mcpServers": mcp_servers})
+    let mut params = json!({"sessionId": session_id, "cwd": cwd, "mcpServers": mcp_servers});
+    if let Some(meta) = session_meta {
+        params["_meta"] = meta.clone();
+    }
+    params
 }
 
 impl Drop for AcpConnection {
@@ -887,25 +911,45 @@ mod tests {
             "headers": [{"name": "Authorization", "value": "Bearer t"}]
         })];
         assert_eq!(
-            session_new_params("/w", &servers),
+            session_new_params("/w", &servers, None),
             json!({"cwd": "/w", "mcpServers": servers})
         );
         // No declaration → the historical empty array, unchanged on the wire.
         assert_eq!(
-            session_new_params("/w", &[]),
+            session_new_params("/w", &[], None),
             json!({"cwd": "/w", "mcpServers": []})
         );
+    }
+
+    #[test]
+    fn session_new_params_carry_the_passed_meta_verbatim_and_omit_it_when_none() {
+        let meta = json!({"systemPrompt": "be terse", "nested": {"k": [1, 2]}});
+        assert_eq!(
+            session_new_params("/w", &[], Some(&meta)),
+            json!({"cwd": "/w", "mcpServers": [], "_meta": meta})
+        );
+        assert!(session_new_params("/w", &[], None).get("_meta").is_none());
+    }
+
+    #[test]
+    fn session_load_params_carry_the_passed_meta_verbatim_and_omit_it_when_none() {
+        let meta = json!({"systemPrompt": "be terse"});
+        assert_eq!(
+            session_load_params("sess_1", "/w", &[], Some(&meta)),
+            json!({"sessionId": "sess_1", "cwd": "/w", "mcpServers": [], "_meta": meta})
+        );
+        assert!(session_load_params("sess_1", "/w", &[], None).get("_meta").is_none());
     }
 
     #[test]
     fn session_load_params_carry_the_passed_mcp_servers_verbatim() {
         let servers = vec![json!({"name": "s", "type": "http", "url": "https://x/mcp"})];
         assert_eq!(
-            session_load_params("sess_1", "/w", &servers),
+            session_load_params("sess_1", "/w", &servers, None),
             json!({"sessionId": "sess_1", "cwd": "/w", "mcpServers": servers})
         );
         assert_eq!(
-            session_load_params("sess_1", "/w", &[]),
+            session_load_params("sess_1", "/w", &[], None),
             json!({"sessionId": "sess_1", "cwd": "/w", "mcpServers": []})
         );
     }

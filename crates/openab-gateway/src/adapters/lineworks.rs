@@ -974,6 +974,7 @@ fn classify_event(event: &LineWorksEvent) -> Option<(GatewayEvent, Option<Pendin
             channel_type,
             thread_id: None,
             mcp_servers: Vec::new(),
+            session_meta: None,
         },
         SenderInfo {
             id: user_id.into(),

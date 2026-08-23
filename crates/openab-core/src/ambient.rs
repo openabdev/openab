@@ -595,7 +595,7 @@ async fn ambient_consumer_loop(
         }
 
         // Ensure session exists.
-        if let Err(e) = target.ensure_session(&session_key, None, &[]).await {
+        if let Err(e) = target.ensure_session(&session_key, None, &[], None).await {
             warn!(
                 channel_id = %crate::redact::redact_session_ids(&channel_id),
                 error = %e,

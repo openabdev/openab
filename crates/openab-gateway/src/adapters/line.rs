@@ -384,6 +384,7 @@ async fn build_gateway_event_from_line_event(
             channel_type,
             thread_id: None,
             mcp_servers: Vec::new(),
+            session_meta: None,
         },
         SenderInfo {
             id: user_id.into(),

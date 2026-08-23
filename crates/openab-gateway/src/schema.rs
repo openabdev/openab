@@ -26,6 +26,10 @@ pub struct ChannelInfo {
     /// agent session (ACP passthrough only; empty for every other platform).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<serde_json::Value>,
+    /// Client-supplied session `_meta` object forwarded verbatim to the inner
+    /// agent session (ACP passthrough only; `None` for every other platform).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_meta: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

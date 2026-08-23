@@ -607,7 +607,7 @@ impl AdapterRouter {
                 .unwrap_or(&ctx.thread_channel.channel_id)
         );
 
-        if let Err(e) = self.pool.get_or_create(&thread_key, None, &[]).await {
+        if let Err(e) = self.pool.get_or_create(&thread_key, None, &[], None).await {
             let msg = format_user_error(&e.to_string());
             let _ = adapter
                 .send_message(&ctx.thread_channel, &format!("⚠️ {msg}"))
