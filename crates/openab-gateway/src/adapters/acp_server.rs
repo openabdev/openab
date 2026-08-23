@@ -4480,6 +4480,86 @@ mod acp_review_fixes {
         assert_eq!(final_stop.as_deref(), Some("end_turn"), "a completed turn ends end_turn");
     }
 
+    // Streamed `edit_message` snapshots and `agent_update` relays must reach the client
+    // in exactly the order handle_reply saw them, and a terminal `send_message` that
+    // repeats the last snapshot must diff to nothing (no duplicate tail) while still
+    // completing the turn with the session/prompt response.
+    #[tokio::test]
+    async fn streamed_deltas_interleave_in_order_and_terminal_snapshot_dedupes() {
+        let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let registry = new_reply_registry();
+        let mut st = crate::AppState::test_default(event_tx);
+        st.acp_reply_registry = Some(registry.clone());
+        let state = Arc::new(st);
+
+        let sessions = sessions_map();
+        let sid = format!("sess_{}", Uuid::new_v4());
+        let channel_id = format!("acp_{}", Uuid::new_v4());
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        sessions.lock().await.insert(
+            sid.clone(),
+            AcpSession { channel_id: channel_id.clone(), busy: true, cancel: Some(cancel.clone()), mcp_servers: Vec::new() },
+        );
+
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+        let st2 = state.clone();
+        let sessions2 = sessions.clone();
+        let sid2 = sid.clone();
+        let handle = tokio::spawn(async move {
+            let params = json!({"sessionId": sid2, "prompt": [{"type": "text", "text": "hi"}]});
+            handle_session_prompt(&st2, &sessions2, json!(12), Some(&params), &out_tx, sid2.clone(), cancel, "conn-test", 0)
+                .await;
+        });
+
+        let mut turn_id = None;
+        for _ in 0..10_000 {
+            if let Some(t) = registry.lock().unwrap().get(&channel_id).map(|s| s.turn_id.clone()) {
+                turn_id = Some(t);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let turn_id = turn_id.expect("handler must register a reply sink");
+
+        // Mid-turn snapshots carry the "draft" placeholder id; updates carry the turn id.
+        let tool_call = json!({"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "check", "status": "pending"});
+        let thought = json!({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "hmm"}});
+        handle_reply(&reply(&channel_id, "draft", "Linode C", Some("edit_message")), &registry).await;
+        handle_reply(&reply(&channel_id, &turn_id, &tool_call.to_string(), Some("agent_update")), &registry).await;
+        handle_reply(&reply(&channel_id, "draft", "Linode CLI ok", Some("edit_message")), &registry).await;
+        handle_reply(&reply(&channel_id, &turn_id, &thought.to_string(), Some("agent_update")), &registry).await;
+        // Terminal reply repeats the last snapshot verbatim — must emit no new chunk.
+        handle_reply(&reply(&channel_id, &turn_id, "Linode CLI ok", Some("send_message")), &registry).await;
+        handle.await.unwrap();
+
+        let mut updates: Vec<(String, String)> = Vec::new();
+        let mut final_stop = None;
+        while let Ok(s) = out_rx.try_recv() {
+            let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+            if v["method"] == json!("session/update") {
+                let u = &v["params"]["update"];
+                updates.push((
+                    u["sessionUpdate"].as_str().unwrap_or("").to_string(),
+                    u["content"]["text"].as_str().unwrap_or("").to_string(),
+                ));
+            }
+            if v.get("id") == Some(&json!(12)) {
+                final_stop = v["result"]["stopReason"].as_str().map(str::to_string);
+            }
+        }
+        let expected = vec![
+            ("agent_message_chunk".to_string(), "Linode C".to_string()),
+            ("tool_call".to_string(), String::new()),
+            ("agent_message_chunk".to_string(), "LI ok".to_string()),
+            ("agent_thought_chunk".to_string(), "hmm".to_string()),
+        ];
+        assert_eq!(
+            updates, expected,
+            "session updates must preserve arrival order with no duplicate terminal chunk"
+        );
+        assert_eq!(final_stop.as_deref(), Some("end_turn"), "turn must still complete via the prompt response");
+    }
+
     // R17-F3c — a request-shaped `session/cancel` (id present) must NOT be acknowledged with
     // an empty success frame. ACP defines cancel as notification-only, so a request form is a
     // protocol violation → -32600 invalid request, and the cancel signal is not fired.

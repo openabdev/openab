@@ -745,6 +745,11 @@ impl AdapterRouter {
         // prefix from `compose_display` would corrupt the deltas, so ACP streams the raw
         // append-only answer text and surfaces tools separately (review F2 / roadmap).
         let platform_is_acp = thread_channel.platform == "acp";
+        // ACP is an in-process channel with no edit rate limit: bypass the paced
+        // edit loop and relay each text snapshot inline, so text stays in strict
+        // arrival order with the tool/thought updates forwarded on the same path.
+        // The gateway diffs successive snapshots into append-only chunks.
+        let acp_direct = streaming && platform_is_acp;
         let prompt_hard_timeout = self.prompt_hard_timeout;
         let liveness_check_interval = self.liveness_check_interval;
 
@@ -786,8 +791,16 @@ impl AdapterRouter {
                     let mut native_last_flush = tokio::time::Instant::now();
                     const NATIVE_FLUSH_MS: u128 = 400;
 
+                    // ACP direct relay: no placeholder, no edit loop — text
+                    // snapshots go out inline from the recv loop below.
+                    let acp_draft_msg = MessageRef {
+                        message_id: "draft".to_string(),
+                        channel: thread_channel.clone(),
+                    };
+
                     // Streaming edit: send placeholder, spawn edit loop
-                    let (buf_tx, placeholder_msg, edit_handle) = if streaming && !native {
+                    let (buf_tx, placeholder_msg, edit_handle) =
+                        if streaming && !native && !acp_direct {
                         let initial = if reset {
                             "⚠️ _Session expired, starting fresh..._\n\n…".to_string()
                         } else {
@@ -971,7 +984,13 @@ impl AdapterRouter {
                             match event {
                                 AcpEvent::Text(t) => {
                                     text_buf.push_str(&t);
-                                    if native {
+                                    if acp_direct {
+                                        // Awaited inline so the snapshot reaches the
+                                        // gateway before any later tool/thought relay.
+                                        let _ = adapter
+                                            .edit_message(&acp_draft_msg, &text_buf)
+                                            .await;
+                                    } else if native {
                                         // Lazy stream_begin: open the stream on first text.
                                         if native_msg.is_none() && !stream_begin_failed {
                                             match adapter.stream_begin(&thread_channel, recipient.clone()).await {
@@ -1141,6 +1160,19 @@ impl AdapterRouter {
                     // FULL buffer (they sit at output start, which the slice may
                     // drop) so a leading [[reply_to:...]] survives the narration
                     // it was emitted alongside.
+                    // ACP direct relay: the raw buffer is exactly what the inline
+                    // snapshots carried; the terminal send below repeats it verbatim
+                    // so the gateway's snapshot diff yields no duplicate chunk.
+                    let acp_streamed = if acp_direct {
+                        text_buf.clone()
+                    } else {
+                        String::new()
+                    };
+                    let acp_error = if acp_direct {
+                        response_error.clone()
+                    } else {
+                        None
+                    };
                     let (directives, text_buf) =
                         split_delivery(&text_buf, answer_start, keep_full_text);
                     // The session-reset notice lives at the head of the buffer; a
@@ -1247,6 +1279,23 @@ impl AdapterRouter {
                                     delivery_failed = true;
                                 }
                             }
+                        }
+                    } else if acp_direct {
+                        // Terminal delivery closes the turn at the gateway (Done →
+                        // session/prompt response). Repeating the exact streamed
+                        // snapshot diffs to nothing new; content the deltas never
+                        // carried (error banner, empty-turn sentinel) is appended
+                        // so it still reaches the client exactly once.
+                        let terminal = if acp_streamed.is_empty() {
+                            final_content.clone()
+                        } else if let Some(ref err) = acp_error {
+                            format!("{acp_streamed}\n\n⚠️ {err}")
+                        } else {
+                            acp_streamed
+                        };
+                        if let Err(e) = adapter.send_message(&thread_channel, &terminal).await {
+                            tracing::warn!(error = ?e, platform = %thread_channel.platform, "acp terminal send failed");
+                            delivery_failed = true;
                         }
                     } else if let Some(msg) = placeholder_msg {
                         if let Some(ref reply_id) = directives.reply_to {
