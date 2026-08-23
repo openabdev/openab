@@ -2094,6 +2094,16 @@ agent_id = "1000002"
 /// Minimal machine-readable status for the ACP sandbox consumer (uptime,
 /// live ACP connections, running claude-agent-acp child processes). Read-only
 /// and unauthenticated like /health — expose it only on trusted networks.
+#[cfg(any(
+    feature = "telegram",
+    feature = "line",
+    feature = "feishu",
+    feature = "googlechat",
+    feature = "wecom",
+    feature = "teams",
+    feature = "acp",
+    feature = "lineworks",
+))]
 async fn statusz() -> axum::Json<serde_json::Value> {
     let started = *PROCESS_STARTED.get_or_init(std::time::Instant::now);
 
@@ -2112,11 +2122,16 @@ async fn statusz() -> axum::Json<serde_json::Value> {
         }
     }
 
+    #[cfg(feature = "acp")]
+    let acp_connections = openab_gateway::adapters::acp_server::ACP_ACTIVE_CONNECTIONS
+        .load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(not(feature = "acp"))]
+    let acp_connections = 0;
+
     axum::Json(serde_json::json!({
         "status": "ok",
         "uptime_seconds": started.elapsed().as_secs(),
-        "acp_connections": openab_gateway::adapters::acp_server::ACP_ACTIVE_CONNECTIONS
-            .load(std::sync::atomic::Ordering::Relaxed),
+        "acp_connections": acp_connections,
         "agent_processes": agent_processes,
     }))
 }

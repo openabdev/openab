@@ -209,6 +209,7 @@ pub async fn webhook(
             id: msg.chat.id.to_string(),
             channel_type: msg.chat.chat_type.clone(),
             thread_id: msg.message_thread_id.map(|id| id.to_string()),
+            mcp_servers: Vec::new(),
         },
         SenderInfo {
             id: from.map(|u| u.id.to_string()).unwrap_or_default(),

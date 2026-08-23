@@ -532,6 +532,7 @@ pub async fn webhook(
             id: conversation_id.to_string(),
             channel_type: conversation_type.to_string(),
             thread_id: None, // Teams conversations don't have sub-threads in the same way
+            mcp_servers: Vec::new(),
         },
         SenderInfo {
             id: sender_id.to_string(),

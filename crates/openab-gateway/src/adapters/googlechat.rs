@@ -732,6 +732,7 @@ fn send_googlechat_event(
             id: space_name.to_string(),
             channel_type: space_type,
             thread_id,
+            mcp_servers: Vec::new(),
         },
         SenderInfo {
             id: sender_id.to_string(),

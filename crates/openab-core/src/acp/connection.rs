@@ -578,9 +578,9 @@ impl AcpConnection {
         Ok(())
     }
 
-    pub async fn session_new(&mut self, cwd: &str) -> Result<String> {
+    pub async fn session_new(&mut self, cwd: &str, mcp_servers: &[serde_json::Value]) -> Result<String> {
         let resp = self
-            .send_request("session/new", Some(json!({"cwd": cwd, "mcpServers": []})))
+            .send_request("session/new", Some(session_new_params(cwd, mcp_servers)))
             .await?;
 
         let session_id = resp
@@ -793,11 +793,16 @@ impl AcpConnection {
 
     /// Resume a previous session by ID. Returns Ok(()) if the agent accepted
     /// the load, or an error if it failed (caller should fall back to session/new).
-    pub async fn session_load(&mut self, session_id: &str, cwd: &str) -> Result<()> {
+    pub async fn session_load(
+        &mut self,
+        session_id: &str,
+        cwd: &str,
+        mcp_servers: &[serde_json::Value],
+    ) -> Result<()> {
         let resp = self
             .send_request(
                 "session/load",
-                Some(json!({"sessionId": session_id, "cwd": cwd, "mcpServers": []})),
+                Some(session_load_params(session_id, cwd, mcp_servers)),
             )
             .await?;
         // Accept any non-error response as success
@@ -841,6 +846,21 @@ impl AcpConnection {
     }
 }
 
+/// `session/new` params. `mcp_servers` are client-declared http-type entries
+/// forwarded verbatim (ACP passthrough); empty for every other caller.
+fn session_new_params(cwd: &str, mcp_servers: &[serde_json::Value]) -> serde_json::Value {
+    json!({"cwd": cwd, "mcpServers": mcp_servers})
+}
+
+/// `session/load` params — same `mcpServers` passthrough as `session_new_params`.
+fn session_load_params(
+    session_id: &str,
+    cwd: &str,
+    mcp_servers: &[serde_json::Value],
+) -> serde_json::Value {
+    json!({"sessionId": session_id, "cwd": cwd, "mcpServers": mcp_servers})
+}
+
 impl Drop for AcpConnection {
     fn drop(&mut self) {
         if let Some(handle) = self._stderr_handle.take() {
@@ -852,8 +872,43 @@ impl Drop for AcpConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_agent_env, build_permission_response, pick_best_option};
+    use super::{
+        build_agent_env, build_permission_response, pick_best_option, session_load_params,
+        session_new_params,
+    };
     use serde_json::json;
+
+    #[test]
+    fn session_new_params_carry_the_passed_mcp_servers_verbatim() {
+        let servers = vec![json!({
+            "name": "nuphos-credentials",
+            "type": "http",
+            "url": "https://x.example/mcp",
+            "headers": [{"name": "Authorization", "value": "Bearer t"}]
+        })];
+        assert_eq!(
+            session_new_params("/w", &servers),
+            json!({"cwd": "/w", "mcpServers": servers})
+        );
+        // No declaration → the historical empty array, unchanged on the wire.
+        assert_eq!(
+            session_new_params("/w", &[]),
+            json!({"cwd": "/w", "mcpServers": []})
+        );
+    }
+
+    #[test]
+    fn session_load_params_carry_the_passed_mcp_servers_verbatim() {
+        let servers = vec![json!({"name": "s", "type": "http", "url": "https://x/mcp"})];
+        assert_eq!(
+            session_load_params("sess_1", "/w", &servers),
+            json!({"sessionId": "sess_1", "cwd": "/w", "mcpServers": servers})
+        );
+        assert_eq!(
+            session_load_params("sess_1", "/w", &[]),
+            json!({"sessionId": "sess_1", "cwd": "/w", "mcpServers": []})
+        );
+    }
 
     #[test]
     fn picks_allow_always_over_other_options() {

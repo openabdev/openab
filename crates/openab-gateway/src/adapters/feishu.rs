@@ -603,6 +603,7 @@ mod event_types {
                 id: chat_id.to_string(),
                 channel_type: channel_type.to_string(),
                 thread_id,
+                mcp_servers: Vec::new(),
             },
             SenderInfo {
                 id: sender_open_id.to_string(),

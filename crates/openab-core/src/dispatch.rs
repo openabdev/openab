@@ -55,6 +55,10 @@ pub struct BufferedMessage {
     /// mode's native streaming is active. `None` for non-Slack platforms and
     /// bot-authored turns.
     pub recipient: Option<(String, String)>,
+    /// Client-declared http-type MCP servers (ACP passthrough), forwarded to
+    /// `ensure_session` so they reach the inner agent's session/new. Empty for
+    /// non-ACP platforms.
+    pub mcp_servers: Vec<serde_json::Value>,
 }
 
 /// How `thread_key` is built for the dispatcher's per-thread map.
@@ -132,7 +136,14 @@ pub trait DispatchTarget: Send + Sync + 'static {
 
     /// Ensure the ACP session for `session_key` exists (idempotent).
     /// Returns `true` if a new session was created, `false` if it already existed.
-    async fn ensure_session(&self, session_key: &str, working_dir: Option<&str>) -> Result<bool>;
+    /// `mcp_servers` are client-declared http-type MCP entries to pass to the
+    /// agent's session/new (empty for platforms without the ACP passthrough).
+    async fn ensure_session(
+        &self,
+        session_key: &str,
+        working_dir: Option<&str>,
+        mcp_servers: &[serde_json::Value],
+    ) -> Result<bool>;
 
     /// Destroy the session for `session_key` (used to rollback on directive failure).
     async fn reset_session(&self, session_key: &str);
@@ -165,8 +176,15 @@ impl DispatchTarget for AdapterRouter {
         self.bot_home_path()
     }
 
-    async fn ensure_session(&self, session_key: &str, working_dir: Option<&str>) -> Result<bool> {
-        self.pool().get_or_create(session_key, working_dir).await
+    async fn ensure_session(
+        &self,
+        session_key: &str,
+        working_dir: Option<&str>,
+        mcp_servers: &[serde_json::Value],
+    ) -> Result<bool> {
+        self.pool()
+            .get_or_create(session_key, working_dir, mcp_servers)
+            .await
     }
 
     async fn reset_session(&self, session_key: &str) {
@@ -692,10 +710,19 @@ async fn dispatch_batch(
     let workspace_override: Option<String> =
         ws_resolved.as_ref().and_then(|r| r.as_ref().ok().cloned());
 
+    // Freshest non-empty declaration in the batch wins (a batch is one turn; the
+    // stored set is updated pool-side and takes effect on next spawn).
+    let mcp_servers: Vec<serde_json::Value> = batch
+        .iter()
+        .rev()
+        .find(|m| !m.mcp_servers.is_empty())
+        .map(|m| m.mcp_servers.clone())
+        .unwrap_or_default();
+
     // Ensure session exists. The create_gate mutex inside get_or_create serializes
     // concurrent callers — only the winner gets created_now == true.
     let created_now = match target
-        .ensure_session(&session_key, workspace_override.as_deref())
+        .ensure_session(&session_key, workspace_override.as_deref(), &mcp_servers)
         .await
     {
         Ok(created) => created,
@@ -1414,6 +1441,7 @@ mod tests {
             &self,
             _session_key: &str,
             _working_dir: Option<&str>,
+            _mcp_servers: &[serde_json::Value],
         ) -> Result<bool> {
             if let Some(msg) = self.ensure_err.lock().unwrap().take() {
                 return Err(anyhow::anyhow!(msg));
@@ -1511,6 +1539,7 @@ mod tests {
             estimated_tokens: tokens,
             other_bot_present: false,
             recipient: None,
+            mcp_servers: vec![],
         }
     }
 

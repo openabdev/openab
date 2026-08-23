@@ -1807,6 +1807,7 @@ async fn handle_message(
         estimated_tokens,
         other_bot_present,
         recipient: stream_recipient,
+        mcp_servers: Vec::new(),
     };
     if let Err(e) = dispatcher
         .submit(thread_key, thread_channel, adapter_dyn, buf_msg)

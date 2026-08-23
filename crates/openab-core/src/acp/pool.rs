@@ -49,6 +49,10 @@ struct PoolState {
     /// Per-session working directory overrides (from control directives).
     /// thread_key → canonical workspace path.
     session_workdirs: HashMap<String, String>,
+    /// Client-declared http-type MCP servers per session (ACP passthrough).
+    /// Kept here so an evicted-then-recreated session re-declares the same
+    /// servers on its next spawn.
+    session_mcp_servers: HashMap<String, Vec<serde_json::Value>>,
 }
 
 pub struct SessionPool {
@@ -184,6 +188,7 @@ fn purge_session_entries(state: &mut PoolState, key: &str) {
     // a concurrent get_or_create mint a fresh gate and run two creations for
     // the same key.
     state.session_workdirs.remove(key);
+    state.session_mcp_servers.remove(key);
 }
 
 /// Escalating kill for a hung agent's process group: wait 10s after the
@@ -299,6 +304,7 @@ impl SessionPool {
                 suspended,
                 creating: HashMap::new(),
                 session_workdirs,
+                session_mcp_servers: HashMap::new(),
             }),
             config,
             max_sessions,
@@ -397,9 +403,20 @@ impl SessionPool {
         &self,
         thread_id: &str,
         working_dir_override: Option<&str>,
+        mcp_servers: &[serde_json::Value],
     ) -> Result<bool> {
         let create_gate = {
             let mut state = self.state.write().await;
+            // A non-empty declaration updates the stored set even when a live
+            // session short-circuits below: it takes effect on the next spawn,
+            // never restarting a live session.
+            if !mcp_servers.is_empty()
+                && state.session_mcp_servers.get(thread_id).map(Vec::as_slice) != Some(mcp_servers)
+            {
+                state
+                    .session_mcp_servers
+                    .insert(thread_id.to_string(), mcp_servers.to_vec());
+            }
             get_or_insert_gate(&mut state.creating, thread_id)
         };
         let _create_guard = create_gate.lock().await;
@@ -468,9 +485,16 @@ impl SessionPool {
 
         // Resolve effective working directory: stored per-session > explicit override > global config.
         // Stored value has highest priority to enforce immutability (ADR §4.5).
-        let stored_workdir = {
+        let (stored_workdir, session_mcp_servers) = {
             let state = self.state.read().await;
-            state.session_workdirs.get(thread_id).cloned()
+            (
+                state.session_workdirs.get(thread_id).cloned(),
+                state
+                    .session_mcp_servers
+                    .get(thread_id)
+                    .cloned()
+                    .unwrap_or_default(),
+            )
         };
 
         let effective_workdir = if let Some(stored) = stored_workdir {
@@ -555,7 +579,10 @@ impl SessionPool {
         let mut load_failed: Option<&str> = None;
         if let Some(ref sid) = saved_session_id {
             if new_conn.supports_load_session {
-                match new_conn.session_load(sid, &effective_workdir).await {
+                match new_conn
+                    .session_load(sid, &effective_workdir, &session_mcp_servers)
+                    .await
+                {
                     Ok(()) => {
                         info!(thread_id = %crate::redact::redact_session_ids(thread_id), session_id = %crate::redact::redact_session_ids(sid), "session resumed via session/load");
                         resumed = true;
@@ -592,7 +619,9 @@ impl SessionPool {
         }
 
         if !resumed {
-            new_conn.session_new(&effective_workdir).await?;
+            new_conn
+                .session_new(&effective_workdir, &session_mcp_servers)
+                .await?;
 
             // Apply default config options (e.g. mode=bypass, model=swe-1-6)
             for (config_id, value) in &self.default_config_options {
@@ -1069,6 +1098,7 @@ mod tests {
             persisted: HashMap::new(),
             creating: HashMap::new(),
             session_workdirs: HashMap::new(),
+            session_mcp_servers: HashMap::new(),
         }
     }
 
@@ -1348,6 +1378,10 @@ mod tests {
             ]),
             creating: HashMap::from([("hung".to_string(), Arc::new(Mutex::new(())))]),
             session_workdirs: HashMap::from([("hung".to_string(), "/tmp/ws".to_string())]),
+            session_mcp_servers: HashMap::from([(
+                "hung".to_string(),
+                vec![serde_json::json!({"type": "http", "name": "x", "url": "http://x"})],
+            )]),
         };
 
         purge_session_entries(&mut state, "hung");
@@ -1359,6 +1393,7 @@ mod tests {
         assert!(!state.suspended.contains_key("hung"));
         assert!(!state.persisted.contains_key("hung"));
         assert!(!state.session_workdirs.contains_key("hung"));
+        assert!(!state.session_mcp_servers.contains_key("hung"));
         // The creating gate is concurrency control, not session state: it must
         // survive so an in-flight get_or_create holder stays serialized.
         assert!(state.creating.contains_key("hung"));

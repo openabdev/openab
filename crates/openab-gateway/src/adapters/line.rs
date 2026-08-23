@@ -383,6 +383,7 @@ async fn build_gateway_event_from_line_event(
             id: channel_id,
             channel_type,
             thread_id: None,
+            mcp_servers: Vec::new(),
         },
         SenderInfo {
             id: user_id.into(),

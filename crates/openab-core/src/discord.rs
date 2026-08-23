@@ -1136,6 +1136,7 @@ impl EventHandler for Handler {
                 estimated_tokens,
                 other_bot_present: other_bot_present_flag,
                 recipient: None, // Slack-only (assistant mode); N/A for Discord
+                mcp_servers: Vec::new(),
             };
             if let Err(e) = dispatcher
                 .submit(thread_key, thread_channel, adapter, buf_msg)
@@ -1377,6 +1378,7 @@ impl EventHandler for Handler {
                 estimated_tokens,
                 other_bot_present,
                 recipient: None,
+                mcp_servers: Vec::new(),
             };
 
             if let Err(e) = dispatcher

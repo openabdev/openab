@@ -331,6 +331,9 @@ struct AcpSession {
     /// "cancelled"` to the prompt's own request id (rather than hard-aborting
     /// the task and orphaning that id).
     cancel: Option<Arc<tokio::sync::Notify>>,
+    /// Client-declared `"type":"http"` mcpServers entries (raw JSON), forwarded
+    /// verbatim to core on each prompt. Empty unless OPENAB_ACP_MCP_SERVERS is on.
+    mcp_servers: Vec<serde_json::Value>,
 }
 
 /// A client-declared MCP-over-ACP server (the RFD `"type":"acp"` `mcpServers` entry). Not in
@@ -391,6 +394,32 @@ fn accept_acp_servers(servers: Vec<AcpMcpServer>) -> Result<Vec<AcpMcpServer>, S
         ));
     }
     Ok(deduped)
+}
+
+/// Extract the `"type":"http"` entries of a `mcpServers` array as raw JSON, for
+/// verbatim passthrough to the inner agent session. Capped at
+/// `MAX_ACP_SERVERS_PER_SESSION` (extras dropped, not an error).
+fn parse_http_mcp_servers(params: Option<&Value>) -> Vec<serde_json::Value> {
+    params
+        .and_then(|p| p.get("mcpServers"))
+        .and_then(|m| m.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter(|e| e.get("type").and_then(Value::as_str) == Some("http"))
+                .take(MAX_ACP_SERVERS_PER_SESSION)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Env gate for the http-mcpServers passthrough (`OPENAB_ACP_MCP_SERVERS=true|1`).
+/// Read once per connection; handlers take the value as a parameter so tests
+/// never mutate process env.
+fn acp_mcp_servers_enabled() -> bool {
+    std::env::var("OPENAB_ACP_MCP_SERVERS")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false)
 }
 
 pub enum ReplyChunk {
@@ -1362,6 +1391,8 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
 
     // Frame tracing (OPENAB_ACP_TRACE) — read once per connection.
     let trace = acp_trace_enabled();
+    // http-mcpServers passthrough gate (OPENAB_ACP_MCP_SERVERS) — read once per connection.
+    let mcp_enabled = acp_mcp_servers_enabled();
 
     // Session state for this connection
     let sessions: Arc<tokio::sync::Mutex<HashMap<String, AcpSession>>> =
@@ -1534,7 +1565,7 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
 
         match req.method.as_str() {
             "initialize" => {
-                let resp = handle_initialize(&req);
+                let resp = handle_initialize(&req, mcp_enabled);
                 // Only mark the connection initialized when negotiation succeeded.
                 let negotiated_ok = resp.error.is_none();
                 let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
@@ -1578,8 +1609,13 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                         continue;
                     }
                 };
+                let http_mcp_servers = if mcp_enabled {
+                    parse_http_mcp_servers(req.params.as_ref())
+                } else {
+                    Vec::new()
+                };
                 let (resp, channel_id) =
-                    handle_session_new(&sessions, id.clone()).await;
+                    handle_session_new(&sessions, id.clone(), http_mcp_servers).await;
                 let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
 
                 // If the client declared "type":"acp" MCP servers, open + register a tunnel to
@@ -1628,7 +1664,8 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                         }
                     };
                 let (resp, resumed_channel) =
-                    handle_session_resume(&sessions, id.clone(), req.params.as_ref()).await;
+                    handle_session_resume(&sessions, id.clone(), req.params.as_ref(), mcp_enabled)
+                        .await;
                 let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
 
                 // Retire tunnels for declarations this resume withdrew.
@@ -1920,7 +1957,7 @@ pub static ACP_ACTIVE_CONNECTIONS: std::sync::atomic::AtomicI64 =
 // Method handlers
 // ---------------------------------------------------------------------------
 
-fn handle_initialize(req: &JsonRpcRequest) -> JsonRpcResponse {
+fn handle_initialize(req: &JsonRpcRequest, mcp_http: bool) -> JsonRpcResponse {
     let id = req.id.clone().unwrap_or(Value::Null);
     // Validate the official request (protocolVersion is required) before negotiating.
     let init: crate::adapters::acp_schema::InitializeRequest =
@@ -1955,11 +1992,10 @@ fn handle_initialize(req: &JsonRpcRequest) -> JsonRpcResponse {
                 // NOTHING already claims "no MCP transport support" — while this gateway ships
                 // MCP-over-ACP. Silence was not neutral (R4).
                 //
-                // http and sse are FALSE, and that is verified rather than assumed: `session/new`
-                // runs `parse_acp_mcp_servers`, keeps only `"type":"acp"` entries, and then calls
-                // `handle_session_new(&sessions, id)` — `req.params` reaches nothing else. An http
-                // or sse declaration is silently dropped, so advertising `true` would be a claim
-                // with no implementation behind it.
+                // http is TRUE only when the OPENAB_ACP_MCP_SERVERS passthrough is enabled
+                // (`mcp_http` — session/new then stores the http entries and forwards them to
+                // core on each prompt). sse stays FALSE: those declarations are still dropped,
+                // so advertising `true` would be a claim with no implementation behind it.
                 //
                 // The ACP capability is declared as a **reverse-DNS-namespaced `_meta` key**, per
                 // the 2026-07-28 MCP `_meta` namespaced-key convention (SEP-1788 — its own reserved
@@ -1971,7 +2007,7 @@ fn handle_initialize(req: &JsonRpcRequest) -> JsonRpcResponse {
                 // fork the generated types, which F1(a) deliberately avoided. It would move to that
                 // typed map if and when the vendored schema gains it; the ADR carries that note.
                 "mcpCapabilities": {
-                    "http": false,
+                    "http": mcp_http,
                     "sse": false,
                     "_meta": { "dev.openab/acp": true }
                 },
@@ -1999,6 +2035,9 @@ fn handle_initialize(req: &JsonRpcRequest) -> JsonRpcResponse {
 async fn handle_session_new(
     sessions: &Arc<tokio::sync::Mutex<HashMap<String, AcpSession>>>,
     id: Value,
+    // Parsed http-type mcpServers entries to store on the session (already env-gated
+    // and capped by the caller).
+    mcp_servers: Vec<serde_json::Value>,
 ) -> (JsonRpcResponse, String) {
     // sessionId and channel_id share one uuid so channel_id is always
     // re-derivable from a persisted sessionId (see session/resume).
@@ -2012,6 +2051,7 @@ async fn handle_session_new(
             channel_id: channel_id.clone(),
             busy: false,
             cancel: None,
+            mcp_servers,
         },
     );
 
@@ -2062,6 +2102,8 @@ async fn handle_session_resume(
     sessions: &Arc<tokio::sync::Mutex<HashMap<String, AcpSession>>>,
     id: Value,
     params: Option<&Value>,
+    // OPENAB_ACP_MCP_SERVERS gate, read by the caller so tests never mutate env.
+    mcp_enabled: bool,
 ) -> (JsonRpcResponse, Option<String>) {
     let session_id = match params.and_then(|p| p.get("sessionId")).and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
@@ -2116,12 +2158,30 @@ async fn handle_session_resume(
             None,
         );
     }
+    // Same ABSENT-vs-EMPTY reading as the tunnel withdrawal below: only a real
+    // `mcpServers` ARRAY replaces the stored http entries; absent/null/malformed
+    // keeps them. Gate off → store nothing.
+    let declared_array = matches!(
+        params.and_then(|p| p.get("mcpServers")),
+        Some(Value::Array(_))
+    );
+    let mcp_servers = if !mcp_enabled {
+        Vec::new()
+    } else if declared_array {
+        parse_http_mcp_servers(params)
+    } else {
+        guard
+            .get(&session_id)
+            .map(|s| s.mcp_servers.clone())
+            .unwrap_or_default()
+    };
     guard.insert(
         session_id.clone(),
         AcpSession {
             channel_id: channel_id.clone(),
             busy: false,
             cancel: None,
+            mcp_servers,
         },
     );
     drop(guard);
@@ -2275,9 +2335,10 @@ async fn handle_session_prompt(
         }
     };
 
-    // The session was reserved a moment ago under the lock; just read its channel_id.
-    let channel_id = match sessions.lock().await.get(&session_id) {
-        Some(s) => s.channel_id.clone(),
+    // The session was reserved a moment ago under the lock; just read its channel_id
+    // and stored http mcpServers entries.
+    let (channel_id, mcp_servers) = match sessions.lock().await.get(&session_id) {
+        Some(s) => (s.channel_id.clone(), s.mcp_servers.clone()),
         None => {
             let resp =
                 JsonRpcResponse::error(
@@ -2299,6 +2360,7 @@ async fn handle_session_prompt(
             id: channel_id.clone(),
             channel_type: "dm".into(),
             thread_id: None,
+            mcp_servers,
         },
         SenderInfo {
             id: "acp_client".into(),
@@ -2624,7 +2686,9 @@ mod acp_conformance {
 
     #[test]
     fn initialize_response() {
-        // mirror of handle_initialize
+        // mirror of handle_initialize — checked for both values of mcpCapabilities.http
+        // (the OPENAB_ACP_MCP_SERVERS gate).
+        for http in [false, true] {
         conforms::<sc::InitializeResponse>(json!({
             "protocolVersion": 1,
             "agentCapabilities": {
@@ -2633,13 +2697,14 @@ mod acp_conformance {
                 // mirroring is worse than no mirror, because it still looks like coverage. This
                 // also proves `_meta` is schema-legal here, which is what makes the ACP capability
                 // expressible before upstream has a real field for it.
-                "mcpCapabilities": { "http": false, "sse": false, "_meta": { "dev.openab/acp": true } },
+                "mcpCapabilities": { "http": http, "sse": false, "_meta": { "dev.openab/acp": true } },
                 "sessionCapabilities": { "resume": {} },
                 "promptCapabilities": { "image": false, "audio": false, "embeddedContext": false }
             },
             "agentInfo": { "name": "openab", "title": "OpenAB", "version": "0.0.0" },
             "authMethods": []
         }));
+        }
     }
 
     #[test]
@@ -3577,7 +3642,8 @@ mod acp_requests {
 mod acp_handlers {
     use super::{
         handle_initialize, handle_session_new, handle_session_resume, parse_acp_mcp_servers,
-        AcpMcpServer, AcpSession, JsonRpcRequest,
+        parse_http_mcp_servers, AcpMcpServer, AcpSession, JsonRpcRequest,
+        MAX_ACP_SERVERS_PER_SESSION,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -3599,7 +3665,7 @@ mod acp_handlers {
 
     #[test]
     fn initialize_returns_conformant_capabilities() {
-        let v = serde_json::to_value(handle_initialize(&init_req(Some(json!({"protocolVersion": 1}))))).unwrap();
+        let v = serde_json::to_value(handle_initialize(&init_req(Some(json!({"protocolVersion": 1}))), false)).unwrap();
         assert_eq!(v["id"], json!(1));
         let result = &v["result"];
         assert_eq!(result["protocolVersion"], json!(1));
@@ -3627,16 +3693,16 @@ mod acp_handlers {
     #[test]
     fn initialize_negotiates_version_and_rejects_bad() {
         // a higher client version negotiates down to ours (1)
-        let v = serde_json::to_value(handle_initialize(&init_req(Some(json!({"protocolVersion": 5}))))).unwrap();
+        let v = serde_json::to_value(handle_initialize(&init_req(Some(json!({"protocolVersion": 5}))), false)).unwrap();
         assert_eq!(v["result"]["protocolVersion"], json!(1));
         // version 0 is below our minimum → -32602
-        let v = serde_json::to_value(handle_initialize(&init_req(Some(json!({"protocolVersion": 0}))))).unwrap();
+        let v = serde_json::to_value(handle_initialize(&init_req(Some(json!({"protocolVersion": 0}))), false)).unwrap();
         assert_eq!(v["error"]["code"], json!(-32602));
         // missing protocolVersion → -32602
-        let v = serde_json::to_value(handle_initialize(&init_req(Some(json!({}))))).unwrap();
+        let v = serde_json::to_value(handle_initialize(&init_req(Some(json!({}))), false)).unwrap();
         assert_eq!(v["error"]["code"], json!(-32602));
         // missing params → -32602
-        let v = serde_json::to_value(handle_initialize(&init_req(None))).unwrap();
+        let v = serde_json::to_value(handle_initialize(&init_req(None), false)).unwrap();
         assert_eq!(v["error"]["code"], json!(-32602));
     }
 
@@ -3644,7 +3710,7 @@ mod acp_handlers {
     async fn session_new_mints_and_stores_a_session() {
         let sessions = new_sessions();
         let v =
-            serde_json::to_value(handle_session_new(&sessions, json!(2)).await.0).unwrap();
+            serde_json::to_value(handle_session_new(&sessions, json!(2), Vec::new()).await.0).unwrap();
         let sid = v["result"]["sessionId"].as_str().unwrap();
         assert!(sid.starts_with("sess_"), "sessionId must be sess_<uuid>: {sid}");
         assert!(sessions.lock().await.contains_key(sid), "session must be stored");
@@ -3672,6 +3738,100 @@ mod acp_handlers {
         assert!(parse_acp_mcp_servers(None).is_empty());
     }
 
+    #[test]
+    fn parse_http_mcp_servers_keeps_http_entries_verbatim_and_caps() {
+        let http = json!({
+            "name": "nuphos-credentials",
+            "type": "http",
+            "url": "https://x.example/mcp",
+            "headers": [{"name": "Authorization", "value": "Bearer t"}]
+        });
+        let params = json!({
+            "cwd": "/w",
+            "mcpServers": [
+                {"type": "acp", "id": "srv-1", "name": "browser"},
+                http,
+                {"type": "stdio", "name": "s", "command": "x"},
+                {"type": "sse", "name": "e", "url": "https://sse"},
+                {"name": "typeless"}
+            ]
+        });
+        assert_eq!(parse_http_mcp_servers(Some(&params)), vec![http]);
+        assert!(parse_http_mcp_servers(Some(&json!({"cwd": "/w"}))).is_empty());
+        assert!(parse_http_mcp_servers(None).is_empty());
+
+        // Over-declaration is bounded deterministically: extras dropped, no error.
+        let many: Vec<serde_json::Value> = (0..MAX_ACP_SERVERS_PER_SESSION + 4)
+            .map(|i| json!({"type": "http", "name": format!("s{i}"), "url": "https://x"}))
+            .collect();
+        let kept = parse_http_mcp_servers(Some(&json!({"mcpServers": many})));
+        assert_eq!(kept.len(), MAX_ACP_SERVERS_PER_SESSION);
+        assert_eq!(kept[0]["name"], json!("s0"), "first entries win, in order");
+    }
+
+    #[tokio::test]
+    async fn session_new_stores_http_mcp_servers_on_the_session() {
+        let sessions = new_sessions();
+        let server = json!({"type": "http", "name": "creds", "url": "https://x/mcp"});
+        let v = serde_json::to_value(
+            handle_session_new(&sessions, json!(2), vec![server.clone()]).await.0,
+        )
+        .unwrap();
+        let sid = v["result"]["sessionId"].as_str().unwrap().to_string();
+        assert_eq!(sessions.lock().await.get(&sid).unwrap().mcp_servers, vec![server]);
+    }
+
+    #[tokio::test]
+    async fn resume_absent_mcp_servers_keeps_stored_entries_and_empty_clears() {
+        let sessions = new_sessions();
+        let server = json!({"type": "http", "name": "creds", "url": "https://x/mcp"});
+        let v = serde_json::to_value(
+            handle_session_new(&sessions, json!(1), vec![server.clone()]).await.0,
+        )
+        .unwrap();
+        let sid = v["result"]["sessionId"].as_str().unwrap().to_string();
+
+        // Omitted mcpServers: the client said nothing → stored entries survive.
+        let absent = json!({"sessionId": sid, "cwd": "/w"});
+        handle_session_resume(&sessions, json!(2), Some(&absent), true).await;
+        assert_eq!(sessions.lock().await.get(&sid).unwrap().mcp_servers, vec![server.clone()]);
+
+        // Null is next to absent, not an empty declaration.
+        let null = json!({"sessionId": sid, "cwd": "/w", "mcpServers": null});
+        handle_session_resume(&sessions, json!(3), Some(&null), true).await;
+        assert_eq!(sessions.lock().await.get(&sid).unwrap().mcp_servers, vec![server.clone()]);
+
+        // An explicit [] is a full re-declaration offering none → cleared.
+        let empty = json!({"sessionId": sid, "cwd": "/w", "mcpServers": []});
+        handle_session_resume(&sessions, json!(4), Some(&empty), true).await;
+        assert!(sessions.lock().await.get(&sid).unwrap().mcp_servers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resume_with_gate_disabled_stores_nothing() {
+        let sessions = new_sessions();
+        let sid = format!("sess_{}", Uuid::new_v4());
+        let p = json!({
+            "sessionId": sid,
+            "cwd": "/w",
+            "mcpServers": [{"type": "http", "name": "creds", "url": "https://x/mcp"}]
+        });
+        handle_session_resume(&sessions, json!(1), Some(&p), false).await;
+        assert!(sessions.lock().await.get(&sid).unwrap().mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn initialize_advertises_http_only_when_gated_on() {
+        let v = serde_json::to_value(handle_initialize(
+            &init_req(Some(json!({"protocolVersion": 1}))),
+            true,
+        ))
+        .unwrap();
+        let mcp = &v["result"]["agentCapabilities"]["mcpCapabilities"];
+        assert_eq!(mcp["http"], json!(true));
+        assert_eq!(mcp["sse"], json!(false), "sse declarations are still dropped");
+    }
+
 
     #[tokio::test]
     async fn session_resume_valid_stores_and_invalid_errors() {
@@ -3679,18 +3839,18 @@ mod acp_handlers {
         // valid sess_<uuid> → {} and the session is (re)stored
         let sid = format!("sess_{}", Uuid::new_v4());
         let params = json!({"sessionId": sid, "cwd": "/w", "mcpServers": []});
-        let v = serde_json::to_value(handle_session_resume(&sessions, json!(3), Some(&params)).await.0)
+        let v = serde_json::to_value(handle_session_resume(&sessions, json!(3), Some(&params), false).await.0)
             .unwrap();
         assert_eq!(v["result"], json!({}));
         assert!(sessions.lock().await.contains_key(&sid));
         // malformed sessionId shape → -32602
         let bad = json!({"sessionId": "not-a-session", "cwd": "/w", "mcpServers": []});
-        let v = serde_json::to_value(handle_session_resume(&sessions, json!(4), Some(&bad)).await.0)
+        let v = serde_json::to_value(handle_session_resume(&sessions, json!(4), Some(&bad), false).await.0)
             .unwrap();
         assert_eq!(v["error"]["code"], json!(-32602));
         // missing sessionId → -32602
         let v = serde_json::to_value(
-            handle_session_resume(&sessions, json!(5), Some(&json!({"cwd": "/w"}))).await.0,
+            handle_session_resume(&sessions, json!(5), Some(&json!({"cwd": "/w"})), false).await.0,
         )
         .unwrap();
         assert_eq!(v["error"]["code"], json!(-32602));
@@ -3721,7 +3881,7 @@ mod acp_review_fixes {
         for _ in 0..MAX_SESSIONS_PER_CONNECTION {
             let sid = format!("sess_{}", Uuid::new_v4());
             let p = json!({ "sessionId": sid });
-            let v = serde_json::to_value(handle_session_resume(&sessions, json!(1), Some(&p)).await.0)
+            let v = serde_json::to_value(handle_session_resume(&sessions, json!(1), Some(&p), false).await.0)
                 .unwrap();
             assert_eq!(v["result"], json!({}), "resume under cap should succeed");
             ids.push(sid);
@@ -3729,13 +3889,13 @@ mod acp_review_fixes {
         assert_eq!(sessions.lock().await.len(), MAX_SESSIONS_PER_CONNECTION);
         // A new distinct session over the cap is refused with ACP_OVERLOADED.
         let over = json!({ "sessionId": format!("sess_{}", Uuid::new_v4()) });
-        let v = serde_json::to_value(handle_session_resume(&sessions, json!(2), Some(&over)).await.0)
+        let v = serde_json::to_value(handle_session_resume(&sessions, json!(2), Some(&over), false).await.0)
             .unwrap();
         assert_eq!(v["error"]["code"], json!(ACP_OVERLOADED), "over-cap resume must be refused");
         // Re-resuming an already-present session is exempt (idempotent).
         let existing = json!({ "sessionId": ids[0] });
         let v =
-            serde_json::to_value(handle_session_resume(&sessions, json!(3), Some(&existing)).await.0)
+            serde_json::to_value(handle_session_resume(&sessions, json!(3), Some(&existing), false).await.0)
                 .unwrap();
         assert_eq!(v["result"], json!({}), "re-resume of existing session must bypass the cap");
     }
@@ -3890,13 +4050,13 @@ mod acp_review_fixes {
 
         // 1. missing sessionId
         let (resp, chan) =
-            handle_session_resume(&sessions, json!(1), Some(&json!({"cwd": "/w"}))).await;
+            handle_session_resume(&sessions, json!(1), Some(&json!({"cwd": "/w"})), false).await;
         assert_eq!(serde_json::to_value(resp).unwrap()["error"]["code"], json!(-32602));
         assert!(chan.is_none(), "missing sessionId must not yield a channel");
 
         // 2. malformed sessionId
         let bad = json!({"sessionId": "not-a-session", "cwd": "/w"});
-        let (resp, chan) = handle_session_resume(&sessions, json!(2), Some(&bad)).await;
+        let (resp, chan) = handle_session_resume(&sessions, json!(2), Some(&bad), false).await;
         assert_eq!(serde_json::to_value(resp).unwrap()["error"]["code"], json!(-32602));
         assert!(chan.is_none(), "malformed sessionId must not yield a channel");
 
@@ -3904,11 +4064,11 @@ mod acp_review_fixes {
         //    derive-from-params guard would have happily produced a channel here.
         for _ in 0..MAX_SESSIONS_PER_CONNECTION {
             let p = json!({ "sessionId": format!("sess_{}", Uuid::new_v4()) });
-            let (_r, chan) = handle_session_resume(&sessions, json!(3), Some(&p)).await;
+            let (_r, chan) = handle_session_resume(&sessions, json!(3), Some(&p), false).await;
             assert!(chan.is_some(), "resume under the cap should succeed");
         }
         let over = json!({ "sessionId": format!("sess_{}", Uuid::new_v4()) });
-        let (resp, chan) = handle_session_resume(&sessions, json!(4), Some(&over)).await;
+        let (resp, chan) = handle_session_resume(&sessions, json!(4), Some(&over), false).await;
         assert_eq!(
             serde_json::to_value(resp).unwrap()["error"]["code"],
             json!(ACP_OVERLOADED)
@@ -3923,10 +4083,11 @@ mod acp_review_fixes {
                 channel_id: derive_channel_id(&busy_sid).unwrap(),
                 busy: true,
                 cancel: Some(Arc::new(tokio::sync::Notify::new())),
+                mcp_servers: Vec::new(),
             },
         );
         let (resp, chan) =
-            handle_session_resume(&sessions, json!(5), Some(&json!({"sessionId": busy_sid}))).await;
+            handle_session_resume(&sessions, json!(5), Some(&json!({"sessionId": busy_sid})), false).await;
         assert_eq!(serde_json::to_value(resp).unwrap()["error"]["code"], json!(-32001));
         assert!(chan.is_none(), "a busy-rejected resume must not yield a channel");
     }
@@ -4108,6 +4269,7 @@ mod acp_review_fixes {
                 channel_id: format!("acp_{}", Uuid::new_v4()),
                 busy: true,
                 cancel: Some(cancel.clone()),
+                mcp_servers: Vec::new(),
             },
         );
         // Cancel arrives before the handler's stream loop (reserved-then-immediate-cancel).
@@ -4138,6 +4300,91 @@ mod acp_review_fixes {
         assert!(!s.busy && s.cancel.is_none(), "cancel must release busy + cancel handle");
     }
 
+    // OPENAB_ACP_MCP_SERVERS passthrough: entries stored at session/new ride every
+    // prompt's GatewayEvent as `channel.mcp_servers`, so core can forward them to
+    // the inner agent session.
+    #[tokio::test]
+    async fn prompt_event_carries_the_sessions_stored_http_mcp_servers() {
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let mut st = crate::AppState::test_default(event_tx);
+        st.acp_reply_registry = Some(new_reply_registry());
+        let state = Arc::new(st);
+
+        let sessions = sessions_map();
+        let server = json!({
+            "name": "nuphos-credentials",
+            "type": "http",
+            "url": "https://x.example/mcp",
+            "headers": [{"name": "Authorization", "value": "Bearer t"}]
+        });
+        let (resp, _channel) =
+            handle_session_new(&sessions, json!(1), vec![server.clone()]).await;
+        let sid = serde_json::to_value(resp).unwrap()["result"]["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Reserve the prompt like the read loop, with the cancel pre-fired so the
+        // handler exits right after dispatching the event.
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        {
+            let mut g = sessions.lock().await;
+            let s = g.get_mut(&sid).unwrap();
+            s.busy = true;
+            s.cancel = Some(cancel.clone());
+        }
+        cancel.notify_one();
+
+        let (out_tx, _out_rx) = mpsc::unbounded_channel::<String>();
+        let params = json!({"sessionId": sid, "prompt": [{"type": "text", "text": "hi"}]});
+        handle_session_prompt(&state, &sessions, json!(7), Some(&params), &out_tx, sid.clone(), cancel, "conn-test", 0)
+            .await;
+
+        let event_json = event_rx.try_recv().expect("prompt must dispatch a GatewayEvent");
+        let event: serde_json::Value = serde_json::from_str(&event_json).unwrap();
+        assert_eq!(
+            event["channel"]["mcp_servers"],
+            json!([server]),
+            "the stored http entries must ride the event verbatim"
+        );
+    }
+
+    // A session declaring nothing serializes no `mcp_servers` key at all (back-compat wire).
+    #[tokio::test]
+    async fn prompt_event_omits_mcp_servers_when_none_declared() {
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let mut st = crate::AppState::test_default(event_tx);
+        st.acp_reply_registry = Some(new_reply_registry());
+        let state = Arc::new(st);
+
+        let sessions = sessions_map();
+        let (resp, _channel) = handle_session_new(&sessions, json!(1), Vec::new()).await;
+        let sid = serde_json::to_value(resp).unwrap()["result"]["sessionId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let cancel = Arc::new(tokio::sync::Notify::new());
+        {
+            let mut g = sessions.lock().await;
+            let s = g.get_mut(&sid).unwrap();
+            s.busy = true;
+            s.cancel = Some(cancel.clone());
+        }
+        cancel.notify_one();
+
+        let (out_tx, _out_rx) = mpsc::unbounded_channel::<String>();
+        let params = json!({"sessionId": sid, "prompt": [{"type": "text", "text": "hi"}]});
+        handle_session_prompt(&state, &sessions, json!(7), Some(&params), &out_tx, sid.clone(), cancel, "conn-test", 0)
+            .await;
+
+        let event_json = event_rx.try_recv().expect("prompt must dispatch a GatewayEvent");
+        let event: serde_json::Value = serde_json::from_str(&event_json).unwrap();
+        assert!(
+            event["channel"].get("mcp_servers").is_none(),
+            "an empty set must not appear on the wire: {event}"
+        );
+    }
+
     // R16-F2 — session/resume on a session with a prompt in flight is rejected (busy), so the
     // active turn's cancel handle + state are NOT clobbered by resume's unconditional rewrite.
     #[tokio::test]
@@ -4151,11 +4398,12 @@ mod acp_review_fixes {
                 channel_id: format!("acp_{}", Uuid::new_v4()),
                 busy: true,
                 cancel: Some(cancel.clone()),
+                mcp_servers: Vec::new(),
             },
         );
 
         let params = json!({"sessionId": sid, "cwd": "/w", "mcpServers": []});
-        let (resp, resumed) = handle_session_resume(&sessions, json!(9), Some(&params)).await;
+        let (resp, resumed) = handle_session_resume(&sessions, json!(9), Some(&params), false).await;
         let v = serde_json::to_value(resp).unwrap();
         assert_eq!(v["error"]["code"], json!(-32001), "resume while busy must be rejected");
         assert!(
@@ -4188,7 +4436,7 @@ mod acp_review_fixes {
         let cancel = Arc::new(tokio::sync::Notify::new());
         sessions.lock().await.insert(
             sid.clone(),
-            AcpSession { channel_id: channel_id.clone(), busy: true, cancel: Some(cancel.clone()) },
+            AcpSession { channel_id: channel_id.clone(), busy: true, cancel: Some(cancel.clone()), mcp_servers: Vec::new() },
         );
 
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
@@ -4264,6 +4512,7 @@ mod acp_review_fixes {
                 channel_id: format!("acp_{}", Uuid::new_v4()),
                 busy: true,
                 cancel: Some(cancel.clone()),
+                mcp_servers: Vec::new(),
             },
         );
         let params = json!({"sessionId": sid});

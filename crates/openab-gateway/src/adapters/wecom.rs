@@ -1063,6 +1063,7 @@ pub async fn webhook(
             id: channel_id,
             channel_type: "direct".into(),
             thread_id: None,
+            mcp_servers: Vec::new(),
         },
         crate::schema::SenderInfo {
             id: msg.from_user.clone(),

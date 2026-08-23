@@ -22,6 +22,10 @@ pub struct ChannelInfo {
     #[serde(rename = "type")]
     pub channel_type: String,
     pub thread_id: Option<String>,
+    /// Client-declared `"type":"http"` MCP servers forwarded verbatim to the inner
+    /// agent session (ACP passthrough only; empty for every other platform).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
