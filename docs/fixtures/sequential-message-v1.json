@@ -1,0 +1,15 @@
+{
+  "jsonrpc": "2.0",
+  "method": "session/update",
+  "params": {
+    "sessionId": "session_123",
+    "update": {
+      "sessionUpdate": "openab_message",
+      "id": "bubble_2",
+      "content": {
+        "type": "text",
+        "text": "your flight moved to 8pm\ngate B12"
+      }
+    }
+  }
+}

@@ -124,6 +124,15 @@ struct GatewayEvent {
     #[allow(dead_code)]
     mentions: Vec<String>,
     message_id: String,
+    /// Marks an **unsolicited** event — one no human just sent (a mailbox
+    /// webhook, a calendar reminder, a monitoring alert). Only these are
+    /// triaged (`[triage]`); a real user message is always dispatched, whatever
+    /// the hour.
+    ///
+    /// Additive and defaulted, so the schema stays `openab.gateway.event.v1`
+    /// and existing sources are unaffected.
+    #[serde(default)]
+    proactive: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -234,6 +243,18 @@ pub struct GatewayAdapter {
     streaming: bool,
     streaming_placeholder: bool,
     telegram_rich_messages: bool,
+    /// Wait for the gateway's ack on every send, independently of `streaming`.
+    ///
+    /// Without an ack a reply is pushed onto the WebSocket and the call returns
+    /// immediately, so N sequential sends become N in-flight messages whose
+    /// processing order on the gateway side is not guaranteed. Structured
+    /// delivery sends one message per bubble and depends on that order, so it
+    /// turns this on (ADR: structured-delivery.md §4).
+    ///
+    /// Deliberately separate from `streaming` rather than reusing it: that flag
+    /// means "edit a placeholder in place", and overloading it would give one
+    /// field two unrelated meanings.
+    await_ack: bool,
 }
 
 impl GatewayAdapter {
@@ -244,6 +265,7 @@ impl GatewayAdapter {
         streaming: bool,
         streaming_placeholder: bool,
         telegram_rich_messages: bool,
+        await_ack: bool,
     ) -> Self {
         Self {
             ws_tx,
@@ -252,6 +274,7 @@ impl GatewayAdapter {
             streaming,
             streaming_placeholder,
             telegram_rich_messages,
+            await_ack,
         }
     }
 
@@ -262,7 +285,7 @@ impl GatewayAdapter {
         content: &str,
         quote_message_id: Option<&str>,
     ) -> Result<MessageRef> {
-        let req_id = if self.streaming {
+        let req_id = if self.streaming || self.await_ack {
             Some(format!("req_{}", uuid::Uuid::new_v4()))
         } else {
             None
@@ -791,6 +814,11 @@ pub async fn run_gateway_adapter(
     };
     let streaming_placeholder = params.streaming_placeholder;
     let telegram_rich_messages = params.telegram_rich_messages;
+    // BOTH bubble modes send one message per bubble and need them to land in
+    // order, which over this transport means waiting for each ack (ADR §4).
+    // Sequential depends on it even more than structured: its bubbles are sent
+    // as they are decided, so consecutive sends can be milliseconds apart.
+    let await_ack = requires_send_ack(router.delivery_config().mode);
     let stt_config = params.stt;
 
     let connect_url = match &params.token {
@@ -842,6 +870,7 @@ pub async fn run_gateway_adapter(
             streaming,
             streaming_placeholder,
             telegram_rich_messages,
+            await_ack,
         ));
         let slash_ws_tx = ws_tx.clone(); // for fire-and-forget slash command responses
         let mut tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
@@ -908,6 +937,12 @@ pub async fn run_gateway_adapter(
                                             }
                                             continue;
                                         }
+                                    }
+
+                                    // Proactive-event noise control, same gate
+                                    // as the unified path.
+                                    if !triage_gateway_event(&event, &router) {
+                                        continue;
                                     }
 
                                     info!(
@@ -1352,6 +1387,65 @@ fn gate_gateway_event(router: &crate::adapter::AdapterRouter, event: &GatewayEve
     }
 }
 
+/// Whether outbound sends must wait for the gateway's ack.
+///
+/// True for **both** bubble modes: each sends one message per bubble and depends
+/// on them landing in order (ADR §4). Without an ack a reply is pushed onto the
+/// WebSocket and the call returns immediately, so N sends are in flight at once
+/// and the gateway is free to process them out of order.
+///
+/// Named so the rule has one home. An earlier version tested `== Structured`
+/// inline and silently dropped the guarantee when sequential delivery — which
+/// needs it *more*, its bubbles being milliseconds apart — was added.
+fn requires_send_ack(mode: crate::structured_delivery::DeliveryMode) -> bool {
+    mode.is_bubbles()
+}
+
+/// Noise control for **unsolicited** events, shared by both ingress paths
+/// (WebSocket and unified webhook) exactly as `gate_gateway_event` is.
+///
+/// Returns `true` when the event should proceed. Runs AFTER the trust gate — so
+/// an unauthorized source cannot burn a conversation's daily allowance — and
+/// BEFORE dispatch, so a suppressed event costs no LLM call.
+///
+/// A message a human actually sent never reaches here: only events flagged
+/// `proactive` are triaged.
+fn triage_gateway_event(event: &GatewayEvent, router: &crate::adapter::AdapterRouter) -> bool {
+    if !event.proactive {
+        return true;
+    }
+    // Keyed by the conversation the reply would land in, so a busy shared
+    // channel cannot exhaust a private DM's allowance.
+    let conversation_key = format!("{}:{}", event.platform, event.channel.id);
+    match router.triage_event(&conversation_key, &event.event_id) {
+        crate::event_triage::Decision::Wake => {
+            info!(
+                decision = "wake",
+                platform = %event.platform,
+                event_id = %event.event_id,
+                channel = %redact_channel(&event.channel.id),
+                "proactive event admitted by triage"
+            );
+            true
+        }
+        crate::event_triage::Decision::Suppress(reason) => {
+            // Structured on purpose: "the agent chose to stay quiet" and "the
+            // broker never asked it" are indistinguishable from the outside,
+            // and only this line can tell them apart.
+            info!(
+                decision = "suppressed",
+                reason = reason.tag(),
+                platform = %event.platform,
+                event_id = %event.event_id,
+                channel = %redact_channel(&event.channel.id),
+                detail = %reason,
+                "proactive event suppressed by triage"
+            );
+            false
+        }
+    }
+}
+
 pub async fn process_gateway_event(
     event_json: &str,
     ctx: &GatewayEventContext,
@@ -1388,6 +1482,10 @@ pub async fn process_gateway_event(
             }
             return Ok(false);
         }
+    }
+
+    if !triage_gateway_event(&event, &ctx.router) {
+        return Ok(false);
     }
 
     tracing::info!(
@@ -1662,6 +1760,161 @@ fn format_size(n: u64) -> String {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    // --- outbound ack (review F3) ---
+
+    /// Regression: sequential delivery sends one message per bubble over the
+    /// same WebSocket and must not skip the ack that keeps them ordered.
+    #[test]
+    fn both_bubble_modes_require_a_send_ack() {
+        use crate::structured_delivery::DeliveryMode;
+        assert!(requires_send_ack(DeliveryMode::Structured));
+        assert!(
+            requires_send_ack(DeliveryMode::Sequential),
+            "sequential bubbles are sent milliseconds apart and need the ack most"
+        );
+        assert!(
+            !requires_send_ack(DeliveryMode::Text),
+            "plain text is one message; there is no order to preserve"
+        );
+    }
+
+    // --- proactive-event triage (Phase 3) ---
+
+    fn triage_router(triage: crate::event_triage::TriageSettings) -> crate::adapter::AdapterRouter {
+        let pool = Arc::new(crate::acp::SessionPool::new(
+            crate::config::AgentConfig::default(),
+            1,
+            crate::config::default_prompt_hard_timeout_secs()
+                .saturating_add(crate::config::default_hung_grace_secs()),
+            std::collections::HashMap::new(),
+        ));
+        crate::adapter::AdapterRouter::new(
+            pool,
+            crate::config::ReactionsConfig::default(),
+            crate::markdown::TableMode::Off,
+            crate::config::default_prompt_hard_timeout_secs(),
+            crate::config::default_liveness_check_secs(),
+            std::collections::HashMap::new(),
+            std::path::PathBuf::from("/tmp"),
+        )
+        .with_triage(triage)
+    }
+
+    fn event_json(event_id: &str, proactive: bool) -> String {
+        serde_json::json!({
+            "schema": "openab.gateway.event.v1",
+            "event_id": event_id,
+            "timestamp": "2026-08-25T03:00:00Z",
+            "platform": "telegram",
+            "channel": { "id": "c1", "type": "dm" },
+            "sender": { "id": "u1", "name": "alice", "display_name": "Alice", "is_bot": false },
+            "content": { "type": "text", "text": "hi" },
+            "message_id": "m1",
+            "proactive": proactive
+        })
+        .to_string()
+    }
+
+    fn parse_event(json: &str) -> GatewayEvent {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// Settings under which any *proactive* event after the first is suppressed.
+    ///
+    /// Deduplication is the suppression lever here, not quiet hours: these tests
+    /// exercise the **routing** decision (does the `proactive` flag send an
+    /// event through triage at all), and the rules themselves are covered in
+    /// `event_triage`. Dedupe also has no dependence on the wall clock, so
+    /// these cannot go flaky at a particular minute of the day.
+    fn suppressing_settings() -> crate::event_triage::TriageSettings {
+        crate::event_triage::TriageSettings {
+            enabled: true,
+            dedupe_window_secs: 3600,
+            ..Default::default()
+        }
+    }
+
+    /// The single most important property of this feature: quiet hours — or any
+    /// other rule — that swallow a question a user actually asked are an
+    /// outage, not a feature.
+    #[test]
+    fn a_human_message_is_never_triaged() {
+        let router = triage_router(suppressing_settings());
+        // The same id five times: as a proactive event, everything after the
+        // first would be dropped as a duplicate.
+        for _ in 0..5 {
+            let event = parse_event(&event_json("same_id", false));
+            assert!(
+                triage_gateway_event(&event, &router),
+                "a non-proactive event must always pass"
+            );
+        }
+    }
+
+    #[test]
+    fn a_proactive_event_passes_when_triage_is_disabled() {
+        // The default posture: Phase 3 changes nothing until configured.
+        let router = triage_router(crate::event_triage::TriageSettings::default());
+        let event = parse_event(&event_json("e1", true));
+        assert!(triage_gateway_event(&event, &router));
+    }
+
+    #[test]
+    fn a_redelivered_proactive_event_is_suppressed_once_admitted() {
+        let router = triage_router(suppressing_settings());
+        let first = parse_event(&event_json("evt_dup", true));
+        let retry = parse_event(&event_json("evt_dup", true));
+        assert!(triage_gateway_event(&first, &router));
+        assert!(
+            !triage_gateway_event(&retry, &router),
+            "a webhook retry must not produce a second message"
+        );
+    }
+
+    #[test]
+    fn an_event_without_the_proactive_field_defaults_to_human() {
+        // Backward compatibility: every existing gateway source omits it, and
+        // must keep being dispatched unconditionally.
+        let legacy = serde_json::json!({
+            "schema": "openab.gateway.event.v1",
+            "event_id": "e1",
+            "timestamp": "2026-08-25T03:00:00Z",
+            "platform": "telegram",
+            "channel": { "id": "c1", "type": "dm" },
+            "sender": { "id": "u1", "name": "alice", "display_name": "Alice", "is_bot": false },
+            "content": { "type": "text", "text": "hi" },
+            "message_id": "m1"
+        })
+        .to_string();
+        let event = parse_event(&legacy);
+        assert!(!event.proactive);
+        let router = triage_router(suppressing_settings());
+        // Twice, so a missing flag cannot be masked by first-delivery luck.
+        assert!(triage_gateway_event(&event, &router));
+        assert!(triage_gateway_event(&event, &router));
+    }
+
+    #[test]
+    fn triage_counters_are_scoped_per_conversation() {
+        let router = triage_router(crate::event_triage::TriageSettings {
+            enabled: true,
+            daily_cap: 1,
+            ..Default::default()
+        });
+        let mut in_c1 = parse_event(&event_json("e1", true));
+        let mut in_c2 = parse_event(&event_json("e2", true));
+        in_c1.channel.id = "c1".into();
+        in_c2.channel.id = "c2".into();
+        assert!(triage_gateway_event(&in_c1, &router));
+        assert!(
+            triage_gateway_event(&in_c2, &router),
+            "one channel's cap must not silence another"
+        );
+        let mut more_c1 = parse_event(&event_json("e3", true));
+        more_c1.channel.id = "c1".into();
+        assert!(!triage_gateway_event(&more_c1, &router));
+    }
 
     #[test]
     fn line_cannot_stream_and_is_forced_send_once() {

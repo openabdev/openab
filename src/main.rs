@@ -871,7 +871,15 @@ async fn main() -> anyhow::Result<()> {
                 "/tmp".into()
             })),
         )
-        .with_trust(gateway_trust),
+        .with_trust(gateway_trust)
+        .with_delivery(cfg.delivery)
+        // Validated during parse_config, so a failure here would mean the
+        // config changed underneath us; fall back to disabled rather than
+        // panicking, and say so loudly.
+        .with_triage(cfg.triage.resolve().unwrap_or_else(|e| {
+            tracing::error!(error = %e, "invalid [triage] config; proactive events will not be triaged");
+            openab_core::event_triage::TriageSettings::default()
+        })),
     );
 
     // Shutdown signal for Slack adapter
@@ -882,6 +890,7 @@ async fn main() -> anyhow::Result<()> {
     // Spawn cleanup task
     let cleanup_pool = pool.clone();
     let cleanup_dispatchers = dispatchers.clone();
+    let cleanup_router = router.clone();
     let cleanup_handle = tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -889,6 +898,9 @@ async fn main() -> anyhow::Result<()> {
             for d in cleanup_dispatchers.lock().unwrap().iter() {
                 d.sweep_stale();
             }
+            // Triage bookkeeping follows the session TTL: a conversation idle
+            // that long has no cooldown or daily count worth remembering.
+            cleanup_router.sweep_triage(ttl_secs);
         }
     });
 

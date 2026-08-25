@@ -37,6 +37,37 @@ pub struct JsonRpcNotification {
 // re-exported here so `crate::acp::HostBridge` keeps resolving.
 pub use openab_mcp::acp::HostBridge;
 
+/// Delivers one bubble as a `session/update` notification the broker turns into
+/// a single chat message (ADR: structured-delivery.md §5.2 / Phase 4).
+///
+/// A one-way notification, not a request: the agent does not wait to hear that
+/// a bubble landed before deciding the next one, or the "sequential" experience
+/// would be gated on a chat platform's round trip.
+struct AcpBubbleSink {
+    bridge: HostBridge,
+    session_id: String,
+}
+
+impl crate::turn_envelope::BubbleSink for AcpBubbleSink {
+    fn emit(&self, id: &str, text: &str) -> anyhow::Result<()> {
+        self.bridge
+            .notify(
+                "session/update",
+                json!({
+                    "sessionId": self.session_id,
+                    "update": {
+                        "sessionUpdate": "openab_message",
+                        "id": id,
+                        // Same `{type, text}` shape as agent_message_chunk, so
+                        // agents and readers reuse one content convention.
+                        "content": { "type": "text", "text": text }
+                    }
+                }),
+            )
+            .map_err(|_| anyhow::anyhow!("host channel closed"))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct ModelOption {
     value: String,
@@ -65,6 +96,10 @@ pub struct AcpServer {
     active_provider: Option<String>,
     /// Last model list exposed to the ACP client; used to validate model switches.
     model_options: Vec<ModelOption>,
+    /// Set once `run` owns stdout. Sessions clone it to build a bubble sink for
+    /// sequential delivery; `None` outside `run` (tests, facade-only) simply
+    /// leaves sessions in envelope mode.
+    host_bridge: Option<HostBridge>,
 }
 
 impl AcpServer {
@@ -75,6 +110,7 @@ impl AcpServer {
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| "/tmp".to_string()),
             mcp_manager: mcp::load_runtime_or_warn(),
+            host_bridge: None,
             active_model: None,
             active_provider: None,
             model_options: Vec::new(),
@@ -119,6 +155,8 @@ impl AcpServer {
         // host bridge for elicitation. Inbound host replies are routed through
         // `try_resolve_response` below.
         let bridge = HostBridge::new(out_tx.clone());
+        // Sessions created from here on can deliver bubbles as they decide them.
+        self.host_bridge = Some(bridge.clone());
         if let Some(manager) = self.mcp_manager.as_mut() {
             manager.set_host_bridge(bridge.clone());
             // Provider injection moved out of `from_config` when the runtime
@@ -287,7 +325,29 @@ impl AcpServer {
         // OPENAB_AGENT_MODEL, validated at construction). Use it as the
         // authoritative reported model instead of a separate hardcoded default.
         let model_name = provider.model().to_string();
-        let agent = Agent::new_boxed(provider, self.working_dir.clone(), self.mcp_manager.clone());
+        let mut agent =
+            Agent::new_boxed(provider, self.working_dir.clone(), self.mcp_manager.clone());
+        // Sequential delivery needs three things to line up: the envelope
+        // configured, the sequential switch on, and a live host to deliver to.
+        // Missing any one leaves the session in envelope mode rather than
+        // half-enabling a mode that cannot actually send.
+        if crate::turn_envelope::configured_schema().is_some()
+            && crate::turn_envelope::sequential_enabled()
+        {
+            match self.host_bridge.clone() {
+                Some(bridge) => {
+                    tracing::info!(session = %session_id, "sequential bubble delivery enabled");
+                    agent = agent.with_bubble_sink(std::sync::Arc::new(AcpBubbleSink {
+                        bridge,
+                        session_id: session_id.clone(),
+                    }));
+                }
+                None => tracing::warn!(
+                    "OPENAB_AGENT_SEQUENTIAL_BUBBLES is set but no host bridge is available; \
+                     falling back to envelope delivery"
+                ),
+            }
+        }
         self.sessions.insert(session_id.clone(), agent);
 
         self.active_model = Some(model_name.clone());
@@ -469,19 +529,26 @@ impl AcpServer {
 
         match agent.run(&prompt_text).await {
             Ok(response_text) => {
-                let notification = serde_json::to_string(&JsonRpcNotification {
-                    jsonrpc: "2.0",
-                    method: "session/update".to_string(),
-                    params: json!({
-                        "sessionId": session_id_owned,
-                        "update": {
-                            "sessionUpdate": "agent_message_chunk",
-                            "content": { "type": "text", "text": response_text }
-                        }
-                    }),
-                })
-                .unwrap();
-                output_lines.push(notification);
+                // In sequential mode the turn already spoke through the sink and
+                // returns nothing. Emitting an empty chunk here would be a
+                // no-op the broker has to recognise and discard — better not to
+                // send it. An empty answer in any other mode is equally not
+                // worth a message.
+                if !response_text.is_empty() {
+                    let notification = serde_json::to_string(&JsonRpcNotification {
+                        jsonrpc: "2.0",
+                        method: "session/update".to_string(),
+                        params: json!({
+                            "sessionId": session_id_owned,
+                            "update": {
+                                "sessionUpdate": "agent_message_chunk",
+                                "content": { "type": "text", "text": response_text }
+                            }
+                        }),
+                    })
+                    .unwrap();
+                    output_lines.push(notification);
+                }
                 output_lines.push(self.ok_response(id, json!({ "stopReason": "end_turn" })));
             }
             Err(e) => {
@@ -646,6 +713,40 @@ mod tests {
         assert_eq!(config_options[0]["category"], "model");
         assert_eq!(config_options[0]["currentValue"], "claude-sonnet-4-6");
         assert!(!config_options[0]["options"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_sequential_sink_matches_the_shared_contract_fixture() {
+        use crate::turn_envelope::BubbleSink;
+        const FIXTURE: &str = include_str!("../../docs/fixtures/sequential-message-v1.json");
+
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+        let sink = AcpBubbleSink {
+            bridge: HostBridge::new(out_tx),
+            session_id: "session_123".to_string(),
+        };
+        sink.emit("bubble_2", "your flight moved to 8pm\ngate B12")
+            .unwrap();
+
+        let line = out_rx.recv().await.expect("sink wrote nothing");
+        let produced: Value = serde_json::from_str(&line).unwrap();
+        let expected: Value = serde_json::from_str(FIXTURE).unwrap();
+        assert_eq!(
+            produced, expected,
+            "the sink no longer emits the notification the broker is tested against"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sequential_sink_errors_when_the_host_is_gone() {
+        use crate::turn_envelope::BubbleSink;
+        let (out_tx, out_rx) = mpsc::unbounded_channel::<String>();
+        drop(out_rx);
+        let sink = AcpBubbleSink {
+            bridge: HostBridge::new(out_tx),
+            session_id: "s1".to_string(),
+        };
+        assert!(sink.emit("bubble_1", "hi").is_err());
     }
 
     #[tokio::test]

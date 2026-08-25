@@ -287,6 +287,61 @@ tables = "code"  # "code" (default) | "bullets" | "off"
                  # natively. This setting applies to platforms that cannot render
                  # tables (Discord and gateway integrations).
 
+# --- Structured Delivery: one platform message per "bubble" ---
+# Default mode ("text") is the behavior OpenAB has always had: the whole turn is
+# one message, split only at the platform's length limit. See
+# docs/adr/structured-delivery.md and docs/config-reference.md#delivery.
+# [delivery]
+# mode = "text"                         # "text" (default) | "structured" | "sequential"
+#                                       # structured: the agent plans every bubble up front in one
+#                                       # JSON envelope; each `messages[]` entry becomes its own
+#                                       # platform message, in order. Newlines stay INSIDE a bubble.
+#                                       # sequential: the agent emits each bubble as it decides on
+#                                       # it, so a later bubble can reflect a tool result the
+#                                       # earlier one triggered ("on it" → lookup → the answer).
+#                                       # Costs one model call per bubble and needs an agent that
+#                                       # implements the openab_message ACP extension.
+#                                       # structured is recommended; sequential is the experiment.
+# schema = "openab.turn.v1"             # structured only: the envelope must declare this
+#                                       # verbatim; a mismatch is rejected rather than guessed at
+# max_bubbles = 4                       # a turn with more bubbles is REJECTED, never truncated —
+#                                       # a silently dropped tail reads as a complete answer
+# max_bubble_chars = 1200               # composition bound, 0 disables. Separate from the
+#                                       # platform's hard limit, which still applies at send time
+# bubble_delay_ms = 400                 # pause between bubbles: conversational rhythm, and keeps
+#                                       # bursts clear of platform rate limits
+# on_parse_error = "fallback_text"      # "fallback_text" (default): deliver the turn's text with
+#                                       # any envelope fragment stripped — covers the common case
+#                                       # of a model that forgot the envelope and answered in prose.
+#                                       # "error_message": deliver parse_error_text instead.
+#                                       # "silent": deliver nothing. Raw or truncated JSON is
+#                                       # never delivered under any policy.
+# parse_error_text = "⚠️ something went wrong composing that reply"
+#
+# NOTE: structured mode forces streaming OFF on every platform (including Slack's
+# native assistant stream) — nothing may reach the user before the envelope
+# validates. Typing/status indicators still work. `[reactions] tool_display` and
+# `narration_display` are ignored in this mode.
+
+# --- Triage: noise control for UNSOLICITED events ---
+# Only events flagged `proactive: true` are triaged. A message a human actually
+# sent is dispatched whatever the hour — quiet hours that swallow a user's
+# question are an outage, not a feature.
+# See docs/config-reference.md#triage.
+# [triage]
+# enabled = false                       # master switch; off = proactive events pass straight through
+# quiet_hours = "22:00-08:00"           # local window where proactive events are dropped; may wrap
+#                                       # midnight. Half-open: 22:00 is quiet, 08:00 is not.
+# timezone = "UTC"                      # IANA zone for quiet_hours and the daily-cap rollover
+# cooldown_secs = 900                   # min seconds between two proactive wakes per conversation;
+#                                       # 0 disables. Only an ADMITTED event starts the clock.
+# daily_cap = 8                         # max proactive wakes per conversation per local day; 0 disables
+# dedupe_window_secs = 3600             # how long an event_id is remembered, so a webhook retry
+#                                       # does not produce a second message; 0 disables
+#
+# A malformed quiet_hours or timezone is a STARTUP ERROR, not a warning — a
+# deployment that thinks it configured quiet hours and did not would find out at 3am.
+
 [reactions]
 enabled = true
 remove_after_reply = false

@@ -24,6 +24,12 @@ pub struct AgentConfig {
     pub model: Option<String>,
     /// Default max output tokens.
     pub max_tokens: Option<u32>,
+    /// Turn-envelope schema to produce, e.g. `"openab.turn.v1"`. Absent — the
+    /// default — leaves the agent answering in plain text exactly as before.
+    /// Set it to make the agent reply through the `reply` tool so the broker
+    /// can deliver one chat message per bubble (see `crate::turn_envelope`).
+    /// Env override: `OPENAB_AGENT_TURN_ENVELOPE`.
+    pub turn_envelope: Option<String>,
 }
 
 impl AgentConfig {
@@ -86,6 +92,13 @@ mod tests {
         let c = AgentConfig::parse("{}").unwrap();
         assert_eq!(c.model, None);
         assert_eq!(c.max_tokens, None);
+        assert_eq!(c.turn_envelope, None);
+    }
+
+    #[test]
+    fn parse_reads_turn_envelope() {
+        let c = AgentConfig::parse(r#"{"turn_envelope":"openab.turn.v1"}"#).unwrap();
+        assert_eq!(c.turn_envelope.as_deref(), Some("openab.turn.v1"));
     }
 
     #[test]

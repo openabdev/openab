@@ -1,0 +1,32 @@
+# Phase 3: proactive events are triaged; human messages never are.
+# Quiet hours are set to a window you can flip: 00:00-23:59 suppresses
+# essentially all proactive events, so the contrast is visible immediately.
+[agent]
+command = "python3"
+args = ["scripts/fake-acp-agent.py"]
+# The agent is spawned with this as its cwd; "." = wherever you ran openab from,
+# which must be the repo root for the relative path above to resolve.
+working_dir = "."
+env = { SCENARIO = "envelope" }
+
+[gateway]
+url = "ws://127.0.0.1:8765"
+platform = "telegram"
+allow_all_users = true
+allow_all_channels = true
+streaming = false
+
+[delivery]
+mode = "structured"
+bubble_delay_ms = 200
+
+[triage]
+enabled = true
+quiet_hours = "00:00-23:59"   # flip to "03:00-03:01" to let events through
+timezone = "UTC"
+cooldown_secs = 60
+daily_cap = 3
+dedupe_window_secs = 3600
+
+[reactions]
+enabled = false

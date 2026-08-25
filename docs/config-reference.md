@@ -659,6 +659,179 @@ web    = "~/projects/frontend"
 
 ---
 
+## `[delivery]`
+
+How a turn's reply is delivered to the platform. See [ADR: Structured Delivery](adr/structured-delivery.md).
+
+The default (`mode = "text"`) is the behavior OpenAB has always had: the whole turn is one message, split only at the platform's length limit. `mode = "structured"` makes the agent emit a versioned JSON envelope and delivers **one platform message per bubble**, so a reply can have deliberate conversational beats.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `mode` | string | `"text"` | `"text"` = existing single-message path. `"structured"` = the agent plans every bubble up front in one envelope. `"sequential"` = the agent emits each bubble as it decides on it (see [Sequential](#sequential-delivery)). |
+| `schema` | string | `"openab.turn.v1"` | Schema identifier the envelope must declare verbatim. A mismatch is rejected, not guessed at. |
+| `max_bubbles` | int | `4` | Reject a turn carrying more bubbles than this. Never truncated — a silently dropped tail would read as a complete answer. |
+| `max_bubble_chars` | int | `1200` | Reject a turn whose bubble exceeds this many characters; `0` disables the check. A *composition* bound, separate from the platform's hard limit. |
+| `bubble_delay_ms` | int | `400` | Pause between bubbles. Gives a multi-bubble reply a conversational rhythm and keeps bursts clear of rate limits. |
+| `on_parse_error` | string | `"fallback_text"` | `"fallback_text"` = deliver the turn text with any envelope fragment stripped. `"error_message"` = deliver `parse_error_text`. `"silent"` = deliver nothing. |
+| `parse_error_text` | string | `"⚠️ something went wrong composing that reply"` | The line delivered under `on_parse_error = "error_message"`, or when stripping the envelope leaves nothing to say. |
+
+### Example
+
+```toml
+[delivery]
+mode = "structured"
+max_bubbles = 4
+bubble_delay_ms = 400
+on_parse_error = "fallback_text"
+```
+
+The agent then returns, as its entire turn output:
+
+```json
+{
+  "schema": "openab.turn.v1",
+  "messages": [
+    { "id": "bubble_1", "text": "on it" },
+    { "id": "bubble_2", "text": "your flight moved to 8pm, gate B12" }
+  ],
+  "next": { "type": "stop" }
+}
+```
+
+`next.type` is `stop` (end the turn), `wait` (end the turn, expect a reply), `silent` (send nothing), or `tool` (a *proposal* — recorded, not executed).
+
+### What structured mode changes
+
+- **Streaming is off.** Structured sessions never stream tokens, on any platform, including Slack's native assistant stream — the envelope has to validate before anything is shown. Typing / status indicators still work.
+- **`[reactions] tool_display` is ignored.** There is no single message to prepend a tool summary to, and an extra `✅ 2 tool(s)` bubble would break the reply's rhythm.
+- **`[reactions] narration_display` is ignored.** Only the text after the last tool call is parsed.
+- **`[[reply_to:…]]` applies to the first bubble only**; the rest are plain sends in the same thread.
+- **A failed bubble stops the turn.** Remaining bubbles are abandoned and the turn is marked failed (❌), rather than delivering a reply with a hole in it.
+
+### Trying it without a platform
+
+`scripts/bubble-test/` runs all of this offline — a fake gateway that prints each
+delivered message, and a fake agent that replays scripted turns. Useful for
+seeing what `max_bubbles`, `bubble_delay_ms` and `on_parse_error` actually do
+before pointing a real model at them. See
+[scripts/bubble-test/README.md](../scripts/bubble-test/README.md).
+
+### Platform notes
+
+| Platform | Notes |
+|---|---|
+| Discord, Slack | No configuration needed. Each send awaits its HTTP round-trip, so order is guaranteed. |
+| Custom Gateway (`[gateway]`) | Structured mode automatically waits for the gateway's ack on every send, so bubbles cannot be reordered in flight. |
+| Unified binary (Telegram / LINE / Feishu / …) | Order is guaranteed already — the adapter awaits each platform call in-process. |
+| LINE | The first bubble uses the free Reply API; the rest fall through to Push and consume push quota. |
+
+### Sequential delivery
+
+`mode = "sequential"` swaps *when* the agent decides its bubbles, not what the user sees.
+
+| | `structured` | `sequential` |
+|---|---|---|
+| Model calls per turn | one | one **per bubble** |
+| A later bubble can reflect a tool result the earlier one triggered | no | **yes** |
+| First bubble reaches the user | after the whole turn | as soon as it is decided |
+| Transport | one envelope in the turn's text | a `session/update` notification per bubble |
+| Failure after bubble 1 | nothing was sent yet | the user keeps what already arrived |
+
+The concrete difference: with `structured`, an agent that wants to say "on it" before a slow mailbox lookup has to decide the second bubble *before* running the lookup. With `sequential`, "on it" is already on the user's screen while the lookup runs.
+
+That costs a model call per bubble. `structured` remains the recommended mode; `sequential` is the experiment to run against it.
+
+**The agent must implement the extension.** It emits, per bubble:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "session/update",
+  "params": {
+    "sessionId": "…",
+    "update": {
+      "sessionUpdate": "openab_message",
+      "id": "bubble_1",
+      "content": { "type": "text", "text": "on it" }
+    }
+  }
+}
+```
+
+This is a **non-standard ACP extension**. An agent that does not implement it simply never emits the event; the broker then falls back to delivering the turn's text as one message, so a mismatch degrades rather than breaks. `openab-agent` implements it — see [Multi-Message Replies](native-agent.md#multi-message-replies-turn-envelope).
+
+In this mode `max_bubbles` is enforced by the broker as a per-turn cap, `bubble_delay_ms` still paces delivery, and `[[reply_to:…]]` still applies to the first bubble only. A bubble that fails to send abandons the rest of the turn, exactly as in `structured`.
+
+`schema`, `on_parse_error` and `parse_error_text` are **not used** in this mode: there is no envelope to parse. A turn that emits no bubbles at all falls through to the plain-text path.
+
+### Output directive
+
+An agent may declare its schema per turn with `[[delivery:openab.turn.v1]]`. This is an **override only** — whether a session parses envelopes at all comes from `mode`, because streaming has to be disabled before the turn starts. A turn that declares a schema this deployment does not serve is logged and delivered anyway. See [output-directives.md](output-directives.md).
+
+---
+
+## `[triage]`
+
+Noise control for **unsolicited** events — a mailbox webhook, a calendar reminder, a monitoring alert. See [ADR: Structured Delivery](adr/structured-delivery.md) §7.
+
+> **Only events flagged `proactive` are triaged.** A message a human actually sent is dispatched whatever the hour. Quiet hours that swallow a user's question are an outage, not a feature.
+
+Disabled by default — proactive events pass straight through, exactly as before this section existed.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Master switch. |
+| `quiet_hours` | string | — | Local window in which proactive events are dropped, `"HH:MM-HH:MM"`. May wrap midnight. Half-open: the start minute is quiet, the end minute is not. `start == end` is an empty window, never a 24-hour one. |
+| `timezone` | string | `"UTC"` | IANA timezone for `quiet_hours` and the daily-cap rollover. |
+| `cooldown_secs` | int | `900` | Minimum seconds between two proactive wakes on one conversation. `0` disables. |
+| `daily_cap` | int | `8` | Maximum proactive wakes per conversation per local day. `0` disables. |
+| `dedupe_window_secs` | int | `3600` | How long a delivered `event_id` is remembered, so a webhook retry does not produce a second message. `0` disables. |
+
+A malformed `quiet_hours` or `timezone` is a **startup error**, not a warning — a deployment that thinks it configured quiet hours and did not would find out at 3am.
+
+### Example
+
+```toml
+[triage]
+enabled = true
+quiet_hours = "22:00-08:00"
+timezone = "Asia/Taipei"
+cooldown_secs = 900
+daily_cap = 8
+```
+
+### Marking an event proactive
+
+Set `proactive: true` on the gateway event. The field is additive and defaults to `false`, so the schema stays `openab.gateway.event.v1` and existing sources are unaffected.
+
+```json
+{
+  "schema": "openab.gateway.event.v1",
+  "event_id": "gmail-thread-18f2c",
+  "platform": "telegram",
+  "channel": { "id": "123456", "type": "dm" },
+  "sender": { "id": "gmail", "name": "gmail", "display_name": "Gmail", "is_bot": false },
+  "content": { "type": "text", "text": "New mail from airline@example.com: flight delayed" },
+  "message_id": "gmail-18f2c",
+  "proactive": true
+}
+```
+
+`event_id` carries the deduplication identity — use something stable per real-world event (a mail thread id, a calendar event id), not a fresh UUID per delivery attempt, or retries will each produce their own message.
+
+The sender still passes the [trust gate](#platform-trust): a proactive source needs to be in `allowed_users` like any other sender. Triage runs **after** that gate, so an unauthorized source cannot burn a conversation's daily allowance.
+
+### Two layers of quiet
+
+| Layer | Cost | Decides |
+|---|---|---|
+| `[triage]` | free, deterministic | whether the agent is woken at all |
+| The agent's `next: "silent"` (see [`[delivery]`](#delivery)) | one LLM call | whether it has anything worth saying |
+
+Triage exists so the second layer is not consulted for every routine notification. Suppressions are logged with a stable `reason` tag (`duplicate`, `quiet_hours`, `cooldown`, `daily_cap`) — from the outside, "the agent chose to stay quiet" and "the broker never asked it" look identical, and only the log can tell them apart.
+
+---
+
 ## `[ambient]`
 
 Passive channel listening with batch flush. See [ambient.md](ambient.md) for full guide.

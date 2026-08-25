@@ -8,6 +8,7 @@ Agents can control platform-specific message delivery by prefixing their output 
 
 ```
 [[reply_to:1502606076451885136]]
+[[delivery:openab.turn.v1]]
 [[ephemeral:true]]              ← future
 Actual message content starts here...
 ```
@@ -51,6 +52,25 @@ Here is my reply to that specific message.
   ...
 }
 ```
+
+### `delivery`
+
+Declare the structured-delivery schema this turn's output uses.
+
+```
+[[delivery:openab.turn.v1]]
+{"schema":"openab.turn.v1","messages":[{"id":"bubble_1","text":"on it"}],"next":{"type":"stop"}}
+```
+
+**Value**: a schema identifier. Same shape rule as `reply_to` — non-empty, ≤64 chars, ASCII alphanumeric plus `.`, `-`, `_`.
+
+**Behavior**: this is an **override, not a switch**. Whether a session parses envelopes at all comes from `[delivery] mode` in `config.toml`, because structured delivery has to disable streaming *before* the turn starts — a turn-final directive cannot stop half a JSON object from being streamed into a live message. See [ADR: Structured Delivery](adr/structured-delivery.md) §2.1.
+
+- Router in `mode = "text"`: the directive is logged and ignored; the turn is delivered as plain text.
+- Router in `mode = "structured"`, value matches the configured `schema`: no effect (it agrees with the config).
+- Router in `mode = "structured"`, value differs: logged as a warning, and the turn is still parsed against the *configured* schema — which will fail its schema check and fall back per `on_parse_error`.
+
+The directive header is stripped before parsing, and is never visible to users. Neither is the envelope: a turn that fails to parse falls back to its text with any JSON fragment removed. Raw or truncated JSON is never delivered.
 
 ## Multi-Agent Use Case
 

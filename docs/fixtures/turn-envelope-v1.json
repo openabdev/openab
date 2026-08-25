@@ -1,0 +1,8 @@
+{
+  "schema": "openab.turn.v1",
+  "messages": [
+    { "id": "bubble_1", "text": "on it" },
+    { "id": "bubble_2", "text": "your flight moved to 8pm\ngate B12" }
+  ],
+  "next": { "type": "stop" }
+}

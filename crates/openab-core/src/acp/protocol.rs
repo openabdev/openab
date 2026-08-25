@@ -353,6 +353,21 @@ pub enum AcpEvent {
         options: Vec<ConfigOption>,
     },
     Status,
+    /// A complete chat message the agent wants delivered **now**, rather than
+    /// accumulated into the turn's text buffer.
+    ///
+    /// Non-standard ACP extension (`sessionUpdate: "openab_message"`), used by
+    /// sequential delivery: the agent emits one of these per bubble as it
+    /// decides on it, so a later bubble can reflect a tool result the earlier
+    /// one triggered. Agents that do not implement it are unaffected — the
+    /// variant simply never arrives.
+    ///
+    /// See ADR: structured-delivery.md §5.2 / Phase 4.
+    Message {
+        /// Agent-assigned identifier, for logs and delivery correlation.
+        id: String,
+        text: String,
+    },
 }
 
 pub fn classify_notification(msg: &JsonRpcMessage) -> Option<AcpEvent> {
@@ -409,6 +424,21 @@ pub fn classify_notification(msg: &JsonRpcMessage) -> Option<AcpEvent> {
             }
         }
         "plan" => Some(AcpEvent::Status),
+        // Non-standard extension: a whole message to deliver immediately.
+        // Shares `content: {type, text}` with `agent_message_chunk` so agents
+        // and readers reuse the same shape.
+        "openab_message" => {
+            let text = update.get("content")?.get("text")?.as_str()?;
+            let id = update
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(AcpEvent::Message {
+                id,
+                text: text.to_string(),
+            })
+        }
         "config_option_update" => {
             let options = parse_config_options(update);
             Some(AcpEvent::ConfigUpdate { options })
@@ -421,6 +451,85 @@ pub fn classify_notification(msg: &JsonRpcMessage) -> Option<AcpEvent> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn notification(update: Value) -> JsonRpcMessage {
+        JsonRpcMessage {
+            id: None,
+            method: Some("session/update".into()),
+            result: None,
+            error: None,
+            params: Some(json!({ "sessionId": "s1", "update": update })),
+        }
+    }
+
+    /// Shared contract fixture, byte-identical to the one `openab-agent`'s
+    /// `AcpBubbleSink` is tested against. That crate is its own workspace and
+    /// cannot be called from here, so the fixture is the seam.
+    const SEQUENTIAL_FIXTURE: &str =
+        include_str!("../../../../docs/fixtures/sequential-message-v1.json");
+
+    #[test]
+    fn the_agents_sequential_notification_classifies_as_a_message() {
+        let msg: JsonRpcMessage = serde_json::from_str(SEQUENTIAL_FIXTURE).unwrap();
+        match classify_notification(&msg).unwrap() {
+            AcpEvent::Message { id, text } => {
+                assert_eq!(id, "bubble_2");
+                // The newline stays inside the bubble — one message, two lines.
+                assert_eq!(text, "your flight moved to 8pm\ngate B12");
+            }
+            other => panic!("expected Message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classifies_the_sequential_message_extension() {
+        let event = classify_notification(&notification(json!({
+            "sessionUpdate": "openab_message",
+            "id": "bubble_2",
+            "content": { "type": "text", "text": "gate B12" }
+        })))
+        .unwrap();
+        match event {
+            AcpEvent::Message { id, text } => {
+                assert_eq!(id, "bubble_2");
+                assert_eq!(text, "gate B12");
+            }
+            other => panic!("expected Message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sequential_message_id_is_optional() {
+        let event = classify_notification(&notification(json!({
+            "sessionUpdate": "openab_message",
+            "content": { "type": "text", "text": "hi" }
+        })))
+        .unwrap();
+        assert!(matches!(event, AcpEvent::Message { .. }));
+    }
+
+    #[test]
+    fn sequential_message_without_text_is_not_an_event() {
+        // Malformed extension must not be mistaken for an empty message and
+        // delivered as a blank bubble.
+        assert!(classify_notification(&notification(json!({
+            "sessionUpdate": "openab_message",
+            "content": { "type": "image" }
+        })))
+        .is_none());
+    }
+
+    #[test]
+    fn agent_message_chunk_is_still_text_not_message() {
+        // The standard event must keep flowing to the text buffer — sequential
+        // delivery is additive, not a replacement.
+        let event = classify_notification(&notification(json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": "hello" }
+        })))
+        .unwrap();
+        assert!(matches!(event, AcpEvent::Text(t) if t == "hello"));
+    }
 
     #[test]
     fn parse_standard_config_options() {

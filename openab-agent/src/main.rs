@@ -6,6 +6,7 @@ mod llm;
 mod mcp;
 mod skills;
 mod tools;
+mod turn_envelope;
 
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;

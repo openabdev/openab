@@ -1,0 +1,29 @@
+# Phase 1 + 2: one envelope per turn, one platform message per bubble.
+#   SCENARIO=envelope   → 3 separate bubbles
+#   SCENARIO=multiline  → 1 bubble, 3 lines
+#   SCENARIO=silent     → nothing at all
+#   SCENARIO=toolong    → rejected; the body was nothing BUT the envelope, so
+#                         stripping it leaves nothing and you get parse_error_text
+#   SCENARIO=broken     → truncated JSON must NOT appear
+#   SCENARIO=prose      → delivered verbatim as one message
+[agent]
+command = "python3"
+args = ["scripts/fake-acp-agent.py"]
+# The agent is spawned with this as its cwd; "." = wherever you ran openab from,
+# which must be the repo root for the relative path above to resolve.
+working_dir = "."
+env = { SCENARIO = "envelope" }
+
+[gateway]
+url = "ws://127.0.0.1:8765"
+platform = "telegram"
+allow_all_users = true
+allow_all_channels = true
+streaming = false
+
+[delivery]
+mode = "structured"
+bubble_delay_ms = 400
+
+[reactions]
+enabled = false

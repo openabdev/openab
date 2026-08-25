@@ -1,0 +1,25 @@
+# Phase 4: each bubble delivered the moment the agent decides it.
+#   SCENARIO=sequential → 3 bubbles, back to back
+#   SCENARIO=seqslow    → 3 bubbles, 2s apart (watch them arrive live)
+#   SCENARIO=seqhalf    → 2 bubbles then a mid-turn failure
+[agent]
+command = "python3"
+args = ["scripts/fake-acp-agent.py"]
+# The agent is spawned with this as its cwd; "." = wherever you ran openab from,
+# which must be the repo root for the relative path above to resolve.
+working_dir = "."
+env = { SCENARIO = "seqslow" }
+
+[gateway]
+url = "ws://127.0.0.1:8765"
+platform = "telegram"
+allow_all_users = true
+allow_all_channels = true
+streaming = false
+
+[delivery]
+mode = "sequential"
+bubble_delay_ms = 0
+
+[reactions]
+enabled = false

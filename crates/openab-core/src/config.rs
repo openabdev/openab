@@ -1,4 +1,5 @@
 use crate::markdown::TableMode;
+use crate::structured_delivery::{self, DeliveryMode, ParseErrorPolicy};
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -258,6 +259,10 @@ pub struct Config {
     pub stt: SttConfig,
     #[serde(default)]
     pub markdown: MarkdownConfig,
+    #[serde(default)]
+    pub delivery: DeliveryConfig,
+    #[serde(default)]
+    pub triage: TriageConfig,
     #[serde(default)]
     pub cron: CronConfig,
     #[serde(default)]
@@ -2027,6 +2032,167 @@ pub struct MarkdownConfig {
     pub tables: TableMode,
 }
 
+// --- delivery ---
+
+/// How a turn's final text is delivered to the platform
+/// (ADR: [`structured-delivery.md`](../../../docs/adr/structured-delivery.md)).
+///
+/// Default (`mode = "text"`) is the pre-existing path: the whole turn is one
+/// message, split only at the platform's length limit. `mode = "structured"`
+/// parses a versioned JSON envelope and sends one platform message per bubble.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeliveryConfig {
+    #[serde(default)]
+    pub mode: DeliveryMode,
+    /// Schema identifier the envelope must declare verbatim. A turn whose
+    /// `schema` differs is rejected (and falls back per `on_parse_error`)
+    /// rather than parsed on a guess.
+    #[serde(default = "default_delivery_schema")]
+    pub schema: String,
+    /// Reject a turn carrying more bubbles than this. Never truncated: a
+    /// silently dropped tail reads to the user as a complete answer.
+    #[serde(default = "default_max_bubbles")]
+    pub max_bubbles: usize,
+    /// Reject a turn whose bubble exceeds this many Unicode characters; `0`
+    /// disables the check. This is a *composition* bound — a bubble this long
+    /// means the agent stopped writing beats. The platform's own hard limit is
+    /// separate and still applied by `format::split_message` at send time.
+    #[serde(default = "default_max_bubble_chars")]
+    pub max_bubble_chars: usize,
+    /// Pause between bubbles. Gives a multi-bubble reply a conversational
+    /// rhythm, and keeps bursts clear of platform rate limits.
+    #[serde(default = "default_bubble_delay_ms")]
+    pub bubble_delay_ms: u64,
+    /// What the user sees when a structured turn does not parse. Every policy
+    /// is envelope-safe — none of them can deliver raw or truncated JSON.
+    #[serde(default)]
+    pub on_parse_error: ParseErrorPolicy,
+    /// Line delivered under `on_parse_error = "error_message"`.
+    #[serde(default = "default_parse_error_text")]
+    pub parse_error_text: String,
+}
+
+impl Default for DeliveryConfig {
+    fn default() -> Self {
+        Self {
+            mode: DeliveryMode::default(),
+            schema: default_delivery_schema(),
+            max_bubbles: default_max_bubbles(),
+            max_bubble_chars: default_max_bubble_chars(),
+            bubble_delay_ms: default_bubble_delay_ms(),
+            on_parse_error: ParseErrorPolicy::default(),
+            parse_error_text: default_parse_error_text(),
+        }
+    }
+}
+
+fn default_delivery_schema() -> String {
+    structured_delivery::SCHEMA_V1.to_string()
+}
+fn default_max_bubbles() -> usize {
+    structured_delivery::DEFAULT_MAX_BUBBLES
+}
+fn default_max_bubble_chars() -> usize {
+    structured_delivery::DEFAULT_MAX_BUBBLE_CHARS
+}
+fn default_bubble_delay_ms() -> u64 {
+    400
+}
+fn default_parse_error_text() -> String {
+    "\u{26a0}\u{fe0f} something went wrong composing that reply".to_string()
+}
+
+// --- triage ---
+
+/// `[triage]` — noise control for **unsolicited** events (ADR:
+/// structured-delivery.md §7, Phase 3).
+///
+/// Applies only to events a source explicitly marks proactive. A message a
+/// human actually sent is never triaged: quiet hours that swallow a user's
+/// question are an outage, not a feature.
+///
+/// Disabled by default — proactive events pass straight through, exactly as
+/// they did before this section existed.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TriageConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Local window in which proactive events are dropped, `"HH:MM-HH:MM"`.
+    /// May wrap midnight (`"22:00-08:00"`). Unset = never quiet.
+    #[serde(default)]
+    pub quiet_hours: Option<String>,
+    /// IANA timezone for `quiet_hours` and the daily-cap rollover.
+    #[serde(default = "default_triage_timezone")]
+    pub timezone: String,
+    /// Minimum seconds between two proactive wakes on one conversation.
+    /// `0` disables. Only an admitted event starts the clock — a suppressed one
+    /// must not push the next opening further out.
+    #[serde(default = "default_triage_cooldown_secs")]
+    pub cooldown_secs: u64,
+    /// Maximum proactive wakes per conversation per local day. `0` disables.
+    #[serde(default = "default_triage_daily_cap")]
+    pub daily_cap: u32,
+    /// How long a delivered `event_id` is remembered, for duplicate
+    /// suppression across webhook retries. `0` disables.
+    #[serde(default = "default_triage_dedupe_window_secs")]
+    pub dedupe_window_secs: u64,
+}
+
+impl Default for TriageConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            quiet_hours: None,
+            timezone: default_triage_timezone(),
+            cooldown_secs: default_triage_cooldown_secs(),
+            daily_cap: default_triage_daily_cap(),
+            dedupe_window_secs: default_triage_dedupe_window_secs(),
+        }
+    }
+}
+
+impl TriageConfig {
+    /// Resolve into the runtime form, validating the string fields.
+    ///
+    /// A bad `quiet_hours` or `timezone` is a hard error: silently falling back
+    /// to "never quiet" would make a deployment think it had configured quiet
+    /// hours when it had not. Mirrors `validate_cronjobs`' fail-fast on a bad
+    /// timezone.
+    pub fn resolve(&self) -> anyhow::Result<crate::event_triage::TriageSettings> {
+        let quiet_hours = match self.quiet_hours.as_deref().map(str::trim) {
+            Some(spec) if !spec.is_empty() => Some(
+                crate::event_triage::QuietHours::parse(spec)
+                    .map_err(|e| anyhow::anyhow!("triage.quiet_hours: {e}"))?,
+            ),
+            _ => None,
+        };
+        let timezone = self.timezone.parse().map_err(|e| {
+            anyhow::anyhow!("triage.timezone: invalid timezone {:?}: {e}", self.timezone)
+        })?;
+        Ok(crate::event_triage::TriageSettings {
+            enabled: self.enabled,
+            quiet_hours,
+            timezone,
+            cooldown_secs: self.cooldown_secs,
+            daily_cap: self.daily_cap,
+            dedupe_window_secs: self.dedupe_window_secs,
+        })
+    }
+}
+
+fn default_triage_timezone() -> String {
+    "UTC".to_string()
+}
+fn default_triage_cooldown_secs() -> u64 {
+    900
+}
+fn default_triage_daily_cap() -> u32 {
+    8
+}
+fn default_triage_dedupe_window_secs() -> u64 {
+    3600
+}
+
 // --- loading ---
 
 /// Resolve an allow_all flag: if explicitly set, use it; otherwise infer from the list.
@@ -2326,6 +2492,11 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
         config.pool.liveness_check_secs > 0,
         "pool.liveness_check_secs must be > 0 (zero would spin the recv loop)"
     );
+
+    // Fail fast on a malformed quiet window / timezone, the way validate_cronjobs
+    // does: a deployment that thinks it configured quiet hours and did not would
+    // page its user at 3am to find out.
+    config.triage.resolve()?;
 
     Ok(config)
 }
@@ -3407,6 +3578,84 @@ command = "echo"
         assert_eq!(cfg.agent.command, "echo");
         assert_eq!(cfg.pool.max_sessions, 10);
         assert!(cfg.reactions.enabled);
+    }
+
+    #[test]
+    fn delivery_defaults_to_the_existing_text_path() {
+        // Backward compatibility (AGENTS.md rule 1): a config with no
+        // [delivery] section must behave exactly as it did before.
+        let cfg = parse_config(MINIMAL_TOML, "test").unwrap();
+        assert_eq!(cfg.delivery.mode, DeliveryMode::Text);
+        assert_eq!(cfg.delivery.schema, structured_delivery::SCHEMA_V1);
+        assert_eq!(cfg.delivery.max_bubbles, 4);
+        assert_eq!(cfg.delivery.on_parse_error, ParseErrorPolicy::FallbackText);
+    }
+
+    #[test]
+    fn delivery_section_parses_from_toml() {
+        let toml = format!(
+            "{MINIMAL_TOML}\n[delivery]\nmode = \"structured\"\nmax_bubbles = 3\n\
+             bubble_delay_ms = 0\non_parse_error = \"silent\"\n"
+        );
+        let cfg = parse_config(&toml, "test").unwrap();
+        assert_eq!(cfg.delivery.mode, DeliveryMode::Structured);
+        assert_eq!(cfg.delivery.max_bubbles, 3);
+        assert_eq!(cfg.delivery.bubble_delay_ms, 0);
+        assert_eq!(cfg.delivery.on_parse_error, ParseErrorPolicy::Silent);
+        // Unset keys still fall back to their defaults.
+        assert_eq!(cfg.delivery.schema, structured_delivery::SCHEMA_V1);
+        assert_eq!(cfg.delivery.max_bubble_chars, 1200);
+    }
+
+    #[test]
+    fn triage_defaults_to_disabled() {
+        // Backward compatibility: proactive events pass straight through until
+        // a deployment opts in.
+        let cfg = parse_config(MINIMAL_TOML, "test").unwrap();
+        assert!(!cfg.triage.enabled);
+        assert_eq!(cfg.triage.quiet_hours, None);
+        let resolved = cfg.triage.resolve().unwrap();
+        assert!(!resolved.enabled);
+        assert_eq!(resolved.quiet_hours, None);
+    }
+
+    #[test]
+    fn triage_section_parses_and_resolves() {
+        let toml = format!(
+            "{MINIMAL_TOML}\n[triage]\nenabled = true\nquiet_hours = \"22:00-08:00\"\n\
+             timezone = \"Asia/Taipei\"\ncooldown_secs = 600\ndaily_cap = 3\n"
+        );
+        let cfg = parse_config(&toml, "test").unwrap();
+        let resolved = cfg.triage.resolve().unwrap();
+        assert!(resolved.enabled);
+        assert!(resolved.quiet_hours.unwrap().contains(23 * 60));
+        assert_eq!(resolved.timezone.name(), "Asia/Taipei");
+        assert_eq!(resolved.cooldown_secs, 600);
+        assert_eq!(resolved.daily_cap, 3);
+        // Unset keys keep their defaults.
+        assert_eq!(resolved.dedupe_window_secs, 3600);
+    }
+
+    #[test]
+    fn triage_fails_loud_on_a_bad_quiet_window() {
+        // Silently falling back to "never quiet" would let a deployment think
+        // it had configured quiet hours when it had not.
+        let toml = format!("{MINIMAL_TOML}\n[triage]\nquiet_hours = \"10pm to 8am\"\n");
+        let err = parse_config(&toml, "test").unwrap_err().to_string();
+        assert!(err.contains("quiet_hours"), "got: {err}");
+    }
+
+    #[test]
+    fn triage_fails_loud_on_a_bad_timezone() {
+        let toml = format!("{MINIMAL_TOML}\n[triage]\ntimezone = \"Mars/Olympus\"\n");
+        let err = parse_config(&toml, "test").unwrap_err().to_string();
+        assert!(err.contains("timezone"), "got: {err}");
+    }
+
+    #[test]
+    fn delivery_rejects_an_unknown_mode() {
+        let toml = format!("{MINIMAL_TOML}\n[delivery]\nmode = \"bubblez\"\n");
+        assert!(parse_config(&toml, "test").is_err());
     }
 
     #[test]

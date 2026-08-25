@@ -1,12 +1,14 @@
 use anyhow::Result;
 use serde::Deserialize;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use crate::llm::{ContentBlock, LlmEvent, LlmProvider, Message, ToolDef};
 use crate::mcp::{self, McpRuntimeManager};
 use crate::skills;
 use crate::tools;
+use crate::turn_envelope;
 
 const SYSTEM_PROMPT: &str = r#"You are openab-agent, a coding assistant. You help users by reading, writing, and editing files, and running shell commands.
 
@@ -69,6 +71,17 @@ pub struct Agent {
     /// Anthropic round trip switches back to OAuth instead of silently
     /// preferring `ANTHROPIC_API_KEY` (a different account/billing context).
     anthropic_oauth_preferred: bool,
+    /// Envelope schema to produce, when the turn envelope is enabled. `None` —
+    /// the default — leaves the agent answering in plain text exactly as before
+    /// (`crate::turn_envelope`).
+    turn_envelope: Option<String>,
+    /// Bubble cap for this run, resolved once at construction alongside
+    /// `turn_envelope` so a mid-session env change cannot make one turn's
+    /// rendering disagree with the tool schema the model was shown.
+    max_bubbles: usize,
+    /// Where bubbles go the moment they are decided (sequential mode). `None`
+    /// keeps `reply` terminal: one envelope carries the whole turn.
+    bubble_sink: Option<Arc<dyn turn_envelope::BubbleSink>>,
 }
 
 /// The sticky-preference update shared by construction and provider swap:
@@ -94,6 +107,9 @@ impl Agent {
             tools: tools::tool_definitions(),
             mcp_manager: None,
             anthropic_oauth_preferred,
+            turn_envelope: None,
+            max_bubbles: turn_envelope::DEFAULT_MAX_BUBBLES,
+            bubble_sink: None,
         }
     }
 
@@ -102,11 +118,33 @@ impl Agent {
         working_dir: String,
         mcp_manager: Option<McpRuntimeManager>,
     ) -> Self {
+        // Resolved once: the tool schema the model is shown and the renderer
+        // that validates its output must agree for the whole session.
+        let turn_envelope = turn_envelope::configured_schema();
+        let max_bubbles = turn_envelope::max_bubbles();
         let system_prompt = Self::build_system_prompt(&working_dir, mcp_manager.as_ref());
+        let system_prompt = match &turn_envelope {
+            Some(schema) => {
+                info!(%schema, max_bubbles, "turn envelope enabled; replies go through the reply tool");
+                format!(
+                    "{system_prompt}{}",
+                    turn_envelope::system_prompt_appendix(max_bubbles)
+                )
+            }
+            None => system_prompt,
+        };
         let tools = {
             let mut t = tools::tool_definitions();
             if mcp_manager.is_some() {
                 t.push(mcp::mcp_tool_def());
+            }
+            if turn_envelope.is_some() {
+                // The tool the model is shown must match how the loop treats it
+                // (terminal vs not), so both read the same flag.
+                t.push(turn_envelope::reply_tool_def(
+                    max_bubbles,
+                    turn_envelope::sequential_enabled(),
+                ));
             }
             t
         };
@@ -119,7 +157,20 @@ impl Agent {
             tools,
             mcp_manager,
             anthropic_oauth_preferred,
+            turn_envelope,
+            max_bubbles,
+            bubble_sink: None,
         }
+    }
+
+    /// Attach the sink that delivers bubbles as they are decided, switching the
+    /// `reply` tool from terminal to streaming (sequential mode).
+    ///
+    /// Builder style, set by the ACP layer once it knows the session id.
+    /// Without it the agent stays in envelope mode.
+    pub fn with_bubble_sink(mut self, sink: Arc<dyn turn_envelope::BubbleSink>) -> Self {
+        self.bubble_sink = Some(sink);
+        self
     }
 
     /// Replace the LLM provider while preserving conversation history (and the
@@ -205,6 +256,10 @@ impl Agent {
         });
 
         let mut final_text = String::new();
+        // Bubbles already delivered this turn (sequential mode only). Also the
+        // signal that an empty `final_text` at the end is success rather than a
+        // runaway loop: the turn already spoke.
+        let mut emitted = 0usize;
         let max_loops = max_tool_loops();
         if max_loops != DEFAULT_MAX_TOOL_LOOPS {
             info!("max_tool_loops={max_loops} (overridden)");
@@ -256,18 +311,136 @@ impl Agent {
                 content: assistant_content,
             });
 
+            // What this iteration's `reply` call actually delivered, so its tool
+            // result can say so. `None` when the model did not call `reply`.
+            let mut reply_outcome: Option<(usize, usize)> = None;
+
+            // How `reply` behaves depends on the mode:
+            //
+            // - envelope (no sink): terminal. Its input *is* the answer, so it
+            //   never executes as a tool and ends the turn.
+            // - sequential (sink present): NOT terminal. Each call delivers now
+            //   and the loop continues, so the model can acknowledge, run a
+            //   tool, then report what it found.
+            if let Some(schema) = self.turn_envelope.clone() {
+                if let Some((_, _, input)) = tool_calls
+                    .iter()
+                    .find(|(_, name, _)| name == turn_envelope::REPLY_TOOL)
+                {
+                    match self.bubble_sink.clone() {
+                        None => {
+                            // Envelope mode: other calls in this batch are
+                            // dropped — the model has already said its piece,
+                            // and running a tool whose result nobody will see is
+                            // worse than skipping it.
+                            if tool_calls.len() > 1 {
+                                let dropped: Vec<&str> = tool_calls
+                                    .iter()
+                                    .map(|(_, name, _)| name.as_str())
+                                    .filter(|n| *n != turn_envelope::REPLY_TOOL)
+                                    .collect();
+                                warn!(
+                                    ?dropped,
+                                    "reply tool ended the turn; other tool calls dropped"
+                                );
+                            }
+                            final_text = turn_envelope::render(input, &schema, self.max_bubbles)?;
+                            break;
+                        }
+                        Some(sink) => {
+                            // Sequential mode: deliver now, then keep working.
+                            // The call is consumed here and NOT executed as a
+                            // tool below, so it gets its own result block there.
+                            let texts = turn_envelope::bubbles_from_tool_input(input)?;
+                            let requested = texts.len();
+                            let mut sent = 0usize;
+                            for text in texts {
+                                if emitted >= self.max_bubbles {
+                                    warn!(
+                                        max_bubbles = self.max_bubbles,
+                                        sent,
+                                        requested,
+                                        "sequential turn hit the bubble cap; dropping the rest"
+                                    );
+                                    break;
+                                }
+                                emitted += 1;
+                                let id = format!("bubble_{emitted}");
+                                if let Err(e) = sink.emit(&id, &text) {
+                                    // The host is gone; finishing a reply nobody
+                                    // will receive is pointless, and the error is
+                                    // the honest outcome.
+                                    return Err(anyhow::anyhow!(
+                                        "sequential delivery failed after {} bubble(s): {e}",
+                                        emitted - 1
+                                    ));
+                                }
+                                sent += 1;
+                            }
+                            reply_outcome = Some((sent, requested));
+                        }
+                    }
+                }
+            }
+
             // Done only when the turn carries no tool calls. A turn with BOTH
             // text and tool_calls (common on Chat Completions — commentary
             // before the call) must keep looping so the tools actually run;
             // the text is already preserved in the assistant message above.
             if tool_calls.is_empty() {
                 final_text = text_parts.join("");
+                // Envelope mode, but the model answered in free text. The broker
+                // would fall back to plain text with the same visible result —
+                // wrap it here anyway so an agent that declared itself to be in
+                // envelope mode keeps producing envelopes, and the broker's
+                // fallback stays reserved for genuine faults.
+                // Sequential mode has no envelope to wrap into — bubbles were
+                // already delivered, and trailing free text is thinking-out-loud
+                // the model was told would not be sent.
+                if self.bubble_sink.is_some() {
+                    if emitted > 0 {
+                        if !final_text.trim().is_empty() {
+                            debug!("discarding trailing free text after sequential delivery");
+                        }
+                        final_text.clear();
+                    }
+                    break;
+                }
+                if let Some(schema) = &self.turn_envelope {
+                    if let Some(wrapped) = turn_envelope::wrap_plain_text(&final_text, schema) {
+                        warn!("turn ended without calling the reply tool; wrapping as one bubble");
+                        final_text = wrapped;
+                    }
+                }
                 break;
             }
 
             // Execute tool calls and add results
             let mut tool_results: Vec<ContentBlock> = Vec::new();
             for (id, name, input) in &tool_calls {
+                // In sequential mode `reply` was already delivered above and is
+                // not a real tool. It still needs a result block, or the
+                // provider rejects the next request for an unanswered tool_use.
+                if self.bubble_sink.is_some() && name == turn_envelope::REPLY_TOOL {
+                    // Report what actually went out. A silent "delivered" after
+                    // the cap truncated the call would leave the model believing
+                    // it said something the user never saw.
+                    let content = match reply_outcome {
+                        Some((sent, requested)) if sent < requested => format!(
+                            "delivered {sent} of {requested} messages; the rest were dropped \
+                             because this turn reached its limit of {} messages",
+                            self.max_bubbles
+                        ),
+                        Some((sent, _)) => format!("delivered {sent} message(s)"),
+                        None => "delivered".to_string(),
+                    };
+                    tool_results.push(ContentBlock::ToolResult {
+                        tool_use_id: id.clone(),
+                        content,
+                        is_error: None,
+                    });
+                    continue;
+                }
                 info!("executing tool: {name}");
                 let result = self.execute_tool_call(name, input).await;
                 match result {
@@ -294,7 +467,10 @@ impl Agent {
             });
         }
 
-        if final_text.is_empty() {
+        // An empty answer normally means the loop ran out of iterations. In
+        // sequential mode it is the expected shape of a turn that already spoke:
+        // the bubbles went out through the sink, not the return value.
+        if final_text.is_empty() && emitted == 0 {
             return Err(anyhow::anyhow!(
                 "agent exceeded maximum tool loop iterations ({max_loops})"
             ));
@@ -384,6 +560,233 @@ mod tests {
             let events = self.responses[idx].clone();
             Box::pin(async move { Ok(events) })
         }
+    }
+
+    // --- sequential bubble delivery (Phase 4) ---
+
+    /// Records what the agent emitted, and can fail on the Nth bubble.
+    #[derive(Default)]
+    struct RecordingSink {
+        emitted: std::sync::Mutex<Vec<(String, String)>>,
+        fail_at: Option<usize>,
+    }
+
+    impl RecordingSink {
+        fn failing_at(index: usize) -> Self {
+            Self {
+                fail_at: Some(index),
+                ..Default::default()
+            }
+        }
+        fn texts(&self) -> Vec<String> {
+            self.emitted
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, t)| t.clone())
+                .collect()
+        }
+        fn ids(&self) -> Vec<String> {
+            self.emitted
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(i, _)| i.clone())
+                .collect()
+        }
+    }
+
+    impl turn_envelope::BubbleSink for RecordingSink {
+        fn emit(&self, id: &str, text: &str) -> Result<()> {
+            let mut emitted = self.emitted.lock().unwrap();
+            let index = emitted.len();
+            emitted.push((id.to_string(), text.to_string()));
+            if self.fail_at == Some(index) {
+                return Err(anyhow::anyhow!("simulated host failure"));
+            }
+            Ok(())
+        }
+    }
+
+    fn reply_call(id: &str, messages: &[&str]) -> LlmEvent {
+        LlmEvent::ToolUse {
+            id: id.to_string(),
+            name: turn_envelope::REPLY_TOOL.to_string(),
+            input: serde_json::json!({ "messages": messages }),
+        }
+    }
+
+    /// Build an agent in sequential mode. Fields are set directly rather than
+    /// through env vars so tests do not race each other's process environment.
+    fn sequential_agent(
+        mock: MockLlmProvider,
+        sink: Arc<RecordingSink>,
+        max_bubbles: usize,
+    ) -> (Agent, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut agent = Agent::new(mock, tmp.path().to_string_lossy().to_string());
+        agent.turn_envelope = Some(turn_envelope::SCHEMA_V1.to_string());
+        agent.max_bubbles = max_bubbles;
+        agent.bubble_sink = Some(sink);
+        (agent, tmp)
+    }
+
+    #[tokio::test]
+    async fn sequential_reply_does_not_end_the_turn() {
+        // The whole point of Phase 4: after the first bubble the model keeps
+        // working, so a later bubble can reflect what it learned in between.
+        let mock = MockLlmProvider::new(vec![
+            vec![reply_call("t1", &["on it"])],
+            vec![reply_call("t2", &["your flight moved to 8pm"])],
+            vec![LlmEvent::Stop],
+        ]);
+        let sink = Arc::new(RecordingSink::default());
+        let calls = mock.call_count.clone();
+        let (mut agent, _tmp) = sequential_agent(mock, sink.clone(), 4);
+
+        let answer = agent.run("what about my flight").await.unwrap();
+
+        assert_eq!(sink.texts(), vec!["on it", "your flight moved to 8pm"]);
+        assert_eq!(sink.ids(), vec!["bubble_1", "bubble_2"]);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "the model must be consulted again after the first bubble"
+        );
+        assert!(
+            answer.is_empty(),
+            "a sequential turn speaks through the sink, not the return value"
+        );
+    }
+
+    #[tokio::test]
+    async fn sequential_one_call_can_carry_several_bubbles() {
+        let mock = MockLlmProvider::new(vec![
+            vec![reply_call("t1", &["red", "green", "blue"])],
+            vec![LlmEvent::Stop],
+        ]);
+        let sink = Arc::new(RecordingSink::default());
+        let (mut agent, _tmp) = sequential_agent(mock, sink.clone(), 4);
+        agent.run("colours").await.unwrap();
+        assert_eq!(sink.texts(), vec!["red", "green", "blue"]);
+        assert_eq!(sink.ids(), vec!["bubble_1", "bubble_2", "bubble_3"]);
+    }
+
+    #[tokio::test]
+    async fn sequential_stops_when_the_host_is_gone() {
+        // Finishing a reply nobody will receive is pointless; the error is the
+        // honest outcome, and the broker marks the turn failed.
+        let mock = MockLlmProvider::new(vec![
+            vec![reply_call("t1", &["one", "two", "three"])],
+            vec![LlmEvent::Stop],
+        ]);
+        let sink = Arc::new(RecordingSink::failing_at(1));
+        let (mut agent, _tmp) = sequential_agent(mock, sink.clone(), 4);
+
+        let err = agent.run("hi").await.unwrap_err().to_string();
+        assert!(err.contains("sequential delivery failed"), "got: {err}");
+        assert_eq!(
+            sink.texts(),
+            vec!["one", "two"],
+            "the failing bubble was attempted; the rest were not"
+        );
+    }
+
+    #[tokio::test]
+    async fn sequential_respects_the_bubble_cap_across_calls() {
+        // The cap is per turn, not per call — otherwise a chatty model could
+        // loop past it one message at a time.
+        let mock = MockLlmProvider::new(vec![
+            vec![reply_call("t1", &["a", "b"])],
+            vec![reply_call("t2", &["c", "d"])],
+            vec![LlmEvent::Stop],
+        ]);
+        let sink = Arc::new(RecordingSink::default());
+        let (mut agent, _tmp) = sequential_agent(mock, sink.clone(), 3);
+        agent.run("hi").await.unwrap();
+        assert_eq!(sink.texts(), vec!["a", "b", "c"]);
+    }
+
+    /// Regression (review F4): when the cap truncates a `reply` call, the tool
+    /// result must say so. A bare "delivered" would leave the model believing it
+    /// said something the user never saw.
+    #[tokio::test]
+    async fn sequential_tool_result_reports_a_truncated_delivery() {
+        let mock = MockLlmProvider::new(vec![
+            vec![reply_call("t1", &["a", "b", "c"])],
+            vec![LlmEvent::Stop],
+        ]);
+        let sink = Arc::new(RecordingSink::default());
+        let (mut agent, _tmp) = sequential_agent(mock, sink.clone(), 2);
+        agent.run("hi").await.unwrap();
+
+        assert_eq!(sink.texts(), vec!["a", "b"]);
+        let results: Vec<String> = agent
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results.len(), 1, "the reply call needs exactly one result");
+        assert!(
+            results[0].contains("2 of 3"),
+            "the model must be told what actually went out, got: {}",
+            results[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn sequential_tool_result_reports_a_complete_delivery() {
+        let mock = MockLlmProvider::new(vec![
+            vec![reply_call("t1", &["a", "b"])],
+            vec![LlmEvent::Stop],
+        ]);
+        let sink = Arc::new(RecordingSink::default());
+        let (mut agent, _tmp) = sequential_agent(mock, sink.clone(), 4);
+        agent.run("hi").await.unwrap();
+        let result = agent
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .find_map(|b| match b {
+                ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(result.contains("2 message"), "got: {result}");
+        assert!(!result.contains(" of "), "nothing was truncated: {result}");
+    }
+
+    #[tokio::test]
+    async fn sequential_turn_with_no_reply_still_returns_its_text() {
+        // The model never called `reply`. The broker's safety net delivers the
+        // text as one message, so the agent must not swallow it.
+        let mock = MockLlmProvider::new(vec![vec![
+            LlmEvent::Text("just words".to_string()),
+            LlmEvent::Stop,
+        ]]);
+        let sink = Arc::new(RecordingSink::default());
+        let (mut agent, _tmp) = sequential_agent(mock, sink.clone(), 4);
+        let answer = agent.run("hi").await.unwrap();
+        assert_eq!(answer, "just words");
+        assert!(sink.texts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn envelope_mode_is_unaffected_by_phase_4() {
+        // No sink: `reply` is still terminal and still returns an envelope.
+        let mock = MockLlmProvider::new(vec![vec![reply_call("t1", &["hey"])]]);
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut agent = Agent::new(mock, tmp.path().to_string_lossy().to_string());
+        agent.turn_envelope = Some(turn_envelope::SCHEMA_V1.to_string());
+
+        let answer = agent.run("hi").await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&answer).unwrap();
+        assert_eq!(parsed["schema"], turn_envelope::SCHEMA_V1);
+        assert_eq!(parsed["messages"][0]["text"], "hey");
     }
 
     #[tokio::test]
