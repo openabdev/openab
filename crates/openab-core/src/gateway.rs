@@ -814,10 +814,11 @@ pub async fn run_gateway_adapter(
     };
     let streaming_placeholder = params.streaming_placeholder;
     let telegram_rich_messages = params.telegram_rich_messages;
-    // Structured delivery sends one message per bubble and needs them to land in
+    // BOTH bubble modes send one message per bubble and need them to land in
     // order, which over this transport means waiting for each ack (ADR §4).
-    let await_ack =
-        router.delivery_config().mode == crate::structured_delivery::DeliveryMode::Structured;
+    // Sequential depends on it even more than structured: its bubbles are sent
+    // as they are decided, so consecutive sends can be milliseconds apart.
+    let await_ack = requires_send_ack(router.delivery_config().mode);
     let stt_config = params.stt;
 
     let connect_url = match &params.token {
@@ -1386,6 +1387,20 @@ fn gate_gateway_event(router: &crate::adapter::AdapterRouter, event: &GatewayEve
     }
 }
 
+/// Whether outbound sends must wait for the gateway's ack.
+///
+/// True for **both** bubble modes: each sends one message per bubble and depends
+/// on them landing in order (ADR §4). Without an ack a reply is pushed onto the
+/// WebSocket and the call returns immediately, so N sends are in flight at once
+/// and the gateway is free to process them out of order.
+///
+/// Named so the rule has one home. An earlier version tested `== Structured`
+/// inline and silently dropped the guarantee when sequential delivery — which
+/// needs it *more*, its bubbles being milliseconds apart — was added.
+fn requires_send_ack(mode: crate::structured_delivery::DeliveryMode) -> bool {
+    mode.is_bubbles()
+}
+
 /// Noise control for **unsolicited** events, shared by both ingress paths
 /// (WebSocket and unified webhook) exactly as `gate_gateway_event` is.
 ///
@@ -1745,6 +1760,24 @@ fn format_size(n: u64) -> String {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    // --- outbound ack (review F3) ---
+
+    /// Regression: sequential delivery sends one message per bubble over the
+    /// same WebSocket and must not skip the ack that keeps them ordered.
+    #[test]
+    fn both_bubble_modes_require_a_send_ack() {
+        use crate::structured_delivery::DeliveryMode;
+        assert!(requires_send_ack(DeliveryMode::Structured));
+        assert!(
+            requires_send_ack(DeliveryMode::Sequential),
+            "sequential bubbles are sent milliseconds apart and need the ack most"
+        );
+        assert!(
+            !requires_send_ack(DeliveryMode::Text),
+            "plain text is one message; there is no order to preserve"
+        );
+    }
 
     // --- proactive-event triage (Phase 3) ---
 

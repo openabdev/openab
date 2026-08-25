@@ -863,12 +863,18 @@ impl AdapterRouter {
 
                     let mut text_buf = String::new();
                     let mut tool_lines: Vec<ToolEntry> = Vec::new();
-                    // Sequential delivery: how many bubbles already went out,
-                    // and whether one of them failed. A non-zero count means
-                    // the turn has already spoken, so the finalize path must
-                    // NOT deliver the text buffer on top of it.
+                    // Sequential delivery state. A non-zero `sent` means the turn
+                    // has already spoken, so the finalize path must NOT deliver
+                    // the text buffer on top of it.
+                    //
+                    // `failed` and `capped` are deliberately separate: a send
+                    // that errored leaves the reply with a hole and must surface
+                    // ❌, while reaching `max_bubbles` is the configured limit
+                    // doing its job — the user got a complete answer and must
+                    // not see an error on top of it.
                     let mut sequential_sent = 0usize;
                     let mut sequential_failed = false;
+                    let mut sequential_capped = false;
                     // Byte offset into `text_buf` where the final answer block
                     // begins — advanced to the buffer end on every tool
                     // completion so it tracks "just past the last tool". Used by
@@ -1198,10 +1204,11 @@ impl AdapterRouter {
                                         );
                                         continue;
                                     }
-                                    if sequential_failed {
+                                    if sequential_failed || sequential_capped {
                                         // A hole in the middle of a reply is
-                                        // worse than a short one — once a
-                                        // bubble fails, stop sending.
+                                        // worse than a short one — once a bubble
+                                        // fails, stop sending. Same for the cap,
+                                        // which also warns exactly once.
                                         continue;
                                     }
                                     if text.trim().is_empty() {
@@ -1213,9 +1220,10 @@ impl AdapterRouter {
                                         warn!(
                                             bubble = %id,
                                             max_bubbles = delivery.max_bubbles,
-                                            "sequential turn exceeded max_bubbles; dropping the rest"
+                                            delivered = sequential_sent,
+                                            "sequential turn reached max_bubbles; dropping the rest"
                                         );
-                                        sequential_failed = true;
+                                        sequential_capped = true;
                                         continue;
                                     }
                                     if sequential_sent > 0 && delivery.bubble_delay_ms > 0 {
@@ -1329,15 +1337,14 @@ impl AdapterRouter {
                         tracing::debug!(
                             platform = %thread_channel.platform,
                             bubbles = sequential_sent,
+                            capped = sequential_capped,
                             "sequential turn delivered"
                         );
-                        return if sequential_failed {
-                            Err(anyhow::anyhow!(
-                                "sequential delivery incomplete: {sequential_sent} bubble(s) delivered"
-                            ))
-                        } else {
-                            Ok(())
-                        };
+                        return sequential_outcome(
+                            sequential_sent,
+                            sequential_failed,
+                            sequential_capped,
+                        );
                     }
                     // Sequential mode with nothing emitted is the safety net: the
                     // agent either chose to stay silent (no bubbles, no text) or
@@ -1617,6 +1624,28 @@ impl AdapterRouter {
             })
             .await
     }
+}
+
+/// The turn outcome for a sequential delivery.
+///
+/// Reaching `max_bubbles` is **not** a failure: the cap is configuration doing
+/// its job, and the user received a complete, readable answer. Only a send that
+/// actually errored leaves the reply with a hole, and only that should surface
+/// ❌ instead of 🆗.
+///
+/// Pure helper: deliberately mirrors the inline branch in
+/// [`AdapterRouter::stream_prompt_blocks`] so the truth table can be exercised
+/// without a live ACP session — the same reason [`finalize_body`] exists.
+pub(crate) fn sequential_outcome(sent: usize, failed: bool, capped: bool) -> Result<()> {
+    if failed {
+        return Err(anyhow::anyhow!(
+            "sequential delivery incomplete: {sent} bubble(s) delivered"
+        ));
+    }
+    if capped {
+        tracing::debug!(sent, "sequential turn was capped, not failed");
+    }
+    Ok(())
 }
 
 /// Split `content` at `message_limit`, preserving Discord mention footers across
@@ -3225,6 +3254,37 @@ mod structured_delivery_tests {
             ..cfg()
         };
         assert!(plan_structured_bubbles("plain prose", &c).is_none());
+    }
+
+    // --- sequential turn outcome (review F2) ---
+
+    /// Regression: hitting `max_bubbles` used to set the same flag a real send
+    /// failure sets, so a turn that said everything it was allowed to say
+    /// surfaced ❌ to the user.
+    #[test]
+    fn a_capped_sequential_turn_is_a_success() {
+        assert!(
+            sequential_outcome(4, false, true).is_ok(),
+            "the cap is configuration working, not a fault"
+        );
+    }
+
+    #[test]
+    fn a_failed_sequential_turn_is_an_error() {
+        let err = sequential_outcome(2, true, false).unwrap_err().to_string();
+        assert!(err.contains("2 bubble(s) delivered"), "got: {err}");
+    }
+
+    #[test]
+    fn a_failure_outranks_a_cap() {
+        // Both flags can be set if the cap was reached and a later send failed.
+        // The hole in the reply is the fact worth surfacing.
+        assert!(sequential_outcome(3, true, true).is_err());
+    }
+
+    #[test]
+    fn a_clean_sequential_turn_is_a_success() {
+        assert!(sequential_outcome(3, false, false).is_ok());
     }
 
     // --- delivery (async) ---

@@ -311,6 +311,10 @@ impl Agent {
                 content: assistant_content,
             });
 
+            // What this iteration's `reply` call actually delivered, so its tool
+            // result can say so. `None` when the model did not call `reply`.
+            let mut reply_outcome: Option<(usize, usize)> = None;
+
             // How `reply` behaves depends on the mode:
             //
             // - envelope (no sink): terminal. Its input *is* the answer, so it
@@ -348,10 +352,14 @@ impl Agent {
                             // The call is consumed here and NOT executed as a
                             // tool below, so it gets its own result block there.
                             let texts = turn_envelope::bubbles_from_tool_input(input)?;
+                            let requested = texts.len();
+                            let mut sent = 0usize;
                             for text in texts {
                                 if emitted >= self.max_bubbles {
                                     warn!(
                                         max_bubbles = self.max_bubbles,
+                                        sent,
+                                        requested,
                                         "sequential turn hit the bubble cap; dropping the rest"
                                     );
                                     break;
@@ -367,7 +375,9 @@ impl Agent {
                                         emitted - 1
                                     ));
                                 }
+                                sent += 1;
                             }
+                            reply_outcome = Some((sent, requested));
                         }
                     }
                 }
@@ -412,9 +422,21 @@ impl Agent {
                 // not a real tool. It still needs a result block, or the
                 // provider rejects the next request for an unanswered tool_use.
                 if self.bubble_sink.is_some() && name == turn_envelope::REPLY_TOOL {
+                    // Report what actually went out. A silent "delivered" after
+                    // the cap truncated the call would leave the model believing
+                    // it said something the user never saw.
+                    let content = match reply_outcome {
+                        Some((sent, requested)) if sent < requested => format!(
+                            "delivered {sent} of {requested} messages; the rest were dropped \
+                             because this turn reached its limit of {} messages",
+                            self.max_bubbles
+                        ),
+                        Some((sent, _)) => format!("delivered {sent} message(s)"),
+                        None => "delivered".to_string(),
+                    };
                     tool_results.push(ContentBlock::ToolResult {
                         tool_use_id: id.clone(),
-                        content: "delivered".to_string(),
+                        content,
                         is_error: None,
                     });
                     continue;
@@ -683,6 +705,59 @@ mod tests {
         let (mut agent, _tmp) = sequential_agent(mock, sink.clone(), 3);
         agent.run("hi").await.unwrap();
         assert_eq!(sink.texts(), vec!["a", "b", "c"]);
+    }
+
+    /// Regression (review F4): when the cap truncates a `reply` call, the tool
+    /// result must say so. A bare "delivered" would leave the model believing it
+    /// said something the user never saw.
+    #[tokio::test]
+    async fn sequential_tool_result_reports_a_truncated_delivery() {
+        let mock = MockLlmProvider::new(vec![
+            vec![reply_call("t1", &["a", "b", "c"])],
+            vec![LlmEvent::Stop],
+        ]);
+        let sink = Arc::new(RecordingSink::default());
+        let (mut agent, _tmp) = sequential_agent(mock, sink.clone(), 2);
+        agent.run("hi").await.unwrap();
+
+        assert_eq!(sink.texts(), vec!["a", "b"]);
+        let results: Vec<String> = agent
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results.len(), 1, "the reply call needs exactly one result");
+        assert!(
+            results[0].contains("2 of 3"),
+            "the model must be told what actually went out, got: {}",
+            results[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn sequential_tool_result_reports_a_complete_delivery() {
+        let mock = MockLlmProvider::new(vec![
+            vec![reply_call("t1", &["a", "b"])],
+            vec![LlmEvent::Stop],
+        ]);
+        let sink = Arc::new(RecordingSink::default());
+        let (mut agent, _tmp) = sequential_agent(mock, sink.clone(), 4);
+        agent.run("hi").await.unwrap();
+        let result = agent
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .find_map(|b| match b {
+                ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(result.contains("2 message"), "got: {result}");
+        assert!(!result.contains(" of "), "nothing was truncated: {result}");
     }
 
     #[tokio::test]

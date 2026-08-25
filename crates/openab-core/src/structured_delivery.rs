@@ -446,9 +446,10 @@ struct EnvelopeSpan {
 /// - a trailing **unclosed** `{` run, if the buffer ended mid-object.
 ///
 /// An unclosed trailing object wins (it is the thing the agent was writing when
-/// the turn was cut off). Each candidate must look like an envelope — contain a
-/// `"schema"` or `"messages"` key — otherwise it is ignored, which keeps a JSON
-/// code sample in an ordinary prose reply from being treated as a turn.
+/// the turn was cut off). A complete candidate must actually *parse* as an
+/// object carrying `schema` or `messages`; a truncated one, which cannot be
+/// parsed, falls back to a substring check. Either way a JSON code sample in an
+/// ordinary prose reply is not treated as a turn.
 ///
 /// All of `{`, `}`, `"` and `\` are ASCII, and multi-byte UTF-8 continuation
 /// bytes are all `>= 0x80`, so byte scanning cannot land mid-character and the
@@ -496,7 +497,7 @@ fn find_envelope_span(text: &str) -> Option<EnvelopeSpan> {
     // Truncated tail first: it is the object the turn died inside.
     if depth > 0 {
         if let Some(start) = open_at {
-            if looks_like_envelope(&text[start..]) {
+            if looks_like_truncated_envelope(&text[start..]) {
                 return Some(EnvelopeSpan {
                     start,
                     end: text.len(),
@@ -507,7 +508,7 @@ fn find_envelope_span(text: &str) -> Option<EnvelopeSpan> {
     }
 
     last_balanced.and_then(|(start, end)| {
-        looks_like_envelope(&text[start..end]).then_some(EnvelopeSpan {
+        is_envelope_object(&text[start..end]).then_some(EnvelopeSpan {
             start,
             end,
             complete: true,
@@ -515,12 +516,34 @@ fn find_envelope_span(text: &str) -> Option<EnvelopeSpan> {
     })
 }
 
-/// Whether a JSON fragment carries the envelope's marker keys.
+/// Whether a **complete** fragment is an envelope.
 ///
-/// Deliberately key-based, not schema-value-based: a truncated turn may be cut
-/// off before its `schema` value is written, and it still must not be delivered
-/// as text.
-fn looks_like_envelope(fragment: &str) -> bool {
+/// Parsed, not guessed: a balanced object can be deserialized, so there is no
+/// reason to match substrings and risk swallowing a JSON snippet the agent
+/// meant to show the user (a config sample containing a `"schema"` key would
+/// otherwise be stripped out of a plain-text reply).
+///
+/// The marker is `messages`, not `schema`. An envelope is by definition a list
+/// of messages, while a bare `schema` key is common in unrelated JSON (a JSON
+/// Schema document, a config sample) that the agent may legitimately be showing
+/// the user.
+///
+/// Keyed on the field rather than its value, so a turn declaring the *wrong*
+/// `schema` is still recognised as an envelope and rejected loudly rather than
+/// delivered as text.
+fn is_envelope_object(fragment: &str) -> bool {
+    serde_json::from_str::<Value>(fragment)
+        .ok()
+        .and_then(|v| v.as_object().map(|o| o.contains_key("messages")))
+        .unwrap_or(false)
+}
+
+/// Whether a fragment cut off mid-object looks like an envelope.
+///
+/// A truncated fragment cannot be parsed, so this stays a substring heuristic.
+/// Deliberately loose: half an envelope must never reach the user as text, and
+/// stripping slightly too much is the safe direction to be wrong in.
+fn looks_like_truncated_envelope(fragment: &str) -> bool {
     fragment.contains("\"schema\"") || fragment.contains("\"messages\"")
 }
 
@@ -903,6 +926,45 @@ mod tests {
     fn strip_leaves_ordinary_prose_untouched() {
         let raw = "try this config:\n{\"retries\": 3}";
         assert_eq!(strip_envelope(raw), raw);
+    }
+
+    /// Regression (review F1): a *complete* JSON object is parsed, not
+    /// substring-matched, so a config sample that happens to contain a
+    /// `"schema"` key is left alone instead of being stripped out of the reply.
+    #[test]
+    fn a_json_sample_mentioning_schema_is_not_an_envelope() {
+        let raw = "your validator wants:\n{\"schema\": \"draft-07\", \"type\": \"object\"}";
+        let err = parse(raw).unwrap_err();
+        assert_eq!(err, StructuredError::NotStructured);
+        assert!(
+            !err.found_envelope(),
+            "prose showing the user some JSON must stay deliverable verbatim"
+        );
+        assert_eq!(strip_envelope(raw), raw, "and must not be stripped");
+    }
+
+    /// The other half of F1: tightening the complete-fragment check must not
+    /// let a wrong-schema envelope through as text.
+    #[test]
+    fn a_wrong_schema_envelope_is_still_recognised_as_one() {
+        let raw = envelope(
+            json!([{"id": "b1", "text": "CANARY"}]),
+            json!({"type": "stop"}),
+        )
+        .replace("openab.turn.v1", "openab.turn.v9");
+        let err = parse(&raw).unwrap_err();
+        assert!(matches!(err, StructuredError::SchemaMismatch { .. }));
+        assert!(err.found_envelope(), "must not be delivered verbatim");
+        assert!(!strip_envelope(&raw).contains("CANARY"));
+    }
+
+    /// And a truncated one, which cannot be parsed, still falls back to the
+    /// substring heuristic — the safe direction to be wrong in.
+    #[test]
+    fn a_truncated_envelope_is_still_caught_without_parsing() {
+        let raw = "one sec\n{\"schema\":\"openab.turn.v1\",\"messages\":[{\"id\":\"b1\",\"te";
+        assert_eq!(parse(raw).unwrap_err(), StructuredError::Truncated);
+        assert_eq!(strip_envelope(raw), "one sec");
     }
 
     #[test]
