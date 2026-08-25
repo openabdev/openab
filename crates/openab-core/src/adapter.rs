@@ -19,7 +19,21 @@ use crate::reactions::StatusReactionController;
 pub struct OutputDirectives {
     /// Message ID to reply to (Discord: message_reference)
     pub reply_to: Option<String>,
+    /// Structured-delivery schema this turn declares, e.g.
+    /// `[[delivery:openab.turn.v1]]`. A **per-turn override only**: whether the
+    /// session parses envelopes at all is decided at router construction from
+    /// `[delivery] mode`, because streaming has to be disabled before the turn
+    /// starts (ADR: structured-delivery.md §2.1 I1). A turn that sets this
+    /// while the router is in text mode is logged and otherwise ignored.
+    pub delivery: Option<String>,
 }
+
+/// The broker's session-reset notice, seeded at the head of a turn buffer when
+/// the previous session expired. Shared by the streaming placeholder, the
+/// send-once re-prepend ([`finalize_body`]) and the structured path, which
+/// delivers it as its own bubble rather than gluing it onto the agent's first
+/// beat.
+pub(crate) const SESSION_RESET_NOTICE: &str = "⚠️ _Session expired, starting fresh..._\n\n";
 
 /// Chunk limit for delivering a reply on `platform`. ACP is a WebSocket transport with
 /// no small per-message limit, and its reply route is closed after the first delivered
@@ -53,8 +67,28 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
                         "reply_to" => {
                             let v = value.trim();
                             // Validate: non-empty, reasonable length, no whitespace/control chars
-                            if !v.is_empty() && v.len() <= 64 && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_') {
+                            if !v.is_empty()
+                                && v.len() <= 64
+                                && v.chars().all(|c| {
+                                    c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'
+                                })
+                            {
                                 directives.reply_to = Some(v.to_string());
+                            }
+                        }
+                        "delivery" => {
+                            let v = value.trim();
+                            // Same shape rule as reply_to: a bounded token, no
+                            // whitespace or control characters. Whether the
+                            // value names a *known* schema is the delivery
+                            // layer's call, not the parser's.
+                            if !v.is_empty()
+                                && v.len() <= 64
+                                && v.chars().all(|c| {
+                                    c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'
+                                })
+                            {
+                                directives.delivery = Some(v.to_string());
                             }
                         }
                         _ => {
@@ -199,7 +233,7 @@ pub(crate) fn finalize_body(
     body: String,
 ) -> String {
     if reset && !keep_full_text && answer_start > 0 {
-        format!("⚠️ _Session expired, starting fresh..._\n\n{body}")
+        format!("{SESSION_RESET_NOTICE}{body}")
     } else {
         body
     }
@@ -464,6 +498,19 @@ pub struct AdapterRouter {
     /// [`AdapterRouter::with_trust`]; empty default = deny-all per platform
     /// (only consulted by paths wired to the gate — currently the gateway path).
     trust: crate::trust::PlatformTrustConfigs,
+    /// Outbound delivery mode. Populated via [`AdapterRouter::with_delivery`];
+    /// the default is `mode = "text"`, i.e. the pre-existing single-message
+    /// path. Read at the *start* of every turn, not the end — structured mode
+    /// has to disable streaming before any output exists
+    /// (ADR: structured-delivery.md §2.1 I1).
+    delivery: crate::config::DeliveryConfig,
+    /// Noise control for unsolicited events. Populated via
+    /// [`AdapterRouter::with_triage`]; the default is disabled, i.e. every
+    /// proactive event is dispatched exactly as before this existed.
+    triage: crate::event_triage::TriageSettings,
+    /// Per-conversation triage counters, shared process-wide so a cooldown
+    /// means the same thing on both gateway ingress paths.
+    triage_state: crate::event_triage::TriageState,
 }
 
 impl AdapterRouter {
@@ -494,6 +541,9 @@ impl AdapterRouter {
             workspace_aliases,
             bot_home,
             trust: crate::trust::PlatformTrustConfigs::default(),
+            delivery: crate::config::DeliveryConfig::default(),
+            triage: crate::event_triage::TriageSettings::default(),
+            triage_state: crate::event_triage::TriageState::new(),
         }
     }
 
@@ -502,6 +552,53 @@ impl AdapterRouter {
     pub fn with_trust(mut self, trust: crate::trust::PlatformTrustConfigs) -> Self {
         self.trust = trust;
         self
+    }
+
+    /// Attach the outbound delivery settings (builder style, same reason as
+    /// [`AdapterRouter::with_trust`]). Omitting it leaves the router in text
+    /// mode — byte-identical to the behavior before structured delivery existed.
+    pub fn with_delivery(mut self, delivery: crate::config::DeliveryConfig) -> Self {
+        self.delivery = delivery;
+        self
+    }
+
+    /// The configured delivery settings (used by dispatch.rs / tests).
+    pub fn delivery_config(&self) -> &crate::config::DeliveryConfig {
+        &self.delivery
+    }
+
+    /// Attach proactive-event noise control (builder style, as with
+    /// [`AdapterRouter::with_trust`]). Omitting it leaves triage disabled.
+    pub fn with_triage(mut self, triage: crate::event_triage::TriageSettings) -> Self {
+        self.triage = triage;
+        self
+    }
+
+    /// The proactive-event counterpart of [`AdapterRouter::gate_incoming`]:
+    /// decide whether an unsolicited event is worth waking the agent for.
+    ///
+    /// Callers must consult this **only** for events explicitly flagged
+    /// proactive — a message a human sent is dispatched whatever the hour.
+    pub fn triage_event(
+        &self,
+        conversation_key: &str,
+        event_id: &str,
+    ) -> crate::event_triage::Decision {
+        self.triage_state
+            .admit(conversation_key, event_id, &self.triage, chrono::Utc::now())
+    }
+
+    /// Drop triage bookkeeping for conversations idle longer than
+    /// `idle_ttl_secs`. Called from the same periodic sweep that expires idle
+    /// sessions, so a long-lived broker does not accumulate state for channels
+    /// that went quiet.
+    ///
+    /// Takes seconds rather than a timestamp so callers need no `chrono` of
+    /// their own — the session TTL they already have is the right input.
+    pub fn sweep_triage(&self, idle_ttl_secs: u64) {
+        let secs = i64::try_from(idle_ttl_secs).unwrap_or(i64::MAX);
+        self.triage_state
+            .sweep(chrono::Utc::now() - chrono::Duration::seconds(secs));
     }
 
     /// The single ingress trust gate: evaluate L2 (scope) + L3 (identity) for an
@@ -705,7 +802,17 @@ impl AdapterRouter {
         // coupling): it streams append-only `agent_message_chunk` deltas built from the
         // post+edit (`edit_message` snapshot) path, i.e. streaming=false. Decide it
         // explicitly by platform rather than by whatever Telegram happens to be set to.
-        let streaming = if thread_channel.platform == "acp" {
+        // Structured delivery must be known BEFORE the turn starts: the
+        // placeholder is posted and the native stream opened long before any
+        // output exists, so a turn-final directive could not stop half an
+        // envelope from being shown (ADR: structured-delivery.md §2.1 I1).
+        let structured = self.delivery.mode == crate::structured_delivery::DeliveryMode::Structured;
+        let sequential = self.delivery.mode == crate::structured_delivery::DeliveryMode::Sequential;
+        // Both bubble modes must suppress streaming and the tool-summary
+        // prefix; only plain text keeps them.
+        let bubbles = self.delivery.mode.is_bubbles();
+        let delivery = self.delivery.clone();
+        let streaming = if bubbles || thread_channel.platform == "acp" {
             false
         } else {
             adapter.use_streaming(other_bot_present)
@@ -716,8 +823,13 @@ impl AdapterRouter {
         // Platform-agnostic — read from the shared reactions config, alongside
         // `tool_display`. `streaming` still drives the placeholder / native-stream
         // paths below; only the final-text selection uses `keep_full_text`.
-        let keep_full_text = streaming || self.reactions_config.narration_display;
-        let native = adapter.uses_native_streaming(other_bot_present);
+        // Structured mode also pins `keep_full_text` off: the envelope is the
+        // text after the last tool, and keeping the inter-tool narration would
+        // wrap it in prose the parser then has to dig it out of.
+        let keep_full_text = !bubbles && (streaming || self.reactions_config.narration_display);
+        // …and `native` off for the same reason as `streaming`: Slack's
+        // assistant mode would `stream_append` raw JSON tokens.
+        let native = !bubbles && adapter.uses_native_streaming(other_bot_present);
         let assistant_status = adapter.uses_assistant_status();
         // Platforms that render Markdown tables natively (e.g. Slack Block Kit
         // `markdown` blocks / `markdown_text` stream chunks) skip the
@@ -751,6 +863,12 @@ impl AdapterRouter {
 
                     let mut text_buf = String::new();
                     let mut tool_lines: Vec<ToolEntry> = Vec::new();
+                    // Sequential delivery: how many bubbles already went out,
+                    // and whether one of them failed. A non-zero count means
+                    // the turn has already spoken, so the finalize path must
+                    // NOT deliver the text buffer on top of it.
+                    let mut sequential_sent = 0usize;
+                    let mut sequential_failed = false;
                     // Byte offset into `text_buf` where the final answer block
                     // begins — advanced to the buffer end on every tool
                     // completion so it tracks "just past the last tool". Used by
@@ -759,7 +877,7 @@ impl AdapterRouter {
                     let mut answer_start = 0usize;
 
                     if reset {
-                        text_buf.push_str("⚠️ _Session expired, starting fresh..._\n\n");
+                        text_buf.push_str(SESSION_RESET_NOTICE);
                     }
 
                     // Native streaming: defer stream_begin until first Text event
@@ -776,7 +894,7 @@ impl AdapterRouter {
                     // Streaming edit: send placeholder, spawn edit loop
                     let (buf_tx, placeholder_msg, edit_handle) = if streaming && !native {
                         let initial = if reset {
-                            "⚠️ _Session expired, starting fresh..._\n\n…".to_string()
+                            format!("{SESSION_RESET_NOTICE}…")
                         } else {
                             "…".to_string()
                         };
@@ -1064,6 +1182,98 @@ impl AdapterRouter {
                                         ));
                                     }
                                 }
+                                AcpEvent::Message { id, text } => {
+                                    // Sequential delivery: send it now. The
+                                    // agent decided on this bubble already and
+                                    // may be about to run a tool before it
+                                    // decides the next one.
+                                    if !sequential {
+                                        // An agent emitting the extension into a
+                                        // broker that is not in sequential mode
+                                        // would otherwise vanish silently.
+                                        warn!(
+                                            bubble = %id,
+                                            mode = %delivery.mode,
+                                            "received a sequential message event but [delivery] mode                                              is not `sequential`; ignoring it (the turn's text is                                              delivered normally at the end)"
+                                        );
+                                        continue;
+                                    }
+                                    if sequential_failed {
+                                        // A hole in the middle of a reply is
+                                        // worse than a short one — once a
+                                        // bubble fails, stop sending.
+                                        continue;
+                                    }
+                                    if text.trim().is_empty() {
+                                        continue;
+                                    }
+                                    if delivery.max_bubbles > 0
+                                        && sequential_sent >= delivery.max_bubbles
+                                    {
+                                        warn!(
+                                            bubble = %id,
+                                            max_bubbles = delivery.max_bubbles,
+                                            "sequential turn exceeded max_bubbles; dropping the rest"
+                                        );
+                                        sequential_failed = true;
+                                        continue;
+                                    }
+                                    if sequential_sent > 0 && delivery.bubble_delay_ms > 0 {
+                                        tokio::time::sleep(std::time::Duration::from_millis(
+                                            delivery.bubble_delay_ms,
+                                        ))
+                                        .await;
+                                    }
+                                    // Directives sit at the head of the turn's
+                                    // text buffer, which in sequential mode may
+                                    // still be empty — so reply_to is resolved
+                                    // from whatever has arrived so far, and only
+                                    // the first bubble uses it.
+                                    let reply_to = if sequential_sent == 0 {
+                                        parse_output_directives(&text_buf).0.reply_to
+                                    } else {
+                                        None
+                                    };
+                                    let rendered = markdown::convert_tables(&text, table_mode);
+                                    let chunks =
+                                        chunk_for_delivery(&adapter, &rendered, message_limit);
+                                    let mut first_chunk = true;
+                                    for chunk in
+                                        chunks.iter().filter(|c| !c.trim().is_empty())
+                                    {
+                                        let sent = match (first_chunk, reply_to.as_deref()) {
+                                            (true, Some(reply_id)) => {
+                                                adapter
+                                                    .send_message_with_reply(
+                                                        &thread_channel,
+                                                        chunk,
+                                                        reply_id,
+                                                    )
+                                                    .await
+                                            }
+                                            _ => {
+                                                adapter
+                                                    .send_message(&thread_channel, chunk)
+                                                    .await
+                                            }
+                                        };
+                                        first_chunk = false;
+                                        if let Err(e) = sent {
+                                            error!(
+                                                error = ?e,
+                                                platform = %thread_channel.platform,
+                                                bubble = %id,
+                                                delivered = sequential_sent,
+                                                "sequential bubble send failed;                                                  abandoning the rest of the turn"
+                                            );
+                                            sequential_failed = true;
+                                            break;
+                                        }
+                                    }
+                                    if !sequential_failed {
+                                        sequential_sent += 1;
+                                    }
+                                }
                                 AcpEvent::ConfigUpdate { options } => {
                                     conn.config_options = options;
                                 }
@@ -1111,6 +1321,65 @@ impl AdapterRouter {
                     // slice, so re-prepend it to the (directive-stripped) body in
                     // exactly that case. `finalize_body` is the pure helper that
                     // encodes the four-corner truth table so it can be unit-tested.
+
+                    // Sequential delivery already spoke, bubble by bubble, while
+                    // the turn was running. Delivering the text buffer now would
+                    // repeat it all as one extra message.
+                    if sequential && sequential_sent > 0 {
+                        tracing::debug!(
+                            platform = %thread_channel.platform,
+                            bubbles = sequential_sent,
+                            "sequential turn delivered"
+                        );
+                        return if sequential_failed {
+                            Err(anyhow::anyhow!(
+                                "sequential delivery incomplete: {sequential_sent} bubble(s) delivered"
+                            ))
+                        } else {
+                            Ok(())
+                        };
+                    }
+                    // Sequential mode with nothing emitted is the safety net: the
+                    // agent either chose to stay silent (no bubbles, no text) or
+                    // does not implement the extension at all, in which case its
+                    // text must still reach the user. Fall through to the normal
+                    // text path.
+                    if sequential {
+                        tracing::debug!(
+                            platform = %thread_channel.platform,
+                            has_text = !text_buf.trim().is_empty(),
+                            "sequential turn emitted no bubbles; falling back to the text path"
+                        );
+                    }
+
+                    // Structured delivery branches HERE — before `finalize_body`
+                    // and `display_for`, both of which prepend text to the body
+                    // (the session-reset notice and the tool summary) and would
+                    // make every envelope fail to deserialize
+                    // (ADR: structured-delivery.md §2.2).
+                    if structured {
+                        if let Some(schema) = directives.delivery.as_deref() {
+                            if schema != delivery.schema {
+                                warn!(
+                                    declared = schema,
+                                    configured = %delivery.schema,
+                                    "turn declared a delivery schema this deployment does not serve"
+                                );
+                            }
+                        }
+                        return deliver_structured(
+                            &adapter,
+                            &thread_channel,
+                            &text_buf,
+                            &directives,
+                            reset,
+                            &delivery,
+                            message_limit,
+                            table_mode,
+                        )
+                        .await;
+                    }
+
                     let text_buf = finalize_body(reset, keep_full_text, answer_start, text_buf);
 
                     // Build final content
@@ -1134,17 +1403,7 @@ impl AdapterRouter {
                     };
 
                     let final_content = markdown::convert_tables(&final_content, table_mode);
-                    let chunks = if adapter.platform() == "discord" {
-                        let mentions = extract_mentions(&final_content);
-                        let mention_reserve = mention_footer_len(&mentions);
-                        let chunks = format::split_message(
-                            &final_content,
-                            message_limit.saturating_sub(mention_reserve),
-                        );
-                        propagate_mentions_to_chunks(chunks, &mentions, message_limit)
-                    } else {
-                        format::split_message(&final_content, message_limit)
-                    };
+                    let chunks = chunk_for_delivery(&adapter, &final_content, message_limit);
                     // Track delivery health across all final write paths. Any failure
                     // here means the user's view is incomplete; we propagate Err at the
                     // end of the closure so dispatch surfaces set_error (❌) instead of
@@ -1358,6 +1617,175 @@ impl AdapterRouter {
             })
             .await
     }
+}
+
+/// Split `content` at `message_limit`, preserving Discord mention footers across
+/// chunks.
+///
+/// This is the platform's **hard** limit, applied identically by both delivery
+/// paths: the text path chunks one finalized message, the structured path chunks
+/// each bubble on its own. Splitting here never changes bubble order — an
+/// over-long bubble becomes several messages in place, and the next bubble
+/// still follows them.
+fn chunk_for_delivery(
+    adapter: &Arc<dyn ChatAdapter>,
+    content: &str,
+    message_limit: usize,
+) -> Vec<String> {
+    if adapter.platform() == "discord" {
+        let mentions = extract_mentions(content);
+        let mention_reserve = mention_footer_len(&mentions);
+        let chunks = format::split_message(content, message_limit.saturating_sub(mention_reserve));
+        propagate_mentions_to_chunks(chunks, &mentions, message_limit)
+    } else {
+        format::split_message(content, message_limit)
+    }
+}
+
+/// Resolve a structured turn's body into the bubbles to send.
+///
+/// Split out of [`deliver_structured`] so the parse-and-fall-back decision — the
+/// part carrying the "never leak the envelope" rule — is a pure function with
+/// direct unit tests, while the async half stays a plain send loop.
+///
+/// `body` must already have the session-reset notice stripped; the notice is a
+/// broker message and is re-added as its own bubble by the caller.
+/// `None` means "deliver nothing" (`next.type = silent`, or a parse failure
+/// under `on_parse_error = "silent"`).
+pub(crate) fn plan_structured_bubbles(
+    body: &str,
+    cfg: &crate::config::DeliveryConfig,
+) -> Option<Vec<String>> {
+    use crate::structured_delivery::{
+        parse_structured, strip_envelope, NextAction, ParseErrorPolicy,
+    };
+
+    match parse_structured(body, &cfg.schema, cfg.max_bubbles, cfg.max_bubble_chars) {
+        Ok(plan) => {
+            if let NextAction::Tool { ref name, .. } = plan.next {
+                // Recorded, not executed: the model may only *propose*, and the
+                // harness decides (ADR: structured-delivery.md §1.3).
+                tracing::info!(
+                    tool = %name,
+                    "structured turn proposed a tool call; not executed in this phase"
+                );
+            }
+            if plan.is_silent() {
+                tracing::info!(next = ?plan.next, "structured turn delivered nothing");
+                return None;
+            }
+            Some(plan.bubbles)
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                policy = %cfg.on_parse_error,
+                "structured turn did not parse"
+            );
+            match cfg.on_parse_error {
+                ParseErrorPolicy::Silent => None,
+                ParseErrorPolicy::ErrorMessage => Some(vec![cfg.parse_error_text.clone()]),
+                ParseErrorPolicy::FallbackText => {
+                    // `NotStructured` is the ONE error where the body holds no
+                    // envelope and is safe verbatim — the model answered in
+                    // prose. Every other error means JSON is in there, whole or
+                    // truncated, and must be stripped first (ADR §2.1 I2).
+                    let text = if e.found_envelope() {
+                        strip_envelope(body)
+                    } else {
+                        body.trim().to_string()
+                    };
+                    if text.is_empty() {
+                        Some(vec![cfg.parse_error_text.clone()])
+                    } else {
+                        Some(vec![text])
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Deliver a structured turn: one platform message per bubble, in order.
+///
+/// Ordering is by construction — each send is awaited before the next begins.
+/// On the Custom Gateway that requires `await_ack` (ADR §4); on Discord/Slack
+/// the HTTP round-trip provides it.
+///
+/// Returns `Err` when a bubble fails to send, mirroring the text path's
+/// `delivery_failed` contract so dispatch surfaces ❌ rather than 🆗 over a
+/// half-delivered turn. Remaining bubbles are abandoned: continuing past a
+/// failure would hand the user a reply with a hole in the middle.
+#[allow(clippy::too_many_arguments)]
+async fn deliver_structured(
+    adapter: &Arc<dyn ChatAdapter>,
+    channel: &ChannelRef,
+    body: &str,
+    directives: &OutputDirectives,
+    reset: bool,
+    cfg: &crate::config::DeliveryConfig,
+    message_limit: usize,
+    table_mode: TableMode,
+) -> Result<()> {
+    // Strip the notice before parsing so it is handled in exactly one place:
+    // it is present in `body` when no tool ran, and absent (sliced off with the
+    // narration) when one did.
+    let body = body.strip_prefix(SESSION_RESET_NOTICE).unwrap_or(body);
+
+    let mut bubbles = match plan_structured_bubbles(body, cfg) {
+        Some(bubbles) => bubbles,
+        None => return Ok(()),
+    };
+
+    if reset {
+        bubbles.insert(0, SESSION_RESET_NOTICE.trim().to_string());
+    }
+
+    let total = bubbles.len();
+    let mut is_first_message = true;
+
+    for (index, bubble) in bubbles.iter().enumerate() {
+        if index > 0 && cfg.bubble_delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(cfg.bubble_delay_ms)).await;
+        }
+        let rendered = markdown::convert_tables(bubble, table_mode);
+        let chunks = chunk_for_delivery(adapter, &rendered, message_limit);
+        for chunk in chunks.iter().filter(|c| !c.trim().is_empty()) {
+            // Only the very first message carries the reply_to directive; the
+            // rest are plain sends in the same thread.
+            let sent = if is_first_message {
+                match directives.reply_to.as_deref() {
+                    Some(reply_id) => {
+                        adapter
+                            .send_message_with_reply(channel, chunk, reply_id)
+                            .await
+                    }
+                    None => adapter.send_message(channel, chunk).await,
+                }
+            } else {
+                adapter.send_message(channel, chunk).await
+            };
+            is_first_message = false;
+            if let Err(e) = sent {
+                error!(
+                    error = ?e,
+                    platform = %channel.platform,
+                    bubble = index,
+                    // Everything before this bubble landed; this one and the
+                    // rest did not.
+                    delivered = index,
+                    total,
+                    "structured bubble send failed; abandoning the rest of the turn"
+                );
+                return Err(anyhow::anyhow!(
+                    "structured delivery incomplete: {index}/{total} bubbles delivered"
+                ));
+            }
+        }
+    }
+
+    tracing::debug!(platform = %channel.platform, bubbles = total, "structured turn delivered");
+    Ok(())
 }
 
 /// Returns true if `content` contains a Discord user/bot mention (`<@123>`, `<@!123>`)
@@ -2553,5 +2981,441 @@ mod directive_tests {
         };
         let result = classify_empty_turn(None, &tr);
         assert_eq!(result, "_(no response)_");
+    }
+}
+
+#[cfg(test)]
+mod structured_delivery_tests {
+    use super::*;
+    use crate::config::DeliveryConfig;
+    use crate::structured_delivery::{DeliveryMode, ParseErrorPolicy, SCHEMA_V1};
+    use std::sync::Mutex;
+
+    /// A `ChatAdapter` that records what was sent, in order, and can be told to
+    /// fail on the Nth send. Everything the structured path does not touch is a
+    /// no-op success.
+    struct RecordingAdapter {
+        sent: Mutex<Vec<(String, Option<String>)>>,
+        /// 0-based index of the send that should fail, if any.
+        fail_on: Option<usize>,
+        limit: usize,
+    }
+
+    impl RecordingAdapter {
+        fn new() -> Self {
+            Self {
+                sent: Mutex::new(Vec::new()),
+                fail_on: None,
+                limit: 2000,
+            }
+        }
+        fn failing_on(index: usize) -> Self {
+            Self {
+                fail_on: Some(index),
+                ..Self::new()
+            }
+        }
+        fn with_limit(limit: usize) -> Self {
+            Self {
+                limit,
+                ..Self::new()
+            }
+        }
+        fn record(&self, content: &str, reply_to: Option<&str>) -> Result<MessageRef> {
+            let mut sent = self.sent.lock().unwrap();
+            let index = sent.len();
+            sent.push((content.to_string(), reply_to.map(|s| s.to_string())));
+            if self.fail_on == Some(index) {
+                return Err(anyhow::anyhow!("simulated platform failure"));
+            }
+            Ok(MessageRef {
+                channel: test_channel(),
+                message_id: format!("m{index}"),
+            })
+        }
+        fn contents(&self) -> Vec<String> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(c, _)| c.clone())
+                .collect()
+        }
+        fn reply_targets(&self) -> Vec<Option<String>> {
+            self.sent
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, r)| r.clone())
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl ChatAdapter for RecordingAdapter {
+        fn platform(&self) -> &'static str {
+            "mock"
+        }
+        fn message_limit(&self) -> usize {
+            self.limit
+        }
+        async fn send_message(&self, _channel: &ChannelRef, content: &str) -> Result<MessageRef> {
+            self.record(content, None)
+        }
+        async fn send_message_with_reply(
+            &self,
+            _channel: &ChannelRef,
+            content: &str,
+            reply_to_message_id: &str,
+        ) -> Result<MessageRef> {
+            self.record(content, Some(reply_to_message_id))
+        }
+        async fn create_thread(
+            &self,
+            channel: &ChannelRef,
+            _trigger_msg: &MessageRef,
+            _title: &str,
+        ) -> Result<ChannelRef> {
+            Ok(channel.clone())
+        }
+        async fn add_reaction(&self, _msg: &MessageRef, _emoji: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn remove_reaction(&self, _msg: &MessageRef, _emoji: &str) -> Result<()> {
+            Ok(())
+        }
+        fn use_streaming(&self, _other_bot_present: bool) -> bool {
+            false
+        }
+    }
+
+    fn test_channel() -> ChannelRef {
+        ChannelRef {
+            platform: "mock".into(),
+            channel_id: "c1".into(),
+            thread_id: Some("t1".into()),
+            parent_id: None,
+            origin_event_id: None,
+        }
+    }
+
+    /// Structured config with the inter-bubble pause off, so tests do not sleep.
+    fn cfg() -> DeliveryConfig {
+        DeliveryConfig {
+            mode: DeliveryMode::Structured,
+            bubble_delay_ms: 0,
+            ..DeliveryConfig::default()
+        }
+    }
+
+    fn envelope(bubbles: &[&str]) -> String {
+        let messages: Vec<serde_json::Value> = bubbles
+            .iter()
+            .enumerate()
+            .map(|(i, t)| serde_json::json!({"id": format!("b{i}"), "text": t}))
+            .collect();
+        serde_json::json!({
+            "schema": SCHEMA_V1,
+            "messages": messages,
+            "next": {"type": "stop"}
+        })
+        .to_string()
+    }
+
+    async fn deliver(
+        adapter: &Arc<dyn ChatAdapter>,
+        body: &str,
+        directives: &OutputDirectives,
+        reset: bool,
+        cfg: &DeliveryConfig,
+        limit: usize,
+    ) -> Result<()> {
+        deliver_structured(
+            adapter,
+            &test_channel(),
+            body,
+            directives,
+            reset,
+            cfg,
+            limit,
+            TableMode::Off,
+        )
+        .await
+    }
+
+    // --- planning (pure) ---
+
+    #[test]
+    fn plan_returns_bubbles_in_order() {
+        let bubbles =
+            plan_structured_bubbles(&envelope(&["red", "green", "blue"]), &cfg()).unwrap();
+        assert_eq!(bubbles, vec!["red", "green", "blue"]);
+    }
+
+    #[test]
+    fn plan_returns_none_on_silent() {
+        let raw = serde_json::json!({
+            "schema": SCHEMA_V1, "messages": [], "next": {"type": "silent"}
+        })
+        .to_string();
+        assert!(plan_structured_bubbles(&raw, &cfg()).is_none());
+    }
+
+    #[test]
+    fn plan_falls_back_to_prose_verbatim() {
+        // The common failure: the model forgot the envelope entirely.
+        let bubbles = plan_structured_bubbles("hey what's up", &cfg()).unwrap();
+        assert_eq!(bubbles, vec!["hey what's up"]);
+    }
+
+    #[test]
+    fn plan_never_falls_back_to_raw_json() {
+        // A validation failure means JSON IS in the body — it must be stripped.
+        let raw = format!(
+            "{}\n{}",
+            "here:",
+            serde_json::json!({
+                "schema": "openab.turn.v9",
+                "messages": [{"id": "b1", "text": "CANARY"}],
+                "next": {"type": "stop"}
+            })
+        );
+        let bubbles = plan_structured_bubbles(&raw, &cfg()).unwrap();
+        assert_eq!(bubbles, vec!["here:"]);
+        assert!(!bubbles[0].contains("CANARY"));
+        assert!(!bubbles[0].contains("schema"));
+    }
+
+    #[test]
+    fn plan_never_falls_back_to_truncated_json() {
+        let raw = "one sec\n{\"schema\":\"openab.turn.v1\",\"messages\":[{\"id\":\"b1\",\"te";
+        let bubbles = plan_structured_bubbles(raw, &cfg()).unwrap();
+        assert_eq!(bubbles, vec!["one sec"]);
+        assert!(!bubbles[0].contains('{'));
+    }
+
+    #[test]
+    fn plan_uses_the_error_line_when_stripping_leaves_nothing() {
+        let c = cfg();
+        // Body is nothing but a rejected envelope — stripping empties it.
+        let raw = serde_json::json!({
+            "schema": "openab.turn.v9",
+            "messages": [{"id": "b1", "text": "x"}],
+            "next": {"type": "stop"}
+        })
+        .to_string();
+        let bubbles = plan_structured_bubbles(&raw, &c).unwrap();
+        assert_eq!(bubbles, vec![c.parse_error_text.clone()]);
+    }
+
+    #[test]
+    fn plan_honors_error_message_policy() {
+        let c = DeliveryConfig {
+            on_parse_error: ParseErrorPolicy::ErrorMessage,
+            ..cfg()
+        };
+        let bubbles = plan_structured_bubbles("plain prose", &c).unwrap();
+        assert_eq!(bubbles, vec![c.parse_error_text.clone()]);
+    }
+
+    #[test]
+    fn plan_honors_silent_policy() {
+        let c = DeliveryConfig {
+            on_parse_error: ParseErrorPolicy::Silent,
+            ..cfg()
+        };
+        assert!(plan_structured_bubbles("plain prose", &c).is_none());
+    }
+
+    // --- delivery (async) ---
+
+    #[tokio::test]
+    async fn each_bubble_becomes_its_own_message_in_order() {
+        let rec = Arc::new(RecordingAdapter::new());
+        let adapter: Arc<dyn ChatAdapter> = rec.clone();
+        deliver(
+            &adapter,
+            &envelope(&["red", "green", "blue"]),
+            &OutputDirectives::default(),
+            false,
+            &cfg(),
+            2000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rec.contents(), vec!["red", "green", "blue"]);
+    }
+
+    #[tokio::test]
+    async fn a_multiline_bubble_stays_one_message() {
+        // The load-bearing property: newlines are not bubble boundaries.
+        let rec = Arc::new(RecordingAdapter::new());
+        let adapter: Arc<dyn ChatAdapter> = rec.clone();
+        deliver(
+            &adapter,
+            &envelope(&["alpha\nbeta\ngamma"]),
+            &OutputDirectives::default(),
+            false,
+            &cfg(),
+            2000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(rec.contents(), vec!["alpha\nbeta\ngamma"]);
+    }
+
+    #[tokio::test]
+    async fn silent_turn_sends_nothing() {
+        let rec = Arc::new(RecordingAdapter::new());
+        let adapter: Arc<dyn ChatAdapter> = rec.clone();
+        let raw = serde_json::json!({
+            "schema": SCHEMA_V1, "messages": [], "next": {"type": "silent"}
+        })
+        .to_string();
+        deliver(
+            &adapter,
+            &raw,
+            &OutputDirectives::default(),
+            false,
+            &cfg(),
+            2000,
+        )
+        .await
+        .unwrap();
+        assert!(rec.contents().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reply_to_applies_to_the_first_message_only() {
+        let rec = Arc::new(RecordingAdapter::new());
+        let adapter: Arc<dyn ChatAdapter> = rec.clone();
+        let directives = OutputDirectives {
+            reply_to: Some("101".into()),
+            delivery: None,
+        };
+        deliver(
+            &adapter,
+            &envelope(&["first", "second"]),
+            &directives,
+            false,
+            &cfg(),
+            2000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            rec.reply_targets(),
+            vec![Some("101".to_string()), None],
+            "only the opening message quotes the trigger"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_bubble_abandons_the_rest() {
+        let rec = Arc::new(RecordingAdapter::failing_on(1));
+        let adapter: Arc<dyn ChatAdapter> = rec.clone();
+        let err = deliver(
+            &adapter,
+            &envelope(&["one", "two", "three"]),
+            &OutputDirectives::default(),
+            false,
+            &cfg(),
+            2000,
+        )
+        .await
+        .unwrap_err();
+        // "two" was attempted and failed; "three" must never be sent — a reply
+        // with a hole in the middle is worse than a truncated one.
+        assert_eq!(rec.contents(), vec!["one", "two"]);
+        assert!(err.to_string().contains("1/3"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn an_over_long_bubble_splits_without_reordering() {
+        let rec = Arc::new(RecordingAdapter::with_limit(10));
+        let adapter: Arc<dyn ChatAdapter> = rec.clone();
+        // First bubble is two lines, each within the limit but over it combined.
+        deliver(
+            &adapter,
+            &envelope(&["aaaaa\nbbbbb", "next"]),
+            &OutputDirectives::default(),
+            false,
+            &cfg(),
+            10,
+        )
+        .await
+        .unwrap();
+        let sent = rec.contents();
+        assert_eq!(sent, vec!["aaaaa", "bbbbb", "next"]);
+        assert_eq!(
+            sent.last().unwrap(),
+            "next",
+            "the second bubble still follows the first bubble's chunks"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_reset_notice_gets_its_own_leading_bubble() {
+        let rec = Arc::new(RecordingAdapter::new());
+        let adapter: Arc<dyn ChatAdapter> = rec.clone();
+        // No tool ran, so the notice is still at the head of the body.
+        let body = format!("{}{}", SESSION_RESET_NOTICE, envelope(&["hey"]));
+        deliver(
+            &adapter,
+            &body,
+            &OutputDirectives::default(),
+            true,
+            &cfg(),
+            2000,
+        )
+        .await
+        .unwrap();
+        let sent = rec.contents();
+        assert_eq!(sent.len(), 2, "notice + one bubble, got {sent:?}");
+        assert_eq!(sent[0], SESSION_RESET_NOTICE.trim());
+        assert_eq!(sent[1], "hey");
+    }
+
+    #[tokio::test]
+    async fn session_reset_notice_is_not_duplicated_after_a_tool_ran() {
+        let rec = Arc::new(RecordingAdapter::new());
+        let adapter: Arc<dyn ChatAdapter> = rec.clone();
+        // A tool advanced answer_start past the notice, so the body lacks it.
+        deliver(
+            &adapter,
+            &envelope(&["hey"]),
+            &OutputDirectives::default(),
+            true,
+            &cfg(),
+            2000,
+        )
+        .await
+        .unwrap();
+        let sent = rec.contents();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0], SESSION_RESET_NOTICE.trim());
+    }
+
+    // --- the delivery directive ---
+
+    #[test]
+    fn delivery_directive_is_parsed_alongside_reply_to() {
+        let input = "[[reply_to:123]]\n[[delivery:openab.turn.v1]]\n{}";
+        let (directives, content) = parse_output_directives(input);
+        assert_eq!(directives.reply_to.as_deref(), Some("123"));
+        assert_eq!(directives.delivery.as_deref(), Some("openab.turn.v1"));
+        assert_eq!(content, "{}");
+    }
+
+    #[test]
+    fn delivery_directive_rejects_whitespace() {
+        let (directives, _) = parse_output_directives("[[delivery:has spaces]]\nx");
+        assert_eq!(directives.delivery, None);
+    }
+
+    #[test]
+    fn delivery_directive_last_value_wins() {
+        let (directives, _) = parse_output_directives("[[delivery:a.v1]]\n[[delivery:b.v2]]\nx");
+        assert_eq!(directives.delivery.as_deref(), Some("b.v2"));
     }
 }

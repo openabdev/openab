@@ -45,7 +45,8 @@ For example, an xAI deployment can use:
 }
 ```
 
-The supported fields are `model` (a `provider/model` string) and `max_tokens`.
+The supported fields are `model` (a `provider/model` string), `max_tokens`, and
+`turn_envelope` (see [Multi-Message Replies](#multi-message-replies-turn-envelope)).
 A missing file is fine (empty config); malformed JSON is logged and ignored, so
 the agent falls back to environment variables and built-in defaults. Unknown
 keys are tolerated for forward compatibility.
@@ -80,6 +81,9 @@ does not by itself enable xAI auto-detection.
 | `OPENAB_AGENT_ANTHROPIC_CLIENT_ID` | Claude Code's client | Custom Anthropic OAuth client ID |
 | `OPENAB_AGENT_XAI_CLIENT_ID` | grok CLI's client | Custom xAI OAuth client ID |
 | `OPENAB_AGENT_MAX_TOOL_LOOPS` | `50` | Max tool-call iterations per prompt before the agent gives up |
+| `OPENAB_AGENT_TURN_ENVELOPE` | — (off) | Emit replies as an `openab.turn.v1` envelope so the broker can deliver one chat message per bubble. See [Multi-Message Replies](#multi-message-replies-turn-envelope). Overrides `turn_envelope` in config.json. |
+| `OPENAB_AGENT_MAX_BUBBLES` | `4` | Max messages per reply when the turn envelope is on. Keep at or below the broker's `[delivery] max_bubbles`. |
+| `OPENAB_AGENT_SEQUENTIAL_BUBBLES` | `false` | Deliver each bubble the moment it is decided instead of planning them all up front. Costs one model call per bubble; requires the broker in `[delivery] mode = "sequential"`. See [Sequential mode](#sequential-mode). |
 | `ANTHROPIC_API_KEY` | — | Anthropic API key. Highest-precedence Anthropic credential (see [Anthropic credentials](#anthropic-credentials)). |
 | `CLAUDE_CODE_OAUTH_TOKEN` | — | Pre-provisioned long-lived Claude Pro/Max subscription token (from `claude setup-token`). Fleet route — no interactive login, no `auth.json` write. |
 | `OPENAB_CONFIG_PATH` | `<auth dir>/config.json` | Override the config-file path. |
@@ -196,6 +200,95 @@ Place an `AGENTS.md` file in the working directory (`cwd`). It will be prepended
             └── my-skill/
                 └── SKILL.md
 ```
+
+## Multi-Message Replies (turn envelope)
+
+Off by default. When enabled, the agent stops answering in free text and instead
+calls a `reply` tool whose input is validated against the
+[`openab.turn.v1`](../docs/adr/structured-delivery.md) schema. Each entry in
+`messages` is delivered as its **own chat message**, so a reply can have
+deliberate conversational beats instead of arriving as one block.
+
+This is the producing half of [ADR: Structured Delivery](adr/structured-delivery.md);
+the broker's `[delivery] mode = "structured"` is the consuming half. **Both must be
+on** — see the pairing table below.
+
+### Enable
+
+```json
+{ "model": "anthropic/claude-opus-5", "turn_envelope": "openab.turn.v1" }
+```
+
+or, env-over-config as usual:
+
+```sh
+OPENAB_AGENT_TURN_ENVELOPE=openab.turn.v1
+OPENAB_AGENT_MAX_BUBBLES=4          # optional, default 4
+```
+
+### What the model sees
+
+A `reply` tool taking an array of strings and one enum:
+
+```json
+{ "messages": ["on it", "your flight moved to 8pm\ngate B12"], "next": "stop" }
+```
+
+The schema identifier, bubble ids and the `next` object shape are filled in by
+the agent, so the model cannot get them wrong. `next` is `stop`, `wait`, or
+`silent` (send nothing at all).
+
+A newline inside one entry stays inside one message. Splitting is by entry, never
+by line break.
+
+### Sequential mode
+
+By default the `reply` tool is **terminal**: one call carries every bubble of the
+turn, and the turn ends. Setting `OPENAB_AGENT_SEQUENTIAL_BUBBLES=true` makes it
+**non-terminal** — each call delivers immediately and the model keeps working:
+
+```sh
+OPENAB_AGENT_TURN_ENVELOPE=openab.turn.v1
+OPENAB_AGENT_SEQUENTIAL_BUBBLES=true
+```
+
+```
+envelope:    [think] ──────────────► reply(["on it", "flight moved to 8pm"])
+                                     (both decided before the lookup ran)
+
+sequential:  [think] ─► reply(["on it"]) ─► search_mail ─► reply(["flight moved to 8pm"])
+                        ↑ already on screen              ↑ decided AFTER seeing the result
+```
+
+The tool the model is shown differs between the two: in sequential mode it has no
+`next` field, because the turn ends when the model stops calling tools, and
+staying silent means never calling `reply` at all. Offering `next` there would
+invite the model to declare an intention the loop does not honour.
+
+Requires the broker in `[delivery] mode = "sequential"`, and costs one model call
+per bubble.
+
+### Pairing with the broker
+
+| Agent | Broker `[delivery] mode` | Result |
+|---|---|---|
+| `turn_envelope` unset | `text` | Plain text. The pre-existing behavior. |
+| `turn_envelope` set | `structured` | Multi-message replies, planned up front. **The recommended pairing.** |
+| `turn_envelope` + `SEQUENTIAL_BUBBLES` | `sequential` | Multi-message replies, decided one at a time. The experiment. |
+| `turn_envelope` set | `text` | The user sees raw JSON. **Do not ship this.** |
+| `turn_envelope` + `SEQUENTIAL_BUBBLES` | `structured` | Bubbles are emitted as notifications the broker ignores in this mode, and the turn returns nothing — **the user sees no reply.** Do not ship this. |
+| `turn_envelope` set (no sequential) | `sequential` | Broker receives no bubble events and falls back to delivering the turn's text — which is the envelope JSON. **Do not ship this.** |
+| `turn_envelope` unset | `structured` / `sequential` | Broker finds no envelope / no bubbles and falls back to plain text — one message. Harmless but pointless. |
+
+The `schema` string must match on both sides for `structured`. A mismatch is
+logged at agent startup and makes every turn fall back to plain text.
+
+### Persona
+
+The envelope carries *how many* messages and *when to stay silent*; it says
+nothing about voice. Voice belongs in `AGENTS.md` (see [Custom System
+Prompt](#custom-system-prompt)) — it is prepended to the system prompt, so a
+personal-assistant persona is a file, not a code change.
 
 ## Skills
 

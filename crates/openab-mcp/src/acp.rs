@@ -72,6 +72,29 @@ impl HostBridge {
         }
     }
 
+    /// Send a one-way agent→host notification: no id, no pending entry, no
+    /// wait for a reply.
+    ///
+    /// The counterpart of [`HostBridge::request`] for the cases where there is
+    /// nothing to answer — a bubble the host should deliver right now, for
+    /// instance. Returns `Err` only when no host is listening, so callers can
+    /// degrade instead of blocking. The error carries the same JSON-RPC shape
+    /// [`HostBridge::request`] uses, so both failures read alike.
+    ///
+    /// Goes through the same writer as everything else, preserving the
+    /// single-stdout-owner invariant.
+    pub fn notify(&self, method: &str, params: Value) -> Result<(), Value> {
+        let line = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        })
+        .to_string();
+        self.writer
+            .send(line)
+            .map_err(|_| json!({ "code": -32603, "message": "host channel closed" }))
+    }
+
     /// If `line` is an inbound JSON-RPC *response* to one of our outbound
     /// requests, resolve the matching pending `oneshot` and return `true`.
     /// Returns `false` for anything else (inbound requests, notifications,
