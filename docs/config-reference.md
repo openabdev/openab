@@ -225,6 +225,7 @@ Full first-class Google Chat section (config-first parity, #1379) — credential
 | `sa_key_json` | string | — | Inline service-account key JSON (wins over `sa_key_file`). Env: `GOOGLE_CHAT_SA_KEY_JSON`. |
 | `sa_key_file` | string | — | Path to a service-account key file. Env: `GOOGLE_CHAT_SA_KEY_FILE`. |
 | `access_token` | string | — | Static access token alternative. Env: `GOOGLE_CHAT_ACCESS_TOKEN`. |
+| `use_adc` | bool | `false` | Keyless ADC — mint the `chat.bot` token from the workload's own GCP identity (GCE metadata + IAM Credentials `generateAccessToken` self-impersonation); no SA key file. Needs `roles/iam.serviceAccountTokenCreator` on the SA over itself + `iamcredentials.googleapis.com`. Ignored when a SA key is set. Env: `GOOGLE_CHAT_USE_ADC`. |
 | `audience` | string | — | JWT audience — enables webhook JWT verification (L1). Env: `GOOGLE_CHAT_AUDIENCE`. |
 | `webhook_path` | string | `/webhook/googlechat` | Env: `GOOGLE_CHAT_WEBHOOK_PATH`. |
 | `allow_all_users` | bool \| omit | `false` (deny-all) | Env: `GOOGLE_CHAT_ALLOW_ALL_USERS`. |

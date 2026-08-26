@@ -35,6 +35,22 @@ fn reply_message_limit(platform: &str, adapter_limit: usize) -> usize {
     }
 }
 
+/// Whether to use cosmetic streaming (placeholder + in-place edits) for
+/// `platform`, given the adapter's own preference. Forces send-once for:
+///   - `acp`: streams append-only `agent_message_chunk` deltas, not edits.
+///   - platforms in `NON_STREAMING_PLATFORMS` — no message-edit API, or an edit
+///     API that cannot be driven per-token (e.g. `googlechat`) — see
+///     `NON_STREAMING_PLATFORMS` for the per-platform rationale and
+///     `platform_supports_streaming`.
+///
+/// This is the embedded/unified dispatch gate; the WebSocket
+/// `run_gateway_adapter` path applies the same `platform_supports_streaming` check.
+fn resolve_streaming(platform: &str, adapter_prefers_streaming: bool) -> bool {
+    platform != "acp"
+        && crate::gateway::platform_supports_streaming(platform)
+        && adapter_prefers_streaming
+}
+
 /// Parse `[[key:value]]` directives from the beginning of agent output.
 /// Returns parsed directives and the remaining content (directives stripped).
 pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
@@ -701,15 +717,14 @@ impl AdapterRouter {
         let adapter = adapter.clone();
         let thread_channel = thread_channel.clone();
         let message_limit = reply_message_limit(&thread_channel.platform, adapter.message_limit());
-        // ACP must not inherit the unified adapter's Telegram streaming flag (wrong
-        // coupling): it streams append-only `agent_message_chunk` deltas built from the
-        // post+edit (`edit_message` snapshot) path, i.e. streaming=false. Decide it
-        // explicitly by platform rather than by whatever Telegram happens to be set to.
-        let streaming = if thread_channel.platform == "acp" {
-            false
-        } else {
-            adapter.use_streaming(other_bot_present)
-        };
+        // Decide streaming explicitly by platform, not by whatever the unified
+        // adapter's Telegram flag happens to be. ACP streams append-only deltas
+        // (not cosmetic edits); Google Chat / LINE can't sustain in-place edits.
+        // See `resolve_streaming`.
+        let streaming = resolve_streaming(
+            &thread_channel.platform,
+            adapter.use_streaming(other_bot_present),
+        );
         // Keep the full turn text (incl. inter-tool narration) when streaming
         // (it was already shown live) OR when `[reactions] narration_display` is
         // set. Otherwise a send-once turn delivers only the final answer block.
@@ -1744,6 +1759,20 @@ mod tests {
         // and a long reply under the ACP limit is a single chunk (delivered whole)
         let long = "x".repeat(50_000);
         assert_eq!(crate::format::split_message(&long, reply_message_limit("acp", 4096)).len(), 1);
+    }
+
+    #[test]
+    fn resolve_streaming_forces_send_once_for_acp_and_googlechat() {
+        // Editable platforms honor the adapter's own streaming preference.
+        assert!(resolve_streaming("discord", true));
+        assert!(!resolve_streaming("discord", false));
+        assert!(resolve_streaming("telegram", true));
+        // ACP streams append-only deltas, not cosmetic edits → always send-once.
+        assert!(!resolve_streaming("acp", true));
+        // Google Chat: synthetic id can't be patched (400 INVALID_ARGUMENT) → send-once regardless of pref.
+        assert!(!resolve_streaming("googlechat", true));
+        // LINE: no edit API → send-once.
+        assert!(!resolve_streaming("line", true));
     }
 
     #[test]

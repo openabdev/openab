@@ -157,10 +157,14 @@ spec:
               value: "false"
             {{- end }}
             {{- end }}
-            {{- $hasGoogleChat := or (($cfg.gateway).googleChat).saKeyJson (($cfg.gateway).googleChat).accessToken (($cfg.gateway).googleChat).audience }}
+            {{- $hasGoogleChat := or (($cfg.gateway).googleChat).saKeyJson (($cfg.gateway).googleChat).accessToken (($cfg.gateway).googleChat).audience (($cfg.gateway).googleChat).useAdc }}
             {{- if $hasGoogleChat }}
             - name: GOOGLE_CHAT_ENABLED
               value: "true"
+            {{- if (($cfg.gateway).googleChat).useAdc }}
+            - name: GOOGLE_CHAT_USE_ADC
+              value: "true"
+            {{- end }}
             {{- if (($cfg.gateway).googleChat).audience }}
             - name: GOOGLE_CHAT_AUDIENCE
               value: {{ ($cfg.gateway).googleChat.audience | quote }}

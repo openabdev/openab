@@ -74,7 +74,7 @@ Google Chat uses a service account to authenticate outbound API calls (bot repli
 
 ## 3. Configure the Gateway
 
-The gateway supports two authentication methods for sending replies:
+The gateway supports three authentication methods for sending replies:
 
 ### Option A: Service Account Key (recommended — auto-refresh)
 
@@ -111,6 +111,29 @@ docker run -d --name openab-gateway \
   -p 8080:8080 \
   ghcr.io/openabdev/openab-gateway:latest
 ```
+
+### Option C: Keyless ADC (recommended on GCP — no key file)
+
+When the gateway runs on GCP (GKE / GCE / Cloud Run) **as** a service account, it can mint the `chat.bot` token from that identity — no service-account key file to mount, manage, or leak. The gateway reads a base token from the GCE metadata server and calls IAM Credentials `generateAccessToken` (the SA impersonates itself) for a `chat.bot`-scoped token, then caches and auto-refreshes it.
+
+Prerequisites:
+
+- The workload's service account **is** the Chat app's service account (the identity that sends must be the space member).
+- Grant that SA `roles/iam.serviceAccountTokenCreator` **on itself**.
+- Enable `iamcredentials.googleapis.com`.
+- The **base token from the metadata server must carry `cloud-platform` (or `.../auth/iam`) scope** — `generateAccessToken` requires it on the caller. GKE Workload Identity and Cloud Run tokens are `cloud-platform`-scoped and satisfy this automatically. A **default-scope GCE VM does not**: it returns `403 PERMISSION_DENIED: "Request had insufficient authentication scopes."` even when the IAM binding above is correct — match on the word *scopes* (not *permission*) to tell it apart from a missing role. GCE access scopes are **immutable after creation**: create the VM with `--scopes=cloud-platform`, or run `gcloud compute instances set-scopes <vm> --scopes=cloud-platform` followed by a stop/start.
+
+> Why self-impersonation (not plain ADC): the `chat.bot` scope is a Workspace scope and is **not** a subset of `cloud-platform`, so no `?scopes=` parameter on the metadata token can produce it. `generateAccessToken` is the only keyless way to obtain a `chat.bot` token.
+
+```bash
+# The pod/VM already runs as the target service account; no key is mounted.
+export GOOGLE_CHAT_ENABLED=true
+export GOOGLE_CHAT_USE_ADC=true
+```
+
+Precedence: if a SA key (`GOOGLE_CHAT_SA_KEY_JSON` / `GOOGLE_CHAT_SA_KEY_FILE`) is also set **and loads successfully**, the SA key wins and ADC is ignored. If a key is configured but **fails to load** (unreadable file / malformed JSON), the adapter falls back to the keyless ADC (workload) identity and logs a warning naming the switch — fix the key, or unset `use_adc` to make that failure explicit.
+
+> **Migrating an existing release from a SA key to ADC:** the chart renders the Google Chat Secret only when `saKeyJson` / `accessToken` is set, and that Secret carries `helm.sh/resource-policy: keep`. Switching to ADC-only stops Helm from managing it but **leaves the old key material in the cluster indefinitely**. Delete the orphaned Secret after the switch (`kubectl delete secret <the Secret that held the key>`), otherwise the "no key to mount or leak" benefit is undercut.
 
 ### Local development
 
@@ -199,7 +222,7 @@ Each field falls back to its `GOOGLE_CHAT_ALLOW_ALL_USERS` / `GOOGLE_CHAT_ALLOWE
   - Links: `[text](url)` → `<url|text>`
   - Inline code, fenced code blocks: pass through unchanged
   - Tables and other unsupported syntax pass through as-is
-- **Streaming (edit_message)** — when OAB streaming is enabled, the bot edits its initial reply in-place as tokens arrive (typewriter effect)
+- **Send-once (no streaming)** — Google Chat is a request/response REST surface, so the adapter posts the full reply once with no in-place editing. It is in `NON_STREAMING_PLATFORMS`; see `docs/platforms/schema/googlechat.toml` for why (the unified adapter's synthetic message id is not a valid resource name → `patch` returns `400 INVALID_ARGUMENT`, and the API documents a 1 write/sec-per-space quota).
 - **Inbound attachments** — image, text file, and audio attachments are downloaded via Google Chat Media API and stored to `~/.openab/media/inbound/<uuid>` (colocate filesystem store):
   - Images: resized to ≤1200px JPEG (q75); GIFs preserved. Max 10 MB.
   - Text files: only known text extensions (`.txt`, `.md`, `.json`, `.py`, `.rs`, etc.). Max 512 KB.
@@ -221,6 +244,7 @@ Each field falls back to its `GOOGLE_CHAT_ALLOW_ALL_USERS` / `GOOGLE_CHAT_ALLOWE
 | `GOOGLE_CHAT_SA_KEY_JSON` | No | — | Service account key JSON string (enables auto-refresh) |
 | `GOOGLE_CHAT_SA_KEY_FILE` | No | — | Path to service account key JSON file (alternative to `SA_KEY_JSON`) |
 | `GOOGLE_CHAT_ACCESS_TOKEN` | No | — | Static OAuth2 access token (fallback, expires in 1 hour) |
+| `GOOGLE_CHAT_USE_ADC` | No | `false` | Keyless ADC auth via the GCE metadata server + IAM Credentials `generateAccessToken` self-impersonation (GCP-hosted only) — see Option C. Ignored when `SA_KEY_JSON`/`SA_KEY_FILE` is set |
 | `GOOGLE_CHAT_WEBHOOK_PATH` | No | `/webhook/googlechat` | Webhook endpoint path |
 
 ## Security: Webhook Verification

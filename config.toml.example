@@ -123,6 +123,7 @@ allowed_channels = ["1234567890"]       # ↑ omitted + non-empty list → auto-
 # sa_key_json = "${GOOGLE_CHAT_SA_KEY_JSON}"   # inline SA key; wins over sa_key_file
 # sa_key_file = "/etc/openab/sa.json"   # env fallback: GOOGLE_CHAT_SA_KEY_FILE
 # access_token = "${GOOGLE_CHAT_ACCESS_TOKEN}" # static token alternative
+# use_adc = true                        # keyless ADC: mint chat.bot token from the workload's own GCP identity (GCE metadata + IAM Credentials); no SA key. env fallback: GOOGLE_CHAT_USE_ADC. Ignored when sa_key_* is set.
 # audience = "projects/<n>/..."         # enables webhook JWT verification (L1)
 # webhook_path = "/webhook/googlechat"  # env fallback: GOOGLE_CHAT_WEBHOOK_PATH
 # allow_all_users = false               # env fallback: GOOGLE_CHAT_ALLOW_ALL_USERS

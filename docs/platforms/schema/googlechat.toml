@@ -131,9 +131,9 @@ pr      = ""
 
 [[openab_features]]
 feature = "streaming"
-status  = "partial"
-note    = "No native streaming API. Gateway adapter leaves uses_native_streaming=false, so core streams via the post-then-edit_message loop; each edit sends the full accumulated text as a patch call."
-source  = ["crates/openab-gateway/src/adapters/googlechat.rs#edit_message", "crates/openab-core/src/adapter.rs#uses_native_streaming"]
+status  = "not_implemented"
+note    = "Send-once by design (no cosmetic streaming). The decisive reason is structural: the unified adapter returns a synthetic `unified_<hex>` message id that is not a valid resource name, so `spaces.messages.patch` rejects it with 400 INVALID_ARGUMENT ('Missing or malformed message resource name') before any content is applied — per-token post-then-edit cannot work at all. Separately, Google Chat documents a 1 write/sec-per-space quota (create+patch+delete combined; https://developers.google.com/workspace/chat/limits); treat that as a documented constraint on high-frequency editing rather than an observed hard failure, since enforcement is burst-tolerant in practice. googlechat is therefore in NON_STREAMING_PLATFORMS, and `resolve_streaming` forces send-once on BOTH the embedded dispatch and the WebSocket gateway paths — matching Google Chat's documented send-once default. (Previously 'partial': core attempted post-then-edit, which failed on every edit.)"
+source  = ["crates/openab-core/src/gateway.rs#NON_STREAMING_PLATFORMS", "crates/openab-core/src/adapter.rs#resolve_streaming", "crates/openab-core/src/adapter.rs#uses_native_streaming"]
 pr      = ""
 
 [[openab_features]]
@@ -243,6 +243,14 @@ title  = "Auth asymmetry: two independent credential paths"
 note   = "Inbound webhooks are authenticated by verifying Google's ID-token (email==chat@system.gserviceaccount.com, RS256 via JWKS, iss=accounts.google.com, audience-checked). Outbound API calls use a *separate* service-account → OAuth2 JWT-bearer exchange (scope=https://www.googleapis.com/auth/chat.bot), cached with a 300 s refresh margin. Missing outbound creds degrade to a logged dry-run that still acks failure to core."
 kind   = "openab_decision"
 source = "crates/openab-gateway/src/adapters/googlechat.rs#build_jwt"
+refs   = []
+
+[[quirks]]
+date   = "2026-08-25"
+title  = "Keyless ADC outbound path (no SA key)"
+note   = "Outbound creds have a third option beside the SA-key JWT-bearer exchange and the static token: keyless ADC (use_adc / GOOGLE_CHAT_USE_ADC). MetadataTokenSource reads the default SA email + a base token from the GCE metadata server, then calls IAM Credentials generateAccessToken (the SA impersonates itself) for a chat.bot-scoped token, cached with the same 300 s refresh margin. Meant for workloads that already run as the Chat app's service account on GCP — no key file to mount or leak. Requires roles/iam.serviceAccountTokenCreator on the SA over itself + iamcredentials.googleapis.com. Auth precedence in get_token: SA key (token_cache) > ADC (metadata_source) > static access_token."
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/googlechat.rs#MetadataTokenSource"
 refs   = []
 
 [[quirks]]

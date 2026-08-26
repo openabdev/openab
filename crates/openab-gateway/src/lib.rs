@@ -199,6 +199,9 @@ impl AppState {
                     std::env::var("GOOGLE_CHAT_SA_KEY_FILE").ok(),
                     std::env::var("GOOGLE_CHAT_ACCESS_TOKEN").ok(),
                     std::env::var("GOOGLE_CHAT_AUDIENCE").ok(),
+                    std::env::var("GOOGLE_CHAT_USE_ADC")
+                        .map(|v| v == "true" || v == "1")
+                        .unwrap_or(false),
                 ))
             } else {
                 None
@@ -454,6 +457,7 @@ impl AppState {
                 cfg.sa_key_file,
                 cfg.access_token,
                 cfg.audience,
+                cfg.use_adc,
             ))
         } else {
             None
@@ -554,6 +558,7 @@ pub struct GatewayGoogleChatConfig {
     pub sa_key_file: Option<String>,
     pub access_token: Option<String>,
     pub audience: Option<String>,
+    pub use_adc: bool,
     pub webhook_path: String,
 }
 
@@ -752,6 +757,9 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
                 std::env::var("GOOGLE_CHAT_SA_KEY_FILE").ok(),
                 std::env::var("GOOGLE_CHAT_ACCESS_TOKEN").ok(),
                 std::env::var("GOOGLE_CHAT_AUDIENCE").ok(),
+                std::env::var("GOOGLE_CHAT_USE_ADC")
+                    .map(|v| v == "true" || v == "1")
+                    .unwrap_or(false),
             ))
         } else {
             None
@@ -1249,6 +1257,7 @@ mod l1_audit_tests {
             sa_key_file: None,
             access_token: Some("tok".into()),
             audience: None,
+            use_adc: false,
             webhook_path: "/hook/gc".into(),
         });
         assert!(s.google_chat.is_some());
@@ -1262,6 +1271,7 @@ mod l1_audit_tests {
             sa_key_file: None,
             access_token: Some("tok".into()),
             audience: Some("aud".into()),
+            use_adc: false,
             webhook_path: "/hook/gc".into(),
         });
         assert!(flagged(&s).is_empty());
@@ -1273,6 +1283,7 @@ mod l1_audit_tests {
             sa_key_file: None,
             access_token: None,
             audience: None,
+            use_adc: false,
             webhook_path: "/hook/gc".into(),
         });
         assert!(s.google_chat.is_none());

@@ -57,12 +57,23 @@ fn platform_acks_writes(platform: &str) -> bool {
 /// for a *capability*. The right long-term model is a capability handshake at
 /// gateway-connect time ("can this adapter edit messages?"); until that exists,
 /// any new gateway platform that lacks a message-edit API MUST be added here.
-const NON_EDITABLE_PLATFORMS: &[&str] = &["line", "lineworks"];
+/// Platforms where cosmetic (typewriter) streaming — a placeholder message
+/// then rapid in-place edits — is not viable, so replies are forced send-once:
+///   - `line` / `lineworks`: no message-edit API at all.
+///   - `googlechat`: has an edit API, but the unified adapter's synthetic
+///     `unified_<hex>` message id is not a valid resource name, so `patch`
+///     rejects it with 400 INVALID_ARGUMENT before any edit applies; the
+///     documented 1 write/sec-per-space quota (create + patch + delete
+///     combined) further constrains high-frequency editing.
+///     See <https://developers.google.com/workspace/chat/limits>.
+const NON_STREAMING_PLATFORMS: &[&str] = &["line", "lineworks", "googlechat"];
 
 /// Whether cosmetic streaming (placeholder + in-place edits) is possible on
-/// `platform`. See `NON_EDITABLE_PLATFORMS`.
-fn platform_supports_streaming(platform: &str) -> bool {
-    !NON_EDITABLE_PLATFORMS.contains(&platform)
+/// `platform`. See `NON_STREAMING_PLATFORMS`. `pub(crate)` so the shared
+/// dispatch path (`AdapterRouter::stream_prompt_blocks`) can force send-once on
+/// these platforms too, not just the WebSocket `run_gateway_adapter` path.
+pub(crate) fn platform_supports_streaming(platform: &str) -> bool {
+    !NON_STREAMING_PLATFORMS.contains(&platform)
 }
 
 /// Shared filter parameters for gateway event gating.
@@ -1670,16 +1681,17 @@ mod tests {
     }
 
     #[test]
+    fn googlechat_rate_limit_forces_send_once() {
+        // Google Chat has an edit API, but the unified adapter's synthetic
+        // message id is not a valid resource name, so patch returns 400
+        // INVALID_ARGUMENT; the documented 1 write/sec-per-space quota further
+        // constrains high-frequency editing. Force send-once.
+        assert!(!platform_supports_streaming("googlechat"));
+    }
+
+    #[test]
     fn editable_platforms_still_allow_streaming() {
-        for platform in [
-            "telegram",
-            "slack",
-            "discord",
-            "feishu",
-            "teams",
-            "googlechat",
-            "wecom",
-        ] {
+        for platform in ["telegram", "slack", "discord", "feishu", "teams", "wecom"] {
             assert!(
                 platform_supports_streaming(platform),
                 "{platform} should still support streaming",

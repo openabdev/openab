@@ -480,6 +480,7 @@ agents:
         audience: ""           # JWT audience → GOOGLE_CHAT_AUDIENCE (set to your webhook URL to enable JWT verification)
         saKeyJson: ""          # Service account key JSON string → GOOGLE_CHAT_SA_KEY_JSON (recommended, auto-refresh)
         accessToken: ""        # Static OAuth2 access token → GOOGLE_CHAT_ACCESS_TOKEN (fallback, 1-hour TTL)
+        useAdc: false          # Keyless ADC → GOOGLE_CHAT_USE_ADC. Mints chat.bot token from the pod's own GCP identity (GCE metadata + IAM Credentials generateAccessToken). No SA key file. Needs roles/iam.serviceAccountTokenCreator on the SA over itself + iamcredentials.googleapis.com enabled. Ignored when saKeyJson is set.
         webhookPath: ""        # Gateway default: /webhook/googlechat → GOOGLE_CHAT_WEBHOOK_PATH
       # WeCom (企业微信) adapter config (gateway-side env vars)
       # See docs/wecom.md for full setup guide
