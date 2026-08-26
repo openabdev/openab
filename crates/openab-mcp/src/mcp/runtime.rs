@@ -26,6 +26,7 @@ use oauth2::{
     DeviceCodeErrorResponseType, RequestTokenError, Scope, StandardDeviceAuthorizationResponse,
     TokenResponse, TokenUrl,
 };
+use reqwest013::header::{HeaderName, HeaderValue, AUTHORIZATION};
 use rmcp::model::{
     ClientInfo, CreateElicitationRequestParams, CreateElicitationResult,
     CreateMessageRequestParams, CreateMessageResult, ElicitationAction, ElicitationCapability,
@@ -632,7 +633,12 @@ impl McpRuntimeManager {
     /// without touching the circuit breaker; a contended refresh lock returns
     /// [`OauthDialError::Transient`] so the caller retries without forcing
     /// re-login or tripping the breaker.
-    async fn resolve_oauth_dial(&self, name: &str, url: &str) -> Result<Dial, OauthDialError> {
+    async fn resolve_oauth_dial(
+        &self,
+        name: &str,
+        url: &str,
+        headers: HttpHeaders,
+    ) -> Result<Dial, OauthDialError> {
         let needs_login = || {
             OauthDialError::NeedsAuth(anyhow!(
                 "mcp server {name:?} needs oauth login — run `mcp login {name}`"
@@ -653,6 +659,7 @@ impl McpRuntimeManager {
         if !near_expiry {
             return Ok(Dial::Http {
                 url: url.to_string(),
+                headers,
                 client: Some(client),
             });
         }
@@ -707,6 +714,7 @@ impl McpRuntimeManager {
         })?;
         Ok(Dial::Http {
             url: url.to_string(),
+            headers,
             client: Some(client),
         })
     }
@@ -1434,10 +1442,18 @@ impl McpRuntimeManager {
                 } => DialPlan::Dial(Dial::Stdio { command, args, env }),
                 ServerConfig::Http {
                     url,
+                    headers,
                     oauth: Some(_),
                     ..
-                } => DialPlan::OauthHttp { url },
-                ServerConfig::Http { url, .. } => DialPlan::Dial(Dial::Http { url, client: None }),
+                } => DialPlan::OauthHttp {
+                    url,
+                    headers: parse_http_headers(name, headers, true)?,
+                },
+                ServerConfig::Http { url, headers, .. } => DialPlan::Dial(Dial::Http {
+                    url,
+                    headers: parse_http_headers(name, headers, false)?,
+                    client: None,
+                }),
             };
             handle.status = ServerStatus::Connecting;
             plan
@@ -1458,34 +1474,36 @@ impl McpRuntimeManager {
         // valid token resolves straight to a `Dial::Http` with the cached client.
         let dial = match plan {
             DialPlan::Dial(d) => d,
-            DialPlan::OauthHttp { url } => match self.resolve_oauth_dial(name, &url).await {
-                Ok(d) => d,
-                Err(OauthDialError::NeedsAuth(e)) => {
-                    let mut guard = self.handles.write().await;
-                    if let Some(h) = guard.get_mut(name) {
-                        // A concurrent connect() may have finished a fresh login +
-                        // dial while we were resolving. Don't clobber the winner's
-                        // Connected status with NeedsAuth.
-                        if !matches!(h.status, ServerStatus::Connected) {
-                            h.status = ServerStatus::NeedsAuth;
+            DialPlan::OauthHttp { url, headers } => {
+                match self.resolve_oauth_dial(name, &url, headers).await {
+                    Ok(d) => d,
+                    Err(OauthDialError::NeedsAuth(e)) => {
+                        let mut guard = self.handles.write().await;
+                        if let Some(h) = guard.get_mut(name) {
+                            // A concurrent connect() may have finished a fresh login +
+                            // dial while we were resolving. Don't clobber the winner's
+                            // Connected status with NeedsAuth.
+                            if !matches!(h.status, ServerStatus::Connected) {
+                                h.status = ServerStatus::NeedsAuth;
+                            }
                         }
+                        return Err(e);
                     }
-                    return Err(e);
-                }
-                Err(OauthDialError::Transient(e)) => {
-                    // Refresh lock contended (another process holds this server's
-                    // refresh). Not an auth or transport failure — leave the status
-                    // retryable (don't force re-login, don't trip the breaker); the
-                    // next connect() retries cleanly once the holder releases.
-                    let mut guard = self.handles.write().await;
-                    if let Some(h) = guard.get_mut(name) {
-                        if !matches!(h.status, ServerStatus::Connected) {
-                            h.status = ServerStatus::Disconnected;
+                    Err(OauthDialError::Transient(e)) => {
+                        // Refresh lock contended (another process holds this server's
+                        // refresh). Not an auth or transport failure — leave the status
+                        // retryable (don't force re-login, don't trip the breaker); the
+                        // next connect() retries cleanly once the holder releases.
+                        let mut guard = self.handles.write().await;
+                        if let Some(h) = guard.get_mut(name) {
+                            if !matches!(h.status, ServerStatus::Connected) {
+                                h.status = ServerStatus::Disconnected;
+                            }
                         }
+                        return Err(e);
                     }
-                    return Err(e);
                 }
-            },
+            }
         };
 
         let dial_result = dial
@@ -1909,7 +1927,40 @@ fn device_poll_error(
 /// lock is released.
 enum DialPlan {
     Dial(Dial),
-    OauthHttp { url: String },
+    OauthHttp { url: String, headers: HttpHeaders },
+}
+
+type HttpHeaders = HashMap<HeaderName, HeaderValue>;
+
+/// Convert resolved header strings into rmcp's strongly typed HTTP map.
+/// Errors identify the server and header name, but never include a header
+/// value because it commonly contains a credential.
+fn parse_http_headers(
+    name: &str,
+    raw: HashMap<String, String>,
+    oauth_enabled: bool,
+) -> Result<HttpHeaders> {
+    let mut parsed = HashMap::with_capacity(raw.len());
+    for (raw_name, raw_value) in raw {
+        let header_name = HeaderName::from_bytes(raw_name.as_bytes()).map_err(|e| {
+            anyhow!("mcp server {name:?} invalid HTTP header name {raw_name:?}: {e}")
+        })?;
+        if oauth_enabled && header_name == AUTHORIZATION {
+            return Err(anyhow!(
+                "mcp server {name:?} custom Authorization header cannot be combined with oauth"
+            ));
+        }
+        let mut header_value = HeaderValue::from_bytes(raw_value.as_bytes()).map_err(|e| {
+            anyhow!("mcp server {name:?} invalid HTTP header value for {raw_name:?}: {e}")
+        })?;
+        header_value.set_sensitive(true);
+        if parsed.insert(header_name, header_value).is_some() {
+            return Err(anyhow!(
+                "mcp server {name:?} has duplicate HTTP header {raw_name:?}"
+            ));
+        }
+    }
+    Ok(parsed)
 }
 
 /// Why [`McpRuntimeManager::resolve_oauth_dial`] couldn't produce a `Dial`.
@@ -1935,6 +1986,7 @@ enum Dial {
     },
     Http {
         url: String,
+        headers: HttpHeaders,
         /// rmcp OAuth client for oauth-protected servers (injects the bearer
         /// per request and refreshes as needed); `None` for anonymous HTTP.
         client: Option<AuthClient<reqwest013::Client>>,
@@ -2027,9 +2079,14 @@ impl Dial {
             // `with_client` yields a transport parameterised by the OAuth client,
             // a different type than the default `from_uri` transport, so each arm
             // runs `serve` itself rather than unifying to a single value.
-            Dial::Http { url, client } => match client {
+            Dial::Http {
+                url,
+                headers,
+                client,
+            } => match client {
                 Some(client) => {
-                    let cfg = StreamableHttpClientTransportConfig::with_uri(url.as_str());
+                    let cfg = StreamableHttpClientTransportConfig::with_uri(url.as_str())
+                        .custom_headers(headers);
                     let transport = StreamableHttpClientTransport::with_client(client, cfg);
                     OpenabClientHandler::new(
                         name.to_string(),
@@ -2043,7 +2100,9 @@ impl Dial {
                     .with_context(|| format!("mcp handshake with {url:?}"))
                 }
                 None => {
-                    let transport = StreamableHttpClientTransport::from_uri(url.as_str());
+                    let cfg = StreamableHttpClientTransportConfig::with_uri(url.as_str())
+                        .custom_headers(headers);
+                    let transport = StreamableHttpClientTransport::from_config(cfg);
                     OpenabClientHandler::new(
                         name.to_string(),
                         tools_cache,
@@ -2481,6 +2540,131 @@ mod tests {
             ServerStatus::Failed(_) => {}
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn connect_http_sends_configured_headers_on_the_wire() {
+        use axum::http::StatusCode;
+        use axum::response::{IntoResponse, Response};
+
+        async fn require_test_header(
+            request: axum::extract::Request,
+            next: axum::middleware::Next,
+        ) -> Response {
+            let allowed = request
+                .headers()
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+                == Some("wire-secret");
+            if allowed {
+                next.run(request).await
+            } else {
+                StatusCode::UNAUTHORIZED.into_response()
+            }
+        }
+
+        let router = crate::mcp::facade::build_router(
+            McpRuntimeManager::from_config(McpConfig::default()),
+            Vec::new(),
+            crate::mcp::sources::SessionTokens::new(),
+        )
+        .layer(axum::middleware::from_fn(require_test_header));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let cfg: McpConfig = serde_json::from_value(serde_json::json!({
+            "mcpServers": {
+                "protected": {
+                    "type": "http",
+                    "url": format!("http://{addr}/mcp"),
+                    "headers": { "X-API-Key": "wire-secret" }
+                }
+            }
+        }))
+        .unwrap();
+        let mgr = McpRuntimeManager::from_config(cfg);
+        mgr.connect("protected").await.unwrap();
+        assert_eq!(mgr.statuses().await[0].1, ServerStatus::Connected);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn connect_http_rejects_invalid_headers_without_leaking_values() {
+        for (header_name, header_value, expected) in [
+            (
+                "bad header",
+                "name-secret-must-not-leak",
+                "invalid HTTP header name",
+            ),
+            (
+                "X-API-Key",
+                "value-secret-must-not-leak\n",
+                "invalid HTTP header value",
+            ),
+        ] {
+            let cfg: McpConfig = serde_json::from_value(serde_json::json!({
+                "mcpServers": {
+                    "protected": {
+                        "type": "http",
+                        "url": "http://127.0.0.1:1/mcp",
+                        "headers": { header_name: header_value }
+                    }
+                }
+            }))
+            .unwrap();
+            let mgr = McpRuntimeManager::from_config(cfg);
+            let err = mgr.connect("protected").await.unwrap_err().to_string();
+            assert!(err.contains("protected"), "expected server context: {err}");
+            assert!(err.contains(header_name), "expected header name: {err}");
+            assert!(err.contains(expected), "got: {err}");
+            assert!(
+                !err.contains("secret-must-not-leak"),
+                "header value leaked: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_http_rejects_custom_authorization_with_oauth() {
+        let cfg: McpConfig = serde_json::from_value(serde_json::json!({
+            "mcpServers": {
+                "protected": {
+                    "type": "http",
+                    "url": "https://mcp.example.com/mcp",
+                    "headers": { "Authorization": "Bearer custom-secret-must-not-leak" },
+                    "oauth": { "provider": "linear" }
+                }
+            }
+        }))
+        .unwrap();
+        let mgr = McpRuntimeManager::from_config(cfg);
+        let err = mgr.connect("protected").await.unwrap_err().to_string();
+        assert!(err.contains("protected"), "expected server context: {err}");
+        assert!(err.contains("Authorization"), "got: {err}");
+        assert!(err.contains("oauth"), "got: {err}");
+        assert!(
+            !err.contains("custom-secret-must-not-leak"),
+            "header value leaked: {err}"
+        );
+    }
+
+    #[test]
+    fn http_headers_reject_case_variant_duplicates() {
+        let err = parse_http_headers(
+            "protected",
+            HashMap::from([
+                ("X-Key".to_string(), "first".to_string()),
+                ("x-key".to_string(), "second".to_string()),
+            ]),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("protected"), "expected server context: {err}");
+        assert!(err.contains("duplicate HTTP header"), "got: {err}");
     }
 
     #[tokio::test]

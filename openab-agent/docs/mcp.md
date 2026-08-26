@@ -22,10 +22,38 @@ LLM-driven dispatch loop. Two consequences run through every capability below:
 It connects over **stdio** and **streamable HTTP** transports (SSE retry honoured
 where rmcp supports it).
 
+### Custom HTTP headers
+
+The native `openab-agent` can send per-request custom headers to remote HTTP MCP
+servers. Keep credential values out of `mcp.json` by resolving them from the
+agent process environment:
+
+```json
+{
+  "mcpServers": {
+    "remote": {
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": {
+        "X-API-Key": "${env:REMOTE_MCP_API_KEY}"
+      }
+    }
+  }
+}
+```
+
+Every header value supports the same `${env:VAR}` interpolation as other MCP
+configuration strings. A missing variable or invalid HTTP header fails only
+that server; other configured servers remain available. Validation errors name
+the server and header, but do not include the header value. When an `oauth`
+block is configured, a custom `Authorization` header is rejected so the OAuth
+bearer token remains unambiguous.
+
 ## Capability matrix (openab-agent)
 
 | Capability | Status | Summary |
 |---|---|---|
+| Custom HTTP headers | ✅ | Per-server headers over streamable HTTP; values support `${env:VAR}` interpolation. |
 | Tools (list / call / describe) | ✅ | Full; enriched projection (title, annotations, schema, task-support). |
 | JSON Schema dialect | ✅ validated | `call` args validated against `inputSchema` (`jsonschema`); draft auto-detected (draft 4/6/7/2019-09/2020-12, absent ⇒ 2020-12); uncompilable dialect refused. |
 | `_meta` keys | ✅ opaque | Never read or rewritten; passed through untouched. |

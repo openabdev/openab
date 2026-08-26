@@ -418,6 +418,11 @@ Single root key `mcpServers` to match Claude Code / Codex / Cursor / Cline conve
       "url": "https://mcp.linear.app/mcp",
       "oauth": { "provider": "linear" }
     },
+    "remote": {
+      "type": "http",
+      "url": "https://mcp.example.com/mcp",
+      "headers": { "X-API-Key": "${env:REMOTE_MCP_API_KEY}" }
+    },
     "fs": {
       "type": "stdio",
       "command": "mcp-server-filesystem",
@@ -428,7 +433,9 @@ Single root key `mcpServers` to match Claude Code / Codex / Cursor / Cline conve
 }
 ```
 
-- `${env:VAR}` interpolation matches Cursor / Cline; missing var = startup error for that server (others continue)
+- `${env:VAR}` interpolation matches Cursor / Cline across string values,
+  including HTTP headers; missing var = startup error for that server (others
+  continue)
 - `tool_filter` supports `include` / `exclude` glob lists (lifted from OpenHands' `filter_tools_regex`)
 - Per-server failure isolated — one bad server does not block agent boot
 

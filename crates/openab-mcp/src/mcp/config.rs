@@ -77,6 +77,10 @@ pub enum ServerConfig {
     #[serde(alias = "streamable-http")]
     Http {
         url: String,
+        /// Custom headers sent with every HTTP MCP request. Values support
+        /// the same `${env:VAR}` interpolation as the rest of `mcp.json`.
+        #[serde(default)]
+        headers: HashMap<String, String>,
         #[serde(default)]
         oauth: Option<OAuthConfig>,
         #[serde(default, rename = "tool_filter")]
@@ -539,7 +543,7 @@ pub fn interpolate_env(input: &str, env: &HashMap<String, String>) -> Result<Str
         let after = &rest[start + "${env:".len()..];
         let end = after
             .find('}')
-            .ok_or_else(|| anyhow!("unterminated ${{env:..}} in {input:?}"))?;
+            .ok_or_else(|| anyhow!("unterminated ${{env:..}} placeholder"))?;
         let var = &after[..end];
         let val = env
             .get(var)
@@ -691,8 +695,14 @@ mod tests {
             _ => panic!("expected stdio"),
         }
         match cfg.servers.get("linear").unwrap() {
-            ServerConfig::Http { url, oauth, .. } => {
+            ServerConfig::Http {
+                url,
+                headers,
+                oauth,
+                ..
+            } => {
                 assert_eq!(url, "https://mcp.linear.app/mcp");
+                assert!(headers.is_empty(), "headers must default to empty");
                 assert_eq!(oauth.as_ref().unwrap().provider.as_deref(), Some("linear"));
             }
             _ => panic!("expected http"),
@@ -943,6 +953,70 @@ mod tests {
     }
 
     #[test]
+    fn http_headers_parse_and_resolve_env_values() {
+        let cfg: ServerConfig = serde_json::from_str(
+            r#"{
+                "type": "http",
+                "url": "https://mcp.example.com/mcp",
+                "headers": {
+                    "X-API-Key": "${env:REMOTE_MCP_API_KEY}",
+                    "X-Client-Version": "test"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let resolved = cfg
+            .resolved_with_env("remote", &env(&[("REMOTE_MCP_API_KEY", "resolved-secret")]))
+            .unwrap();
+        match resolved {
+            ServerConfig::Http { headers, .. } => {
+                assert_eq!(headers.get("X-API-Key").unwrap(), "resolved-secret");
+                assert_eq!(headers.get("X-Client-Version").unwrap(), "test");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn http_header_missing_env_is_isolated_and_names_the_variable() {
+        let cfg: ServerConfig = serde_json::from_str(
+            r#"{
+                "type": "http",
+                "url": "https://mcp.example.com/mcp",
+                "headers": { "X-API-Key": "${env:REMOTE_MCP_API_KEY}" }
+            }"#,
+        )
+        .unwrap();
+
+        let err = cfg.resolved_with_env("remote", &env(&[])).unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("remote"), "expected server context: {err}");
+        assert!(
+            err.contains("REMOTE_MCP_API_KEY"),
+            "expected missing env name: {err}"
+        );
+    }
+
+    #[test]
+    fn http_header_unterminated_env_does_not_leak_value() {
+        let cfg: ServerConfig = serde_json::from_str(
+            r#"{
+                "type": "http",
+                "url": "https://mcp.example.com/mcp",
+                "headers": { "X-API-Key": "canary-secret${env:REMOTE_MCP_API_KEY" }
+            }"#,
+        )
+        .unwrap();
+
+        let err = cfg.resolved_with_env("remote", &env(&[])).unwrap_err();
+        let err = format!("{err:#}");
+        assert!(err.contains("remote"), "expected server context: {err}");
+        assert!(err.contains("unterminated"), "got: {err}");
+        assert!(!err.contains("canary-secret"), "header value leaked: {err}");
+    }
+
+    #[test]
     fn validate_tolerates_env_placeholder_in_urls() {
         // Boot validation must not false-reject an unresolved placeholder.
         let oauth = custom("${env:AUTH_URL}", "${env:TOKEN_URL}");
@@ -952,6 +1026,7 @@ mod tests {
     fn http_with_oauth(oauth: OAuthConfig) -> ServerConfig {
         ServerConfig::Http {
             url: "https://example.com/mcp".into(),
+            headers: HashMap::new(),
             oauth: Some(oauth),
             tool_filter: None,
             request_timeout_secs: default_request_timeout_secs(),
