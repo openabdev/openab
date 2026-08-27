@@ -43,9 +43,15 @@ agent process environment:
 ```
 
 Every header value supports the same `${env:VAR}` interpolation as other MCP
-configuration strings. A missing variable or invalid HTTP header fails only
-that server; other configured servers remain available. Validation errors name
-the server and header, but do not include the header value. When an `oauth`
+configuration strings; header names are literal and do not support
+interpolation. Header names are case-insensitive under HTTP semantics, so
+case-variant duplicates such as `X-Key` and `x-key` are rejected. Headers owned
+by the transport (`Accept`, `MCP-Session-Id`, and `Last-Event-ID`) are also
+rejected. Malformed literal headers fail configuration validation before any
+connection attempt. Values produced by environment resolution are validated
+again at connection time; a missing variable or invalid resolved value marks
+that server as failed without charging its transport circuit breaker. Errors
+name the server and header but never include the header value. When an `oauth`
 block is configured, a custom `Authorization` header is rejected so the OAuth
 bearer token remains unambiguous.
 

@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
+use reqwest013::header::{HeaderName, HeaderValue, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -465,15 +466,16 @@ impl McpConfig {
         Ok(merged)
     }
 
-    /// Validate every server's `oauth` block (ADR §6.3 boot check). Returns
-    /// the first failure — finer-grained per-server isolation lives in §5.6.
+    /// Validate every server's OAuth block and literal HTTP headers before
+    /// connection. Resolved environment-backed values are validated again at
+    /// connect time because placeholders may expand to invalid bytes.
     pub fn validate(&self) -> Result<()> {
         for (name, server) in &self.servers {
-            if let ServerConfig::Http {
-                oauth: Some(oauth), ..
-            } = server
-            {
-                oauth.validate(name)?;
+            if let ServerConfig::Http { headers, oauth, .. } = server {
+                if let Some(oauth) = oauth {
+                    oauth.validate(name)?;
+                }
+                parse_http_headers(name, headers, oauth.is_some())?;
             }
         }
         Ok(())
@@ -484,6 +486,48 @@ impl McpConfig {
             .with_context(|| format!("read mcp config {}", path.display()))?;
         serde_json::from_str(&raw).with_context(|| format!("parse mcp config {}", path.display()))
     }
+}
+
+pub(crate) type HttpHeaders = HashMap<HeaderName, HeaderValue>;
+
+/// Convert configured header strings into rmcp's typed HTTP map. This is
+/// shared by boot validation and connect-time resolution so both paths use
+/// the same syntax, duplicate, OAuth-conflict, and transport-reservation
+/// rules. Errors never include a header value because it may be a credential.
+pub(crate) fn parse_http_headers(
+    server: &str,
+    raw: &HashMap<String, String>,
+    oauth_enabled: bool,
+) -> Result<HttpHeaders> {
+    let mut parsed = HashMap::with_capacity(raw.len());
+    for (raw_name, raw_value) in raw {
+        let header_name = HeaderName::from_bytes(raw_name.as_bytes()).map_err(|e| {
+            anyhow!("mcp server {server:?} invalid HTTP header name {raw_name:?}: {e}")
+        })?;
+        if matches!(
+            header_name.as_str(),
+            "accept" | "mcp-session-id" | "last-event-id"
+        ) {
+            return Err(anyhow!(
+                "mcp server {server:?} custom HTTP header {raw_name:?} is reserved by the rmcp transport"
+            ));
+        }
+        if oauth_enabled && header_name == AUTHORIZATION {
+            return Err(anyhow!(
+                "mcp server {server:?} custom Authorization header cannot be combined with oauth"
+            ));
+        }
+        let mut header_value = HeaderValue::from_bytes(raw_value.as_bytes()).map_err(|e| {
+            anyhow!("mcp server {server:?} invalid HTTP header value for {raw_name:?}: {e}")
+        })?;
+        header_value.set_sensitive(true);
+        if parsed.insert(header_name, header_value).is_some() {
+            return Err(anyhow!(
+                "mcp server {server:?} has duplicate HTTP header {raw_name:?} (HTTP header names are case-insensitive)"
+            ));
+        }
+    }
+    Ok(parsed)
 }
 
 impl ServerConfig {
@@ -976,6 +1020,103 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn validate_http_headers_rejects_literal_errors_and_reserved_names() {
+        for (header_name, header_value, expected) in [
+            (
+                "bad header",
+                "name-secret-must-not-leak",
+                "invalid HTTP header name",
+            ),
+            (
+                "X-API-Key",
+                "value-secret-must-not-leak\n",
+                "invalid HTTP header value",
+            ),
+            (
+                "Accept",
+                "accept-secret-must-not-leak",
+                "reserved by the rmcp transport",
+            ),
+            (
+                "MCP-Session-Id",
+                "session-secret-must-not-leak",
+                "reserved by the rmcp transport",
+            ),
+            (
+                "Last-Event-ID",
+                "event-secret-must-not-leak",
+                "reserved by the rmcp transport",
+            ),
+        ] {
+            let cfg: McpConfig = serde_json::from_value(serde_json::json!({
+                "mcpServers": {
+                    "protected": {
+                        "type": "http",
+                        "url": "https://mcp.example.com/mcp",
+                        "headers": { header_name: header_value }
+                    }
+                }
+            }))
+            .unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("protected"), "expected server context: {err}");
+            assert!(err.contains(header_name), "expected header name: {err}");
+            assert!(err.contains(expected), "got: {err}");
+            assert!(!err.contains("secret-must-not-leak"), "value leaked: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_http_headers_rejects_case_variants_and_oauth_authorization() {
+        let duplicate: McpConfig = serde_json::from_value(serde_json::json!({
+            "mcpServers": {
+                "protected": {
+                    "type": "http",
+                    "url": "https://mcp.example.com/mcp",
+                    "headers": { "X-Key": "first", "x-key": "second" }
+                }
+            }
+        }))
+        .unwrap();
+        let err = duplicate.validate().unwrap_err().to_string();
+        assert!(err.contains("case-insensitive"), "got: {err}");
+
+        let oauth: McpConfig = serde_json::from_value(serde_json::json!({
+            "mcpServers": {
+                "protected": {
+                    "type": "http",
+                    "url": "https://mcp.example.com/mcp",
+                    "headers": { "Authorization": "secret-must-not-leak" },
+                    "oauth": { "provider": "linear" }
+                }
+            }
+        }))
+        .unwrap();
+        let err = oauth.validate().unwrap_err().to_string();
+        assert!(err.contains("Authorization"), "got: {err}");
+        assert!(err.contains("oauth"), "got: {err}");
+        assert!(!err.contains("secret-must-not-leak"), "value leaked: {err}");
+    }
+
+    #[test]
+    fn validate_http_headers_allows_value_placeholders_and_protocol_version() {
+        let cfg: McpConfig = serde_json::from_value(serde_json::json!({
+            "mcpServers": {
+                "protected": {
+                    "type": "http",
+                    "url": "https://mcp.example.com/mcp",
+                    "headers": {
+                        "X-API-Key": "${env:REMOTE_MCP_API_KEY}",
+                        "MCP-Protocol-Version": "2025-06-18"
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        cfg.validate().unwrap();
     }
 
     #[test]

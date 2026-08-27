@@ -434,10 +434,16 @@ Single root key `mcpServers` to match Claude Code / Codex / Cursor / Cline conve
 ```
 
 - `${env:VAR}` interpolation matches Cursor / Cline across string values,
-  including HTTP headers; missing var = startup error for that server (others
-  continue)
+  including HTTP header values; header names are literal and are not interpolated
+- HTTP header names are case-insensitive; case-variant duplicates and
+  transport-owned names (`Accept`, `MCP-Session-Id`, `Last-Event-ID`) are
+  rejected before connection
+- Malformed literal headers fail configuration validation before connection;
+  missing or invalid resolved values mark only that server failed at connect time
+  without charging its transport circuit breaker
 - `tool_filter` supports `include` / `exclude` glob lists (lifted from OpenHands' `filter_tools_regex`)
-- Per-server failure isolated — one bad server does not block agent boot
+- Runtime resolution and transport failures are isolated per server; literal
+  configuration validation failures are reported before manager construction
 
 ### 5.7 Lifecycle
 
