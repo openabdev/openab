@@ -538,6 +538,9 @@ impl McpRuntimeManager {
             .servers
             .into_iter()
             .map(|(name, config)| {
+                // Layered loading preserves malformed header entries so the
+                // runtime can isolate them as `Failed` instead of dropping
+                // every sibling server before manager construction.
                 let status = match &config {
                     ServerConfig::Http { headers, oauth, .. } => {
                         match parse_http_headers(&name, headers, oauth.is_some()) {
@@ -1959,14 +1962,18 @@ enum DialPlan {
     OauthHttp { url: String, headers: HttpHeaders },
 }
 
-/// Build the reqwest client used for MCP traffic. Automatic redirects are
-/// disabled so arbitrary credential-bearing custom headers cannot be replayed
-/// to a redirect target. Both anonymous and OAuth-backed transports use this
-/// builder; OAuth token/discovery requests also fail closed on redirects.
+/// Build the reqwest client used by cached OAuth MCP traffic. Automatic
+/// redirects are disabled so arbitrary credential-bearing custom headers
+/// cannot be replayed to a redirect target. The default idle pool is retained
+/// so sequential OAuth-backed MCP requests can reuse TCP/TLS connections.
 fn mcp_http_client_builder() -> reqwest013::ClientBuilder {
-    reqwest013::Client::builder()
-        .pool_max_idle_per_host(0)
-        .redirect(reqwest013::redirect::Policy::none())
+    reqwest013::Client::builder().redirect(reqwest013::redirect::Policy::none())
+}
+
+/// Match rmcp's anonymous Streamable HTTP client policy: no idle connection
+/// pool, but with redirects explicitly disabled for custom-header safety.
+fn anonymous_mcp_http_client_builder() -> reqwest013::ClientBuilder {
+    mcp_http_client_builder().pool_max_idle_per_host(0)
 }
 
 /// Why [`McpRuntimeManager::resolve_oauth_dial`] couldn't produce a `Dial`.
@@ -2082,9 +2089,9 @@ impl Dial {
                 .await
                 .with_context(|| format!("mcp handshake with {command:?}"))
             }
-            // `with_client` yields a transport parameterised by the OAuth client,
-            // a different type than the default `from_uri` transport, so each arm
-            // runs `serve` itself rather than unifying to a single value.
+            // The two arms use different concrete client types (`AuthClient`
+            // versus `reqwest::Client`), so each arm runs `serve` itself rather
+            // than trying to unify the parameterised transport values.
             Dial::Http {
                 url,
                 headers,
@@ -2108,7 +2115,7 @@ impl Dial {
                 None => {
                     let cfg = StreamableHttpClientTransportConfig::with_uri(url.as_str())
                         .custom_headers(headers);
-                    let client = mcp_http_client_builder()
+                    let client = anonymous_mcp_http_client_builder()
                         .build()
                         .context("build redirect-safe mcp http client")?;
                     let transport = StreamableHttpClientTransport::with_client(client, cfg);
@@ -2240,6 +2247,52 @@ mod tests {
             }
         }))
         .unwrap();
+        let mgr = McpRuntimeManager::from_config(cfg);
+        let statuses = mgr.statuses().await;
+        assert_eq!(statuses.len(), 2);
+        match &statuses[0] {
+            (name, ServerStatus::Failed(message)) => {
+                assert_eq!(name, "bad");
+                assert!(message.contains("reserved by the rmcp transport"));
+                assert!(!message.contains("secret-must-not-leak"));
+            }
+            other => panic!("expected isolated Failed status, got {other:?}"),
+        }
+        assert_eq!(
+            statuses[1],
+            ("good".to_string(), ServerStatus::Disconnected)
+        );
+    }
+
+    #[tokio::test]
+    async fn layered_load_keeps_valid_siblings_when_one_header_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("mcp.json");
+        std::fs::write(
+            &project,
+            r#"{
+                "mcpServers": {
+                    "bad": {
+                        "type": "http",
+                        "url": "https://bad.example/mcp",
+                        "headers": { "Accept": "secret-must-not-leak" }
+                    },
+                    "good": {
+                        "type": "stdio",
+                        "command": "good-server"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let cfg = McpConfig::load_layered(None, Some(&project)).unwrap();
+        assert_eq!(cfg.servers.len(), 2, "layered load must preserve siblings");
+        assert!(
+            cfg.validate().is_err(),
+            "explicit strict validation must still reject the bad literal header"
+        );
+
         let mgr = McpRuntimeManager::from_config(cfg);
         let statuses = mgr.statuses().await;
         assert_eq!(statuses.len(), 2);
@@ -2887,6 +2940,69 @@ mod tests {
 
         redirect_server.abort();
         redirected_server.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_http_client_reuses_idle_http_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn serve_connection(mut socket: tokio::net::TcpStream) {
+            let mut buffered = Vec::new();
+            loop {
+                let header_end = loop {
+                    if let Some(pos) = buffered.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break pos + 4;
+                    }
+                    let mut chunk = [0_u8; 1024];
+                    let Ok(read) = socket.read(&mut chunk).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    buffered.extend_from_slice(&chunk[..read]);
+                };
+                buffered.drain(..header_end);
+                if socket
+                    .write_all(
+                        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n",
+                    )
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn({
+            let accepted = accepted.clone();
+            async move {
+                loop {
+                    let (socket, _) = listener.accept().await.unwrap();
+                    accepted.fetch_add(1, Ordering::SeqCst);
+                    tokio::spawn(serve_connection(socket));
+                }
+            }
+        });
+
+        let client = mcp_http_client_builder().build().unwrap();
+        let url = format!("http://{addr}/reuse");
+        for _ in 0..2 {
+            let response = client.get(&url).send().await.unwrap();
+            assert_eq!(response.status(), reqwest013::StatusCode::NO_CONTENT);
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "cached OAuth MCP client must reuse its idle HTTP/1.1 connection"
+        );
+
+        server.abort();
     }
 
     #[tokio::test]

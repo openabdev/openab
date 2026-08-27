@@ -437,8 +437,9 @@ impl McpConfig {
             // A5: isolate parse failures per layer. A malformed layer (e.g. a
             // broken project config) must not drop the servers contributed by
             // the other layers, so a read/parse error warns and skips this
-            // layer. Semantic validation of the merged result below still
-            // hard-fails.
+            // layer. Whole-config OAuth policy validation below still
+            // hard-fails; literal header errors remain attached to each server
+            // and are surfaced by the runtime manager.
             let layer = match Self::load_file(path) {
                 Ok(layer) => layer,
                 Err(err) => {
@@ -462,20 +463,36 @@ impl McpConfig {
                 merged.max_concurrent_servers = layer.max_concurrent_servers;
             }
         }
-        merged.validate()?;
+        // OAuth policy remains a whole-config boot invariant. Literal HTTP
+        // header errors are intentionally left to `McpRuntimeManager`, which
+        // records them per server so one bad entry cannot remove its siblings.
+        merged.validate_oauth_blocks()?;
         Ok(merged)
     }
 
     /// Validate every server's OAuth block and literal HTTP headers before
     /// connection. Resolved environment-backed values are validated again at
     /// connect time because placeholders may expand to invalid bytes.
+    ///
+    /// Production layered loading validates OAuth here but defers header
+    /// failures to the runtime manager for per-server `Failed` isolation.
     pub fn validate(&self) -> Result<()> {
+        self.validate_oauth_blocks()?;
         for (name, server) in &self.servers {
             if let ServerConfig::Http { headers, oauth, .. } = server {
-                if let Some(oauth) = oauth {
-                    oauth.validate(name)?;
-                }
                 parse_http_headers(name, headers, oauth.is_some())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_oauth_blocks(&self) -> Result<()> {
+        for (name, server) in &self.servers {
+            if let ServerConfig::Http {
+                oauth: Some(oauth), ..
+            } = server
+            {
+                oauth.validate(name)?;
             }
         }
         Ok(())
