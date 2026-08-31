@@ -153,7 +153,7 @@ pr      = ""
 [[openab_features]]
 feature = "delete_message"
 status  = "not_implemented"
-note    = "GatewayAdapter overrides delete_message to emit a fire-and-forget command:\"delete_message\" instead of the trait default (edit-to-zero-width). The googlechat adapter does not match delete_message in handle_reply (only add_reaction/remove_reaction/create_topic/edit_message), so it falls through to the send path with empty text → hits the empty-message short-circuit and sends nothing. Net: delete is a no-op on Google Chat."
+note    = "GatewayAdapter emits a fire-and-forget command:\"delete_message\" instead of the trait default (edit-to-zero-width). The googlechat adapter explicitly matches delete_message with the other unsupported commands and returns before token resolution, logging, or network I/O. Net: delete is an intentional no-op on Google Chat."
 source  = ["crates/openab-gateway/src/adapters/googlechat.rs#handle_reply", "crates/openab-core/src/gateway.rs#delete_message", "crates/openab-core/src/adapter.rs#delete_message"]
 pr      = ""
 
@@ -295,8 +295,8 @@ refs   = []
 
 [[quirks]]
 date   = "2026-07-04"
-title  = "Delete is a silent no-op (not even the edit fallback)"
-note   = "Unlike platforms where delete_message falls back to the trait's edit-to-zero-width, on Google Chat the delete_message command isn't matched in handle_reply, falls through to the send path with empty text, and hits the empty-message short-circuit — so nothing is sent and no edit occurs. Streaming-placeholder cleanup that relies on delete is therefore a no-op here."
+title  = "Delete is an explicit no-op (not even the edit fallback)"
+note   = "Unlike platforms where delete_message falls back to the trait's edit-to-zero-width, Google Chat matches the delete_message command in handle_reply and returns before token resolution, logging, or network I/O. Streaming-placeholder cleanup that relies on delete is therefore an intentional no-op here."
 kind   = "openab_decision"
 source = "crates/openab-gateway/src/adapters/googlechat.rs#handle_reply"
 refs   = []

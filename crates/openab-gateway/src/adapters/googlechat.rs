@@ -436,7 +436,13 @@ impl GoogleChatAdapter {
     ) {
         // Command routing
         match reply.command.as_deref() {
-            Some("add_reaction") | Some("remove_reaction") | Some("create_topic") => return,
+            // Google Chat does not support these gateway commands. Return before
+            // token resolution or send-path logging/network I/O; in particular,
+            // `delete_message` must not fall through as an empty send.
+            Some("add_reaction")
+            | Some("remove_reaction")
+            | Some("create_topic")
+            | Some("delete_message") => return,
             Some("edit_message") => {
                 // Google Chat is send-once (see core's `NON_STREAMING_PLATFORMS`):
                 // the unified adapter's synthetic `unified_<hex>` id is not a
@@ -2499,6 +2505,38 @@ mod tests {
 
         adapter.handle_reply(&reply, &event_tx).await;
         // MockServer verifies the expect(0) on drop.
+    }
+
+    #[tokio::test]
+    async fn handle_reply_delete_message_is_explicit_noop() {
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(16);
+        let adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "spaces/SP/messages/msg1".into(),
+            platform: "googlechat".into(),
+            channel: ReplyChannel {
+                id: "spaces/SP".into(),
+                thread_id: None,
+            },
+            content: Content {
+                content_type: "text".into(),
+                attachments: Vec::new(),
+                text: String::new(),
+            },
+            command: Some("delete_message".into()),
+            // Under the old fallthrough behavior this request id produced an
+            // "empty message" GatewayResponse. Explicit command routing emits
+            // no response and performs no token/network work.
+            request_id: Some("req_delete".into()),
+            quote_message_id: None,
+        };
+
+        adapter.handle_reply(&reply, &event_tx).await;
+        assert!(
+            event_rx.try_recv().is_err(),
+            "delete_message must return before the empty-send response path"
+        );
     }
 
     // --- Bot filtering logic test ---
