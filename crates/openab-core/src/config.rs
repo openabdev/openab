@@ -1228,8 +1228,10 @@ pub struct GoogleChatConfig {
     /// Use keyless ADC (GCE metadata server + IAM Credentials
     /// `generateAccessToken` self-impersonation) to mint the `chat.bot` token,
     /// instead of a SA key file or a static token. Env fallback:
-    /// `GOOGLE_CHAT_USE_ADC` (`true`/`1`; default false). Ignored when a SA key
-    /// is configured — the SA key takes precedence.
+    /// `GOOGLE_CHAT_USE_ADC` (`true`/`1`; default false). Ignored when a
+    /// configured SA key loads successfully — the SA key takes precedence; a
+    /// key that fails to load falls back to ADC with a warning naming the
+    /// identity switch (see docs/google-chat.md Option C).
     pub use_adc: Option<bool>,
 }
 
