@@ -72,6 +72,12 @@ const NON_STREAMING_PLATFORMS: &[&str] = &["line", "lineworks", "googlechat"];
 /// `platform`. See `NON_STREAMING_PLATFORMS`. `pub(crate)` so the shared
 /// dispatch path (`AdapterRouter::stream_prompt_blocks`) can force send-once on
 /// these platforms too, not just the WebSocket `run_gateway_adapter` path.
+///
+/// Sibling gate: the embedded/unified dispatch path wraps this in
+/// `adapter::resolve_streaming`, which additionally forces send-once for
+/// `acp` (embedded-only, streams append-only deltas). An embedded-only
+/// non-streaming platform must be handled there — adding it to the shared
+/// list above covers both paths, but a platform-specific carve-out does not.
 pub(crate) fn platform_supports_streaming(platform: &str) -> bool {
     !NON_STREAMING_PLATFORMS.contains(&platform)
 }

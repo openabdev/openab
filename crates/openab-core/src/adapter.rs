@@ -44,7 +44,10 @@ fn reply_message_limit(platform: &str, adapter_limit: usize) -> usize {
 ///     `platform_supports_streaming`.
 ///
 /// This is the embedded/unified dispatch gate; the WebSocket
-/// `run_gateway_adapter` path applies the same `platform_supports_streaming` check.
+/// `run_gateway_adapter` path applies the same `platform_supports_streaming`
+/// check but has no `acp` case (ACP is embedded-only). The two gates are
+/// siblings: adding a platform to `NON_STREAMING_PLATFORMS` covers both
+/// paths, while an embedded-only carve-out belongs here.
 fn resolve_streaming(platform: &str, adapter_prefers_streaming: bool) -> bool {
     platform != "acp"
         && crate::gateway::platform_supports_streaming(platform)

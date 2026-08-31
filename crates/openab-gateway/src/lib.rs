@@ -195,13 +195,15 @@ impl AppState {
                 .unwrap_or(false);
             if enabled {
                 Some(adapters::googlechat::GoogleChatAdapter::from_parts(
-                    std::env::var("GOOGLE_CHAT_SA_KEY_JSON").ok(),
-                    std::env::var("GOOGLE_CHAT_SA_KEY_FILE").ok(),
-                    std::env::var("GOOGLE_CHAT_ACCESS_TOKEN").ok(),
-                    std::env::var("GOOGLE_CHAT_AUDIENCE").ok(),
-                    std::env::var("GOOGLE_CHAT_USE_ADC")
-                        .map(|v| v == "true" || v == "1")
-                        .unwrap_or(false),
+                    adapters::googlechat::GoogleChatParts {
+                        sa_key_json: std::env::var("GOOGLE_CHAT_SA_KEY_JSON").ok(),
+                        sa_key_file: std::env::var("GOOGLE_CHAT_SA_KEY_FILE").ok(),
+                        access_token: std::env::var("GOOGLE_CHAT_ACCESS_TOKEN").ok(),
+                        audience: std::env::var("GOOGLE_CHAT_AUDIENCE").ok(),
+                        use_adc: std::env::var("GOOGLE_CHAT_USE_ADC")
+                            .map(|v| v == "true" || v == "1")
+                            .unwrap_or(false),
+                    },
                 ))
             } else {
                 None
@@ -453,11 +455,13 @@ impl AppState {
         self.googlechat_webhook_path = cfg.webhook_path;
         self.google_chat = if cfg.enabled {
             Some(adapters::googlechat::GoogleChatAdapter::from_parts(
-                cfg.sa_key_json,
-                cfg.sa_key_file,
-                cfg.access_token,
-                cfg.audience,
-                cfg.use_adc,
+                adapters::googlechat::GoogleChatParts {
+                    sa_key_json: cfg.sa_key_json,
+                    sa_key_file: cfg.sa_key_file,
+                    access_token: cfg.access_token,
+                    audience: cfg.audience,
+                    use_adc: cfg.use_adc,
+                },
             ))
         } else {
             None
@@ -753,13 +757,15 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
             info!(path = %googlechat_webhook_path, "googlechat adapter enabled");
             app = app.route(&googlechat_webhook_path, post(adapters::googlechat::webhook));
             Some(adapters::googlechat::GoogleChatAdapter::from_parts(
-                std::env::var("GOOGLE_CHAT_SA_KEY_JSON").ok(),
-                std::env::var("GOOGLE_CHAT_SA_KEY_FILE").ok(),
-                std::env::var("GOOGLE_CHAT_ACCESS_TOKEN").ok(),
-                std::env::var("GOOGLE_CHAT_AUDIENCE").ok(),
-                std::env::var("GOOGLE_CHAT_USE_ADC")
-                    .map(|v| v == "true" || v == "1")
-                    .unwrap_or(false),
+                adapters::googlechat::GoogleChatParts {
+                    sa_key_json: std::env::var("GOOGLE_CHAT_SA_KEY_JSON").ok(),
+                    sa_key_file: std::env::var("GOOGLE_CHAT_SA_KEY_FILE").ok(),
+                    access_token: std::env::var("GOOGLE_CHAT_ACCESS_TOKEN").ok(),
+                    audience: std::env::var("GOOGLE_CHAT_AUDIENCE").ok(),
+                    use_adc: std::env::var("GOOGLE_CHAT_USE_ADC")
+                        .map(|v| v == "true" || v == "1")
+                        .unwrap_or(false),
+                },
             ))
         } else {
             None
