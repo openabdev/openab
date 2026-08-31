@@ -248,7 +248,7 @@ refs   = []
 [[quirks]]
 date   = "2026-08-25"
 title  = "Keyless ADC outbound path (no SA key)"
-note   = "Outbound creds have a third option beside the SA-key JWT-bearer exchange and the static token: keyless ADC (use_adc / GOOGLE_CHAT_USE_ADC). MetadataTokenSource reads the default SA email + a base token from the GCE metadata server, then calls IAM Credentials generateAccessToken (the SA impersonates itself) for a chat.bot-scoped token, cached with the same 300 s refresh margin. Meant for workloads that already run as the Chat app's service account on GCP — no key file to mount or leak. Requires roles/iam.serviceAccountTokenCreator on the SA over itself + iamcredentials.googleapis.com. Auth precedence in get_token: SA key (token_cache) > ADC (metadata_source) > static access_token."
+note   = "Outbound creds have a third option beside the SA-key JWT-bearer exchange and the static token: keyless ADC (use_adc / GOOGLE_CHAT_USE_ADC). MetadataTokenSource reads the attached runtime SA email + base token from GCE metadata, then calls IAM Credentials generateAccessToken for the distinct adc_target_service_account / GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT and requests chat.bot. Google prohibits access-token self-impersonation, so runtime and target identities MUST differ; the code rejects equality before minting. The runtime SA needs roles/iam.serviceAccountTokenCreator on the target. Auth precedence: SA key > ADC target > explicitly configured static token (ADC-to-static degradation logs a possible identity switch)."
 kind   = "openab_decision"
 source = "crates/openab-gateway/src/adapters/googlechat.rs#MetadataTokenSource"
 refs   = []

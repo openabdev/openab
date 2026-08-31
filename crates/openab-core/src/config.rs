@@ -1226,13 +1226,15 @@ pub struct GoogleChatConfig {
     /// `GOOGLE_CHAT_ALLOWED_USERS` (comma-separated).
     pub allowed_users: Option<Vec<String>>,
     /// Use keyless ADC (GCE metadata server + IAM Credentials
-    /// `generateAccessToken` self-impersonation) to mint the `chat.bot` token,
-    /// instead of a SA key file or a static token. Env fallback:
-    /// `GOOGLE_CHAT_USE_ADC` (`true`/`1`; default false). Ignored when a
-    /// configured SA key loads successfully — the SA key takes precedence; a
-    /// key that fails to load falls back to ADC with a warning naming the
-    /// identity switch (see docs/google-chat.md Option C).
+    /// `generateAccessToken`) to mint the `chat.bot` token for a distinct target
+    /// service account. Env fallback: `GOOGLE_CHAT_USE_ADC` (`true`/`1`; default
+    /// false). Ignored when a configured SA key loads successfully.
     pub use_adc: Option<bool>,
+    /// Dedicated Google Chat service account impersonated by the attached
+    /// runtime service account. Required when `use_adc=true`; MUST differ from
+    /// the runtime identity because Google prohibits access-token
+    /// self-impersonation. Env: `GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT`.
+    pub adc_target_service_account: Option<String>,
 }
 
 /// Fully resolved Google Chat settings (config → env → default applied).
@@ -1243,6 +1245,7 @@ pub struct ResolvedGoogleChat {
     pub sa_key_file: Option<String>,
     pub access_token: Option<String>,
     pub use_adc: bool,
+    pub adc_target_service_account: Option<String>,
     pub audience: Option<String>,
     pub webhook_path: String,
     pub allow_all_users: bool,
@@ -1273,6 +1276,10 @@ impl GoogleChatConfig {
                     .map(|v| v == "true" || v == "1")
                     .unwrap_or(false)
             }),
+            adc_target_service_account: opt_str(
+                &self.adc_target_service_account,
+                "GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT",
+            ),
             audience: opt_str(&self.audience, "GOOGLE_CHAT_AUDIENCE"),
             webhook_path: opt_str(&self.webhook_path, "GOOGLE_CHAT_WEBHOOK_PATH")
                 .unwrap_or_else(|| "/webhook/googlechat".into()),
@@ -2981,6 +2988,7 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
             "GOOGLE_CHAT_SA_KEY_FILE",
             "GOOGLE_CHAT_ACCESS_TOKEN",
             "GOOGLE_CHAT_USE_ADC",
+            "GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT",
             "GOOGLE_CHAT_AUDIENCE",
             "GOOGLE_CHAT_WEBHOOK_PATH",
         ] {
@@ -2996,10 +3004,17 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         // --- use_adc: config value resolves without touching env ---
         let r = GoogleChatConfig {
             use_adc: Some(true),
+            adc_target_service_account: Some(
+                "chat-bot@project.iam.gserviceaccount.com".into(),
+            ),
             ..Default::default()
         }
         .resolve();
         assert!(r.use_adc);
+        assert_eq!(
+            r.adc_target_service_account.as_deref(),
+            Some("chat-bot@project.iam.gserviceaccount.com")
+        );
 
         // --- config wins over env ---
         std::env::set_var("GOOGLE_CHAT_ENABLED", "true");

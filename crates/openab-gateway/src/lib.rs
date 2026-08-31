@@ -203,6 +203,11 @@ impl AppState {
                         use_adc: std::env::var("GOOGLE_CHAT_USE_ADC")
                             .map(|v| v == "true" || v == "1")
                             .unwrap_or(false),
+                        adc_target_service_account: std::env::var(
+                            "GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT",
+                        )
+                        .ok()
+                        .filter(|s| !s.trim().is_empty()),
                     },
                 ))
             } else {
@@ -461,6 +466,7 @@ impl AppState {
                     access_token: cfg.access_token,
                     audience: cfg.audience,
                     use_adc: cfg.use_adc,
+                    adc_target_service_account: cfg.adc_target_service_account,
                 },
             ))
         } else {
@@ -563,6 +569,7 @@ pub struct GatewayGoogleChatConfig {
     pub access_token: Option<String>,
     pub audience: Option<String>,
     pub use_adc: bool,
+    pub adc_target_service_account: Option<String>,
     pub webhook_path: String,
 }
 
@@ -765,6 +772,11 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
                     use_adc: std::env::var("GOOGLE_CHAT_USE_ADC")
                         .map(|v| v == "true" || v == "1")
                         .unwrap_or(false),
+                    adc_target_service_account: std::env::var(
+                        "GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT",
+                    )
+                    .ok()
+                    .filter(|s| !s.trim().is_empty()),
                 },
             ))
         } else {
@@ -1264,6 +1276,7 @@ mod l1_audit_tests {
             access_token: Some("tok".into()),
             audience: None,
             use_adc: false,
+            adc_target_service_account: None,
             webhook_path: "/hook/gc".into(),
         });
         assert!(s.google_chat.is_some());
@@ -1278,6 +1291,7 @@ mod l1_audit_tests {
             access_token: Some("tok".into()),
             audience: Some("aud".into()),
             use_adc: false,
+            adc_target_service_account: None,
             webhook_path: "/hook/gc".into(),
         });
         assert!(flagged(&s).is_empty());
@@ -1290,6 +1304,7 @@ mod l1_audit_tests {
             access_token: None,
             audience: None,
             use_adc: false,
+            adc_target_service_account: None,
             webhook_path: "/hook/gc".into(),
         });
         assert!(s.google_chat.is_none());

@@ -311,13 +311,18 @@ pub(crate) struct GoogleChatParts {
     pub access_token: Option<String>,
     pub audience: Option<String>,
     pub use_adc: bool,
+    /// Dedicated Google Chat service account impersonated by the attached
+    /// workload identity. It MUST differ from the metadata server's default SA;
+    /// Google prohibits access-token self-impersonation.
+    pub adc_target_service_account: Option<String>,
 }
 
 impl GoogleChatAdapter {
     /// Build an adapter from resolved parts (#1379): SA key JSON (inline wins
     /// over file path), optional static access token, optional JWT audience,
-    /// and `use_adc` (keyless ADC via the GCE metadata server + IAM
-    /// Credentials). Auth precedence at send time: SA key > ADC > static token.
+    /// and keyless ADC via GCE metadata + IAM Credentials for a distinct
+    /// `adc_target_service_account`. Auth precedence at send time:
+    /// SA key > ADC target > static token.
     /// Shared by env-derived construction and `apply_googlechat_config`.
     pub(crate) fn from_parts(parts: GoogleChatParts) -> Self {
         use tracing::{info, warn};
@@ -327,6 +332,7 @@ impl GoogleChatAdapter {
             access_token,
             audience,
             use_adc,
+            adc_target_service_account,
         } = parts;
         let key_configured = sa_key_json.is_some() || sa_key_file.is_some();
         let token_cache = sa_key_json
@@ -349,27 +355,41 @@ impl GoogleChatAdapter {
             GoogleChatJwtVerifier::new(aud)
         });
         // Precedence at send time (see `get_token`): SA key > ADC > static token.
-        if use_adc {
-            if key_configured && token_cache.is_none() {
+        let adc_target = adc_target_service_account
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        if use_adc && token_cache.is_none() {
+            if key_configured {
                 // A key WAS configured but failed to load. Don't switch identity
-                // silently: name it. get_token still falls to ADC, but the operator
-                // is told the bot now presents the workload identity, not the key's.
-                warn!(
-                    "Google Chat SA key was configured but could not be loaded; \
-                     falling back to the keyless ADC (workload) identity — this is NOT \
-                     the configured key identity. Fix the key, or unset use_adc."
+                // silently: name the distinct target identity selected instead.
+                match adc_target.as_deref() {
+                    Some(target) => warn!(
+                        target_service_account = %target,
+                        "Google Chat SA key was configured but could not be loaded; \
+                         falling back to keyless ADC impersonation of the configured \
+                         target — this is NOT the failed key identity"
+                    ),
+                    None => error!(
+                        "Google Chat SA key was configured but could not be loaded, and \
+                         use_adc=true has no adc_target_service_account; ADC is disabled"
+                    ),
+                }
+            } else if let Some(target) = adc_target.as_deref() {
+                info!(
+                    target_service_account = %target,
+                    "googlechat keyless ADC enabled (distinct target, chat.bot via IAM Credentials)"
                 );
-            } else if token_cache.is_none() {
-                info!("googlechat keyless ADC enabled (chat.bot via IAM Credentials)");
             }
         }
         let mut adapter = Self::new(token_cache, access_token, jwt_verifier);
-        // Install ADC only when it can actually be consulted: a loaded SA key
-        // wins outright at send time (see `get_token`), so don't construct a
-        // dead-at-runtime source behind it. A configured key that FAILED to
-        // load still installs ADC — that is the named fallback warned above.
-        adapter.metadata_source =
-            (use_adc && adapter.token_cache.is_none()).then(MetadataTokenSource::new);
+        // Install ADC only when it can actually be consulted and a distinct
+        // target is configured. A loaded SA key wins outright; use_adc without
+        // a target fails closed instead of attempting prohibited self-impersonation.
+        if use_adc && adapter.token_cache.is_none() {
+            adapter.metadata_source = adc_target.map(MetadataTokenSource::new);
+        }
         adapter
     }
 
@@ -392,10 +412,10 @@ impl GoogleChatAdapter {
     /// > ADC (`metadata_source`) > static `access_token`.
     ///
     /// Failure behavior is asymmetric by design: an SA-key exchange error
-    /// hard-fails (`None` — the operator explicitly configured that identity,
-    /// so nothing is silently substituted), while an ADC mint error falls
-    /// through to the static token (both are the same workload's credential,
-    /// so degrading is not an identity switch).
+    /// hard-fails (`None` — the operator explicitly configured that identity),
+    /// while an ADC mint error can fall through to an explicitly configured
+    /// static token. The static token is opaque and may represent a different
+    /// principal, so that degradation is logged as a possible identity switch.
     async fn get_token(&self) -> Option<String> {
         if let Some(ref cache) = self.token_cache {
             match cache.get_token(&self.client).await {
@@ -410,13 +430,14 @@ impl GoogleChatAdapter {
             match src.get_token().await {
                 Ok(t) => return Some(t),
                 Err(e) => {
-                    // Fall through to a configured static token instead of
-                    // dropping the reply. ADC and the static token are the same
-                    // workload's own credential, so this is not an identity switch.
+                    // A configured static token is an explicit fallback, but it
+                    // is opaque: the adapter cannot prove it represents the same
+                    // principal as the ADC target. Name the possible identity
+                    // switch rather than claiming equivalence.
                     if self.access_token.is_some() {
                         error!(
-                            "googlechat ADC token mint failed ({e}); \
-                             falling back to the configured static access_token"
+                            "googlechat ADC token mint failed ({e}); falling back to \
+                             configured static access_token (possible identity switch)"
                         );
                     } else {
                         error!("googlechat ADC token mint failed: {e}");
@@ -1030,6 +1051,10 @@ const ADC_CHAT_BOT_SCOPE: &str = "https://www.googleapis.com/auth/chat.bot";
 /// Lifetime we request from IAM Credentials for the impersonated token, and
 /// the fallback TTL we cache it under. IAM caps impersonated tokens at 3600s.
 const ADC_TOKEN_LIFETIME_SECS: u64 = 3600;
+/// After a failed refresh while a cached token remains valid, reuse that token
+/// for this cooldown instead of making each queued sender repeat all metadata/
+/// IAM calls serially under the write lock.
+const ADC_REFRESH_RETRY_COOLDOWN_SECS: u64 = 30;
 
 /// Cache TTL (seconds) to use for a minted token, derived from the IAM
 /// response's `expireTime`. Falls back to the full lifetime when the field is
@@ -1056,16 +1081,18 @@ fn refresh_threshold(ttl: u64) -> u64 {
 }
 
 /// Mints a `chat.bot`-scoped access token **without** a service-account key
-/// file, using the workload's own identity (keyless ADC). Flow, per refresh:
-///   1. read the default SA's email + a base token from the GCE metadata server
-///   2. call IAM Credentials `generateAccessToken` (self-impersonation) to
-///      exchange the base token for a `chat.bot`-scoped token
+/// file, using two distinct identities. Flow, per refresh:
+///   1. read the attached runtime SA's email + base token from GCE metadata
+///   2. call IAM Credentials `generateAccessToken` for the separately configured
+///      Google Chat target SA and request the `chat.bot` scope
 ///
-/// Requires `roles/iam.serviceAccountTokenCreator` on the SA over itself and
-/// the `iamcredentials.googleapis.com` API enabled. The `*_base` fields are
-/// overridable so tests can point them at a mock server.
+/// The runtime SA requires `roles/iam.serviceAccountTokenCreator` on the target
+/// SA. The identities MUST differ: Google prohibits using a service account's
+/// short-lived access token to generate another access token for itself.
 pub struct MetadataTokenSource {
     token: RwLock<Option<(String, Instant, u64)>>,
+    refresh_retry_after: RwLock<Option<Instant>>,
+    target_service_account: String,
     // Private: only `new` (prod, fixed trusted hosts) or the in-module
     // `with_bases` (tests, mock server) may set these. Unexported ⇒ no in-process
     // caller can retarget the metadata bearer to an arbitrary host.
@@ -1076,16 +1103,11 @@ pub struct MetadataTokenSource {
     client: reqwest::Client,
 }
 
-impl Default for MetadataTokenSource {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl MetadataTokenSource {
-    /// Production constructor: the fixed, trusted GCP endpoints (IAM over HTTPS).
-    pub fn new() -> Self {
+    /// Production constructor: fixed trusted endpoints and a distinct target SA.
+    pub fn new(target_service_account: String) -> Self {
         Self::with_bases(
+            target_service_account,
             "http://metadata.google.internal".into(),
             "https://iamcredentials.googleapis.com".into(),
         )
@@ -1093,9 +1115,15 @@ impl MetadataTokenSource {
 
     /// Construct with explicit endpoint bases. Prod always goes through `new`
     /// with HTTPS IAM; tests point these at a mock server.
-    fn with_bases(metadata_base: String, iam_credentials_base: String) -> Self {
+    fn with_bases(
+        target_service_account: String,
+        metadata_base: String,
+        iam_credentials_base: String,
+    ) -> Self {
         Self {
             token: RwLock::new(None),
+            refresh_retry_after: RwLock::new(None),
+            target_service_account,
             metadata_base,
             iam_credentials_base,
             client: reqwest::Client::builder()
@@ -1118,31 +1146,50 @@ impl MetadataTokenSource {
         }
         let mut guard = self.token.write().await;
         if let Some((ref tok, ref ts, ttl)) = *guard {
-            if ts.elapsed().as_secs() < refresh_threshold(ttl) {
+            let elapsed = ts.elapsed().as_secs();
+            if elapsed < refresh_threshold(ttl) {
+                return Ok(tok.clone());
+            }
+            // A previous refresh failed but this token is still valid. While
+            // the cooldown is active, queued/subsequent callers reuse it
+            // immediately instead of repeating up to three HTTP timeouts.
+            if elapsed < ttl
+                && self
+                    .refresh_retry_after
+                    .read()
+                    .await
+                    .is_some_and(|deadline| deadline > Instant::now())
+            {
                 return Ok(tok.clone());
             }
         }
         match self.refresh().await {
             Ok(minted) => {
-                let MintedToken { token, ttl, sa_email } = minted;
+                *self.refresh_retry_after.write().await = None;
+                let MintedToken {
+                    token,
+                    ttl,
+                    runtime_service_account,
+                    target_service_account,
+                } = minted;
                 if ttl == 0 {
                     // Freshly minted but already at/after its expireTime — almost
                     // always local clock skew (Google validates against its own
                     // clock, so the token may still work). Serve it once, but do
                     // not cache a dead token: the next call re-mints.
                     warn!(
-                        service_account = %sa_email,
+                        runtime_service_account = %runtime_service_account,
+                        target_service_account = %target_service_account,
                         "googlechat ADC minted a token with ttl=0 (clock skew?); \
                          serving once without caching"
                     );
                     return Ok(token);
                 }
                 *guard = Some((token.clone(), Instant::now(), ttl));
-                // Name the resolved identity so on-call can confirm which SA
-                // self-impersonation actually used when diagnosing send errors.
                 info!(
-                    service_account = %sa_email,
-                    "googlechat ADC token minted (chat.bot, ttl {ttl}s)"
+                    runtime_service_account = %runtime_service_account,
+                    target_service_account = %target_service_account,
+                    "googlechat ADC token minted (distinct target, chat.bot, ttl {ttl}s)"
                 );
                 Ok(token)
             }
@@ -1152,10 +1199,17 @@ impl MetadataTokenSource {
                 if let Some((ref tok, ref ts, ttl)) = *guard {
                     let elapsed = ts.elapsed().as_secs();
                     if elapsed < ttl {
+                        *self.refresh_retry_after.write().await = Some(
+                            Instant::now()
+                                + std::time::Duration::from_secs(
+                                    ADC_REFRESH_RETRY_COOLDOWN_SECS,
+                                ),
+                        );
                         warn!(
                             "googlechat ADC refresh failed ({e}); serving cached token \
-                             still valid for {}s",
-                            ttl - elapsed
+                             still valid for {}s; retry suppressed for {}s",
+                            ttl - elapsed,
+                            ADC_REFRESH_RETRY_COOLDOWN_SECS
                         );
                         return Ok(tok.clone());
                     }
@@ -1184,9 +1238,15 @@ impl MetadataTokenSource {
             .text()
             .await
             .map_err(|e| format!("metadata email read failed: {e}"))?;
-        let email = email.trim();
-        if email.is_empty() {
-            return Err("metadata returned empty SA email".into());
+        let runtime_service_account = email.trim();
+        if runtime_service_account.is_empty() {
+            return Err("metadata returned empty runtime SA email".into());
+        }
+        if runtime_service_account.eq_ignore_ascii_case(&self.target_service_account) {
+            return Err(format!(
+                "ADC target service account must differ from runtime service account \
+                 (self-impersonation is prohibited): {runtime_service_account}"
+            ));
         }
 
         // 2. Base access token for the default SA from the metadata server.
@@ -1211,11 +1271,11 @@ impl MetadataTokenSource {
             .and_then(non_empty_token)
             .ok_or("metadata token response missing or empty access_token")?;
 
-        // 3. Exchange the base token for a chat.bot-scoped token via IAM
-        //    Credentials generateAccessToken (the SA impersonates itself).
+        // 3. Exchange the runtime SA's base token for a chat.bot-scoped token
+        //    for the distinct configured Chat-app service account.
         let url = format!(
-            "{}/v1/projects/-/serviceAccounts/{email}:generateAccessToken",
-            self.iam_credentials_base
+            "{}/v1/projects/-/serviceAccounts/{}:generateAccessToken",
+            self.iam_credentials_base, self.target_service_account
         );
         let resp = client
             .post(&url)
@@ -1268,17 +1328,19 @@ impl MetadataTokenSource {
         Ok(MintedToken {
             token,
             ttl,
-            sa_email: email.to_string(),
+            runtime_service_account: runtime_service_account.to_string(),
+            target_service_account: self.target_service_account.clone(),
         })
     }
 }
 
-/// A successfully minted ADC token plus the identity that minted it, so the
-/// caller can log which service account self-impersonation resolved to.
+/// A successfully minted ADC token plus the source and target identities for
+/// audit logging of the supported two-service-account impersonation flow.
 struct MintedToken {
     token: String,
     ttl: u64,
-    sa_email: String,
+    runtime_service_account: String,
+    target_service_account: String,
 }
 
 /// Best-effort classification of common GCP `generateAccessToken` failures.
@@ -1287,7 +1349,11 @@ struct MintedToken {
 /// missing `roles/iam.serviceAccountTokenCreator` binding.
 fn classify_generate_access_token_error(status: u16, body: &str) -> &'static str {
     let b = body.to_ascii_lowercase();
-    if b.contains("api has not been used") || b.contains("service_disabled") || b.contains("is disabled")
+    if b.contains("failed_precondition") || b.contains("same service account") {
+        "self_impersonation_prohibited"
+    } else if b.contains("api has not been used")
+        || b.contains("service_disabled")
+        || b.contains("is disabled")
     {
         "api_not_enabled"
     } else if status == 403 && b.contains("scopes") {
@@ -2275,7 +2341,7 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        // IAM Credentials: generateAccessToken (self-impersonation) → chat.bot token.
+        // IAM Credentials: runtime SA impersonates distinct Chat target.
         Mock::given(method("POST"))
             .and(path_regex(
                 r"/v1/projects/-/serviceAccounts/.*:generateAccessToken",
@@ -2287,7 +2353,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let src = MetadataTokenSource::with_bases(server.uri(), server.uri());
+        let src = MetadataTokenSource::with_bases(
+            "chat-bot@project.iam.gserviceaccount.com".into(),
+            server.uri(),
+            server.uri(),
+        );
 
         let token = src
             .get_token()
@@ -2296,10 +2366,90 @@ mod tests {
         assert_eq!(token, "chat-bot-tok");
     }
 
+    #[tokio::test]
+    async fn metadata_token_source_rejects_self_impersonation_before_token_request() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let same_sa = "runtime@project.iam.gserviceaccount.com";
+        Mock::given(method("GET"))
+            .and(path(
+                "/computeMetadata/v1/instance/service-accounts/default/email",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string(same_sa))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/computeMetadata/v1/instance/service-accounts/default/token",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let src = MetadataTokenSource::with_bases(
+            same_sa.into(),
+            server.uri(),
+            server.uri(),
+        );
+        let err = src
+            .get_token()
+            .await
+            .expect_err("same runtime/target SA must be rejected");
+        assert!(err.contains("self-impersonation is prohibited"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn adc_refresh_failure_cooldown_prevents_queued_retry_storm() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/computeMetadata/v1/instance/service-accounts/default/email",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("runtime@project.iam.gserviceaccount.com"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/computeMetadata/v1/instance/service-accounts/default/token",
+            ))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let src = MetadataTokenSource::with_bases(
+            "chat-bot@project.iam.gserviceaccount.com".into(),
+            server.uri(),
+            server.uri(),
+        );
+        *src.token.write().await = Some((
+            "cached-token".into(),
+            Instant::now() - std::time::Duration::from_secs(6),
+            10,
+        ));
+
+        // First call attempts refresh, gets 503, serves the still-valid token,
+        // and starts cooldown. Second call must reuse it without another GET.
+        assert_eq!(src.get_token().await.unwrap(), "cached-token");
+        assert_eq!(src.get_token().await.unwrap(), "cached-token");
+    }
+
     #[test]
     fn from_parts_use_adc_toggles_metadata_source() {
         let with = GoogleChatAdapter::from_parts(GoogleChatParts {
             use_adc: true,
+            adc_target_service_account: Some("chat-bot@project.iam.gserviceaccount.com".into()),
             ..Default::default()
         });
         assert!(with.metadata_source.is_some(), "use_adc=true → ADC source");
@@ -2311,6 +2461,18 @@ mod tests {
     }
 
     #[test]
+    fn from_parts_use_adc_without_target_fails_closed() {
+        let adapter = GoogleChatAdapter::from_parts(GoogleChatParts {
+            use_adc: true,
+            ..Default::default()
+        });
+        assert!(
+            adapter.metadata_source.is_none(),
+            "use_adc without adc_target_service_account must not install ADC"
+        );
+    }
+
+    #[test]
     fn from_parts_malformed_key_with_use_adc_installs_adc() {
         // Regression: a configured-but-malformed SA key parses to
         // token_cache=None; with use_adc=true the ADC source is still installed
@@ -2318,6 +2480,7 @@ mod tests {
         let adapter = GoogleChatAdapter::from_parts(GoogleChatParts {
             sa_key_json: Some("not valid json".into()),
             use_adc: true,
+            adc_target_service_account: Some("chat-bot@project.iam.gserviceaccount.com".into()),
             ..Default::default()
         });
         assert!(
@@ -2337,6 +2500,7 @@ mod tests {
         let adapter = GoogleChatAdapter::from_parts(GoogleChatParts {
             sa_key_file: Some("/nonexistent/path/sa-key.json".into()),
             use_adc: true,
+            adc_target_service_account: Some("chat-bot@project.iam.gserviceaccount.com".into()),
             ..Default::default()
         });
         assert!(adapter.token_cache.is_none(), "unreadable key file → no cache");
@@ -2358,6 +2522,7 @@ mod tests {
         let adapter = GoogleChatAdapter::from_parts(GoogleChatParts {
             sa_key_json: Some(key),
             use_adc: true,
+            adc_target_service_account: Some("chat-bot@project.iam.gserviceaccount.com".into()),
             ..Default::default()
         });
         assert!(adapter.token_cache.is_some(), "valid key JSON → SA-key cache");
@@ -2369,6 +2534,13 @@ mod tests {
 
     #[test]
     fn classify_generate_access_token_error_covers_documented_cases() {
+        assert_eq!(
+            classify_generate_access_token_error(
+                400,
+                r#"{"error":{"status":"FAILED_PRECONDITION","message":"You can't create a token for the same service account that you used to authenticate the request."}}"#,
+            ),
+            "self_impersonation_prohibited"
+        );
         // Insufficient scope: the 403 body says "scopes" — the documented
         // signal distinguishing it from a missing IAM role.
         assert_eq!(
@@ -2455,11 +2627,15 @@ mod tests {
         let mut adapter = GoogleChatAdapter::from_parts(GoogleChatParts {
             access_token: Some("static-tok".into()),
             use_adc: true,
+            adc_target_service_account: Some("chat-bot@project.iam.gserviceaccount.com".into()),
             ..Default::default()
         });
         // Repoint the ADC source at the mock server (bases are private now).
-        adapter.metadata_source =
-            Some(MetadataTokenSource::with_bases(server.uri(), server.uri()));
+        adapter.metadata_source = Some(MetadataTokenSource::with_bases(
+            "chat-bot@project.iam.gserviceaccount.com".into(),
+            server.uri(),
+            server.uri(),
+        ));
         let token = adapter.get_token().await.expect("a token");
         assert_eq!(token, "chat-bot-tok", "ADC should win over static token");
     }
@@ -2502,7 +2678,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let src = MetadataTokenSource::with_bases(server.uri(), server.uri());
+        let src = MetadataTokenSource::with_bases(
+            "chat-bot@project.iam.gserviceaccount.com".into(),
+            server.uri(),
+            server.uri(),
+        );
         let err = src.get_token().await.expect_err("blank token must be rejected");
         assert!(
             err.contains("missing or empty accessToken"),

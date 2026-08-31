@@ -114,24 +114,27 @@ docker run -d --name openab-gateway \
 
 ### Option C: Keyless ADC (recommended on GCP — no key file)
 
-When the gateway runs on GCP (GKE / GCE / Cloud Run) **as** a service account, it can mint the `chat.bot` token from that identity — no service-account key file to mount, manage, or leak. The gateway reads a base token from the GCE metadata server and calls IAM Credentials `generateAccessToken` (the SA impersonates itself) for a `chat.bot`-scoped token, then caches and auto-refreshes it.
+When the gateway runs on GCP (GKE / GCE / Cloud Run), its attached **runtime service account** can impersonate a separate **Google Chat service account** and mint a `chat.bot` token without any key file. The gateway reads the runtime identity and a base token from the GCE metadata server, then calls IAM Credentials `generateAccessToken` for the configured Chat-app target identity.
+
+The two identities **must be different**. Google prohibits using a service account's short-lived access token to generate another access token for that same service account (`FAILED_PRECONDITION`); see [Service account credentials — Self-impersonation](https://cloud.google.com/iam/docs/service-account-creds#self-impersonation).
 
 Prerequisites:
 
-- The workload's service account **is** the Chat app's service account (the identity that sends must be the space member).
-- Grant that SA `roles/iam.serviceAccountTokenCreator` **on itself**.
+- Attach a runtime SA to the workload (for example `openab-runtime@PROJECT.iam.gserviceaccount.com`).
+- Use a distinct SA as the Google Chat app identity (for example `openab-chat@PROJECT.iam.gserviceaccount.com`); that target SA must be the app/space member that sends messages.
+- Grant the runtime SA `roles/iam.serviceAccountTokenCreator` **on the target Chat SA**.
 - Enable `iamcredentials.googleapis.com`.
-- The **base token from the metadata server must carry `cloud-platform` (or `.../auth/iam`) scope** — `generateAccessToken` requires it on the caller. GKE Workload Identity and Cloud Run tokens are `cloud-platform`-scoped and satisfy this automatically. A **default-scope GCE VM does not**: it returns `403 PERMISSION_DENIED: "Request had insufficient authentication scopes."` even when the IAM binding above is correct — match on the word *scopes* (not *permission*) to tell it apart from a missing role. GCE access scopes **cannot be changed while the VM is running**: create the VM with `--scopes=cloud-platform`, or run `gcloud compute instances set-scopes <vm> --scopes=cloud-platform` followed by a stop/start.
+- The metadata base token must carry `cloud-platform` (or `.../auth/iam`) scope. A default-scope GCE VM returns `403 PERMISSION_DENIED: "Request had insufficient authentication scopes."`; match *scopes* to distinguish it from a missing role. GCE access scopes cannot be changed while the VM is running: create the VM with `--scopes=cloud-platform`, or use `gcloud compute instances set-scopes` followed by a stop/start.
 
-> Why self-impersonation (not plain ADC): the `chat.bot` scope is a Workspace scope and is **not** a subset of `cloud-platform`, so no `?scopes=` parameter on the metadata token can produce it. `generateAccessToken` is the only keyless way to obtain a `chat.bot` token.
+`chat.bot` is a Workspace scope and is not a subset of `cloud-platform`, so the runtime metadata token cannot call Chat directly. The supported flow is runtime SA → distinct target Chat SA via `generateAccessToken`.
 
 ```bash
-# The pod/VM already runs as the target service account; no key is mounted.
 export GOOGLE_CHAT_ENABLED=true
 export GOOGLE_CHAT_USE_ADC=true
+export GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT="openab-chat@PROJECT.iam.gserviceaccount.com"
 ```
 
-Precedence: if a SA key (`GOOGLE_CHAT_SA_KEY_JSON` / `GOOGLE_CHAT_SA_KEY_FILE`) is also set **and loads successfully**, the SA key wins and ADC is ignored. If a key is configured but **fails to load** (unreadable file / malformed JSON), the adapter falls back to the keyless ADC (workload) identity and logs a warning naming the switch — fix the key, or unset `use_adc` to make that failure explicit.
+Precedence: if a configured SA key loads successfully, it wins and ADC is ignored. If a key is configured but fails to load, the adapter uses the configured ADC target and logs the identity switch. `GOOGLE_CHAT_USE_ADC=true` without `GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT` fails closed (ADC is not installed). If ADC fails and a static token is explicitly configured, the adapter degrades to it with a warning that it may represent a different identity.
 
 > **Migrating an existing release from a SA key to ADC:** the chart renders the Google Chat Secret only when `saKeyJson` / `accessToken` is set, and that Secret carries `helm.sh/resource-policy: keep`. Switching to ADC-only stops Helm from managing it but **leaves the old key material in the cluster indefinitely**. Delete the orphaned Secret after the switch: it is the gateway Secret named by the chart's `openab.agentFullname` helper — `<release>-<agent>-gateway` by default (or the agent's `nameOverride`) — and it contains the `google-chat-sa-key-json` key. Find it with `kubectl get secrets -o name | grep gateway`, confirm with `kubectl get secret <name> -o jsonpath='{.data}' | grep -o google-chat-sa-key-json`, then `kubectl delete secret <name>`. Otherwise the "no key to mount or leak" benefit is undercut.
 
@@ -244,7 +247,8 @@ Each field falls back to its `GOOGLE_CHAT_ALLOW_ALL_USERS` / `GOOGLE_CHAT_ALLOWE
 | `GOOGLE_CHAT_SA_KEY_JSON` | No | — | Service account key JSON string (enables auto-refresh) |
 | `GOOGLE_CHAT_SA_KEY_FILE` | No | — | Path to service account key JSON file (alternative to `SA_KEY_JSON`) |
 | `GOOGLE_CHAT_ACCESS_TOKEN` | No | — | Static OAuth2 access token (fallback, expires in 1 hour) |
-| `GOOGLE_CHAT_USE_ADC` | No | `false` | Keyless ADC auth via the GCE metadata server + IAM Credentials `generateAccessToken` self-impersonation (GCP-hosted only) — see Option C. Ignored when `SA_KEY_JSON`/`SA_KEY_FILE` is set and loads; a configured key that fails to load falls back to ADC with a warning (Option C) |
+| `GOOGLE_CHAT_USE_ADC` | No | `false` | Enable keyless ADC: attached runtime SA impersonates a distinct Chat-app target via IAM Credentials — see Option C |
+| `GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT` | With ADC | — | Email of the dedicated Chat-app SA to impersonate. Required when `USE_ADC=true`; MUST differ from the runtime SA |
 | `GOOGLE_CHAT_WEBHOOK_PATH` | No | `/webhook/googlechat` | Webhook endpoint path |
 
 ## Security: Webhook Verification

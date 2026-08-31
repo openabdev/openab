@@ -10,8 +10,12 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
-/// Timeout for waiting on gateway reply acknowledgement.
+/// Legacy timeout for streaming platforms that may not acknowledge normal sends.
 const GATEWAY_REPLY_TIMEOUT_SECS: u64 = 5;
+/// Acknowledged send-once replies can include bounded auth refresh (up to three
+/// 10-second requests), so allow that work to finish; unlike the legacy path,
+/// timeout is an error because the adapter promised a delivery response.
+const ACKED_GATEWAY_REPLY_TIMEOUT_SECS: u64 = 35;
 
 /// Platforms whose gateway adapter emits a `GatewayResponse` for `edit_message`
 /// so core can observe edit success or failure (used to gate the per-edit
@@ -40,6 +44,22 @@ fn platform_acks_writes(platform: &str) -> bool {
     EDIT_RESPONSE_PLATFORMS.contains(&platform)
 }
 
+
+/// Platforms whose gateway adapters acknowledge normal send replies with a
+/// `GatewayResponse`. This capability is independent of cosmetic streaming:
+/// Google Chat is send-once, but its adapter reports API/auth failures and core
+/// must retain the request id to observe them.
+const REPLY_RESPONSE_PLATFORMS: &[&str] = &["googlechat"];
+
+fn platform_acks_replies(platform: &str) -> bool {
+    REPLY_RESPONSE_PLATFORMS.contains(&platform)
+}
+
+/// Preserve legacy request/response waits for streaming adapters while also
+/// supporting send-once adapters that explicitly acknowledge delivery.
+fn reply_requires_ack(platform: &str, streaming: bool) -> bool {
+    streaming || platform_acks_replies(platform)
+}
 /// Gateway platforms whose messaging API cannot edit a message after it is sent.
 ///
 /// Cosmetic (typewriter) streaming works by posting a placeholder and then
@@ -230,6 +250,18 @@ struct GatewayResponse {
     error: Option<String>,
 }
 
+fn gateway_delivery_result(resp: GatewayResponse) -> Result<String> {
+    if resp.success {
+        Ok(resp.message_id.unwrap_or_else(|| "gw_sent".into()))
+    } else {
+        Err(anyhow::anyhow!(
+            "gateway reported failure: {}",
+            resp.error
+                .unwrap_or_else(|| "gateway reported failure".to_string())
+        ))
+    }
+}
+
 // --- GatewayAdapter: ChatAdapter over WebSocket ---
 
 type PendingRequests = Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<GatewayResponse>>>>;
@@ -279,7 +311,7 @@ impl GatewayAdapter {
         content: &str,
         quote_message_id: Option<&str>,
     ) -> Result<MessageRef> {
-        let req_id = if self.streaming {
+        let req_id = if reply_requires_ack(self.platform_name, self.streaming) {
             Some(format!("req_{}", uuid::Uuid::new_v4()))
         } else {
             None
@@ -315,33 +347,42 @@ impl GatewayAdapter {
             return Err(e.into());
         }
         let msg_id = if let (Some(rx), Some(ref id)) = (pending_rx, &req_id) {
-            match tokio::time::timeout(std::time::Duration::from_secs(GATEWAY_REPLY_TIMEOUT_SECS), rx).await {
-                Ok(Ok(resp)) if resp.success => resp.message_id.unwrap_or_else(|| "gw_sent".into()),
-                Ok(Ok(resp)) => {
-                    // Gateway explicitly reported failure (success=false). Surface
-                    // as Err so dispatch sets ❌ instead of 🆗 over an incomplete
-                    // delivery. Examples: Feishu edit cap reached after append-new
-                    // fallback also failed; chunked send delivered N/M chunks.
-                    let err_msg = resp.error.clone()
-                        .unwrap_or_else(|| "gateway reported failure".to_string());
-                    tracing::warn!(request_id = %id, error = %err_msg, "gateway replied with failure");
-                    return Err(anyhow::anyhow!("gateway reported failure: {err_msg}"));
-                }
+            let ack_required = platform_acks_replies(self.platform_name);
+            let timeout_secs = if ack_required {
+                ACKED_GATEWAY_REPLY_TIMEOUT_SECS
+            } else {
+                GATEWAY_REPLY_TIMEOUT_SECS
+            };
+            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
+                Ok(Ok(resp)) => match gateway_delivery_result(resp) {
+                    Ok(message_id) => message_id,
+                    Err(e) => {
+                        tracing::warn!(request_id = %id, error = %e, "gateway replied with failure");
+                        return Err(e);
+                    }
+                },
                 Ok(Err(_)) => {
-                    // Channel closed (gateway shutting down or pending dropped).
-                    // Maintain legacy behavior — adapters that don't implement
-                    // GatewayResponse for all reply types (LINE, Teams) rely on
-                    // this for non-failure outcomes.
+                    if ack_required {
+                        return Err(anyhow::anyhow!(
+                            "gateway acknowledgement channel closed for {}",
+                            self.platform_name
+                        ));
+                    }
+                    // Legacy streaming adapters may not acknowledge normal sends.
                     tracing::warn!(request_id = %id, "gateway response channel closed");
                     "gw_sent".into()
                 }
                 Err(_) => {
-                    // Timeout. Many adapters (LINE, Teams) intentionally do not
-                    // emit GatewayResponse for replies, so timeout is the expected
-                    // path for them. Maintain legacy behavior to avoid breaking
-                    // platforms that have not yet wired request/response feedback.
-                    tracing::warn!(request_id = %id, "gateway reply timed out");
                     self.pending.lock().await.remove(id);
+                    if ack_required {
+                        return Err(anyhow::anyhow!(
+                            "gateway delivery acknowledgement timed out after {timeout_secs}s for {}",
+                            self.platform_name
+                        ));
+                    }
+                    // Preserve legacy behavior for adapters that do not promise
+                    // a GatewayResponse for normal sends.
+                    tracing::warn!(request_id = %id, "gateway reply timed out");
                     "gw_sent".into()
                 }
             }
@@ -1693,6 +1734,29 @@ mod tests {
         // INVALID_ARGUMENT; the documented 1 write/sec-per-space quota further
         // constrains high-frequency editing. Force send-once.
         assert!(!platform_supports_streaming("googlechat"));
+    }
+
+    #[test]
+    fn googlechat_send_once_still_requires_delivery_ack() {
+        assert!(platform_acks_replies("googlechat"));
+        assert!(reply_requires_ack("googlechat", false));
+        assert!(!reply_requires_ack("line", false));
+        // Preserve legacy behavior: streaming adapters still carry request IDs.
+        assert!(reply_requires_ack("discord", true));
+    }
+
+    #[test]
+    fn acknowledged_reply_failure_is_propagated() {
+        let err = gateway_delivery_result(GatewayResponse {
+            schema: "openab.gateway.response.v1".into(),
+            request_id: "req_test".into(),
+            success: false,
+            thread_id: None,
+            message_id: None,
+            error: Some("googlechat API returned 403".into()),
+        })
+        .expect_err("success=false must reach core as Err");
+        assert!(err.to_string().contains("googlechat API returned 403"));
     }
 
     #[test]
