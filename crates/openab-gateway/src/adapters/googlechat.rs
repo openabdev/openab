@@ -265,6 +265,32 @@ impl GoogleChatJwtVerifier {
     }
 }
 
+/// Accept an external token value only when it contains non-whitespace bytes.
+/// All three OAuth boundaries (SA-key exchange, metadata base token, IAM
+/// Credentials mint) share this validator so their failure semantics cannot
+/// drift independently.
+fn non_empty_token(value: &str) -> Option<&str> {
+    (!value.trim().is_empty()).then_some(value)
+}
+
+/// Google Chat edit targets must be full `spaces/{space}/messages/{message}`
+/// resource names. Reject synthetic ids and incomplete `spaces/` prefixes
+/// before token resolution or network I/O.
+fn is_google_chat_message_name(name: &str) -> bool {
+    let mut parts = name.split('/');
+    matches!(
+        (
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+            parts.next(),
+        ),
+        (Some("spaces"), Some(space), Some("messages"), Some(message), None)
+            if !space.is_empty() && !message.is_empty()
+    )
+}
+
 // --- Adapter (encapsulates all Google Chat state) ---
 
 pub struct GoogleChatAdapter {
@@ -450,7 +476,7 @@ impl GoogleChatAdapter {
                 // it with 400 INVALID_ARGUMENT before any edit applies. Refuse
                 // non-resource-name ids here instead of sending a doomed request,
                 // so a future caller cannot silently reintroduce that failure.
-                if !reply.reply_to.starts_with("spaces/") {
+                if !is_google_chat_message_name(&reply.reply_to) {
                     tracing::warn!(
                         reply_to = %reply.reply_to,
                         "googlechat edit_message ignored: not a message resource name \
@@ -957,7 +983,7 @@ impl GoogleChatTokenCache {
             .and_then(|v| v.as_str())
             // Boundary validation: an empty token would be cached as "valid"
             // and fail every send with 401 until the refresh threshold.
-            .filter(|s| !s.trim().is_empty())
+            .and_then(non_empty_token)
             .ok_or_else(|| {
                 let err = body
                     .get("error_description")
@@ -1182,7 +1208,7 @@ impl MetadataTokenSource {
         let base_token = base
             .get("access_token")
             .and_then(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty())
+            .and_then(non_empty_token)
             .ok_or("metadata token response missing or empty access_token")?;
 
         // 3. Exchange the base token for a chat.bot-scoped token via IAM
@@ -1228,7 +1254,7 @@ impl MetadataTokenSource {
             .and_then(|v| v.as_str())
             // Boundary validation: an empty token would be cached as "valid"
             // for its full TTL and bypass the static-token degradation path.
-            .filter(|s| !s.trim().is_empty())
+            .and_then(non_empty_token)
             .ok_or("generateAccessToken response missing or empty accessToken")?
             .to_string();
         // Cache under the server-granted lifetime (respects an org policy that
@@ -2372,6 +2398,24 @@ mod tests {
         assert_eq!(classify_generate_access_token_error(500, "boom"), "unclassified");
     }
 
+    #[test]
+    fn external_token_values_must_be_non_whitespace() {
+        assert_eq!(None::<&str>.and_then(non_empty_token), None);
+        assert_eq!(non_empty_token(""), None);
+        assert_eq!(non_empty_token(" \t\n"), None);
+        assert_eq!(non_empty_token(" token "), Some(" token "));
+    }
+
+    #[test]
+    fn edit_targets_require_full_message_resource_names() {
+        assert!(is_google_chat_message_name("spaces/SP/messages/msg1"));
+        assert!(!is_google_chat_message_name("unified_a1b2c3d4"));
+        assert!(!is_google_chat_message_name("spaces/"));
+        assert!(!is_google_chat_message_name("spaces/SP"));
+        assert!(!is_google_chat_message_name("spaces/SP/messages/"));
+        assert!(!is_google_chat_message_name("spaces/SP/messages/msg1/extra"));
+    }
+
     #[tokio::test]
     async fn adc_takes_precedence_over_static_access_token() {
         use wiremock::matchers::{method, path, path_regex};
@@ -2974,6 +3018,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(
                 serde_json::json!({"name": "spaces/SP/messages/msg1"}),
             ))
+            .expect(1)
             .mount(&mock_server)
             .await;
 
