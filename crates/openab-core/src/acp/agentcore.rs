@@ -271,9 +271,12 @@ where
                 .as_millis();
             let runtime_sid = format!("oab-reconnect-{ts:020}-{ts:013x}");
             match self.open_shell(&runtime_sid).await {
-                Ok(handle) => { self.sessions.insert(acp_sid.clone(), handle); }
+                Ok(handle) => {
+                    self.sessions.insert(acp_sid.clone(), handle);
+                }
                 Err(e) => {
-                    self.write_error(id, -32000, &format!("reconnect failed: {e}")).await?;
+                    self.write_error(id, -32000, &format!("reconnect failed: {e}"))
+                        .await?;
                     return Ok(());
                 }
             }
@@ -281,7 +284,9 @@ where
 
         // Allocate ID before borrowing sessions
         let kiro_id = self.alloc_id();
-        let kiro_sid = self.sessions.get(&acp_sid)
+        let kiro_sid = self
+            .sessions
+            .get(&acp_sid)
             .map(|s| s.kiro_session_id.clone())
             .unwrap_or_default();
         let mut fwd_params = params.clone();
@@ -425,7 +430,8 @@ where
     }
 
     async fn open_shell(&self, session_id: &str) -> Result<ShellHandle> {
-        let (request, host) = build_signed_request(&self.runtime_arn, session_id, &self.region).await?;
+        let (request, host) =
+            build_signed_request(&self.runtime_arn, session_id, &self.region).await?;
 
         // Manual TLS connection — gives us full control, avoids connect_async host override
         let tcp = tokio::net::TcpStream::connect(format!("{host}:443"))
@@ -564,7 +570,9 @@ where
                     Ok(Some(line)) => {
                         // Check if this is the initialize response (has "id":0 or "id": 0)
                         if let Ok(v) = serde_json::from_str::<Value>(&line) {
-                            if v.get("id").and_then(|i| i.as_u64()) == Some(0) && v.get("result").is_some() {
+                            if v.get("id").and_then(|i| i.as_u64()) == Some(0)
+                                && v.get("result").is_some()
+                            {
                                 info!(attempt, "agent initialized");
                                 initialized = true;
                                 break;
@@ -580,10 +588,14 @@ where
                     }
                 }
             }
-            if initialized { break; }
+            if initialized {
+                break;
+            }
         }
         if !initialized {
-            return Err(anyhow!("agent failed to respond to initialize after 5 attempts"));
+            return Err(anyhow!(
+                "agent failed to respond to initialize after 5 attempts"
+            ));
         }
 
         // Send session/new to kiro-cli to create a session
@@ -616,7 +628,8 @@ where
                     Ok(Some(line)) => {
                         if let Ok(v) = serde_json::from_str::<Value>(&line) {
                             if v.get("id").and_then(|i| i.as_u64()) == Some(1) {
-                                sid = v.pointer("/result/sessionId")
+                                sid = v
+                                    .pointer("/result/sessionId")
                                     .and_then(|s| s.as_str())
                                     .unwrap_or("default")
                                     .to_string();
@@ -710,7 +723,10 @@ async fn build_signed_request(
         .header("connection", "Upgrade")
         .header("upgrade", "websocket")
         .header("sec-websocket-version", "13")
-        .header("sec-websocket-key", tokio_tungstenite::tungstenite::handshake::client::generate_key());
+        .header(
+            "sec-websocket-key",
+            tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+        );
 
     // Add SigV4 auth headers (x-amz-date, authorization)
     for (name, value) in instructions.headers() {

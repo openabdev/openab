@@ -81,10 +81,7 @@ impl ProjectContext {
             )
         })?;
         if !canonical.is_dir() {
-            return Err(format!(
-                "project_root {:?} is not a directory",
-                canonical
-            ));
+            return Err(format!("project_root {:?} is not a directory", canonical));
         }
         Ok(canonical)
     }
@@ -134,10 +131,7 @@ mod tests {
             "/this/path/does/not/exist/anywhere_2026_08_18",
         ));
         let err = p.validate().expect_err("nonexistent root must fail");
-        assert!(
-            err.contains("cannot be canonicalized"),
-            "{err}"
-        );
+        assert!(err.contains("cannot be canonicalized"), "{err}");
     }
 
     #[test]

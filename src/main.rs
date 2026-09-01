@@ -1,3 +1,7 @@
+#[cfg(feature = "acp")]
+mod acp_tunnel;
+#[cfg(feature = "acp")]
+mod acp_tunnel_source;
 mod ctl;
 #[cfg(any(
     feature = "telegram",
@@ -10,10 +14,6 @@ mod ctl;
     feature = "lineworks",
 ))]
 mod unified_adapter;
-#[cfg(feature = "acp")]
-mod acp_tunnel;
-#[cfg(feature = "acp")]
-mod acp_tunnel_source;
 use openab_core::acp;
 use openab_core::adapter::{self, AdapterRouter};
 use openab_core::bot_turns;
@@ -25,12 +25,17 @@ use openab_core::dispatch;
 use openab_core::gateway;
 use openab_core::hooks;
 use openab_core::multibot_cache;
+use openab_core::native_completion::{
+    DurableNativeCompletionPort, HttpNativeCompletionPort, NativeCompletionOutbox,
+    SharedNativeCompletionPort,
+};
 #[cfg(feature = "discord")]
 use openab_core::remind;
 use openab_core::secrets;
 use openab_core::setup;
 #[cfg(feature = "slack")]
 use openab_core::slack;
+use openab_core::workflow::{ChatAdapterWorkflowMessenger, WorkflowService};
 
 use clap::Parser;
 #[cfg(feature = "discord")]
@@ -67,6 +72,35 @@ async fn shutdown_signal() {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
+}
+
+/// Explicit one-shot operator switch for the Phase 5.5.2d-R6 differential
+/// Discord send diagnostic.  Absent or any value other than an affirmative
+/// boolean is disabled, so normal daemon starts never emit diagnostic posts.
+fn control_plane_send_diagnostic_enabled(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim),
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES")
+    )
+}
+
+/// Configured Discord destination used by the control-plane diagnostic and as
+/// the default native-work delivery target. It is a Discord snowflake, unlike
+/// AAP's opaque canonical conversation capability.
+#[cfg(feature = "discord")]
+const CONTROL_PLANE_DISCORD_TARGET_CHANNEL_ID: &str = "1539923659345502208";
+
+/// Creates the one shared admission handle for the two production ingress
+/// consumers. Keeping the clones together in the composition root makes the
+/// shared-object invariant directly testable without widening either handler's
+/// public API.
+#[cfg(unix)]
+fn shared_admission_handles() -> (
+    Arc<openab_core::admission::AdmissionPortHandle>,
+    Arc<openab_core::admission::AdmissionPortHandle>,
+) {
+    let admission_handle = Arc::new(openab_core::admission::AdmissionPortHandle::new());
+    (admission_handle.clone(), admission_handle)
 }
 
 #[derive(Parser)]
@@ -364,6 +398,7 @@ async fn main() -> anyhow::Result<()> {
                 thread_id: thread.or_else(|| std::env::var("OPENAB_THREAD_ID").ok()),
                 target_user_id,
                 project: None,
+                agent_work: None,
             })
             .await?;
             if resp.ok {
@@ -382,6 +417,7 @@ async fn main() -> anyhow::Result<()> {
                 thread_id: thread.or_else(|| std::env::var("OPENAB_THREAD_ID").ok()),
                 target_user_id: None,
                 project: None,
+                agent_work: None,
             })
             .await?;
             if resp.ok {
@@ -509,8 +545,8 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "acp")]
     let acp_tunnel_registry = openab_gateway::adapters::acp_server::new_tunnel_registry();
     #[cfg(feature = "acp")]
-    let acp_tunnel: Arc<dyn openab_core::acp_mcp::AcpMcpTunnel> = Arc::new(
-        acp_tunnel::RootAcpTunnel::new(
+    let acp_tunnel: Arc<dyn openab_core::acp_mcp::AcpMcpTunnel> =
+        Arc::new(acp_tunnel::RootAcpTunnel::new(
             acp_tunnel_registry.clone(),
             // Browser control requires `[mcp]`, so the absent case is unreachable in practice;
             // fall back through the SAME function serde uses rather than repeating the literal.
@@ -525,8 +561,7 @@ async fn main() -> anyhow::Result<()> {
                 openab_gateway::adapters::acp_server::warn_if_tunnel_timeout_is_ineffective(t);
                 t
             },
-        ),
-    );
+        ));
 
     // OAB MCP Facade (`[mcp]` in config.toml — OAB MCP Adapter ADR §6.2):
     // serve the loopback Streamable HTTP MCP server in-process so any coding
@@ -557,15 +592,13 @@ async fn main() -> anyhow::Result<()> {
         // be skipped in bridge mode; with the bridge gone there is no mode in which the facade
         // runs without it.
         #[cfg(feature = "acp")]
-        let sources: Vec<Arc<dyn openab_mcp::mcp::sources::CapabilitySource>> =
-            vec![Arc::new(acp_tunnel_source::AcpTunnelSource::new(
-                acp_tunnel.clone(),
-            ))];
+        let sources: Vec<Arc<dyn openab_mcp::mcp::sources::CapabilitySource>> = vec![Arc::new(
+            acp_tunnel_source::AcpTunnelSource::new(acp_tunnel.clone()),
+        )];
         #[cfg(not(feature = "acp"))]
         let sources: Vec<Arc<dyn openab_mcp::mcp::sources::CapabilitySource>> = Vec::new();
         tokio::spawn(async move {
-            if let Err(e) =
-                openab_mcp::mcp::facade::serve_http_with(&listen, sources, tokens).await
+            if let Err(e) = openab_mcp::mcp::facade::serve_http_with(&listen, sources, tokens).await
             {
                 tracing::error!(error = %format!("{e:#}"), listen, "OAB MCP facade exited");
                 std::process::exit(1);
@@ -580,7 +613,7 @@ async fn main() -> anyhow::Result<()> {
             .prompt_hard_timeout_secs
             .saturating_add(cfg.pool.hung_grace_secs),
         cfg.pool.default_config_options,
-    );
+    )?;
     // Facade session wiring: only when the facade is actually serving. With no `[mcp]` there is
     // no registrar and no facade url, and the pool simply starts sessions without browser
     // capabilities — there is no longer a proxy path for it to fall back to.
@@ -593,7 +626,10 @@ async fn main() -> anyhow::Result<()> {
         facade_serving.then(|| {
             format!(
                 "http://{}/mcp",
-                cfg.mcp.as_ref().map(|m| m.listen.as_str()).unwrap_or("127.0.0.1:8848")
+                cfg.mcp
+                    .as_ref()
+                    .map(|m| m.listen.as_str())
+                    .unwrap_or("127.0.0.1:8848")
             )
         }),
     );
@@ -611,7 +647,9 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         if cfg.stt.api_key.is_empty() {
-            anyhow::bail!("stt.enabled = true but no API key found — set stt.api_key in config or export GROQ_API_KEY");
+            anyhow::bail!(
+                "stt.enabled = true but no API key found — set stt.api_key in config or export GROQ_API_KEY"
+            );
         }
         info!(model = %cfg.stt.model, base_url = %cfg.stt.base_url, "STT enabled");
     }
@@ -684,12 +722,24 @@ async fn main() -> anyhow::Result<()> {
         // [discord].allow_all_users/allowed_users, so the gate agrees with
         // Discord's existing user check (behavior-preserving). L2 + dispatch-path
         // privatization for Discord follow once the richer channel model lands.
+        //
+        // Phase 6.4.1D — populate `allowed_channels` from the resolved
+        // `[platform.discord].allowed_channels` so the new
+        // `PlatformTrustConfigs::surface_allowed_for_outbound` gate can
+        // fail-closed on outbound `agent.work` replies when the
+        // operator has explicitly narrowed the inbound allowlist.
+        // Behaviour-preserving when the operator does NOT set the list
+        // (`resolve_allow_all` returns `true` → `allow_all_channels=true`
+        // → every channel passes), which matches today's behaviour.
         if let Some(d) = &cfg.discord {
             reg.insert(
                 "discord",
                 TrustConfig::new(
-                    Some(true), // L2 open — Discord's own channel/thread/DM logic still applies
-                    Vec::<String>::new(),
+                    Some(config::resolve_allow_all(
+                        d.allow_all_channels,
+                        &d.allowed_channels,
+                    )),
+                    d.allowed_channels.clone(),
                     Some(true),
                     Some(config::resolve_allow_all(
                         d.allow_all_users,
@@ -708,12 +758,20 @@ async fn main() -> anyhow::Result<()> {
         // entry, Slack was the only configured platform absent from the
         // registry, falling back to the deny-all default if the gate ever ran
         // for it (#1361).
+        //
+        // Phase 6.4.1D — same outbound-gating propagation as Discord
+        // above: `allowed_channels` is populated so the canonical
+        // `PlatformTrustConfigs::surface_allowed_for_outbound` gate
+        // applies to outbound `agent.work` replies.
         if let Some(s) = &cfg.slack {
             reg.insert(
                 "slack",
                 TrustConfig::new(
-                    Some(true), // L2 open — Slack's own channel check still applies
-                    Vec::<String>::new(),
+                    Some(config::resolve_allow_all(
+                        s.allow_all_channels,
+                        &s.allowed_channels,
+                    )),
+                    s.allowed_channels.clone(),
                     Some(true),
                     Some(config::resolve_allow_all(
                         s.allow_all_users,
@@ -868,25 +926,140 @@ async fn main() -> anyhow::Result<()> {
         );
         reg
     };
+    // Phase 6.4.1D — wrap the gateway trust registry in `Arc` so it
+    // can be shared with both `AdapterRouter::with_trust(...)`
+    // (which takes ownership of the value — see the `.clone()` call
+    // below) and the ctl `RuntimeHandler` (which needs
+    // `Arc<PlatformTrustConfigs>` for the outbound
+    // `surface_allowed_for_outbound` gate).
+    let gateway_trust = std::sync::Arc::new(gateway_trust);
 
-    let router = Arc::new(
-        AdapterRouter::new(
-            pool.clone(),
-            cfg.reactions,
-            cfg.markdown.tables,
-            cfg.pool.prompt_hard_timeout_secs,
-            cfg.pool.liveness_check_secs,
-            cfg.workspace.aliases,
-            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| {
-                tracing::warn!(
-                    "HOME environment variable is not set — falling back to /tmp as bot_home. \
+    #[cfg(feature = "discord")]
+    let workflow_service = cfg.discord.as_ref().map(|discord_config| {
+        let adapter = Arc::new(discord::DiscordAdapter::new(Arc::new(
+            serenity::http::Http::new(&discord_config.bot_token),
+        ))) as Arc<dyn adapter::ChatAdapter>;
+        Arc::new(WorkflowService::new(
+            cfg.workflow.parsed_tech_lead_user_ids(),
+            cfg.workflow.parsed_bot_user_ids(),
+            Arc::new(ChatAdapterWorkflowMessenger::new(adapter)),
+        ))
+    });
+    #[cfg(not(feature = "discord"))]
+    let workflow_service: Option<Arc<WorkflowService>> = None;
+
+    let router_builder = AdapterRouter::new(
+        pool.clone(),
+        cfg.reactions,
+        cfg.markdown.tables,
+        cfg.pool.prompt_hard_timeout_secs,
+        cfg.pool.liveness_check_secs,
+        cfg.workspace.aliases,
+        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| {
+            tracing::warn!(
+                "HOME environment variable is not set — falling back to /tmp as bot_home. \
                      This weakens the workspace security boundary."
-                );
-                "/tmp".into()
-            })),
-        )
-        .with_trust(gateway_trust),
+            );
+            "/tmp".into()
+        })),
+    )
+    .with_trust((*gateway_trust).clone())
+    .with_workflow_config(
+        cfg.workflow.parsed_tech_lead_user_ids(),
+        cfg.workflow.parsed_bot_user_ids(),
     );
+    // Native completion uses the dedicated OpenAB bearer only.  The URL is
+    // deployment-owned; no credential is ever logged or embedded in config.
+    let native_delivery: SharedNativeCompletionPort = Arc::new(
+        HttpNativeCompletionPort::from_env(
+            std::env::var("AAP_OPENAB_COMPLETION_URL").unwrap_or_else(|_| {
+                "http://127.0.0.1:8000/v1/integrations/openab/completion".into()
+            }),
+            "ARTHUR_AGENT_KEY_OPENAB",
+            2,
+            250,
+        )
+        .expect("native completion requires ARTHUR_AGENT_KEY_OPENAB"),
+    );
+    let native_outbox = Arc::new(
+        NativeCompletionOutbox::open(
+            NativeCompletionOutbox::agent_scoped_path(
+                std::env::var("HOME").expect("native completion requires HOME"),
+                &std::env::var("ARTHUR_AGENT_NAME")
+                    .expect("native completion requires ARTHUR_AGENT_NAME"),
+            )
+            .expect("native completion requires safe ARTHUR_AGENT_NAME"),
+        )
+        .expect("native completion outbox must be available"),
+    );
+    let durable_native_completion = Arc::new(DurableNativeCompletionPort::new(
+        native_delivery,
+        native_outbox,
+    ));
+    // Replay only pre-captured native end_turn records; no agent work or scheduler
+    // is invoked by this task.
+    let replay_port = durable_native_completion.clone();
+    tokio::spawn(async move {
+        replay_port.replay_pending().await;
+    });
+    let native_completion_port: SharedNativeCompletionPort = durable_native_completion;
+    let router_builder = router_builder.with_native_completion_port(native_completion_port);
+    let router = Arc::new(match workflow_service {
+        Some(service) => router_builder.with_workflow_service(service),
+        None => router_builder,
+    });
+
+    // Phase 6.4: deterministic OpenAB → AAP autonomous ingress routing.
+    //
+    // When `[autonomous_ingress]` is configured in `config.toml`, build
+    // a real HTTP client and wire it into the router so human Discord
+    // requests addressed to a declared AAP-autonomous agent are routed
+    // to AAP Runtime BEFORE ordinary ACP dispatch. Absent config =
+    // legacy behavior preserved exactly.
+    //
+    // The router is unwrapped from its single-strong-reference Arc at
+    // this seam (it has not yet been shared with any task); after
+    // wiring we re-wrap it. `with_autonomous_ingress` consumes `self`.
+    let router = if let Some(aap_cfg) = cfg.autonomous_ingress.clone() {
+        match openab_core::autonomous_ingress::build_production_client(&aap_cfg) {
+            Ok(client) => {
+                info!(
+                    aap_runtime_url = %aap_cfg.aap_runtime_url,
+                    project_id = %aap_cfg.project_id,
+                    aap_agents = ?aap_cfg.aap_agents,
+                    "Phase 6.4: OpenAB → AAP autonomous ingress wired into production AdapterRouter",
+                );
+                let inner = Arc::try_unwrap(router)
+                    .ok()
+                    .expect("router has a single strong reference at startup seam");
+                let inner = inner.with_autonomous_ingress(
+                    Arc::new(client)
+                        as Arc<dyn openab_core::autonomous_ingress::AutonomousIngressClient>,
+                    aap_cfg,
+                );
+                Arc::new(inner)
+            }
+            Err(openab_core::autonomous_ingress::AutonomousIngressError::AuthMissing) => {
+                error!(
+                    credential_env = %aap_cfg.aap_credential_env,
+                    "Phase 6.4: autonomous ingress is configured but the credential \
+                     environment variable is missing or empty. Refusing to fall back to \
+                     ordinary ACP for the declared agents; aborting startup.",
+                );
+                return Err(anyhow::anyhow!(
+                    "Phase 6.4 fail-closed: configured autonomous ingress requires \
+                     `{}` to be set and non-empty",
+                    aap_cfg.aap_credential_env,
+                ));
+            }
+            Err(other) => {
+                error!(error = %other, "Phase 6.4: failed to build autonomous ingress client");
+                return Err(anyhow::anyhow!("Phase 6.4 startup error: {other}"));
+            }
+        }
+    } else {
+        router
+    };
 
     // Shutdown signal for Slack adapter
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -908,11 +1081,94 @@ async fn main() -> anyhow::Result<()> {
 
     // Pre-build shared adapters for cron scheduler
     #[cfg(feature = "discord")]
+    let shared_discord_adapter = cfg.discord.as_ref().map(|dc| {
+        let http = Arc::new(serenity::http::Http::new(&dc.bot_token));
+        Arc::new(discord::DiscordAdapter::new(http))
+    });
+    #[cfg(feature = "discord")]
+    if let Some(adapter) = shared_discord_adapter.as_ref() {
+        // This is intentionally the concrete adapter that is immediately
+        // coerced below into the `ChatAdapter` passed to RuntimeHandler.  The
+        // diagnostic therefore uses the exact Arc<Http> later used by
+        // `send_message_targeted`, rather than reconstructing a token/client.
+        let diagnostic = adapter
+            .diagnostic_identity(serenity::model::id::ChannelId::new(
+                CONTROL_PLANE_DISCORD_TARGET_CHANNEL_ID
+                    .parse()
+                    .expect("configured Discord target channel ID is valid"),
+            ))
+            .await;
+        let agent_name =
+            std::env::var("OPENAB_AGENT_NAME").unwrap_or_else(|_| "unknown".to_owned());
+        info!(
+            event = "openab.control_plane.discord_identity",
+            adapter_instance_id = %adapter.adapter_instance_id(),
+            agent_name = %agent_name,
+            control_socket = %ctl::socket_path().display(),
+            discord_authenticated_user_id = ?diagnostic.authenticated_user_id,
+            discord_username = ?diagnostic.authenticated_username,
+            target_channel_id = %diagnostic.target_channel_id,
+            target_channel_access = if diagnostic.target_channel_access { "PASS" } else { "FAIL" },
+            target_channel_type = ?diagnostic.target_channel_type,
+            identity_http_status = ?diagnostic.identity_error.as_ref().and_then(|error| error.status),
+            identity_discord_error_code = ?diagnostic.identity_error.as_ref().and_then(|error| error.discord_code),
+            identity_discord_error_message = ?diagnostic.identity_error.as_ref().map(|error| &error.message),
+            target_http_status = ?diagnostic.target_channel_error.as_ref().and_then(|error| error.status),
+            target_discord_error_code = ?diagnostic.target_channel_error.as_ref().and_then(|error| error.discord_code),
+            target_discord_error_message = ?diagnostic.target_channel_error.as_ref().map(|error| &error.message),
+            "control-plane Discord identity diagnostic"
+        );
+        if control_plane_send_diagnostic_enabled(
+            std::env::var("OPENAB_CONTROL_PLANE_DISCORD_SEND_DIAGNOSTIC")
+                .ok()
+                .as_deref(),
+        ) {
+            // This intentionally uses the same concrete adapter (and hence
+            // exact Arc<Http>) that is coerced below for RuntimeHandler.  It
+            // is not a control-socket command and cannot resume a workflow.
+            for result in adapter
+                .diagnostic_shared_http_sends(
+                    serenity::model::id::ChannelId::new(
+                        CONTROL_PLANE_DISCORD_TARGET_CHANNEL_ID
+                            .parse()
+                            .expect("configured Discord target channel ID is valid"),
+                    ),
+                    serenity::model::id::UserId::new(1536733602304499852),
+                )
+                .await
+            {
+                let error = result.error.as_ref();
+                info!(
+                    event = "openab.control_plane.discord_send_diagnostic",
+                    adapter_instance_id = %adapter.adapter_instance_id(),
+                    variant = result.variant.as_str(),
+                    discord_authenticated_user_id = ?diagnostic.authenticated_user_id,
+                    target_channel_id = %result.target_channel_id,
+                    status = if result.success { "PASS" } else { "FAIL" },
+                    message_id = ?result.message_id,
+                    http_status = ?error.and_then(|details| details.status),
+                    discord_error_code = ?error.and_then(|details| details.discord_code),
+                    method = ?error.and_then(|details| details.method.as_deref()),
+                    safe_route = ?error.and_then(|details| details.route.as_deref()),
+                    discord_message = ?error.map(|details| &details.message),
+                    content_length_bytes = result.content_length_bytes,
+                    content_length_chars = result.content_length_chars,
+                    "bounded same-shared-HTTP Discord send diagnostic"
+                );
+            }
+        }
+    }
+    #[cfg(feature = "discord")]
+    if let Some(adapter) = shared_discord_adapter.as_ref() {
+        info!(
+            event = "openab.control_plane.runtime_handler_adapter",
+            adapter_instance_id = %adapter.adapter_instance_id(),
+            "injecting shared DiscordAdapter into RuntimeHandler adapter map"
+        );
+    }
+    #[cfg(feature = "discord")]
     let shared_discord_adapter: Option<Arc<dyn adapter::ChatAdapter>> =
-        cfg.discord.as_ref().map(|dc| {
-            let http = Arc::new(serenity::http::Http::new(&dc.bot_token));
-            Arc::new(discord::DiscordAdapter::new(http)) as Arc<dyn adapter::ChatAdapter>
-        });
+        shared_discord_adapter.map(|adapter| adapter as Arc<dyn adapter::ChatAdapter>);
     #[cfg(not(feature = "discord"))]
     let shared_discord_adapter: Option<Arc<dyn adapter::ChatAdapter>> = None;
 
@@ -929,22 +1185,21 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize filestore (for uploading file attachments to S3/R2).
     #[cfg(feature = "filestore")]
-    let filestore: Option<Arc<openab_core::filestore::Filestore>> = if let Some(ref fs_cfg) =
-        cfg.filestore
-    {
-        info!(
-            bucket = %fs_cfg.bucket,
-            region = %fs_cfg.region,
-            prefix = %fs_cfg.prefix,
-            presigned_ttl = fs_cfg.presigned_ttl,
-            "filestore enabled"
-        );
-        Some(Arc::new(
-            openab_core::filestore::Filestore::new(fs_cfg).await,
-        ))
-    } else {
-        None
-    };
+    let filestore: Option<Arc<openab_core::filestore::Filestore>> =
+        if let Some(ref fs_cfg) = cfg.filestore {
+            info!(
+                bucket = %fs_cfg.bucket,
+                region = %fs_cfg.region,
+                prefix = %fs_cfg.prefix,
+                presigned_ttl = fs_cfg.presigned_ttl,
+                "filestore enabled"
+            );
+            Some(Arc::new(
+                openab_core::filestore::Filestore::new(fs_cfg).await,
+            ))
+        } else {
+            None
+        };
 
     #[cfg(feature = "slack")]
     let shared_slack_adapter: Option<Arc<slack::SlackAdapter>> = cfg.slack.as_ref().map(|s| {
@@ -968,6 +1223,12 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(unix)]
     let ctl_registry = ctl::new_registry();
 
+    // Stable shared admission handle. The Discord dispatcher is installed once
+    // when its platform path is assembled below; ctl and Discord share this
+    // handle rather than constructing separate dispatchers.
+    #[cfg(unix)]
+    let (runtime_admission_handle, discord_admission_handle) = shared_admission_handles();
+
     // Spawn control socket server for `openab set/get` IPC
     #[cfg(unix)]
     let ctl_handle = {
@@ -987,12 +1248,21 @@ async fn main() -> anyhow::Result<()> {
             // those keys return `pool unavailable`; legacy `thread.message`
             // (no project) continues to work.
             Some(ctl::spawn_server(Arc::new(
-                ctl::RuntimeHandler::new(
-                    adapters,
-                    ctl_registry.clone(),
-                    ctl_shard.clone(),
-                )
-                .with_pool(pool.clone()),
+                ctl::RuntimeHandler::new(adapters, ctl_registry.clone(), ctl_shard.clone())
+                    .with_pool(pool.clone())
+                    .with_admission(runtime_admission_handle)
+                    .with_native_delivery_target(adapter::ChannelRef {
+                        platform: "discord".into(),
+                        channel_id: CONTROL_PLANE_DISCORD_TARGET_CHANNEL_ID.into(),
+                        thread_id: None,
+                        parent_id: None,
+                        origin_event_id: None,
+                    })
+                    // Phase 6.4.1D — wire the canonical
+                    // PlatformTrustConfigs into the ctl RuntimeHandler
+                    // so the outbound `surface_allowed_for_outbound`
+                    // gate can fail-closed on unlisted channels.
+                    .with_trust_configs(gateway_trust.clone()),
             )))
         }
     };
@@ -1012,13 +1282,7 @@ async fn main() -> anyhow::Result<()> {
         configured_platforms.push("telegram");
     }
     #[cfg(feature = "googlechat")]
-    if cfg
-        .googlechat
-        .clone()
-        .unwrap_or_default()
-        .resolve()
-        .enabled
-    {
+    if cfg.googlechat.clone().unwrap_or_default().resolve().enabled {
         configured_platforms.push("googlechat");
     }
     #[cfg(feature = "lineworks")]
@@ -1035,7 +1299,9 @@ async fn main() -> anyhow::Result<()> {
         let allow_all_users =
             config::resolve_allow_all(slack_cfg.allow_all_users, &slack_cfg.allowed_users);
         if !allow_all_channels && slack_cfg.allowed_channels.is_empty() {
-            warn!("allow_all_channels=false with empty allowed_channels for Slack — bot will deny all channels");
+            warn!(
+                "allow_all_channels=false with empty allowed_channels for Slack — bot will deny all channels"
+            );
         }
         info!(
             allow_all_channels,
@@ -1133,15 +1399,15 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(feature = "filestore")]
         let gw_filestore = filestore.clone();
         Some(tokio::spawn(async move {
-            if let Err(e) =
-                gateway::run_gateway_adapter(
-                    params,
-                    shutdown_rx,
-                    gw_dispatcher,
-                    gw_router,
-                    #[cfg(feature = "filestore")]
-                    gw_filestore,
-                ).await
+            if let Err(e) = gateway::run_gateway_adapter(
+                params,
+                shutdown_rx,
+                gw_dispatcher,
+                gw_router,
+                #[cfg(feature = "filestore")]
+                gw_filestore,
+            )
+            .await
             {
                 error!("gateway adapter error: {e}");
             }
@@ -1220,7 +1486,6 @@ async fn main() -> anyhow::Result<()> {
                     },
                 ));
             }
-
 
             // First-class `[telegram]` config overrides env-derived values
             // (config-authoritative + ${} expansion + TELEGRAM_* env fallback).
@@ -1419,7 +1684,10 @@ async fn main() -> anyhow::Result<()> {
                         f.config.api_base(),
                         idle_ms,
                     ));
-                    info!(idle_ms, "unified: feishu card-streaming idle reaper started");
+                    info!(
+                        idle_ms,
+                        "unified: feishu card-streaming idle reaper started"
+                    );
                 }
                 if f.config.connection_mode == feishu::ConnectionMode::Websocket {
                     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1561,19 +1829,22 @@ async fn main() -> anyhow::Result<()> {
 
             info!(addr = %listen_addr, "unified webhook server starting");
 
-            (Some(tokio::spawn(async move {
-                let listener = match tokio::net::TcpListener::bind(&listen_addr).await {
-                    Ok(l) => l,
-                    Err(e) => {
-                        error!(addr = %listen_addr, error = %e, "unified webhook server bind failed");
-                        return;
+            (
+                Some(tokio::spawn(async move {
+                    let listener = match tokio::net::TcpListener::bind(&listen_addr).await {
+                        Ok(l) => l,
+                        Err(e) => {
+                            error!(addr = %listen_addr, error = %e, "unified webhook server bind failed");
+                            return;
+                        }
+                    };
+                    info!(addr = %listen_addr, "unified webhook server listening");
+                    if let Err(e) = axum::serve(listener, app).await {
+                        error!(error = %e, "unified webhook server error");
                     }
-                };
-                info!(addr = %listen_addr, "unified webhook server listening");
-                if let Err(e) = axum::serve(listener, app).await {
-                    error!(error = %e, "unified webhook server error");
-                }
-            })), Some(cron_unified_adapter))
+                })),
+                Some(cron_unified_adapter),
+            )
         } else {
             (None, None)
         }
@@ -1651,15 +1922,19 @@ async fn main() -> anyhow::Result<()> {
         let allowed_channels =
             parse_id_set(&discord_cfg.allowed_channels, "discord.allowed_channels")?;
         if !allow_all_channels && allowed_channels.is_empty() {
-            warn!("allow_all_channels=false with empty allowed_channels for Discord — bot will deny all channels");
+            warn!(
+                "allow_all_channels=false with empty allowed_channels for Discord — bot will deny all channels"
+            );
         }
         let allowed_users = parse_id_set(&discord_cfg.allowed_users, "discord.allowed_users")?;
         let trusted_bot_ids =
             parse_id_set(&discord_cfg.trusted_bot_ids, "discord.trusted_bot_ids")?;
         let allowed_role_ids =
             parse_id_set(&discord_cfg.allowed_role_ids, "discord.allowed_role_ids")?;
-        let peer_agent_role_ids =
-            parse_id_set(&discord_cfg.peer_agent_role_ids, "discord.peer_agent_role_ids")?;
+        let peer_agent_role_ids = parse_id_set(
+            &discord_cfg.peer_agent_role_ids,
+            "discord.peer_agent_role_ids",
+        )?;
         info!(
             allow_all_channels,
             allow_all_users,
@@ -1685,6 +1960,15 @@ async fn main() -> anyhow::Result<()> {
             discord_grouping,
             discord_idle,
         ));
+        #[cfg(unix)]
+        if discord_admission_handle
+            .install(Arc::new(
+                openab_core::admission::DispatcherAdmissionPort::new(discord_dispatcher.clone()),
+            ))
+            .is_err()
+        {
+            panic!("Discord admission port installed exactly once");
+        }
         dispatchers.lock().unwrap().push(discord_dispatcher.clone());
 
         // Initialize reminder store
@@ -1736,6 +2020,7 @@ async fn main() -> anyhow::Result<()> {
             )),
             allow_dm: discord_cfg.allow_dm,
             dispatcher: discord_dispatcher,
+            admission: discord_admission_handle,
             ambient: ambient_dispatcher,
             reminder_store: reminder_store.clone(),
             scheduled_ids: tokio::sync::Mutex::new(std::collections::HashSet::new()),
@@ -1856,6 +2141,27 @@ mod tests {
 
     use super::*;
     use clap::Parser;
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_and_discord_share_same_admission_handle() {
+        let (runtime_handler_admission, discord_handler_admission) = shared_admission_handles();
+
+        assert!(Arc::ptr_eq(
+            &runtime_handler_admission,
+            &discord_handler_admission
+        ));
+        assert_eq!(Arc::strong_count(&runtime_handler_admission), 2);
+    }
+
+    #[test]
+    fn control_plane_send_diagnostic_is_off_by_default() {
+        assert!(!control_plane_send_diagnostic_enabled(None));
+        assert!(!control_plane_send_diagnostic_enabled(Some("0")));
+        assert!(!control_plane_send_diagnostic_enabled(Some("false")));
+        assert!(control_plane_send_diagnostic_enabled(Some("1")));
+        assert!(control_plane_send_diagnostic_enabled(Some("true")));
+    }
 
     /// The shipped tunnel-timeout default must stay strictly beneath the ceiling that overtakes it.
     ///
@@ -2029,13 +2335,10 @@ allowed_users = ["u1"]
         assert_ne!(trust.decide("c2", false, "u1"), Decision::Allow);
 
         // Empty lists → allow-all (matching the old inline filter default).
-        let gw_open = config::parse_config_str(
-            "[gateway]\nurl = \"ws://gw:8080/ws\"\n",
-            "test",
-        )
-        .unwrap()
-        .gateway
-        .unwrap();
+        let gw_open = config::parse_config_str("[gateway]\nurl = \"ws://gw:8080/ws\"\n", "test")
+            .unwrap()
+            .gateway
+            .unwrap();
         let trust_open = gateway_section_trust(&gw_open);
         assert_eq!(trust_open.decide("any", false, "anyone"), Decision::Allow);
     }

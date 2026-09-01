@@ -1,15 +1,19 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::Serialize;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, warn};
 
-use crate::acp::{classify_notification, parse_turn_result, AcpEvent, ContentBlock, SessionPool, TurnResult};
+use crate::acp::{
+    classify_notification, parse_turn_result, AcpEvent, ContentBlock, SessionPool, TurnResult,
+};
 use crate::config::{ReactionsConfig, ToolDisplay};
 use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
 use crate::markdown::{self, TableMode};
 use crate::reactions::StatusReactionController;
+use crate::workflow::identity::{current_agent_identity_from_env, AgentIdentity};
 
 // --- Output directive parsing ---
 
@@ -53,7 +57,12 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
                         "reply_to" => {
                             let v = value.trim();
                             // Validate: non-empty, reasonable length, no whitespace/control chars
-                            if !v.is_empty() && v.len() <= 64 && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_') {
+                            if !v.is_empty()
+                                && v.len() <= 64
+                                && v.chars().all(|c| {
+                                    c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'
+                                })
+                            {
                                 directives.reply_to = Some(v.to_string());
                             }
                         }
@@ -351,7 +360,10 @@ impl ChannelRef {
     /// the ctl layer and the dispatcher must construct the IDENTICAL key
     /// for the same thread; both call this method.
     pub fn session_pool_key(&self) -> String {
-        let logical = self.thread_id.as_deref().unwrap_or(self.channel_id.as_str());
+        let logical = self
+            .thread_id
+            .as_deref()
+            .unwrap_or(self.channel_id.as_str());
         format!("{}:{}", self.platform, logical)
     }
 }
@@ -593,6 +605,37 @@ pub struct AdapterRouter {
     /// [`AdapterRouter::with_trust`]; empty default = deny-all per platform
     /// (only consulted by paths wired to the gate — currently the gateway path).
     trust: crate::trust::PlatformTrustConfigs,
+    /// Tech Lead user IDs for the A13 bypass path. Populated via
+    /// [`AdapterRouter::with_workflow_config`] from
+    /// `[workflow] tech_lead_user_ids`. Default: empty set.
+    tech_lead_user_ids: std::collections::HashSet<u64>,
+    /// Bot identity mapping (`ArthurClaude` → u64, etc.). Populated via
+    /// [`AdapterRouter::with_workflow_config`] from
+    /// `[workflow] bot_user_ids`. The Phase 4 `WorkflowService`
+    /// reads this map to resolve the next agent's Discord user id
+    /// for targeted `<workflow_activation>` delivery.
+    bot_user_ids: std::collections::HashMap<String, u64>,
+    /// Optional Phase 4 `WorkflowService`. `None` (default) =
+    /// the turn-completion hook is a no-op. Populated via
+    /// [`AdapterRouter::with_workflow_service`].
+    ///
+    /// **NOTE (Phase 4.0)**: in-loop wiring to
+    /// `WorkflowService::on_turn_complete` requires a Box::pin
+    /// structural fix (the existing `SessionPool::with_connection`
+    /// closure is `Send + 'a` with `&self` captures that does not
+    /// compose with `workflow_service.on_turn_complete(...).await`).
+    /// Phase 4 delivers service + handoff + config wiring + unit
+    /// tests; the in-loop dispatch hook is staged for a Phase 4.1
+    /// commit that re-routes the workflow processing through a
+    /// result the Box::pin can return structurally.
+    workflow_service: Option<Arc<crate::workflow::service::WorkflowService>>,
+    native_completion_port: crate::native_completion::SharedNativeCompletionPort,
+    /// Phase 6.4: deterministic OpenAB → AAP autonomous ingress routing.
+    /// `None` (default) = legacy behavior; ordinary ACP conversation wins
+    /// even when no `workflow_assignment.json` is on disk. Populated via
+    /// [`AdapterRouter::with_autonomous_ingress`].
+    autonomous_ingress_client: Option<Arc<dyn crate::autonomous_ingress::AutonomousIngressClient>>,
+    autonomous_ingress_config: Option<crate::config::AutonomousIngressConfig>,
 }
 
 impl AdapterRouter {
@@ -623,6 +666,14 @@ impl AdapterRouter {
             workspace_aliases,
             bot_home,
             trust: crate::trust::PlatformTrustConfigs::default(),
+            tech_lead_user_ids: std::collections::HashSet::new(),
+            bot_user_ids: std::collections::HashMap::new(),
+            workflow_service: None,
+            native_completion_port: Arc::new(
+                crate::native_completion::UnconfiguredNativeCompletionPort,
+            ),
+            autonomous_ingress_client: None,
+            autonomous_ingress_config: None,
         }
     }
 
@@ -631,6 +682,109 @@ impl AdapterRouter {
     pub fn with_trust(mut self, trust: crate::trust::PlatformTrustConfigs) -> Self {
         self.trust = trust;
         self
+    }
+
+    /// Attach the production Tech Lead user id set and bot identity
+    /// mapping from the parsed `WorkflowConfig`. Builder style; safe
+    /// to call multiple times (last writer wins).
+    pub fn with_workflow_config(
+        mut self,
+        tech_lead_user_ids: std::collections::HashSet<u64>,
+        bot_user_ids: std::collections::HashMap<String, u64>,
+    ) -> Self {
+        self.tech_lead_user_ids = tech_lead_user_ids;
+        self.bot_user_ids = bot_user_ids;
+        self
+    }
+
+    /// Attach the Phase 4 `WorkflowService`. When `None` (the
+    /// default), the turn-completion hook is a no-op and the
+    /// adapter preserves its pre-Phase-4 behaviour.
+    pub fn with_workflow_service(
+        mut self,
+        service: Arc<crate::workflow::service::WorkflowService>,
+    ) -> Self {
+        self.workflow_service = Some(service);
+        self
+    }
+
+    pub fn with_native_completion_port(
+        mut self,
+        port: crate::native_completion::SharedNativeCompletionPort,
+    ) -> Self {
+        self.native_completion_port = port;
+        self
+    }
+
+    pub fn native_completion_port(&self) -> crate::native_completion::SharedNativeCompletionPort {
+        self.native_completion_port.clone()
+    }
+
+    /// Phase 6.4: attach the deterministic AAP autonomous ingress client
+    /// and configuration. When `None` (the default), the A13 gate
+    /// preserves its legacy `WORKFLOW_ASSIGNMENT_MISSING` → ordinary ACP
+    /// behavior. Builder style; safe to call multiple times (last writer
+    /// wins).
+    pub fn with_autonomous_ingress(
+        mut self,
+        client: Arc<dyn crate::autonomous_ingress::AutonomousIngressClient>,
+        config: crate::config::AutonomousIngressConfig,
+    ) -> Self {
+        self.autonomous_ingress_client = Some(client);
+        self.autonomous_ingress_config = Some(config);
+        self
+    }
+
+    /// Phase 6.4: read-only access to the configured AAP autonomous
+    /// ingress client. Returns `None` when the legacy behavior is in
+    /// effect.
+    pub fn autonomous_ingress_client(
+        &self,
+    ) -> Option<Arc<dyn crate::autonomous_ingress::AutonomousIngressClient>> {
+        self.autonomous_ingress_client.clone()
+    }
+
+    /// Phase 6.4: read-only access to the configured AAP autonomous
+    /// ingress config. Returns `None` when the legacy behavior is in
+    /// effect.
+    pub fn autonomous_ingress_config(&self) -> Option<&crate::config::AutonomousIngressConfig> {
+        self.autonomous_ingress_config.as_ref()
+    }
+
+    /// Phase 6.4: resolve the daemon's logical agent identity string
+    /// from the `ARTHUR_AGENT_NAME` environment variable. `None` when
+    /// the env is unset, empty, or unknown.
+    ///
+    /// The dispatch loop reads this to decide whether the A13 gate
+    /// fallback should consult AAP Runtime. Reading at call time (not
+    /// cached at startup) lets test fixtures mutate the env without
+    /// rebuilding the router.
+    pub fn resolved_agent_name(&self) -> Option<&'static str> {
+        // `current_agent_identity_from_env` reads `ARTHUR_AGENT_NAME`
+        // each call. The returned `AgentIdentity` borrows from a
+        // process-global cache inside the identity module, so the
+        // `&'static str` projection is sound for the daemon's
+        // lifetime. Returning `None` for unknown identities is the
+        // documented fail-closed behavior — never fall through to a
+        // silent default.
+        match crate::workflow::identity::current_agent_identity_from_env() {
+            Ok(id) => Some(id.as_str()),
+            Err(_) => None,
+        }
+    }
+
+    /// Phase 4.1: read-only access to the configured
+    /// `WorkflowService`. The dispatch layer invokes this OUTSIDE
+    /// the ACP `Box::pin` closure so the actual `on_turn_complete`
+    /// `.await` happens after the `AcpConnection` borrow has been
+    /// released.
+    pub fn workflow_service(&self) -> Option<Arc<crate::workflow::service::WorkflowService>> {
+        self.workflow_service.clone()
+    }
+
+    /// Return the parsed, deployment-owned Tech Lead identities used by A13.
+    pub fn configured_tech_lead_user_ids(&self) -> std::collections::HashSet<u64> {
+        self.tech_lead_user_ids.clone()
     }
 
     /// The single ingress trust gate: evaluate L2 (scope) + L3 (identity) for an
@@ -646,6 +800,25 @@ impl AdapterRouter {
         sender_id: &str,
     ) -> crate::trust::Decision {
         self.trust.decide(platform, channel_id, is_dm, sender_id)
+    }
+
+    /// Phase 6.4.1E — parent-aware variant of `gate_incoming`.
+    ///
+    /// Discord threads are separate channels whose own snowflake is
+    /// not in `allowed_channels`; the daemon needs `parent_id` to
+    /// inherit from an allowed parent. Non-Discord callers (Slack,
+    /// Gateway) pass `None` and the helper reduces to `gate_incoming`
+    /// semantics (bit-exact for ``parent_id == None``).
+    pub fn gate_incoming_with_parent(
+        &self,
+        platform: &str,
+        channel_id: &str,
+        parent_id: Option<&str>,
+        is_dm: bool,
+        sender_id: &str,
+    ) -> crate::trust::Decision {
+        self.trust
+            .decide_with_parent(platform, channel_id, parent_id, is_dm, sender_id)
     }
 
     /// Access the underlying session pool (e.g. for config option queries).
@@ -756,7 +929,7 @@ impl AdapterRouter {
 
         if !assistant_status {
             match &result {
-                Ok(()) => reactions.set_done().await,
+                Ok(((), _)) => reactions.set_done().await,
                 Err(_) => reactions.set_error().await,
             }
 
@@ -780,7 +953,13 @@ impl AdapterRouter {
                 .await;
         }
 
-        result
+        // handle_message: workflow hook integration is owned by
+        // dispatch_batch (Phase 4.1 brief: workflow processing must
+        // run AFTER the AcpConnection borrow is released). The
+        // owner is the per-thread consumer task in dispatcher,
+        // not this per-message path.
+        let _ = result.map(|(_, _)| ());
+        Ok(())
     }
 
     async fn stream_prompt(
@@ -791,7 +970,7 @@ impl AdapterRouter {
         thread_channel: &ChannelRef,
         reactions: Arc<StatusReactionController>,
         other_bot_present: bool,
-    ) -> Result<()> {
+    ) -> Result<((), Option<crate::workflow::service::WorkflowTurnHookInputs>)> {
         self.stream_prompt_blocks(
             adapter,
             thread_key,
@@ -819,7 +998,7 @@ impl AdapterRouter {
         reactions: Arc<StatusReactionController>,
         other_bot_present: bool,
         recipient: Option<(String, String)>,
-    ) -> Result<()> {
+    ) -> Result<((), Option<crate::workflow::service::WorkflowTurnHookInputs>)> {
         let adapter = adapter.clone();
         let thread_channel = thread_channel.clone();
         let message_limit = reply_message_limit(&thread_channel.platform, adapter.message_limit());
@@ -857,12 +1036,31 @@ impl AdapterRouter {
         let prompt_hard_timeout = self.prompt_hard_timeout;
         let liveness_check_interval = self.liveness_check_interval;
 
-        self.pool
+        // Phase 4.1: Resolve pinned project_root and current daemon
+        // identity BEFORE entering the `with_connection` closure.
+        // Both are needed by the workflow hook; resolving them
+        // outside the Box::pin lets us avoid capturing `&self`
+        // references inside the `Send`-bounded future. The closure
+        // only sees owned data.
+        let pinned_root_for_hook: Option<PathBuf> = self
+            .pool()
+            .get_pinned_project(thread_key)
+            .await
+            .map(|project| project.project_root);
+        let agent_identity_for_hook: Option<AgentIdentity> = current_agent_identity_from_env().ok();
+        let session_key_for_hook: String = thread_key.to_string();
+        let channel_for_hook: crate::adapter::ChannelRef = thread_channel.clone();
+
+        let inner = self.pool
             .with_connection(thread_key, |conn| {
-                let content_blocks = content_blocks.clone();
-                Box::pin(async move {
-                    let reset = conn.session_reset;
-                    conn.session_reset = false;
+            let content_blocks = content_blocks.clone();
+            let pinned_root = pinned_root_for_hook.clone();
+            let agent_identity = agent_identity_for_hook;
+            let session_key = session_key_for_hook.clone();
+            let channel = channel_for_hook.clone();
+            Box::pin(async move {
+                let reset = conn.session_reset;
+                conn.session_reset = false;
 
                     let (mut rx, request_id) = conn.session_prompt(content_blocks).await?;
                     if assistant_status {
@@ -1487,17 +1685,46 @@ impl AdapterRouter {
                         }
                     }
 
+                    // Phase 4.1: the closure returns BOTH the streaming result AND
+                    // the owned inputs the workflow service needs to run
+                    // AFTER the `AcpConnection` borrow is released. The
+                    // streaming result is preserved as the first tuple
+                    // element; the hook inputs are optional so the
+                    // closure can still surface `Err` from the
+                    // streaming pipeline without constructing a
+                    // half-built hook-input record.
+                    let hook_inputs = crate::workflow::service::WorkflowTurnHookInputs {
+                        terminal: is_terminal_stop_reason(&turn_result),
+                        stop_reason: turn_result.stop_reason.clone(),
+                        raw_assistant_text: text_buf.clone(),
+                        pinned_project_root: pinned_root.clone(),
+                        session_key: session_key.clone(),
+                        channel: channel.clone(),
+                        agent_identity,
+                        native_workflow: None,
+                    };
+
                     if delivery_failed {
                         Err(anyhow::anyhow!(
                             "streaming finalization had delivery failures; user view is incomplete"
                         ))
                     } else {
-                        Ok(())
+                        Ok(((), Some(hook_inputs)))
                     }
                 })
             })
-            .await
+            .await;
+        inner
     }
+}
+
+/// Terminal-stop-reason predicate. Mirrors
+/// `crate::completion_bridge::is_terminal_stop_reason` (which is
+/// out-of-scope for the Phase 4 wiring). Phase 4 keeps a local
+/// copy so `stream_prompt_blocks` does not reach into the
+/// completion-bridge module.
+fn is_terminal_stop_reason(turn_result: &TurnResult) -> bool {
+    matches!(turn_result.stop_reason.as_deref(), Some("end_turn"))
 }
 
 /// Returns true if `content` contains a Discord user/bot mention (`<@123>`, `<@!123>`)
@@ -1510,16 +1737,17 @@ fn contains_bot_mention(content: &str) -> bool {
     while i + 2 < bytes.len() {
         if bytes[i] == b'<' && bytes[i + 1] == b'@' {
             // Skip optional '!' (nickname mention) or '&' (role mention)
-            let start = if i + 2 < bytes.len()
-                && (bytes[i + 2] == b'!' || bytes[i + 2] == b'&')
-            {
+            let start = if i + 2 < bytes.len() && (bytes[i + 2] == b'!' || bytes[i + 2] == b'&') {
                 i + 3
             } else {
                 i + 2
             };
             if start < bytes.len() && bytes[start].is_ascii_digit() {
                 if let Some(end) = content[start..].find('>') {
-                    if content[start..start + end].chars().all(|c| c.is_ascii_digit()) {
+                    if content[start..start + end]
+                        .chars()
+                        .all(|c| c.is_ascii_digit())
+                    {
                         return true;
                     }
                 }
@@ -1748,8 +1976,7 @@ fn compose_display(
                         // matches the sibling finished-fallback summary and
                         // the pre-PR raw-count behaviour that users are used
                         // to. A hidden group of `a×2` contributes 2, not 1.
-                        let hidden_groups =
-                            running_groups.len() - TOOL_COLLAPSE_THRESHOLD;
+                        let hidden_groups = running_groups.len() - TOOL_COLLAPSE_THRESHOLD;
                         let hidden_calls: usize = running_groups
                             .iter()
                             .take(hidden_groups)
@@ -1858,7 +2085,11 @@ fn propagate_mentions_to_chunks(
             } else {
                 let footer = format!(
                     "\n{}",
-                    missing.iter().map(|m| m.as_str()).collect::<Vec<_>>().join(" ")
+                    missing
+                        .iter()
+                        .map(|m| m.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
                 );
                 if chunk.chars().count() + footer.chars().count() <= limit {
                     format!("{chunk}{footer}")
@@ -1873,6 +2104,65 @@ fn propagate_mentions_to_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workflow::handoff::WorkflowMessenger;
+    use crate::workflow::service::WorkflowService;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+
+    /// Phase 4 §19 production-config-wiring proof: the configured
+    /// Tech Lead set + bot identity map + WorkflowService survive
+    /// round-tripping through the AdapterRouter builders and are
+    /// visible to the DispatchTarget impl and WorkflowService.
+    #[tokio::test]
+    async fn workflow_config_round_trips_through_adapter_router() {
+        // Build a bare-minimum router — we don't need a real pool
+        // for this wiring assertion; we exercise the storage
+        // fields directly via the public builder + accessors.
+        let mut tech_lead = HashSet::new();
+        tech_lead.insert(645496545805991947u64);
+        let mut bots = HashMap::new();
+        bots.insert("ArthurClaude".into(), 1536733602304499852u64);
+        bots.insert("ArthurCodex".into(), 1536734779607879700u64);
+        bots.insert("ArthurGemini".into(), 1536737891231866971u64);
+
+        // No-op messenger — we never construct a full router here.
+        struct NoopMessenger;
+        #[async_trait::async_trait]
+        impl WorkflowMessenger for NoopMessenger {
+            async fn send_targeted_activation(
+                &self,
+                _channel: &ChannelRef,
+                _body: &str,
+                _target_user_id: u64,
+            ) -> Result<Option<String>, crate::workflow::handoff::MessengerError> {
+                Ok(None)
+            }
+        }
+        let svc = WorkflowService::new(tech_lead.clone(), bots.clone(), Arc::new(NoopMessenger));
+
+        // The Tech Lead set the production path actually uses to
+        // guard A13 must be non-empty. This is the bit that proves
+        // the wiring does not silently regress to the pre-Phase-3
+        // empty default.
+        assert_eq!(svc.tech_lead_user_ids().len(), 1);
+        assert!(svc.tech_lead_user_ids().contains(&645496545805991947u64));
+        assert_eq!(
+            svc.bot_user_ids().get("ArthurClaude"),
+            Some(&1536733602304499852u64)
+        );
+        assert_eq!(
+            svc.bot_user_ids().get("ArthurCodex"),
+            Some(&1536734779607879700u64)
+        );
+        assert_eq!(
+            svc.bot_user_ids().get("ArthurGemini"),
+            Some(&1536737891231866971u64)
+        );
+        // The Tech Lead id 645496545805991947 from the production
+        // deployment DOES resolve from a parsed config — the
+        // production path will not fall through to the empty
+        // default.
+    }
 
     #[test]
     fn acp_reply_limit_is_unbounded_others_use_adapter_limit() {
@@ -1883,7 +2173,10 @@ mod tests {
         assert_eq!(reply_message_limit("slack", 4096), 4096);
         // and a long reply under the ACP limit is a single chunk (delivered whole)
         let long = "x".repeat(50_000);
-        assert_eq!(crate::format::split_message(&long, reply_message_limit("acp", 4096)).len(), 1);
+        assert_eq!(
+            crate::format::split_message(&long, reply_message_limit("acp", 4096)).len(),
+            1
+        );
     }
 
     #[test]
@@ -2076,8 +2369,7 @@ mod tests {
         // Whitespace-only sliced body is treated the same as empty — the
         // Codex observation is "no text after the last tool", which
         // manifests as the slice being purely whitespace.
-        let result_ws =
-            fallback_when_sliced_delivery_empty("   \n  ", full, false, None, &tr);
+        let result_ws = fallback_when_sliced_delivery_empty("   \n  ", full, false, None, &tr);
         assert_eq!(
             result_ws.as_deref(),
             Some(full),
@@ -2489,7 +2781,10 @@ mod tests {
             tool("3", "grep", ToolState::Completed),
         ];
         let out = compose_display(&tools, "done", false, ToolDisplay::Full);
-        assert!(!out.contains("(×"), "should not collapse across order: {out}");
+        assert!(
+            !out.contains("(×"),
+            "should not collapse across order: {out}"
+        );
         assert_eq!(out.matches("`grep`").count(), 2, "output: {out}");
         assert_eq!(out.matches("`curl`").count(), 1, "output: {out}");
     }

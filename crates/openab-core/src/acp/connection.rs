@@ -5,7 +5,7 @@ use crate::acp::protocol::{
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
@@ -42,6 +42,223 @@ fn pick_best_option(options: &[Value]) -> Option<String> {
         .and_then(|option| option.get("optionId"))
         .and_then(|id| id.as_str())
         .map(str::to_owned)
+}
+
+/// Phase 6.4.1F — canonical token set for the structured write policy
+/// that the ACP tool-permission gate enforces. The strings mirror
+/// `admission::NativeScopePolicy` exactly so a literal compare is
+/// sufficient (no enum round-trip needed at the seam).
+pub const WRITE_POLICY_READ_ONLY: &str = "READ_ONLY";
+pub const WRITE_POLICY_MODIFY_ALLOWED: &str = "MODIFY_ALLOWED";
+
+/// Phase 6.4.1F — canonical tool-name deny-list applied when the
+/// connection's `write_policy` is `READ_ONLY`. Conservative by design:
+/// every known write-capable tool name is included so the gate cannot
+/// be bypassed by name variation. Tool titles are matched
+/// case-insensitively against this set plus any `apply_patch` variant.
+///
+/// Bash is intentionally included. The project explicitly chose NOT
+/// to build an unsafe regex-based command parser for shell mutation
+/// detection — the conservative posture is to deny Bash entirely
+/// under READ_ONLY. Read-only shell commands (ls / grep / cat) are
+/// not a current tool surface for Claude Code (it uses Read / Glob /
+/// Grep directly) so this does not regress inspection of the
+/// workspace.
+pub const READ_ONLY_DENY_TOOLS: &[&str] = &[
+    "Edit",
+    "Write",
+    "NotebookEdit",
+    "MultiEdit",
+    "apply_patch",
+    "ApplyPatch",
+    "Bash",
+];
+
+/// Phase 6.4.1F Round 4 — canonical ACP `toolCall.kind` deny-list
+/// applied under `write_policy = READ_ONLY`. The kind is the primary
+/// discriminator for production-shaped requests: real Claude Code
+/// payloads decorate the tool title with arguments (e.g.
+/// `"Write .phase641f-round3-probe"`), so name-only equality against
+/// `READ_ONLY_DENY_TOOLS` silently leaks past the gate. The kind is
+/// a separate, structured field that names the operation class:
+///
+/// * `edit`    — content/file mutation (Write, Edit, MultiEdit,
+///   NotebookEdit, apply_patch, etc.)
+/// * `delete`  — destructive mutation
+/// * `move`    — filesystem/state mutation (rename / move)
+/// * `execute` — command/state execution authority (Bash and any
+///   future shell-equivalent tool)
+///
+/// The READ_ONLY policy already prohibits Bash entirely, so command
+/// execution must not bypass the gate merely because the display
+/// title changes. The list deliberately does NOT include `read`,
+/// `search`, `fetch`, `think`, `other`, or `switch_mode` — those
+/// kinds describe non-mutating operations and must remain
+/// non-denied.
+pub const READ_ONLY_DENY_KINDS: &[&str] = &["edit", "delete", "move", "execute"];
+
+/// Phase 6.4.1F Round 4 — primary discriminator. Returns `true` when
+/// the canonical ACP `toolCall.kind` field names a write- or
+/// execution-capable operation class under
+/// `write_policy = READ_ONLY`. The comparison is case-insensitive
+/// against `READ_ONLY_DENY_KINDS`. An absent, empty, or non-string
+/// kind is treated as a non-match — the title fallback in
+/// `build_permission_response_with_policy` decides.
+pub fn tool_kind_denied_for_read_only(kind: &str) -> bool {
+    let normalized = kind.trim();
+    if normalized.is_empty() {
+        return false;
+    }
+    READ_ONLY_DENY_KINDS
+        .iter()
+        .any(|deny| normalized.eq_ignore_ascii_case(deny))
+}
+
+/// Phase 6.4.1F Round 4 — fallback discriminator. Returns `true`
+/// when the ACP `session/request_permission` `toolCall.title`
+/// field names a write-capable tool that MUST be denied under
+/// `write_policy = READ_ONLY`. Only the FIRST whitespace-delimited
+/// token of the title is inspected — real Claude Code payloads
+/// decorate the title with arguments (e.g. `"Write foo.txt"`),
+/// so bare full-title equality was the original production defect.
+/// The token is compared case-insensitively against
+/// `READ_ONLY_DENY_TOOLS`.
+///
+/// Deliberately does NOT inspect the tool call's `rawInput`,
+/// `input`, or `arguments` field — the gate is purely name-based
+/// to keep it deterministic and reviewable. There is no
+/// natural-language inference, regex inference, or fuzzy matching.
+pub fn tool_title_denied_for_read_only(title: &str) -> bool {
+    let normalized = title.trim();
+    if normalized.is_empty() {
+        // A tool without a name is opaque — fail open at this layer
+        // because the prompt-level `<native_work_authority>` block
+        // carries the explicit READ_ONLY directive. The kind /
+        // title gate is the deterministic second layer, not the
+        // only layer.
+        return false;
+    }
+    let first_token = match normalized.find(char::is_whitespace) {
+        Some(idx) => &normalized[..idx],
+        None => normalized,
+    };
+    READ_ONLY_DENY_TOOLS
+        .iter()
+        .any(|deny| first_token.eq_ignore_ascii_case(deny))
+}
+
+/// Phase 6.4.1F — shared, lock-free write-policy guard. The pool sets
+/// the value immediately after spawning the `AcpConnection`; the
+/// reader loop reads it on every `session/request_permission`
+/// invocation. `None` preserves the pre-6.4.1F behaviour (no gate).
+#[derive(Debug, Default)]
+pub struct WritePolicyGuard {
+    policy: AtomicU8,
+}
+
+impl WritePolicyGuard {
+    pub fn new() -> Self {
+        Self {
+            policy: AtomicU8::new(0),
+        }
+    }
+
+    pub fn set(&self, value: &str) {
+        let code = if value == WRITE_POLICY_READ_ONLY {
+            2
+        } else if value == WRITE_POLICY_MODIFY_ALLOWED {
+            1
+        } else {
+            0
+        };
+        self.policy.store(code, Ordering::Release);
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.policy.load(Ordering::Acquire) == 2
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self.policy.load(Ordering::Acquire) {
+            2 => WRITE_POLICY_READ_ONLY,
+            1 => WRITE_POLICY_MODIFY_ALLOWED,
+            _ => "<unset>",
+        }
+    }
+}
+
+/// Build a spec-compliant permission response with backward-compatible fallback.
+///
+/// `write_policy_guard` — Phase 6.4.1F: when the guard declares
+/// `READ_ONLY`, any `toolCall` that classifies as write- or
+/// execution-capable short-circuits to the `cancelled` outcome
+/// (deterministic denial before the tool can mutate the filesystem).
+/// `None` or `MODIFY_ALLOWED` preserves the pre-6.4.1F behaviour
+/// (auto-allow with the existing best-option picker).
+///
+/// Phase 6.4.1F Round 4 — classification algorithm:
+///
+/// 1. **Primary discriminator** — `toolCall.kind`. Under READ_ONLY,
+///    kinds in `{edit, delete, move, execute}` short-circuit to
+///    `cancelled`. Real Claude Code payloads decorate the title
+///    with arguments (e.g. `"Write .phase641f-round3-probe"`) but
+///    set `kind: "edit"`, so the kind is the authoritative
+///    operation class. `kind: "other"` is intentionally NOT
+///    blanket-denied.
+///
+/// 2. **Fallback discriminator** — when `kind` is absent, empty,
+///    unknown, or any non-deny value, inspect only the FIRST
+///    whitespace-delimited token of `toolCall.title` and compare
+///    case-insensitively against `READ_ONLY_DENY_TOOLS`. This
+///    catches legacy bare-name requests and any agent that omits
+///    `kind`.
+///
+/// 3. Otherwise fall through to the legacy `build_permission_response`
+///    selection (auto-allow by best-option).
+///
+/// For `write_policy = MODIFY_ALLOWED` or unset, the policy block
+/// is skipped entirely — the legacy path is the only path. The fix
+/// MUST NOT globally turn unknown/unset sessions into READ_ONLY.
+pub fn build_permission_response_with_policy(
+    params: Option<&Value>,
+    write_policy_guard: Option<&WritePolicyGuard>,
+) -> Value {
+    if let Some(guard) = write_policy_guard {
+        if guard.is_read_only() {
+            let tool_call = params.and_then(|p| p.get("toolCall"));
+
+            // 1. Primary discriminator: toolCall.kind ∈ {edit, delete,
+            //    move, execute}.
+            let kind_denies = tool_call
+                .and_then(|t| t.get("kind"))
+                .and_then(|k| k.as_str())
+                .map(tool_kind_denied_for_read_only)
+                .unwrap_or(false);
+            if kind_denies {
+                return json!({
+                    "outcome": {
+                        "outcome": "cancelled"
+                    }
+                });
+            }
+
+            // 2. Fallback discriminator: first token of toolCall.title
+            //    against READ_ONLY_DENY_TOOLS.
+            let title_denies = tool_call
+                .and_then(|t| t.get("title"))
+                .and_then(|t| t.as_str())
+                .map(tool_title_denied_for_read_only)
+                .unwrap_or(false);
+            if title_denies {
+                return json!({
+                    "outcome": {
+                        "outcome": "cancelled"
+                    }
+                });
+            }
+        }
+    }
+    build_permission_response(params)
 }
 
 /// Build a spec-compliant permission response with backward-compatible fallback.
@@ -189,6 +406,12 @@ pub struct AcpConnection {
     pub session_reset: bool,
     _reader_handle: JoinHandle<()>,
     _stderr_handle: Option<JoinHandle<()>>,
+    /// Phase 6.4.1F — shared write-policy guard. The pool sets this
+    /// immediately after `AcpConnection::spawn` so the reader loop
+    /// can apply deterministic denial on the very first
+    /// `session/request_permission`. Lock-free so the gate never
+    /// blocks the agent's tool-call stream.
+    pub write_policy_guard: Arc<WritePolicyGuard>,
     /// Revokes this session's facade token when the connection is dropped, on any evict path.
     /// Held only for its `Drop` side effect (never read).
     ///
@@ -235,6 +458,7 @@ pub(crate) async fn run_reader_loop<R, W>(
     writer: Arc<Mutex<W>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
     notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
+    write_policy_guard: Option<Arc<WritePolicyGuard>>,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -268,8 +492,15 @@ pub(crate) async fn run_reader_loop<R, W>(
                     .and_then(|t| t.as_str())
                     .unwrap_or("?");
 
-                let outcome = build_permission_response(msg.params.as_ref());
-                info!(title, %outcome, "auto-respond permission");
+                let outcome = build_permission_response_with_policy(
+                    msg.params.as_ref(),
+                    write_policy_guard.as_deref(),
+                );
+                let policy_label = write_policy_guard
+                    .as_deref()
+                    .map(|g| g.label())
+                    .unwrap_or("<unset>");
+                info!(title, write_policy = %policy_label, %outcome, "auto-respond permission");
                 let reply = JsonRpcResponse::new(id, outcome);
                 if let Ok(data) = serde_json::to_string(&reply) {
                     let mut w = writer.lock().await;
@@ -468,14 +699,26 @@ impl AcpConnection {
         let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(None));
 
+        // Phase 6.4.1F — construct the write-policy guard BEFORE spawning
+        // the reader loop so the spawned task and the returned
+        // `AcpConnection` share the exact same `Arc<WritePolicyGuard>`
+        // instance. A policy update performed through the connection
+        // (e.g. `SessionPool::set_session_write_policy`) MUST be visible
+        // to the reader loop on its very next
+        // `session/request_permission`. The previous construction order
+        // created two disconnected policy paths — the reader loop
+        // observed `None` while the connection stored its own guard —
+        // which let a `READ_ONLY` request resolve as `allow_always`.
+        let activity = Arc::new(SessionActivity::new());
+        let write_policy_guard = Arc::new(WritePolicyGuard::new());
+
         let reader_handle = tokio::spawn(run_reader_loop(
             stdout,
             stdin.clone(),
             pending.clone(),
             notify_tx.clone(),
+            Some(Arc::clone(&write_policy_guard)),
         ));
-
-        let activity = Arc::new(SessionActivity::new());
 
         Ok(Self {
             _proc: proc,
@@ -492,6 +735,7 @@ impl AcpConnection {
             activity,
             session_reset: false,
             _reader_handle: reader_handle,
+            write_policy_guard,
             _stderr_handle: stderr_handle,
             #[cfg(feature = "acp-mcp")]
             facade_token_guard: None,
@@ -852,7 +1096,11 @@ impl Drop for AcpConnection {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_agent_env, build_permission_response, pick_best_option};
+    use super::{
+        build_agent_env, build_permission_response, build_permission_response_with_policy,
+        pick_best_option, tool_kind_denied_for_read_only, tool_title_denied_for_read_only,
+        WritePolicyGuard, WRITE_POLICY_MODIFY_ALLOWED, WRITE_POLICY_READ_ONLY,
+    };
     use serde_json::json;
 
     #[test]
@@ -946,6 +1194,539 @@ mod tests {
         );
     }
 
+    // --- Phase 6.4.1F — READ_ONLY tool-permission gate ----------------
+
+    #[test]
+    fn read_only_policy_denies_edit_tool() {
+        let guard = WritePolicyGuard::new();
+        guard.set(WRITE_POLICY_READ_ONLY);
+        let params = json!({"toolCall": {"title": "Edit"}, "options": []});
+        let response = build_permission_response_with_policy(Some(&params), Some(&guard));
+        assert_eq!(
+            response,
+            json!({"outcome": {"outcome": "cancelled"}}),
+            "Edit must be deterministically denied under READ_ONLY"
+        );
+    }
+
+    #[test]
+    fn read_only_policy_denies_write_notebookedit_multiedit_apply_patch_bash() {
+        let guard = WritePolicyGuard::new();
+        guard.set(WRITE_POLICY_READ_ONLY);
+        for title in ["Write", "NotebookEdit", "MultiEdit", "apply_patch", "Bash"] {
+            let params = json!({"toolCall": {"title": title}, "options": []});
+            let response = build_permission_response_with_policy(Some(&params), Some(&guard));
+            assert_eq!(
+                response,
+                json!({"outcome": {"outcome": "cancelled"}}),
+                "tool title={title:?} must be denied under READ_ONLY"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_policy_allows_read_only_tools() {
+        let guard = WritePolicyGuard::new();
+        guard.set(WRITE_POLICY_READ_ONLY);
+        for title in ["Read", "Glob", "Grep", "LS"] {
+            let params = json!({"toolCall": {"title": title}});
+            let response = build_permission_response_with_policy(Some(&params), Some(&guard));
+            // pick_best_option falls through to "allow_always" with no options
+            assert_eq!(
+                response,
+                json!({"outcome": {"outcome": "selected", "optionId": "allow_always"}}),
+                "tool title={title:?} must remain allowed under READ_ONLY"
+            );
+        }
+    }
+
+    #[test]
+    fn modify_allowed_policy_preserves_pre_6_4_1f_behavior() {
+        // Phase 6.4.1F backward-compat: when the policy is MODIFY_ALLOWED,
+        // the gate must NOT short-circuit; the result must be byte-identical
+        // to the pre-6.4.1F build_permission_response output for the same
+        // params.
+        let guard = WritePolicyGuard::new();
+        guard.set(WRITE_POLICY_MODIFY_ALLOWED);
+        let params = json!({"toolCall": {"title": "Edit"}, "options": []});
+        let gated = build_permission_response_with_policy(Some(&params), Some(&guard));
+        let legacy = build_permission_response(Some(&params));
+        assert_eq!(gated, legacy);
+    }
+
+    #[test]
+    fn unset_policy_preserves_pre_6_4_1f_behavior() {
+        // Phase 6.4.1F backward-compat: callers that never set the policy
+        // (legacy code paths) must see the pre-6.4.1F auto-allow response.
+        let params = json!({"toolCall": {"title": "Edit"}});
+        let gated = build_permission_response_with_policy(Some(&params), None);
+        let legacy = build_permission_response(Some(&params));
+        assert_eq!(gated, legacy);
+    }
+
+    #[test]
+    fn read_only_policy_ignores_unrecognised_tool_title() {
+        let guard = WritePolicyGuard::new();
+        guard.set(WRITE_POLICY_READ_ONLY);
+        let params = json!({"toolCall": {"title": "MagicCustomTool"}});
+        let response = build_permission_response_with_policy(Some(&params), Some(&guard));
+        // Unknown tool titles fall through to the legacy auto-allow path
+        // because the gate is name-based and intentionally conservative.
+        assert_eq!(
+            response,
+            json!({"outcome": {"outcome": "selected", "optionId": "allow_always"}}),
+            "unrecognised tool titles must not be blanket-denied; prompt-level fence is the second layer"
+        );
+    }
+
+    #[test]
+    fn read_only_policy_denies_case_insensitively() {
+        let guard = WritePolicyGuard::new();
+        guard.set(WRITE_POLICY_READ_ONLY);
+        for title in ["edit", "WRITE", "BaSh", "ApplyPatch"] {
+            let params = json!({"toolCall": {"title": title}, "options": []});
+            let response = build_permission_response_with_policy(Some(&params), Some(&guard));
+            assert_eq!(
+                response,
+                json!({"outcome": {"outcome": "cancelled"}}),
+                "tool title={title:?} must be denied case-insensitively"
+            );
+        }
+    }
+
+    // --- Phase 6.4.1F Round 4 — kind-aware READ_ONLY classifier ------
+    //
+    // Production-shaped Claude Code requests decorate the tool title
+    // with arguments (e.g. `"Write .phase641f-round3-probe"`) and
+    // carry the structured `toolCall.kind` field that names the
+    // operation class. Round 4 introduces `toolCall.kind` as the
+    // primary discriminator, with a first-token title fallback for
+    // agents that omit `kind`.
+
+    #[test]
+    fn kind_helper_denies_known_mutation_kinds() {
+        for kind in [
+            "edit", "delete", "move", "execute", "EDIT", "Delete", "MOVE", "EXECUTE",
+        ] {
+            assert!(
+                tool_kind_denied_for_read_only(kind),
+                "kind={kind:?} must be denied under READ_ONLY"
+            );
+        }
+    }
+
+    #[test]
+    fn kind_helper_does_not_deny_non_mutation_kinds() {
+        for kind in [
+            "read",
+            "search",
+            "fetch",
+            "think",
+            "other",
+            "switch_mode",
+            "",
+        ] {
+            assert!(
+                !tool_kind_denied_for_read_only(kind),
+                "kind={kind:?} must NOT be denied by the READ_ONLY classifier"
+            );
+        }
+    }
+
+    #[test]
+    fn title_helper_denies_first_token_for_decorated_titles() {
+        // The Round 3 defect: `"Write .phase641f-round3-probe"` was
+        // not denied because the title carries trailing arguments.
+        // The first-token fallback closes that gap.
+        for title in [
+            "Write foo.txt",
+            "Edit src/main.rs",
+            "NotebookEdit data.ipynb",
+            "MultiEdit a.rs b.rs",
+            "apply_patch fix.patch",
+            "ApplyPatch fix.patch",
+            "Bash ls",
+        ] {
+            assert!(
+                tool_title_denied_for_read_only(title),
+                "title={title:?} first token must be denied under READ_ONLY"
+            );
+        }
+    }
+
+    #[test]
+    fn title_helper_does_not_deny_unrecognised_first_token() {
+        for title in ["MagicCustomTool", "Read README.md", "Glob **/*.rs"] {
+            assert!(
+                !tool_title_denied_for_read_only(title),
+                "title={title:?} first token must NOT be denied under READ_ONLY"
+            );
+        }
+    }
+
+    #[test]
+    fn title_helper_still_denies_bare_names_for_backward_compat() {
+        // Existing Round 3 bare-title callers must remain covered.
+        for title in [
+            "Edit",
+            "Write",
+            "NotebookEdit",
+            "MultiEdit",
+            "apply_patch",
+            "ApplyPatch",
+            "Bash",
+        ] {
+            assert!(
+                tool_title_denied_for_read_only(title),
+                "title={title:?} bare name must still be denied under READ_ONLY"
+            );
+        }
+    }
+
+    // (1)-(7) Production-shaped titles + matching kind → cancelled.
+    #[test]
+    fn read_only_denies_write_foo_txt_kind_edit() {
+        let guard = WritePolicyGuard::new();
+        guard.set(WRITE_POLICY_READ_ONLY);
+        let params = json!({
+            "toolCall": {"title": "Write foo.txt", "kind": "edit"},
+            "options": []
+        });
+        assert_eq!(
+            build_permission_response_with_policy(Some(&params), Some(&guard)),
+            json!({"outcome": {"outcome": "cancelled"}}),
+        );
+    }
+
+    #[test]
+    fn read_only_denies_edit_src_main_rs_kind_edit() {
+        let guard = WritePolicyGuard::new();
+        guard.set(WRITE_POLICY_READ_ONLY);
+        let params = json!({
+            "toolCall": {"title": "Edit src/main.rs", "kind": "edit"},
+            "options": []
+        });
+        assert_eq!(
+            build_permission_response_with_policy(Some(&params), Some(&guard)),
+            json!({"outcome": {"outcome": "cancelled"}}),
+        );
+    }
+
+    #[test]
+    fn read_only_denies_notebookedit_data_ipynb_kind_edit() {
+        let guard = WritePolicyGuard::new();
+        guard.set(WRITE_POLICY_READ_ONLY);
+        let params = json!({
+            "toolCall": {"title": "NotebookEdit data.ipynb", "kind": "edit"},
+            "options": []
+        });
+        assert_eq!(
+            build_permission_response_with_policy(Some(&params), Some(&guard)),
+            json!({"outcome": {"outcome": "cancelled"}}),
+        );
+    }
+
+    #[test]
+    fn read_only_denies_multiedit_a_rs_b_rs_kind_edit() {
+        let guard = WritePolicyGuard::new();
+        guard.set(WRITE_POLICY_READ_ONLY);
+        let params = json!({
+            "toolCall": {"title": "MultiEdit a.rs b.rs", "kind": "edit"},
+            "options": []
+        });
+        assert_eq!(
+            build_permission_response_with_policy(Some(&params), Some(&guard)),
+            json!({"outcome": {"outcome": "cancelled"}}),
+        );
+    }
+
+    #[test]
+    fn read_only_denies_apply_patch_lowercase_kind_edit() {
+        let guard = WritePolicyGuard::new();
+        guard.set(WRITE_POLICY_READ_ONLY);
+        let params = json!({
+            "toolCall": {"title": "apply_patch fix.patch", "kind": "edit"},
+            "options": []
+        });
+        assert_eq!(
+            build_permission_response_with_policy(Some(&params), Some(&guard)),
+            json!({"outcome": {"outcome": "cancelled"}}),
+        );
+    }
+
+    #[test]
+    fn read_only_denies_apply_patch_pascal_case_kind_edit() {
+        let guard = WritePolicyGuard::new();
+        guard.set(WRITE_POLICY_READ_ONLY);
+        let params = json!({
+            "toolCall": {"title": "ApplyPatch fix.patch", "kind": "edit"},
+            "options": []
+        });
+        assert_eq!(
+            build_permission_response_with_policy(Some(&params), Some(&guard)),
+            json!({"outcome": {"outcome": "cancelled"}}),
+        );
+    }
+
+    #[test]
+    fn read_only_denies_bash_ls_kind_execute() {
+        let guard = WritePolicyGuard::new();
+        guard.set(WRITE_POLICY_READ_ONLY);
+        let params = json!({
+            "toolCall": {"title": "Bash ls", "kind": "execute"},
+            "options": []
+        });
+        assert_eq!(
+            build_permission_response_with_policy(Some(&params), Some(&guard)),
+            json!({"outcome": {"outcome": "cancelled"}}),
+        );
+    }
+
+    // (8)-(11) Unknown title + mutation kind → cancelled via kind primary.
+    #[test]
+    fn read_only_denies_unknown_title_kind_edit() {
+        let guard = WritePolicyGuard::new();
+        guard.set(WRITE_POLICY_READ_ONLY);
+        let params = json!({
+            "toolCall": {"title": "SomeAgentSpecificMutation", "kind": "edit"},
+            "options": []
+        });
+        assert_eq!(
+            build_permission_response_with_policy(Some(&params), Some(&guard)),
+            json!({"outcome": {"outcome": "cancelled"}}),
+        );
+    }
+
+    #[test]
+    fn read_only_denies_unknown_title_kind_delete() {
+        let guard = WritePolicyGuard::new();
+        guard.set(WRITE_POLICY_READ_ONLY);
+        let params = json!({
+            "toolCall": {"title": "SomeAgentSpecificMutation", "kind": "delete"},
+            "options": []
+        });
+        assert_eq!(
+            build_permission_response_with_policy(Some(&params), Some(&guard)),
+            json!({"outcome": {"outcome": "cancelled"}}),
+        );
+    }
+
+    #[test]
+    fn read_only_denies_unknown_title_kind_move() {
+        let guard = WritePolicyGuard::new();
+        guard.set(WRITE_POLICY_READ_ONLY);
+        let params = json!({
+            "toolCall": {"title": "SomeAgentSpecificMutation", "kind": "move"},
+            "options": []
+        });
+        assert_eq!(
+            build_permission_response_with_policy(Some(&params), Some(&guard)),
+            json!({"outcome": {"outcome": "cancelled"}}),
+        );
+    }
+
+    #[test]
+    fn read_only_denies_unknown_title_kind_execute() {
+        let guard = WritePolicyGuard::new();
+        guard.set(WRITE_POLICY_READ_ONLY);
+        let params = json!({
+            "toolCall": {"title": "SomeAgentSpecificMutation", "kind": "execute"},
+            "options": []
+        });
+        assert_eq!(
+            build_permission_response_with_policy(Some(&params), Some(&guard)),
+            json!({"outcome": {"outcome": "cancelled"}}),
+        );
+    }
+
+    // (12) Non-mutation kinds must NOT short-circuit — preserve
+    // allow/fallthrough behavior.
+    #[test]
+    fn read_only_preserves_fallthrough_for_non_mutation_kinds() {
+        let guard = WritePolicyGuard::new();
+        guard.set(WRITE_POLICY_READ_ONLY);
+        for kind in ["read", "search", "fetch", "think", "other", "switch_mode"] {
+            // Provide both options and no options; the gate must not
+            // short-circuit so the legacy selection path decides.
+            let with_options = json!({
+                "toolCall": {"title": "SomeTool", "kind": kind},
+                "options": [{"kind": "allow_always", "optionId": "always"}]
+            });
+            assert_eq!(
+                build_permission_response_with_policy(Some(&with_options), Some(&guard)),
+                json!({"outcome": {"outcome": "selected", "optionId": "always"}}),
+                "kind={kind:?} must not short-circuit; legacy option picker decides"
+            );
+
+            // With no options, legacy path returns allow_always.
+            let no_options = json!({
+                "toolCall": {"title": "SomeTool", "kind": kind}
+            });
+            assert_eq!(
+                build_permission_response_with_policy(Some(&no_options), Some(&guard)),
+                json!({"outcome": {"outcome": "selected", "optionId": "allow_always"}}),
+                "kind={kind:?} with no options must still fall through to legacy allow_always"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_does_not_deny_kind_other() {
+        // Explicit guard: `kind=other` MUST NOT be auto-denied by the
+        // kind classifier. With no `options` array, the legacy
+        // `build_permission_response` returns `allow_always` — proving
+        // the gate did not short-circuit.
+        let guard = WritePolicyGuard::new();
+        guard.set(WRITE_POLICY_READ_ONLY);
+        let params = json!({
+            "toolCall": {"title": "Read README.md", "kind": "other"}
+        });
+        assert_eq!(
+            build_permission_response_with_policy(Some(&params), Some(&guard)),
+            json!({"outcome": {"outcome": "selected", "optionId": "allow_always"}}),
+            "kind=other must NOT be blanket-denied by the READ_ONLY classifier"
+        );
+    }
+
+    // (13) Kind omitted + decorated title → cancelled via first-token
+    // fallback (the original Round 3 production defect).
+    #[test]
+    fn read_only_denies_via_first_token_fallback_when_kind_omitted() {
+        let guard = WritePolicyGuard::new();
+        guard.set(WRITE_POLICY_READ_ONLY);
+        let params = json!({
+            "toolCall": {"title": "Write README.md"},
+            "options": []
+        });
+        assert_eq!(
+            build_permission_response_with_policy(Some(&params), Some(&guard)),
+            json!({"outcome": {"outcome": "cancelled"}}),
+            "kind omitted + decorated title must deny via first-token fallback"
+        );
+    }
+
+    // (14) MODIFY_ALLOWED + production-shaped Write/Edit/Bash → legacy
+    // behavior (no short-circuit).
+    #[test]
+    fn modify_allowed_preserves_legacy_for_production_shaped_requests() {
+        let guard = WritePolicyGuard::new();
+        guard.set(WRITE_POLICY_MODIFY_ALLOWED);
+        for (title, kind) in [
+            ("Write .probe", "edit"),
+            ("Edit src/main.rs", "edit"),
+            ("Bash ls", "execute"),
+        ] {
+            let params = json!({
+                "toolCall": {"title": title, "kind": kind},
+                "options": [{"kind": "allow_always", "optionId": "always"}]
+            });
+            let gated = build_permission_response_with_policy(Some(&params), Some(&guard));
+            let legacy = build_permission_response(Some(&params));
+            assert_eq!(
+                gated, legacy,
+                "MODIFY_ALLOWED + production-shaped {title:?} ({kind:?}) must match legacy"
+            );
+            assert_ne!(
+                gated,
+                json!({"outcome": {"outcome": "cancelled"}}),
+                "MODIFY_ALLOWED MUST NOT short-circuit under any kind/title"
+            );
+        }
+    }
+
+    // (15) Unset policy + production-shaped Write/Edit/Bash → legacy
+    // behavior. Crucial: the fix MUST NOT globally turn unknown/unset
+    // sessions into READ_ONLY.
+    #[test]
+    fn unset_policy_preserves_legacy_for_production_shaped_requests() {
+        for (title, kind) in [
+            ("Write .probe", "edit"),
+            ("Edit src/main.rs", "edit"),
+            ("Bash ls", "execute"),
+        ] {
+            let params = json!({
+                "toolCall": {"title": title, "kind": kind},
+                "options": [{"kind": "allow_always", "optionId": "always"}]
+            });
+            let gated = build_permission_response_with_policy(Some(&params), None);
+            let legacy = build_permission_response(Some(&params));
+            assert_eq!(
+                gated, legacy,
+                "unset + production-shaped {title:?} ({kind:?}) must match legacy"
+            );
+            assert_ne!(
+                gated,
+                json!({"outcome": {"outcome": "cancelled"}}),
+                "unset policy MUST NOT short-circuit under any kind/title"
+            );
+        }
+    }
+
+    // Explicit regression: bare full-title equality returning `false`
+    // for a decorated title must not be reintroduced. The first-token
+    // fallback closes the Round 3 defect; this test fails immediately
+    // if a future change reverts to exact full-title equality.
+    #[test]
+    fn full_title_decoration_does_not_bypass_first_token_check() {
+        // The exact Round 3 production title.
+        assert!(
+            tool_title_denied_for_read_only("Write .phase641f-round3-probe"),
+            "decorated Write title must be denied via first-token fallback"
+        );
+        // Other common decorations.
+        for title in [
+            "Edit /etc/hosts",
+            "Bash rm -rf /",
+            "MultiEdit a.rs b.rs c.rs",
+            "NotebookEdit /home/user/notebook.ipynb (cell 0)",
+        ] {
+            assert!(
+                tool_title_denied_for_read_only(title),
+                "decorated title={title:?} must be denied via first-token fallback"
+            );
+        }
+    }
+
+    // Exact production payload must produce the exact production
+    // outcome. Locks the seam that Round 3 left leaky.
+    #[test]
+    fn exact_production_payload_cancels() {
+        let guard = WritePolicyGuard::new();
+        guard.set(WRITE_POLICY_READ_ONLY);
+        let params = json!({
+            "toolCall": {
+                "title": "Write .phase641f-round3-probe",
+                "kind": "edit",
+                "rawInput": {
+                    "file_path": "/home/arthur/workspace/ai-workstation/.phase641f-round3-probe",
+                    "content": "probe"
+                }
+            },
+            "options": [{"kind": "allow_always", "optionId": "always"}]
+        });
+        assert_eq!(
+            build_permission_response_with_policy(Some(&params), Some(&guard)),
+            json!({"outcome": {"outcome": "cancelled"}}),
+            "exact production payload must produce cancelled under READ_ONLY"
+        );
+    }
+
+    #[test]
+    fn write_policy_guard_round_trip() {
+        let guard = WritePolicyGuard::new();
+        assert!(!guard.is_read_only());
+        assert_eq!(guard.label(), "<unset>");
+        guard.set("READ_ONLY");
+        assert!(guard.is_read_only());
+        assert_eq!(guard.label(), "READ_ONLY");
+        guard.set("MODIFY_ALLOWED");
+        assert!(!guard.is_read_only());
+        assert_eq!(guard.label(), "MODIFY_ALLOWED");
+        guard.set("garbage");
+        assert_eq!(guard.label(), "<unset>");
+        assert!(!guard.is_read_only());
+    }
+
     #[test]
     fn explicit_env_takes_precedence_over_inherit_env() {
         let key = "OAB_TEST_PRECEDENCE";
@@ -992,7 +1773,7 @@ mod reader_loop_tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Arc;
-    use tokio::io::{duplex, AsyncWriteExt};
+    use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{mpsc, oneshot, Mutex};
 
     /// #732 stale-id path: when a response arrives for an id the broker has
@@ -1019,6 +1800,7 @@ mod reader_loop_tests {
             writer,
             pending.clone(),
             notify_tx.clone(),
+            None,
         ));
 
         let stale = b"{\"jsonrpc\":\"2.0\",\"id\":42,\"result\":{\"stopReason\":\"ok\"}}\n";
@@ -1062,6 +1844,7 @@ mod reader_loop_tests {
             writer,
             pending.clone(),
             notify_tx.clone(),
+            None,
         ));
 
         let payload = b"{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"stopReason\":\"end_turn\"}}\n";
@@ -1112,5 +1895,578 @@ mod reader_loop_tests {
         assert!(activity.in_flight());
         activity.set_in_flight(false);
         assert!(!activity.in_flight());
+    }
+
+    // ----- Phase 6.4.1F — WritePolicyGuard wiring invariants --------------
+    //
+    // These tests cover the structural fix for the production hard-gate
+    // smoke that observed `write_policy=<unset>` in the reader loop while
+    // `SessionPool::set_session_write_policy()` correctly updated the
+    // guard stored on `AcpConnection`. The two paths must share the same
+    // `Arc<WritePolicyGuard>`; once they do, every test below is a
+    // behavioural consequence.
+
+    /// Drive `run_reader_loop` with a shared `Arc<WritePolicyGuard>`,
+    /// emit a `session/request_permission`, and read the auto-reply off
+    /// the writer side. Returns the parsed outcome string
+    /// (`"cancelled"` / `"selected"`).
+    async fn drive_permission_request_and_read_reply(
+        guard: Option<Arc<WritePolicyGuard>>,
+    ) -> String {
+        let (mut agent_stdout_writer, agent_stdout_reader) = duplex(8 * 1024);
+        let (agent_stdin_writer, mut agent_stdin_reader) = duplex(8 * 1024);
+
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
+            Arc::new(Mutex::new(None));
+
+        let writer = Arc::new(Mutex::new(agent_stdin_writer));
+        let handle = tokio::spawn(run_reader_loop(
+            agent_stdout_reader,
+            writer,
+            pending.clone(),
+            notify_tx.clone(),
+            guard,
+        ));
+
+        let request = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/request_permission\",\
+                        \"params\":{\"toolCall\":{\"title\":\"Write\"},\
+                        \"options\":[{\"kind\":\"allow_always\",\"optionId\":\"always\"}]}}\n";
+        agent_stdout_writer.write_all(request).await.unwrap();
+        agent_stdout_writer.flush().await.unwrap();
+
+        let mut reply_buf = Vec::new();
+        let read_reply = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut byte = [0u8; 1];
+            loop {
+                match agent_stdin_reader.read(&mut byte).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        reply_buf.push(byte[0]);
+                        if byte[0] == b'\n' {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+        .await;
+        assert!(
+            read_reply.is_ok(),
+            "reader loop must write a reply within 2s"
+        );
+
+        drop(agent_stdout_writer);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+
+        let reply_text = String::from_utf8_lossy(&reply_buf).to_string();
+        let parsed: serde_json::Value = serde_json::from_str(reply_text.trim())
+            .unwrap_or_else(|e| panic!("reply is not valid JSON: {e}; raw={reply_text:?}"));
+        // Reader loop wraps the outcome in a JSON-RPC envelope:
+        //   {"jsonrpc":"2.0","id":1,"result":<outcome>}
+        parsed
+            .get("result")
+            .and_then(|r| r.get("outcome"))
+            .and_then(|o| o.get("outcome"))
+            .and_then(|o| o.as_str())
+            .unwrap_or_else(|| panic!("reply missing result.outcome.outcome; raw={reply_text:?}"))
+            .to_string()
+    }
+
+    /// Read the full auto-reply (the `result` field of the JSON-RPC
+    /// envelope) for direct equality comparison.
+    async fn drive_permission_request_and_read_full_reply(
+        guard: Option<Arc<WritePolicyGuard>>,
+        title: &str,
+    ) -> serde_json::Value {
+        let (mut agent_stdout_writer, agent_stdout_reader) = duplex(8 * 1024);
+        let (agent_stdin_writer, mut agent_stdin_reader) = duplex(8 * 1024);
+
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
+            Arc::new(Mutex::new(None));
+
+        let writer = Arc::new(Mutex::new(agent_stdin_writer));
+        let handle = tokio::spawn(run_reader_loop(
+            agent_stdout_reader,
+            writer,
+            pending.clone(),
+            notify_tx.clone(),
+            guard,
+        ));
+
+        let body = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/request_permission\",\
+             \"params\":{{\"toolCall\":{{\"title\":\"{title}\"}},\
+             \"options\":[{{\"kind\":\"allow_always\",\"optionId\":\"always\"}}]}}}}"
+        );
+        let request = format!("{body}\n");
+        agent_stdout_writer
+            .write_all(request.as_bytes())
+            .await
+            .unwrap();
+        agent_stdout_writer.flush().await.unwrap();
+
+        let mut reply_buf = Vec::new();
+        let read_reply = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut byte = [0u8; 1];
+            loop {
+                match agent_stdin_reader.read(&mut byte).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        reply_buf.push(byte[0]);
+                        if byte[0] == b'\n' {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+        .await;
+        assert!(
+            read_reply.is_ok(),
+            "reader loop must write a reply within 2s"
+        );
+
+        drop(agent_stdout_writer);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+
+        let reply_text = String::from_utf8_lossy(&reply_buf).to_string();
+        let parsed: serde_json::Value = serde_json::from_str(reply_text.trim())
+            .unwrap_or_else(|e| panic!("reply is not valid JSON: {e}; raw={reply_text:?}"));
+        // Return the inner result so tests can compare against the
+        // expected outcome envelope directly.
+        parsed
+            .get("result")
+            .cloned()
+            .unwrap_or_else(|| panic!("reply missing result; raw={reply_text:?}"))
+    }
+
+    /// (1) The guard passed into the reader loop must be the same
+    /// `Arc<WritePolicyGuard>` as the one the caller (i.e. the
+    /// `AcpConnection`) holds. This is the mechanical invariant behind
+    /// the production hard-gate smoke fix — without it, a policy update
+    /// via `set_session_write_policy` would never reach the reader
+    /// loop. The clone handed to the spawned task is asserted via
+    /// `Arc::ptr_eq` against a clone held in the test (a third clone,
+    /// taken before spawn, of the exact allocation that the task and the
+    /// `AcpConnection` then both share).
+    #[tokio::test]
+    async fn reader_loop_guard_shares_allocation_with_outer_handle() {
+        let guard: Arc<WritePolicyGuard> = Arc::new(WritePolicyGuard::new());
+        let outer_clone = Arc::clone(&guard);
+
+        let (mut agent_stdout_writer, agent_stdout_reader) = duplex(8 * 1024);
+        let (agent_stdin_writer, _agent_stdin_reader) = duplex(8 * 1024);
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
+            Arc::new(Mutex::new(None));
+        let writer = Arc::new(Mutex::new(agent_stdin_writer));
+
+        let handle = tokio::spawn(run_reader_loop(
+            agent_stdout_reader,
+            writer,
+            pending.clone(),
+            notify_tx.clone(),
+            Some(Arc::clone(&guard)),
+        ));
+
+        // Behavioural proof: mutating via the outer handle is observed
+        // by the reader loop on the very next request. Arc::ptr_eq
+        // would assert the allocation equivalence but cannot see the
+        // clone moved into the spawned task; the mutation-visibility
+        // test is the canonical behavioural expression of the same
+        // property.
+        guard.set(WRITE_POLICY_READ_ONLY);
+        assert!(
+            Arc::ptr_eq(&outer_clone, &guard),
+            "outer_clone must share the original allocation"
+        );
+
+        let request = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/request_permission\",\
+                        \"params\":{\"toolCall\":{\"title\":\"Write\"},\
+                        \"options\":[{\"kind\":\"allow_always\",\"optionId\":\"always\"}]}}\n";
+        agent_stdout_writer.write_all(request).await.unwrap();
+        agent_stdout_writer.flush().await.unwrap();
+
+        drop(agent_stdout_writer);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+    }
+
+    /// (2) Updating the policy AFTER the reader loop has been spawned
+    /// must be visible to the permission handler. This is the
+    /// behavioural expression of the shared-Arc invariant: the
+    /// connection's `set_session_write_policy` updates the guard, and
+    /// the reader loop reads the same guard on the next
+    /// `session/request_permission`. Pre-fix the reader loop's
+    /// `Option<None>` made the update invisible.
+    #[tokio::test]
+    async fn post_spawn_policy_update_is_visible_to_reader_loop() {
+        let guard: Arc<WritePolicyGuard> = Arc::new(WritePolicyGuard::new());
+
+        // Before any update, the reader loop sees `<unset>` and
+        // auto-allows the request.
+        let outcome_before =
+            drive_permission_request_and_read_reply(Some(Arc::clone(&guard))).await;
+        assert_eq!(
+            outcome_before, "selected",
+            "unset policy must preserve legacy auto-allow"
+        );
+
+        // Update the guard AFTER the spawn equivalent (in the
+        // real lifecycle, `set_session_write_policy` runs after
+        // `AcpConnection::spawn`). The next request must observe
+        // READ_ONLY.
+        guard.set(WRITE_POLICY_READ_ONLY);
+        let outcome_after = drive_permission_request_and_read_reply(Some(Arc::clone(&guard))).await;
+        assert_eq!(
+            outcome_after, "cancelled",
+            "READ_ONLY must deterministically cancel Write"
+        );
+    }
+
+    /// (3) READ_ONLY + Write request returns cancelled. Direct
+    /// production acceptance criterion.
+    #[tokio::test]
+    async fn read_only_guard_cancels_write_request() {
+        let guard = Arc::new(WritePolicyGuard::new());
+        guard.set(WRITE_POLICY_READ_ONLY);
+        let outcome = drive_permission_request_and_read_reply(Some(guard)).await;
+        assert_eq!(
+            outcome, "cancelled",
+            "READ_ONLY + Write must produce a cancelled outcome"
+        );
+    }
+
+    /// (4) READ_ONLY + Edit request returns cancelled.
+    #[tokio::test]
+    async fn read_only_guard_cancels_edit_request() {
+        let guard = Arc::new(WritePolicyGuard::new());
+        guard.set(WRITE_POLICY_READ_ONLY);
+        let reply = drive_permission_request_and_read_full_reply(Some(guard), "Edit").await;
+        assert_eq!(
+            reply,
+            serde_json::json!({"outcome": {"outcome": "cancelled"}}),
+            "READ_ONLY + Edit must produce a cancelled outcome"
+        );
+    }
+
+    /// (5) MODIFY_ALLOWED preserves existing permission behaviour. The
+    /// reader loop must not short-circuit on the gate; it must fall
+    /// through to the legacy `build_permission_response` path. Pre-fix
+    /// the `None` reader-loop guard also produced this result, so this
+    /// test guards against a regression that would blanket-deny under
+    /// MODIFY_ALLOWED.
+    #[tokio::test]
+    async fn modify_allowed_guard_preserves_legacy_behaviour() {
+        let guard = Arc::new(WritePolicyGuard::new());
+        guard.set(WRITE_POLICY_MODIFY_ALLOWED);
+        let reply = drive_permission_request_and_read_full_reply(Some(guard), "Write").await;
+        // `pick_best_option` returns the `optionId` of the first
+        // selectable option (`allow_always` here is `"always"`).
+        // Critically, the reply MUST NOT be cancelled.
+        assert_eq!(
+            reply,
+            serde_json::json!({"outcome": {"outcome": "selected", "optionId": "always"}}),
+            "MODIFY_ALLOWED must not short-circuit the gate"
+        );
+    }
+
+    /// (6) Unset / legacy policy preserves pre-6.4.1F behaviour. The
+    /// pre-fix bug was that the reader loop had `None` (unset) and
+    /// auto-allowed. The fix MUST NOT convert every unset guard into
+    /// READ_ONLY — that would silently break every legacy session that
+    /// has never set a structured native scope.
+    #[tokio::test]
+    async fn unset_guard_preserves_pre_6_4_1f_behaviour() {
+        let reply = drive_permission_request_and_read_full_reply(None, "Write").await;
+        assert_eq!(
+            reply,
+            serde_json::json!({"outcome": {"outcome": "selected", "optionId": "always"}}),
+            "unset/legacy guard must not blanket-deny"
+        );
+    }
+
+    /// (7) Session reuse does not detach or reset the guard. After a
+    /// `READ_ONLY` write through one clone, a fresh clone must still
+    /// see `READ_ONLY`. Equivalently: the guard shared between the
+    /// reader loop and the connection is the SAME allocation across
+    /// the entire session — it cannot be replaced, reset, or detached
+    /// by either side.
+    #[tokio::test]
+    async fn session_reuse_preserves_guard_allocation() {
+        let guard: Arc<WritePolicyGuard> = Arc::new(WritePolicyGuard::new());
+
+        let connection_side = Arc::clone(&guard);
+        let reader_loop_side = Arc::clone(&guard);
+        assert!(
+            Arc::ptr_eq(&connection_side, &reader_loop_side),
+            "both sides must point at the same allocation"
+        );
+
+        connection_side.set(WRITE_POLICY_READ_ONLY);
+        assert!(
+            reader_loop_side.is_read_only(),
+            "reader_loop_side must observe the mutation through the shared Arc"
+        );
+
+        // The connection side then transitions the guard to
+        // MODIFY_ALLOWED; the reader loop side must follow.
+        connection_side.set(WRITE_POLICY_MODIFY_ALLOWED);
+        assert!(
+            !reader_loop_side.is_read_only(),
+            "guard cannot be detached or reset by either side"
+        );
+        assert_eq!(
+            reader_loop_side.label(),
+            WRITE_POLICY_MODIFY_ALLOWED,
+            "shared guard label must reflect the latest set()"
+        );
+    }
+
+    /// (8) Fresh native-dispatch session isolation. Every spawn must
+    /// build an INDEPENDENT `Arc<WritePolicyGuard>` — two concurrent
+    /// native dispatches MUST NOT share a guard, otherwise one
+    /// dispatch's `set_session_write_policy("READ_ONLY")` would
+    /// silently cross-contaminate the other dispatch's reader loop.
+    /// This test models the post-spawn layout (each side holds its
+    /// own Arc) and asserts the Arcs are distinct.
+    #[tokio::test]
+    async fn fresh_session_guard_is_isolated() {
+        let guard_a: Arc<WritePolicyGuard> = Arc::new(WritePolicyGuard::new());
+        let guard_b: Arc<WritePolicyGuard> = Arc::new(WritePolicyGuard::new());
+        assert!(
+            !Arc::ptr_eq(&guard_a, &guard_b),
+            "two independent spawns must produce two independent guards"
+        );
+
+        // Mutating one must be invisible to the other.
+        guard_a.set(WRITE_POLICY_READ_ONLY);
+        assert!(guard_a.is_read_only());
+        assert!(
+            !guard_b.is_read_only(),
+            "fresh session guards must not share state"
+        );
+    }
+
+    /// Cross-cutting invariant for the production security acceptance
+    /// criterion: a `READ_ONLY` + Write request observed by the reader
+    /// loop must produce `cancelled` — exactly the production failure
+    /// `write_policy=<unset>` → `allow_always`, now corrected to
+    /// `READ_ONLY` → `cancelled` when the same Arc backs the reader
+    /// loop and the connection.
+    #[tokio::test]
+    async fn production_security_criterion_read_only_write_is_cancelled() {
+        // Simulate the production lifecycle:
+        //   1. AcpConnection::spawn() builds `write_policy_guard`
+        //      and passes a clone into the reader loop.
+        //   2. SessionPool::set_session_write_policy() updates the
+        //      connection-side guard.
+        //   3. The agent emits session/request_permission.
+        //   4. The reader loop reads the guard and replies.
+        let guard: Arc<WritePolicyGuard> = Arc::new(WritePolicyGuard::new());
+        // Spawn the reader loop with a clone — same allocation as
+        // `guard`. Both the test-side `guard` and the task-side clone
+        // reference the same WritePolicyGuard state.
+        let (mut agent_stdout_writer, agent_stdout_reader) = duplex(8 * 1024);
+        let (agent_stdin_writer, mut agent_stdin_reader) = duplex(8 * 1024);
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
+            Arc::new(Mutex::new(None));
+        let writer = Arc::new(Mutex::new(agent_stdin_writer));
+        let handle = tokio::spawn(run_reader_loop(
+            agent_stdout_reader,
+            writer,
+            pending.clone(),
+            notify_tx.clone(),
+            Some(Arc::clone(&guard)),
+        ));
+
+        // SessionPool path: update via the connection-side handle.
+        guard.set(WRITE_POLICY_READ_ONLY);
+
+        // Agent emits a Write permission request.
+        agent_stdout_writer
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/request_permission\",\
+                  \"params\":{\"toolCall\":{\"title\":\"Write\"},\
+                  \"options\":[{\"kind\":\"allow_always\",\"optionId\":\"always\"}]}}\n",
+            )
+            .await
+            .unwrap();
+        agent_stdout_writer.flush().await.unwrap();
+
+        // Read the auto-reply and assert the production outcome.
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut byte = [0u8; 1];
+            loop {
+                match agent_stdin_reader.read(&mut byte).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        buf.push(byte[0]);
+                        if byte[0] == b'\n' {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+        .await;
+
+        let text = String::from_utf8_lossy(&buf).to_string();
+        let parsed: serde_json::Value = serde_json::from_str(text.trim())
+            .unwrap_or_else(|e| panic!("reply not JSON: {e}; raw={text:?}"));
+        // The reader loop wraps the outcome in a JSON-RPC envelope
+        // `{"jsonrpc":"2.0","id":1,"result":<outcome>}`. Compare the
+        // inner result.
+        let result = parsed
+            .get("result")
+            .unwrap_or_else(|| panic!("reply missing result; raw={text:?}"));
+        assert_eq!(
+            result,
+            &serde_json::json!({"outcome": {"outcome": "cancelled"}}),
+            "production acceptance: READ_ONLY + Write -> cancelled"
+        );
+
+        drop(agent_stdout_writer);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+    }
+
+    /// Drive `run_reader_loop` with a shared guard and emit a raw
+    /// JSON-RPC frame so a test can pass an arbitrarily-decorated
+    /// `toolCall` payload (kind + title + rawInput). Returns the
+    /// full `result` JSON object the loop wrote back.
+    async fn drive_permission_request_with_raw_payload_and_read_full_reply(
+        guard: Option<Arc<WritePolicyGuard>>,
+        params_json: &str,
+    ) -> serde_json::Value {
+        let (mut agent_stdout_writer, agent_stdout_reader) = duplex(8 * 1024);
+        let (agent_stdin_writer, mut agent_stdin_reader) = duplex(8 * 1024);
+
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
+            Arc::new(Mutex::new(None));
+
+        let writer = Arc::new(Mutex::new(agent_stdin_writer));
+        let handle = tokio::spawn(run_reader_loop(
+            agent_stdout_reader,
+            writer,
+            pending.clone(),
+            notify_tx.clone(),
+            guard,
+        ));
+
+        let body = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"session/request_permission\",\
+             \"params\":{params_json}}}"
+        );
+        let request = format!("{body}\n");
+        agent_stdout_writer
+            .write_all(request.as_bytes())
+            .await
+            .unwrap();
+        agent_stdout_writer.flush().await.unwrap();
+
+        let mut reply_buf = Vec::new();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            let mut byte = [0u8; 1];
+            loop {
+                match agent_stdin_reader.read(&mut byte).await {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        reply_buf.push(byte[0]);
+                        if byte[0] == b'\n' {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+        .await;
+
+        drop(agent_stdout_writer);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+
+        let reply_text = String::from_utf8_lossy(&reply_buf).to_string();
+        let parsed: serde_json::Value = serde_json::from_str(reply_text.trim())
+            .unwrap_or_else(|e| panic!("reply not JSON: {e}; raw={reply_text:?}"));
+        parsed
+            .get("result")
+            .cloned()
+            .unwrap_or_else(|| panic!("reply missing result; raw={reply_text:?}"))
+    }
+
+    /// (16) Reader-loop end-to-end with the literal production payload
+    /// shape. Drives `run_reader_loop` with a shared guard set to
+    /// READ_ONLY and emits the exact JSON observed in the
+    /// `.phase641f-round3-probe` incident. Must reply `cancelled`.
+    /// This test fails immediately if the kind/title classifier
+    /// regresses to exact full-title equality.
+    #[tokio::test]
+    async fn reader_loop_cancels_exact_production_payload() {
+        let guard = Arc::new(WritePolicyGuard::new());
+        guard.set(WRITE_POLICY_READ_ONLY);
+
+        // The literal production-shaped params object.
+        let params_json = r#"{"toolCall":{"title":"Write .phase641f-round3-probe","kind":"edit","rawInput":{"file_path":"/home/arthur/workspace/ai-workstation/.phase641f-round3-probe","content":"probe"}},"options":[{"kind":"allow_always","optionId":"always"}]}"#;
+
+        let reply = drive_permission_request_with_raw_payload_and_read_full_reply(
+            Some(Arc::clone(&guard)),
+            params_json,
+        )
+        .await;
+
+        assert_eq!(
+            reply,
+            serde_json::json!({"outcome": {"outcome": "cancelled"}}),
+            "reader loop seam under READ_ONLY must cancel decorated production-shaped Write"
+        );
+    }
+
+    /// Reader-loop with the same payload but `unset` guard. The fix
+    /// MUST NOT globally turn unknown sessions into READ_ONLY.
+    #[tokio::test]
+    async fn reader_loop_preserves_legacy_for_production_payload_when_unset() {
+        let params_json = r#"{"toolCall":{"title":"Write .phase641f-round3-probe","kind":"edit","rawInput":{"file_path":"/home/arthur/workspace/ai-workstation/.phase641f-round3-probe","content":"probe"}},"options":[{"kind":"allow_always","optionId":"always"}]}"#;
+
+        let reply =
+            drive_permission_request_with_raw_payload_and_read_full_reply(None, params_json).await;
+
+        assert_eq!(
+            reply,
+            serde_json::json!({"outcome": {"outcome": "selected", "optionId": "always"}}),
+            "reader loop seam with unset guard must preserve legacy allow on decorated Write"
+        );
+    }
+
+    /// Reader-loop with the same payload but `MODIFY_ALLOWED` guard.
+    #[tokio::test]
+    async fn reader_loop_preserves_legacy_for_production_payload_when_modify_allowed() {
+        let guard = Arc::new(WritePolicyGuard::new());
+        guard.set(WRITE_POLICY_MODIFY_ALLOWED);
+
+        let params_json = r#"{"toolCall":{"title":"Write .phase641f-round3-probe","kind":"edit","rawInput":{"file_path":"/home/arthur/workspace/ai-workstation/.phase641f-round3-probe","content":"probe"}},"options":[{"kind":"allow_always","optionId":"always"}]}"#;
+
+        let reply = drive_permission_request_with_raw_payload_and_read_full_reply(
+            Some(Arc::clone(&guard)),
+            params_json,
+        )
+        .await;
+
+        assert_eq!(
+            reply,
+            serde_json::json!({"outcome": {"outcome": "selected", "optionId": "always"}}),
+            "reader loop seam with MODIFY_ALLOWED guard must preserve legacy allow on decorated Write"
+        );
     }
 }

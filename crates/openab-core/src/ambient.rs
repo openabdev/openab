@@ -346,7 +346,9 @@ impl AmbientDispatcher {
 
     /// Check if ambient mode is active and this channel is in the allowlist.
     pub fn is_ambient_channel(&self, channel_id: u64) -> bool {
-        self.config.enabled && !self.enabled_channels.is_empty() && self.enabled_channels.contains(&channel_id)
+        self.config.enabled
+            && !self.enabled_channels.is_empty()
+            && self.enabled_channels.contains(&channel_id)
     }
 
     /// Decide whether a message should be ambient-buffered.
@@ -431,11 +433,7 @@ impl AmbientDispatcher {
         let state = channels.get(channel_id).unwrap();
         // Non-blocking try_send — if buffer is full (hard_cap), drop the message.
         if let Err(e) = state.tx.try_send(msg) {
-            debug!(
-                channel_id,
-                "ambient buffer full, dropping message: {}",
-                e
-            );
+            debug!(channel_id, "ambient buffer full, dropping message: {}", e);
         }
     }
 
@@ -448,7 +446,10 @@ impl AmbientDispatcher {
         if let Some(state) = channels.get(channel_id) {
             // Cancel any in-flight post — consumer discards current batch on next check.
             state.post_guard.cancel();
-            debug!(channel_id, "ambient buffer discard requested (mention arrived)");
+            debug!(
+                channel_id,
+                "ambient buffer discard requested (mention arrived)"
+            );
         }
     }
 
@@ -504,7 +505,8 @@ async fn ambient_consumer_loop(
         let base = Duration::from_secs(base_secs);
         let jitter_range = base.as_millis() as f64 * 0.2;
         let jitter_ms = rand::thread_rng().gen_range(-jitter_range..jitter_range) as i64;
-        let interval = Duration::from_millis((base.as_millis() as i64 + jitter_ms).max(1000) as u64);
+        let interval =
+            Duration::from_millis((base.as_millis() as i64 + jitter_ms).max(1000) as u64);
         let deadline = tokio::time::Instant::now() + interval;
 
         let mut batch = vec![first];
@@ -569,8 +571,16 @@ async fn ambient_consumer_loop(
         // Debug mode: notify channel that a flush is happening.
         if config.debug {
             let senders: Vec<&str> = batch.iter().map(|m| m.sender_name.as_str()).collect();
-            let transcript = batch.iter()
-                .map(|m| format!("{} (<@{}>): {}", m.sender_name, m.sender_id, m.prompt.replace('`', "'")))
+            let transcript = batch
+                .iter()
+                .map(|m| {
+                    format!(
+                        "{} (<@{}>): {}",
+                        m.sender_name,
+                        m.sender_id,
+                        m.prompt.replace('`', "'")
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             let mut debug_msg = format!(
@@ -595,7 +605,7 @@ async fn ambient_consumer_loop(
         }
 
         // Ensure session exists.
-        if let Err(e) = target.ensure_session(&session_key, None).await {
+        if let Err(e) = target.ensure_session(&session_key, None, None).await {
             warn!(
                 channel_id = %crate::redact::redact_session_ids(&channel_id),
                 error = %e,
@@ -646,7 +656,7 @@ async fn ambient_consumer_loop(
             )
             .await
         {
-            Ok(()) => {
+            Ok(((), _)) => {
                 debug!(channel_id = %crate::redact::redact_session_ids(&channel_id), "ambient flush dispatched");
             }
             Err(e) => {
@@ -750,7 +760,8 @@ mod tests {
 
     #[test]
     fn payload_transcript_includes_sender_uid() {
-        let blocks = build_ambient_payload(&[msg("hello")], super::DEFAULT_AMBIENT_SYSTEM_INSTRUCTION);
+        let blocks =
+            build_ambient_payload(&[msg("hello")], super::DEFAULT_AMBIENT_SYSTEM_INSTRUCTION);
         let transcript = match &blocks[1] {
             ContentBlock::Text { text } => text.as_str(),
             #[allow(unreachable_patterns)]

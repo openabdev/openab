@@ -484,8 +484,8 @@ impl openab_core::acp_mcp::SessionTokenRegistrar for FacadeRegistrar {
 mod tests {
     use super::{AcpTunnelSource, CapabilitySource, SessionCtx, Tool};
     use openab_core::acp_mcp::AcpMcpTunnel;
-    use std::collections::HashSet;
     use serde_json::{json, Map, Value};
+    use std::collections::HashSet;
     use std::sync::Arc;
 
     /// Tunnel double: reports declared servers, records forwarded `tools/call`s,
@@ -518,17 +518,16 @@ mod tests {
 
         /// Make `tools/list` answer with these tool names.
         fn set_tools_list(&self, names: &[&str]) {
-            *self.tools_list.lock().unwrap() =
-                Some(names.iter().map(|n| n.to_string()).collect());
+            *self.tools_list.lock().unwrap() = Some(names.iter().map(|n| n.to_string()).collect());
         }
 
         /// Make a specific server's `tools/list` return exactly `names`, verbatim — the tool names
         /// need not be prefixed with the server's name.
         fn set_server_tools(&self, server_name: &str, names: &[&str]) {
-            self.server_tools
-                .lock()
-                .unwrap()
-                .insert(server_name.to_string(), names.iter().map(|n| n.to_string()).collect());
+            self.server_tools.lock().unwrap().insert(
+                server_name.to_string(),
+                names.iter().map(|n| n.to_string()).collect(),
+            );
         }
 
         /// Make `tools/list` fail (no answer configured).
@@ -615,9 +614,9 @@ mod tests {
                         shared
                             .into_iter()
                             .filter(|n| match &server_name {
-                                Some(name) => n
-                                    .split_once('.')
-                                    .is_some_and(|(prefix, _)| prefix == name),
+                                Some(name) => {
+                                    n.split_once('.').is_some_and(|(prefix, _)| prefix == name)
+                                }
                                 None => true,
                             })
                             .collect()
@@ -717,7 +716,10 @@ mod tests {
             .call(Some(&ctx()), "notes.anything", &Map::new())
             .await
             .unwrap();
-        assert!(!is_err, "no allowlist gate: a connected server's declared tool dispatches");
+        assert!(
+            !is_err,
+            "no allowlist gate: a connected server's declared tool dispatches"
+        );
         let fwd = tunnel.forwarded.lock().unwrap();
         assert_eq!(fwd[0].1, "uuid-n");
         assert_eq!(fwd[0].2["name"], "notes.anything");
@@ -819,18 +821,36 @@ mod tests {
         // `attached_server_names`, but a name already in the cache keeps its tools even while it is
         // momentarily not attached — the UNION in `tools()` is what preserves this.
         let tunnel = FakeTunnel::with(&[("katashiro", "uuid-abc")]);
-        tunnel.set_tools_list(&["katashiro.click", "katashiro.navigate", "katashiro.read_dom", "katashiro.screenshot", "katashiro.type"]);
+        tunnel.set_tools_list(&[
+            "katashiro.click",
+            "katashiro.navigate",
+            "katashiro.read_dom",
+            "katashiro.screenshot",
+            "katashiro.type",
+        ]);
         let src = AcpTunnelSource::new(tunnel.clone());
         let _ = src.tools(Some(&ctx()));
         settle().await;
-        let before: Vec<String> =
-            src.tools(Some(&ctx())).iter().map(|t| t.name.to_string()).collect();
-        assert!(!before.is_empty(), "precondition: discovery must have populated the catalog");
+        let before: Vec<String> = src
+            .tools(Some(&ctx()))
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert!(
+            !before.is_empty(),
+            "precondition: discovery must have populated the catalog"
+        );
 
         tunnel.detach("katashiro");
-        let after: Vec<String> =
-            src.tools(Some(&ctx())).iter().map(|t| t.name.to_string()).collect();
-        assert_eq!(after, before, "a detached tunnel must not shrink the catalog");
+        let after: Vec<String> = src
+            .tools(Some(&ctx()))
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert_eq!(
+            after, before,
+            "a detached tunnel must not shrink the catalog"
+        );
     }
 
     #[tokio::test]
@@ -838,13 +858,22 @@ mod tests {
         // Once a catalog has been discovered, a LATER failed fetch must not empty it — the
         // invariant that protects a running deployment through a flap.
         let tunnel = FakeTunnel::with(&[("katashiro", "uuid-abc")]);
-        tunnel.set_tools_list(&["katashiro.click", "katashiro.navigate", "katashiro.read_dom", "katashiro.screenshot", "katashiro.type"]);
+        tunnel.set_tools_list(&[
+            "katashiro.click",
+            "katashiro.navigate",
+            "katashiro.read_dom",
+            "katashiro.screenshot",
+            "katashiro.type",
+        ]);
         let src = AcpTunnelSource::new(tunnel.clone());
 
         let _ = src.tools(Some(&ctx()));
         settle().await;
         let discovered = src.tools(Some(&ctx())).len();
-        assert!(discovered > 0, "precondition: discovery must have populated the catalog");
+        assert!(
+            discovered > 0,
+            "precondition: discovery must have populated the catalog"
+        );
 
         tunnel.fail_tools_list();
         let _ = src.tools(Some(&ctx()));
@@ -967,10 +996,16 @@ mod tests {
             .call(Some(&ctx()), "notes.click", &Map::new())
             .await
             .unwrap();
-        assert!(!err, "prefix selects the tunnel; the server decides what it implements");
+        assert!(
+            !err,
+            "prefix selects the tunnel; the server decides what it implements"
+        );
         let fwd = tunnel.forwarded.lock().unwrap();
         assert_eq!(fwd.len(), 1);
-        assert_eq!(fwd[0].1, "uuid-n", "routed to notes' tunnel, not katashiro's");
+        assert_eq!(
+            fwd[0].1, "uuid-n",
+            "routed to notes' tunnel, not katashiro's"
+        );
         assert_eq!(fwd[0].2["name"], "notes.click");
     }
 
@@ -1006,15 +1041,27 @@ mod tests {
 
         let _ = src.tools(Some(&ctx()));
         settle().await;
-        let names: Vec<String> =
-            src.tools(Some(&ctx())).iter().map(|t| t.name.to_string()).collect();
+        let names: Vec<String> = src
+            .tools(Some(&ctx()))
+            .iter()
+            .map(|t| t.name.to_string())
+            .collect();
         assert_eq!(names, ["build"], "the bare tool is advertised");
 
         let (_v, is_err) = src.call(Some(&ctx()), "build", &Map::new()).await.unwrap();
-        assert!(!is_err, "a bare tool must dispatch, not be rejected as malformed");
+        assert!(
+            !is_err,
+            "a bare tool must dispatch, not be rejected as malformed"
+        );
         let fwd = tunnel.forwarded.lock().unwrap();
-        assert_eq!(fwd[0].1, "uuid-p", "routed to the publishing server's tunnel");
-        assert_eq!(fwd[0].2["name"], "build", "the original tool name is forwarded unchanged");
+        assert_eq!(
+            fwd[0].1, "uuid-p",
+            "routed to the publishing server's tunnel"
+        );
+        assert_eq!(
+            fwd[0].2["name"], "build",
+            "the original tool name is forwarded unchanged"
+        );
     }
 
     #[tokio::test]
@@ -1031,7 +1078,10 @@ mod tests {
         let _ = src.tools(Some(&ctx()));
         settle().await;
 
-        let (_v, is_err) = src.call(Some(&ctx()), "katashiro.click", &Map::new()).await.unwrap();
+        let (_v, is_err) = src
+            .call(Some(&ctx()), "katashiro.click", &Map::new())
+            .await
+            .unwrap();
         assert!(!is_err);
         let fwd = tunnel.forwarded.lock().unwrap();
         assert_eq!(
@@ -1087,7 +1137,10 @@ mod tests {
 
         for tool in ["screenshot", "beta.screenshot"] {
             let (_v, is_err) = src.call(Some(&ctx()), tool, &Map::new()).await.unwrap();
-            assert!(!is_err, "{tool} must dispatch — being advertised is the promise");
+            assert!(
+                !is_err,
+                "{tool} must dispatch — being advertised is the promise"
+            );
         }
         let fwd = tunnel.forwarded.lock().unwrap();
         let routed: Vec<(String, String)> = fwd
@@ -1256,10 +1309,22 @@ mod tests {
         let _ = src.tools(Some(&ctx()));
         settle().await;
 
-        let (_v, is_err) = src.call(Some(&ctx()), "browser.click", &Map::new()).await.unwrap();
-        assert!(!is_err, "a mismatched-prefix tool must route to its publisher, not a phantom server");
+        let (_v, is_err) = src
+            .call(Some(&ctx()), "browser.click", &Map::new())
+            .await
+            .unwrap();
+        assert!(
+            !is_err,
+            "a mismatched-prefix tool must route to its publisher, not a phantom server"
+        );
         let fwd = tunnel.forwarded.lock().unwrap();
-        assert_eq!(fwd[0].1, "uuid-k", "routed to katashiro, not the 'browser' prefix");
-        assert_eq!(fwd[0].2["name"], "browser.click", "the original tool name is forwarded unchanged");
+        assert_eq!(
+            fwd[0].1, "uuid-k",
+            "routed to katashiro, not the 'browser' prefix"
+        );
+        assert_eq!(
+            fwd[0].2["name"], "browser.click",
+            "the original tool name is forwarded unchanged"
+        );
     }
 }

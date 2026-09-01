@@ -230,9 +230,15 @@ pub fn parse_turn_result(result: &Value) -> TurnResult {
         .and_then(|v| v.as_str())
         .map(String::from);
     let usage = result.get("usage");
-    let input_tokens = usage.and_then(|u| u.get("inputTokens")).and_then(|v| v.as_u64());
-    let output_tokens = usage.and_then(|u| u.get("outputTokens")).and_then(|v| v.as_u64());
-    let total_tokens = usage.and_then(|u| u.get("totalTokens")).and_then(|v| v.as_u64());
+    let input_tokens = usage
+        .and_then(|u| u.get("inputTokens"))
+        .and_then(|v| v.as_u64());
+    let output_tokens = usage
+        .and_then(|u| u.get("outputTokens"))
+        .and_then(|v| v.as_u64());
+    let total_tokens = usage
+        .and_then(|u| u.get("totalTokens"))
+        .and_then(|v| v.as_u64());
     TurnResult {
         stop_reason,
         input_tokens,
@@ -281,7 +287,11 @@ pub struct UsageReport {
 /// Returns `None` when `success` is not true or the data shape is missing —
 /// callers should treat that as "usage not supported by this agent".
 pub fn parse_usage_report(result: &Value) -> Option<UsageReport> {
-    if !result.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
+    if !result
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
         return None;
     }
     let data = result.get("data")?;
@@ -307,9 +317,7 @@ pub fn parse_usage_report(result: &Value) -> Option<UsageReport> {
                     let has_limit = b
                         .get("hasLimit")
                         .and_then(|v| v.as_bool())
-                        .unwrap_or_else(|| {
-                            b.get("limit").and_then(|v| v.as_f64()).is_some()
-                        });
+                        .unwrap_or_else(|| b.get("limit").and_then(|v| v.as_f64()).is_some());
                     Some(UsageBreakdown {
                         display_name: b.get("displayName")?.as_str()?.to_string(),
                         used: b.get("used")?.as_f64()?,

@@ -108,7 +108,9 @@ pub fn sanitize_message(msg: &str) -> String {
 /// Validate reminder message length.
 pub fn validate_message(msg: &str) -> Result<(), String> {
     if msg.len() > MAX_MESSAGE_LEN {
-        Err(format!("message too long (max {MAX_MESSAGE_LEN} characters)"))
+        Err(format!(
+            "message too long (max {MAX_MESSAGE_LEN} characters)"
+        ))
     } else {
         Ok(())
     }
@@ -130,7 +132,9 @@ pub fn parse_delay(input: &str) -> Result<u64, String> {
         if ch.is_ascii_digit() {
             num_buf.push(ch);
         } else {
-            let n: u64 = num_buf.parse().map_err(|_| format!("invalid number in delay: {input}"))?;
+            let n: u64 = num_buf
+                .parse()
+                .map_err(|_| format!("invalid number in delay: {input}"))?;
             num_buf.clear();
             let multiplier = match ch {
                 'm' => 60,
@@ -144,7 +148,9 @@ pub fn parse_delay(input: &str) -> Result<u64, String> {
 
     // Handle bare number (default to minutes)
     if !num_buf.is_empty() {
-        let n: u64 = num_buf.parse().map_err(|_| format!("invalid number in delay: {input}"))?;
+        let n: u64 = num_buf
+            .parse()
+            .map_err(|_| format!("invalid number in delay: {input}"))?;
         total_secs += n * 60; // default unit = minutes
     }
 
@@ -164,18 +170,24 @@ pub fn format_delay(secs: u64) -> String {
     let h = (secs % 86400) / 3600;
     let m = (secs % 3600) / 60;
     let mut parts = Vec::new();
-    if d > 0 { parts.push(format!("{d}d")); }
-    if h > 0 { parts.push(format!("{h}h")); }
-    if m > 0 { parts.push(format!("{m}m")); }
-    if parts.is_empty() { "< 1m".into() } else { parts.join(" ") }
+    if d > 0 {
+        parts.push(format!("{d}d"));
+    }
+    if h > 0 {
+        parts.push(format!("{h}h"));
+    }
+    if m > 0 {
+        parts.push(format!("{m}m"));
+    }
+    if parts.is_empty() {
+        "< 1m".into()
+    } else {
+        parts.join(" ")
+    }
 }
 
 /// Spawn a tokio task that fires the reminder after the delay.
-pub fn schedule_reminder(
-    http: Arc<Http>,
-    store: ReminderStore,
-    reminder: Reminder,
-) {
+pub fn schedule_reminder(http: Arc<Http>, store: ReminderStore, reminder: Reminder) {
     let now = Utc::now();
     let delay = if reminder.fire_at > now {
         (reminder.fire_at - now).to_std().unwrap_or_default()
@@ -370,9 +382,18 @@ mod tests {
 
     #[test]
     fn sanitize_message_strips_everyone_here() {
-        assert_eq!(sanitize_message("hello @everyone"), "hello @\u{200b}everyone");
-        assert_eq!(sanitize_message("hey @here check"), "hey @\u{200b}here check");
-        assert_eq!(sanitize_message("@everyone @here"), "@\u{200b}everyone @\u{200b}here");
+        assert_eq!(
+            sanitize_message("hello @everyone"),
+            "hello @\u{200b}everyone"
+        );
+        assert_eq!(
+            sanitize_message("hey @here check"),
+            "hey @\u{200b}here check"
+        );
+        assert_eq!(
+            sanitize_message("@everyone @here"),
+            "@\u{200b}everyone @\u{200b}here"
+        );
     }
 
     #[test]
