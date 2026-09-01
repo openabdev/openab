@@ -850,7 +850,9 @@ mod tests {
             .and(path("/open-apis/cardkit/v1/cards"))
             // Only assert the envelope; the escaped `data` string is covered by
             // the pure card_v2 test above.
-            .and(body_partial_json(serde_json::json!({ "type": "card_json" })))
+            .and(body_partial_json(
+                serde_json::json!({ "type": "card_json" }),
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "code": 0,
                 "msg": "success",
@@ -998,8 +1000,7 @@ mod tests {
             .mount(&server)
             .await;
         let client = reqwest::Client::new();
-        let out =
-            finish_card_stream(&client, &server.uri(), "tok", card_id, "final text", 9).await;
+        let out = finish_card_stream(&client, &server.uri(), "tok", card_id, "final text", 9).await;
         assert_eq!(out, CardOutcome::Updated);
     }
 
@@ -1030,8 +1031,15 @@ mod tests {
             .mount(&server)
             .await;
         let client = reqwest::Client::new();
-        let mid =
-            send_card_message(&client, &server.uri(), "tok", "oc_chat", Some(root), "cardabc").await;
+        let mid = send_card_message(
+            &client,
+            &server.uri(),
+            "tok",
+            "oc_chat",
+            Some(root),
+            "cardabc",
+        )
+        .await;
         assert_eq!(mid.as_deref(), Some("om_sent789"));
     }
 
@@ -1052,7 +1060,8 @@ mod tests {
             .mount(&server)
             .await;
         let client = reqwest::Client::new();
-        let mid = send_card_message(&client, &server.uri(), "tok", "oc_chat", None, "cardabc").await;
+        let mid =
+            send_card_message(&client, &server.uri(), "tok", "oc_chat", None, "cardabc").await;
         assert_eq!(mid.as_deref(), Some("om_new456"));
     }
 
@@ -1088,7 +1097,12 @@ mod tests {
     fn registry_promote_get_remove() {
         let mut reg = FeishuStreamRegistry::default();
         assert!(!reg.contains("om_post1"));
-        reg.promote("om_post1", "card_a".into(), "om_card_msg".into(), "seed".into());
+        reg.promote(
+            "om_post1",
+            "card_a".into(),
+            "om_card_msg".into(),
+            "seed".into(),
+        );
         assert!(reg.contains("om_post1"));
         let s = reg.get("om_post1").expect("session present");
         assert_eq!(s.card_id, "card_a");
@@ -1109,8 +1123,8 @@ mod tests {
         let mut reg = FeishuStreamRegistry::default();
         reg.promote("om_post1", "card_a".into(), "m1".into(), "t1".into());
         reg.get_mut("om_post1").unwrap().next_sequence(); // seq = 1
-        // Re-promoting the same key replaces the session and keeps a single
-        // order entry (a fresh session, sequence reset).
+                                                          // Re-promoting the same key replaces the session and keeps a single
+                                                          // order entry (a fresh session, sequence reset).
         reg.promote("om_post1", "card_b".into(), "m2".into(), "t2".into());
         assert_eq!(reg.len(), 1);
         let s = reg.get("om_post1").unwrap();

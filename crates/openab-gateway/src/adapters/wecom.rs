@@ -1,6 +1,6 @@
+use crate::media::format_bytes;
 use anyhow::Result;
 use axum::extract::State;
-use crate::media::format_bytes;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -47,7 +47,10 @@ impl WecomConfig {
             .unwrap_or(3);
 
         if encoding_aes_key.len() != 43 {
-            warn!("WECOM_ENCODING_AES_KEY must be 43 characters, got {}", encoding_aes_key.len());
+            warn!(
+                "WECOM_ENCODING_AES_KEY must be 43 characters, got {}",
+                encoding_aes_key.len()
+            );
             return None;
         }
 
@@ -138,7 +141,10 @@ fn decrypt_message(
         .map_err(|e| anyhow::anyhow!("base64 decode failed: {e}"))?;
 
     if cipher_bytes.is_empty() || !cipher_bytes.len().is_multiple_of(16) {
-        anyhow::bail!("ciphertext length {} not a multiple of 16", cipher_bytes.len());
+        anyhow::bail!(
+            "ciphertext length {} not a multiple of 16",
+            cipher_bytes.len()
+        );
     }
 
     type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
@@ -153,12 +159,17 @@ fn decrypt_message(
         .map_err(|e| anyhow::anyhow!("aes decrypt failed: {e}"))?;
 
     // Strip WeCom PKCS7 padding (block_size=32): last byte indicates pad length (1-32)
-    let pad_byte = *plaintext.last().ok_or_else(|| anyhow::anyhow!("empty plaintext"))? as usize;
+    let pad_byte = *plaintext
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("empty plaintext"))? as usize;
     if pad_byte == 0 || pad_byte > 32 || pad_byte > plaintext.len() {
         anyhow::bail!("invalid wecom padding value: {pad_byte}");
     }
     let pad_start = plaintext.len() - pad_byte;
-    if !plaintext[pad_start..].iter().all(|&b| b as usize == pad_byte) {
+    if !plaintext[pad_start..]
+        .iter()
+        .all(|&b| b as usize == pad_byte)
+    {
         anyhow::bail!("invalid PKCS#7 padding: not all padding bytes match");
     }
     let plaintext = &plaintext[..pad_start];
@@ -342,7 +353,6 @@ impl WecomAdapter {
         }
     }
 
-
     pub async fn handle_reply(
         &self,
         reply: &crate::schema::GatewayReply,
@@ -375,7 +385,10 @@ impl WecomAdapter {
             .unwrap_or(&reply.channel.id);
 
         let has_pending = {
-            let pending = self.pending_streams.lock().unwrap_or_else(|e| e.into_inner());
+            let pending = self
+                .pending_streams
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             pending.contains_key(&reply.channel.id)
         };
         let is_streaming_placeholder = reply.request_id.is_some() && !has_pending;
@@ -398,10 +411,16 @@ impl WecomAdapter {
 
             let (text_tx, text_rx) = tokio::sync::watch::channel(String::new());
             {
-                let mut pending = self.pending_streams.lock().unwrap_or_else(|e| e.into_inner());
-                pending.insert(reply.channel.id.clone(), PendingStream {
-                    text_watch: text_tx,
-                });
+                let mut pending = self
+                    .pending_streams
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                pending.insert(
+                    reply.channel.id.clone(),
+                    PendingStream {
+                        text_watch: text_tx,
+                    },
+                );
             }
             let client = self.client.clone();
             let token_cache = self.token_cache.clone();
@@ -453,9 +472,16 @@ impl WecomAdapter {
                     return;
                 }
                 flush_thinking(
-                    &client, &token_cache, &corp_id, &secret, &agent_id,
-                    thinking_id.as_deref(), &flush_to_user, &last_text,
-                ).await;
+                    &client,
+                    &token_cache,
+                    &corp_id,
+                    &secret,
+                    &agent_id,
+                    thinking_id.as_deref(),
+                    &flush_to_user,
+                    &last_text,
+                )
+                .await;
             });
 
             if let Some(ref req_id) = reply.request_id {
@@ -479,7 +505,10 @@ impl WecomAdapter {
             // between our earlier read of `has_pending` and now. If it did,
             // fall through to the direct-send path so the chunk isn't lost.
             let appended = {
-                let pending = self.pending_streams.lock().unwrap_or_else(|e| e.into_inner());
+                let pending = self
+                    .pending_streams
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 if let Some(stream) = pending.get(&reply.channel.id) {
                     let current = stream.text_watch.borrow().clone();
                     let combined = if current.is_empty() {
@@ -548,15 +577,21 @@ impl WecomAdapter {
         if text.is_empty() {
             return;
         }
-        let pending = self.pending_streams.lock().unwrap_or_else(|e| e.into_inner());
+        let pending = self
+            .pending_streams
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(stream) = pending.get(&reply.channel.id) {
             let _ = stream.text_watch.send(text.to_string());
         }
     }
 
-
     async fn send_text(&self, to_user: &str, text: &str) -> Result<String> {
-        let agent_id: u64 = self.config.agent_id.parse().expect("agent_id validated at startup");
+        let agent_id: u64 = self
+            .config
+            .agent_id
+            .parse()
+            .expect("agent_id validated at startup");
         let body = serde_json::json!({
             "touser": to_user,
             "msgtype": "text",
@@ -590,16 +625,30 @@ async fn post_with_token_retry(
     body: &serde_json::Value,
 ) -> Result<serde_json::Value> {
     let token = token_cache.get_token(client, corp_id, secret).await?;
-    let url = format!("{}{}?access_token={}", token_cache.base_url, api_path, token);
+    let url = format!(
+        "{}{}?access_token={}",
+        token_cache.base_url, api_path, token
+    );
     let resp: serde_json::Value = client.post(&url).json(body).send().await?.json().await?;
     let errcode = resp["errcode"].as_i64().unwrap_or(-1);
 
     if errcode == 42001 {
-        warn!(api_path, "wecom: access_token expired, refreshing and retrying");
+        warn!(
+            api_path,
+            "wecom: access_token expired, refreshing and retrying"
+        );
         let new_token = token_cache.force_refresh(client, corp_id, secret).await?;
-        let retry_url = format!("{}{}?access_token={}", token_cache.base_url, api_path, new_token);
-        let retry_resp: serde_json::Value =
-            client.post(&retry_url).json(body).send().await?.json().await?;
+        let retry_url = format!(
+            "{}{}?access_token={}",
+            token_cache.base_url, api_path, new_token
+        );
+        let retry_resp: serde_json::Value = client
+            .post(&retry_url)
+            .json(body)
+            .send()
+            .await?
+            .json()
+            .await?;
         let retry_code = retry_resp["errcode"].as_i64().unwrap_or(-1);
         if retry_code != 0 {
             anyhow::bail!(
@@ -780,7 +829,11 @@ async fn flush_thinking(
     to_user: &str,
     text: &str,
 ) {
-    info!(?thinking_msg_id, text_len = text.len(), "wecom: flush_thinking starting");
+    info!(
+        ?thinking_msg_id,
+        text_len = text.len(),
+        "wecom: flush_thinking starting"
+    );
 
     // Recall thinking placeholder (only when streaming was enabled)
     if let Some(id) = thinking_msg_id {
@@ -947,7 +1000,10 @@ pub async fn webhook(
     if let Ok(ts) = timestamp.parse::<i64>() {
         let now = chrono::Utc::now().timestamp();
         if (now - ts).abs() > 300 {
-            warn!(timestamp_age_secs = now - ts, "wecom webhook: rejecting stale callback");
+            warn!(
+                timestamp_age_secs = now - ts,
+                "wecom webhook: rejecting stale callback"
+            );
             return axum::http::StatusCode::FORBIDDEN.into_response();
         }
     }
@@ -988,7 +1044,10 @@ pub async fn webhook(
         return axum::http::StatusCode::FORBIDDEN.into_response();
     }
 
-    info!(encrypt_len = envelope.encrypt.len(), "wecom: decrypting callback");
+    info!(
+        encrypt_len = envelope.encrypt.len(),
+        "wecom: decrypting callback"
+    );
     let decrypted = match decrypt_message(
         &wecom.config.encoding_aes_key,
         &envelope.encrypt,
@@ -999,7 +1058,10 @@ pub async fn webhook(
             d
         }
         Err(e) => {
-            warn!(encrypt_len = envelope.encrypt.len(), "wecom decrypt failed: {e}");
+            warn!(
+                encrypt_len = envelope.encrypt.len(),
+                "wecom decrypt failed: {e}"
+            );
             return "success".into_response();
         }
     };
@@ -1076,7 +1138,12 @@ pub async fn webhook(
     );
     event.content.attachments = attachments;
 
-    let att_sizes: Vec<usize> = event.content.attachments.iter().map(|a| a.data.len()).collect();
+    let att_sizes: Vec<usize> = event
+        .content
+        .attachments
+        .iter()
+        .map(|a| a.data.len())
+        .collect();
     info!(
         attachments = event.content.attachments.len(),
         text_len = event.content.text.len(),
@@ -1151,7 +1218,11 @@ async fn download_wecom_image(
                     "wecom_image.jpg",
                     "image/jpeg",
                     size,
-                    format!("size exceeded: {} exceeds {}", format_bytes(size), format_bytes(IMAGE_MAX_DOWNLOAD)),
+                    format!(
+                        "size exceeded: {} exceeds {}",
+                        format_bytes(size),
+                        format_bytes(IMAGE_MAX_DOWNLOAD)
+                    ),
                 );
             }
         }
@@ -1176,7 +1247,11 @@ async fn download_wecom_image(
             "wecom_image.jpg",
             "image/jpeg",
             bytes.len() as u64,
-            format!("size exceeded: {} exceeds {}", format_bytes(bytes.len() as u64), format_bytes(IMAGE_MAX_DOWNLOAD)),
+            format!(
+                "size exceeded: {} exceeds {}",
+                format_bytes(bytes.len() as u64),
+                format_bytes(IMAGE_MAX_DOWNLOAD)
+            ),
         );
     }
     let (compressed, mime) = match resize_and_compress(&bytes) {
@@ -1222,13 +1297,21 @@ const FILE_MAX_DOWNLOAD: u64 = 20 * 1024 * 1024;
 const TEXT_EXTENSIONS: &[&str] = &[
     "txt", "csv", "log", "md", "json", "jsonl", "yaml", "yml", "toml", "xml", "rs", "py", "js",
     "ts", "jsx", "tsx", "go", "java", "c", "cpp", "h", "hpp", "rb", "sh", "bash", "zsh", "fish",
-    "ps1", "bat", "sql", "html", "css", "scss", "less", "ini", "cfg", "conf", "env",
-    "swift", "kt", "scala", "r", "pl", "lua", "graphql", "tsv",
+    "ps1", "bat", "sql", "html", "css", "scss", "less", "ini", "cfg", "conf", "env", "swift", "kt",
+    "scala", "r", "pl", "lua", "graphql", "tsv",
 ];
 
 const TEXT_FILENAMES: &[&str] = &[
-    "dockerfile", "makefile", "justfile", "rakefile", "gemfile",
-    "procfile", "vagrantfile", ".gitignore", ".dockerignore", ".editorconfig",
+    "dockerfile",
+    "makefile",
+    "justfile",
+    "rakefile",
+    "gemfile",
+    "procfile",
+    "vagrantfile",
+    ".gitignore",
+    ".dockerignore",
+    ".editorconfig",
 ];
 
 fn is_text_file(filename: &str) -> bool {
@@ -1326,7 +1409,11 @@ async fn download_wecom_file(
                     filename.to_string(),
                     "application/octet-stream",
                     size,
-                    format!("size exceeded: {} exceeds {}", format_bytes(size), format_bytes(FILE_MAX_DOWNLOAD)),
+                    format!(
+                        "size exceeded: {} exceeds {}",
+                        format_bytes(size),
+                        format_bytes(FILE_MAX_DOWNLOAD)
+                    ),
                 );
             }
         }
@@ -1351,7 +1438,11 @@ async fn download_wecom_file(
             filename.to_string(),
             "application/octet-stream",
             bytes.len() as u64,
-            format!("size exceeded: {} exceeds {}", format_bytes(bytes.len() as u64), format_bytes(FILE_MAX_DOWNLOAD)),
+            format!(
+                "size exceeded: {} exceeds {}",
+                format_bytes(bytes.len() as u64),
+                format_bytes(FILE_MAX_DOWNLOAD)
+            ),
         );
     }
 
@@ -1451,7 +1542,10 @@ mod tests {
             ("WECOM_CORP_ID", "ww_test_corp"),
             ("WECOM_SECRET", "test_secret"),
             ("WECOM_TOKEN", "test_token"),
-            ("WECOM_ENCODING_AES_KEY", "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG"),
+            (
+                "WECOM_ENCODING_AES_KEY",
+                "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+            ),
             ("WECOM_AGENT_ID", "1000002"),
         ]);
         let config = WecomConfig::from_reader(env).unwrap();
@@ -1613,11 +1707,17 @@ mod tests {
 
         let cache = WecomTokenCache::with_base_url(server.uri());
         let client = reqwest::Client::new();
-        let token = cache.get_token(&client, "ww_test_corp", "test_secret").await.unwrap();
+        let token = cache
+            .get_token(&client, "ww_test_corp", "test_secret")
+            .await
+            .unwrap();
         assert_eq!(token, "test_token_abc");
 
         // Second call uses cache (mock expects exactly 1 call)
-        let token2 = cache.get_token(&client, "ww_test_corp", "test_secret").await.unwrap();
+        let token2 = cache
+            .get_token(&client, "ww_test_corp", "test_secret")
+            .await
+            .unwrap();
         assert_eq!(token2, "test_token_abc");
     }
 

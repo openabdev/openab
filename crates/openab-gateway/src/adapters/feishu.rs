@@ -453,7 +453,9 @@ mod event_types {
             return None;
         }
 
-        let content_json: serde_json::Value = msg.content.as_deref()
+        let content_json: serde_json::Value = msg
+            .content
+            .as_deref()
             .and_then(|s| serde_json::from_str(s).ok())?;
 
         let message_id = msg.message_id.as_deref()?;
@@ -462,9 +464,8 @@ mod event_types {
         let (clean_text, mention_ids, media_refs) = match msg_type {
             "image" => {
                 let image_key = content_json.get("image_key")?.as_str()?;
-                let mentions = extract_mentions(
-                    "", msg.mentions.as_deref().unwrap_or(&[]), bot_open_id,
-                );
+                let mentions =
+                    extract_mentions("", msg.mentions.as_deref().unwrap_or(&[]), bot_open_id);
                 let refs = vec![MediaRef::Image {
                     message_id: message_id.to_string(),
                     image_key: image_key.to_string(),
@@ -473,12 +474,12 @@ mod event_types {
             }
             "file" => {
                 let file_key = content_json.get("file_key")?.as_str()?;
-                let file_name = content_json.get("file_name")
+                let file_name = content_json
+                    .get("file_name")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
-                let mentions = extract_mentions(
-                    "", msg.mentions.as_deref().unwrap_or(&[]), bot_open_id,
-                );
+                let mentions =
+                    extract_mentions("", msg.mentions.as_deref().unwrap_or(&[]), bot_open_id);
                 let refs = vec![MediaRef::File {
                     message_id: message_id.to_string(),
                     file_key: file_key.to_string(),
@@ -488,9 +489,8 @@ mod event_types {
             }
             "audio" => {
                 let file_key = content_json.get("file_key")?.as_str()?;
-                let mentions = extract_mentions(
-                    "", msg.mentions.as_deref().unwrap_or(&[]), bot_open_id,
-                );
+                let mentions =
+                    extract_mentions("", msg.mentions.as_deref().unwrap_or(&[]), bot_open_id);
                 let refs = vec![MediaRef::Audio {
                     message_id: message_id.to_string(),
                     file_key: file_key.to_string(),
@@ -512,7 +512,9 @@ mod event_types {
                                         }
                                     }
                                     Some("img") => {
-                                        if let Some(key) = el.get("image_key").and_then(|v| v.as_str()) {
+                                        if let Some(key) =
+                                            el.get("image_key").and_then(|v| v.as_str())
+                                        {
                                             refs.push(MediaRef::Image {
                                                 message_id: message_id.to_string(),
                                                 image_key: key.to_string(),
@@ -543,7 +545,10 @@ mod event_types {
             }
             _ => {
                 // text
-                let raw_text = content_json.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                let raw_text = content_json
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 if raw_text.trim().is_empty() {
                     return None;
                 }
@@ -768,7 +773,8 @@ impl FeishuTokenCache {
 
         let expire = body.get("expire").and_then(|v| v.as_u64()).unwrap_or(7200);
 
-        let token = body.get("tenant_access_token")
+        let token = body
+            .get("tenant_access_token")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .ok_or_else(|| anyhow::anyhow!("feishu token refresh: missing tenant_access_token"))?;
@@ -902,7 +908,10 @@ async fn get_ws_endpoint(
     let body: serde_json::Value = resp.json().await?;
     let code = body.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
     if code != 0 {
-        let msg = body.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let msg = body
+            .get("msg")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
         anyhow::bail!("feishu ws endpoint error: code={code} msg={msg}");
     }
     body.get("data")
@@ -1135,10 +1144,16 @@ async fn handle_ws_message(
     // - MultibotMentions: bypass only if participated AND no other bot in thread
     // - Mentions: never bypass
     let bypass_mention = detect_and_mark_multibot(
-        &envelope, bot_id_ref, config, participated_threads, multibot_threads,
+        &envelope,
+        bot_id_ref,
+        config,
+        participated_threads,
+        multibot_threads,
     );
 
-    if let Some((mut gateway_event, media_refs)) = parse_message_event(&envelope, bot_id_ref, config, bypass_mention) {
+    if let Some((mut gateway_event, media_refs)) =
+        parse_message_event(&envelope, bot_id_ref, config, bypass_mention)
+    {
         // Also dedupe by message_id
         if dedupe.is_duplicate(&gateway_event.message_id) {
             return;
@@ -1170,8 +1185,13 @@ async fn handle_ws_message(
 
         // Resolve sender display name (lazy, cached)
         let name = resolve_user_name(
-            &gateway_event.sender.id, name_cache, token_cache, client, &config.api_base(),
-        ).await;
+            &gateway_event.sender.id,
+            name_cache,
+            token_cache,
+            client,
+            &config.api_base(),
+        )
+        .await;
         gateway_event.sender.name = name.clone();
         gateway_event.sender.display_name = name;
 
@@ -1181,14 +1201,29 @@ async fn handle_ws_message(
                 let api_base = config.api_base();
                 for media_ref in &media_refs {
                     let attachment = match media_ref {
-                        MediaRef::Image { message_id, image_key } => {
-                            download_feishu_image(client, &api_base, &token, message_id, image_key).await
+                        MediaRef::Image {
+                            message_id,
+                            image_key,
+                        } => {
+                            download_feishu_image(client, &api_base, &token, message_id, image_key)
+                                .await
                         }
-                        MediaRef::File { message_id, file_key, file_name } => {
-                            download_feishu_file(client, &api_base, &token, message_id, file_key, file_name).await
+                        MediaRef::File {
+                            message_id,
+                            file_key,
+                            file_name,
+                        } => {
+                            download_feishu_file(
+                                client, &api_base, &token, message_id, file_key, file_name,
+                            )
+                            .await
                         }
-                        MediaRef::Audio { message_id, file_key } => {
-                            download_feishu_audio(client, &api_base, &token, message_id, file_key).await
+                        MediaRef::Audio {
+                            message_id,
+                            file_key,
+                        } => {
+                            download_feishu_audio(client, &api_base, &token, message_id, file_key)
+                                .await
                         }
                     };
                     gateway_event.content.attachments.push(attachment);
@@ -1197,7 +1232,9 @@ async fn handle_ws_message(
         }
 
         // Skip if no text and no attachments (e.g. unsupported file type)
-        if gateway_event.content.text.trim().is_empty() && gateway_event.content.attachments.is_empty() {
+        if gateway_event.content.text.trim().is_empty()
+            && gateway_event.content.attachments.is_empty()
+        {
             return;
         }
 
@@ -1293,10 +1330,7 @@ fn is_feishu_cap_reached_body(body: &str) -> bool {
             .get("code")
             .and_then(|c| c.as_i64())
             .is_some_and(|code| code == 230072),
-        Err(_) => {
-            body.contains("230072")
-                || body.contains("number of times it can be edited")
-        }
+        Err(_) => body.contains("230072") || body.contains("number of times it can be edited"),
     }
 }
 
@@ -1321,10 +1355,7 @@ pub enum EditOutcome {
 /// over `EDIT_COUNTS_CACHE_MAX`, the oldest *insertions* are evicted (not the
 /// lowest-count entries) so active streams are not bumped out from under
 /// themselves.
-fn increment_edit_count(
-    cache: &Arc<parking_lot::Mutex<EditCountsCache>>,
-    message_id: &str,
-) {
+fn increment_edit_count(cache: &Arc<parking_lot::Mutex<EditCountsCache>>, message_id: &str) {
     let mut c = cache.lock();
     let was_new = !c.counts.contains_key(message_id);
     let entry = c.counts.entry(message_id.to_string()).or_insert(0);
@@ -1340,10 +1371,7 @@ fn increment_edit_count(
 /// Mark a message_id as cap-reached; subsequent edit attempts skip the API
 /// call and signal `EditOutcome::CapReached` directly so the core finalize
 /// path can take over.
-fn mark_edit_cap(
-    cache: &Arc<parking_lot::Mutex<EditCountsCache>>,
-    message_id: &str,
-) {
+fn mark_edit_cap(cache: &Arc<parking_lot::Mutex<EditCountsCache>>, message_id: &str) {
     let mut c = cache.lock();
     let was_new = !c.counts.contains_key(message_id);
     c.counts.insert(message_id.to_string(), u32::MAX);
@@ -1371,10 +1399,7 @@ fn evict_if_overcap(c: &mut EditCountsCache) {
 
 /// Return true if this message_id has already reached the edit cap (either
 /// tracked locally or marked via 230072 sentinel).
-fn is_edit_cap_reached(
-    cache: &Arc<parking_lot::Mutex<EditCountsCache>>,
-    message_id: &str,
-) -> bool {
+fn is_edit_cap_reached(cache: &Arc<parking_lot::Mutex<EditCountsCache>>, message_id: &str) -> bool {
     let c = cache.lock();
     c.counts
         .get(message_id)
@@ -1387,11 +1412,7 @@ fn is_edit_cap_reached(
 /// and generic failure. Performs a preemptive local cap check (`FEISHU_EDIT_CAP`)
 /// before hitting the network, and detects the server-side errcode 230072 via
 /// body-code-first parsing if the local count drifts from reality.
-async fn edit_feishu_message(
-    adapter: &FeishuAdapter,
-    message_id: &str,
-    text: &str,
-) -> EditOutcome {
+async fn edit_feishu_message(adapter: &FeishuAdapter, message_id: &str, text: &str) -> EditOutcome {
     // Pre-check: if we've already tracked >= FEISHU_EDIT_CAP edits (or the sentinel
     // u32::MAX from a 230072 response), skip the API call and signal CapReached so
     // the caller can stop attempting edits and let the core finalize path recover.
@@ -1413,9 +1434,14 @@ async fn edit_feishu_message(
         "msg_type": "post",
         "content": post_content.to_string(),
     });
-    match adapter.client.put(&url).bearer_auth(&token)
+    match adapter
+        .client
+        .put(&url)
+        .bearer_auth(&token)
         .header("Content-Type", "application/json; charset=utf-8")
-        .json(&body).send().await
+        .json(&body)
+        .send()
+        .await
     {
         Ok(resp) => {
             let status = resp.status();
@@ -1498,10 +1524,7 @@ async fn edit_feishu_message(
 /// `message_id` shape is validated by the caller (`handle_reply` dispatch seam,
 /// via `is_valid_feishu_message_id`) before this is reached, so it is safe to
 /// interpolate into the URL path here.
-async fn delete_feishu_message(
-    adapter: &FeishuAdapter,
-    message_id: &str,
-) -> Result<(), String> {
+async fn delete_feishu_message(adapter: &FeishuAdapter, message_id: &str) -> Result<(), String> {
     let token = adapter
         .token_cache
         .get_token(&adapter.client)
@@ -1509,13 +1532,7 @@ async fn delete_feishu_message(
         .map_err(|e| format!("token error: {e}"))?;
     let api_base = adapter.config.api_base();
     let url = format!("{}/open-apis/im/v1/messages/{}", api_base, message_id);
-    match adapter
-        .client
-        .delete(&url)
-        .bearer_auth(&token)
-        .send()
-        .await
-    {
+    match adapter.client.delete(&url).bearer_auth(&token).send().await {
         Ok(resp) if resp.status().is_success() => {
             tracing::info!(message_id = %message_id, "feishu message deleted");
             Ok(())
@@ -1582,9 +1599,7 @@ fn has_code_fence(text: &str) -> bool {
 fn has_markdown_table(text: &str) -> bool {
     text.split('\n').any(|line| {
         let t = line.trim();
-        t.contains('|')
-            && t.contains('-')
-            && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
+        t.contains('|') && t.contains('-') && t.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
     })
 }
 
@@ -1783,9 +1798,19 @@ fn try_parse_link(chars: &[char], start: usize) -> Option<(String, String, usize
 
 /// Reference to a media resource that needs async download after parse_message_event.
 pub enum MediaRef {
-    Image { message_id: String, image_key: String },
-    File { message_id: String, file_key: String, file_name: String },
-    Audio { message_id: String, file_key: String },
+    Image {
+        message_id: String,
+        image_key: String,
+    },
+    File {
+        message_id: String,
+        file_key: String,
+        file_name: String,
+    },
+    Audio {
+        message_id: String,
+        file_key: String,
+    },
 }
 
 const IMAGE_MAX_DIMENSION_PX: u32 = 1200;
@@ -1861,13 +1886,21 @@ pub async fn download_feishu_image(
     if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
         if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
             if size > IMAGE_MAX_DOWNLOAD {
-                tracing::warn!(image_key, size, "feishu image Content-Length exceeds 10MB limit, skipping download");
+                tracing::warn!(
+                    image_key,
+                    size,
+                    "feishu image Content-Length exceeds 10MB limit, skipping download"
+                );
                 return crate::schema::Attachment::rejected(
                     "image",
                     format!("{}.jpg", image_key),
                     "application/octet-stream",
                     size,
-                    format!("size exceeded: {} exceeds {}", format_bytes(size), format_bytes(IMAGE_MAX_DOWNLOAD)),
+                    format!(
+                        "size exceeded: {} exceeds {}",
+                        format_bytes(size),
+                        format_bytes(IMAGE_MAX_DOWNLOAD)
+                    ),
                 );
             }
         }
@@ -1887,13 +1920,21 @@ pub async fn download_feishu_image(
     };
     // Fallback check (Content-Length may be absent or misreported)
     if bytes.len() as u64 > IMAGE_MAX_DOWNLOAD {
-        tracing::warn!(image_key, size = bytes.len(), "feishu image exceeds 10MB limit");
+        tracing::warn!(
+            image_key,
+            size = bytes.len(),
+            "feishu image exceeds 10MB limit"
+        );
         return crate::schema::Attachment::rejected(
             "image",
             format!("{}.jpg", image_key),
             "application/octet-stream",
             bytes.len() as u64,
-            format!("size exceeded: {} exceeds {}", format_bytes(bytes.len() as u64), format_bytes(IMAGE_MAX_DOWNLOAD)),
+            format!(
+                "size exceeded: {} exceeds {}",
+                format_bytes(bytes.len() as u64),
+                format_bytes(IMAGE_MAX_DOWNLOAD)
+            ),
         );
     }
     let (compressed, mime) = match resize_and_compress(&bytes) {
@@ -1946,9 +1987,9 @@ pub async fn download_feishu_file(
     // Only download text-like files
     let ext = file_name.rsplit('.').next().unwrap_or("").to_lowercase();
     const TEXT_EXTS: &[&str] = &[
-        "txt", "csv", "log", "md", "json", "jsonl", "yaml", "yml", "toml", "xml",
-        "rs", "py", "js", "ts", "jsx", "tsx", "go", "java", "c", "cpp", "h", "hpp",
-        "rb", "sh", "bash", "sql", "html", "css", "ini", "cfg", "conf", "env",
+        "txt", "csv", "log", "md", "json", "jsonl", "yaml", "yml", "toml", "xml", "rs", "py", "js",
+        "ts", "jsx", "tsx", "go", "java", "c", "cpp", "h", "hpp", "rb", "sh", "bash", "sql",
+        "html", "css", "ini", "cfg", "conf", "env",
     ];
     if !TEXT_EXTS.contains(&ext.as_str()) {
         tracing::debug!(file_name, "skipping non-text file attachment");
@@ -1992,13 +2033,21 @@ pub async fn download_feishu_file(
     if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
         if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
             if size > FILE_MAX_DOWNLOAD {
-                tracing::warn!(file_name, size, "feishu file Content-Length exceeds 512KB limit, skipping download");
+                tracing::warn!(
+                    file_name,
+                    size,
+                    "feishu file Content-Length exceeds 512KB limit, skipping download"
+                );
                 return crate::schema::Attachment::rejected(
                     "text_file",
                     file_name.to_string(),
                     "application/octet-stream",
                     size,
-                    format!("size exceeded: {} exceeds {}", format_bytes(size), format_bytes(FILE_MAX_DOWNLOAD)),
+                    format!(
+                        "size exceeded: {} exceeds {}",
+                        format_bytes(size),
+                        format_bytes(FILE_MAX_DOWNLOAD)
+                    ),
                 );
             }
         }
@@ -2018,13 +2067,21 @@ pub async fn download_feishu_file(
     };
     // Fallback check (Content-Length may be absent or misreported)
     if bytes.len() as u64 > FILE_MAX_DOWNLOAD {
-        tracing::warn!(file_name, size = bytes.len(), "feishu file exceeds 512KB limit");
+        tracing::warn!(
+            file_name,
+            size = bytes.len(),
+            "feishu file exceeds 512KB limit"
+        );
         return crate::schema::Attachment::rejected(
             "text_file",
             file_name.to_string(),
             "application/octet-stream",
             bytes.len() as u64,
-            format!("size exceeded: {} exceeds {}", format_bytes(bytes.len() as u64), format_bytes(FILE_MAX_DOWNLOAD)),
+            format!(
+                "size exceeded: {} exceeds {}",
+                format_bytes(bytes.len() as u64),
+                format_bytes(FILE_MAX_DOWNLOAD)
+            ),
         );
     }
     let path = match crate::store::store_media(&bytes).await {
@@ -2064,7 +2121,9 @@ pub async fn download_feishu_audio(
     use urlencoding::encode;
     let url = format!(
         "{}/open-apis/im/v1/messages/{}/resources/{}?type=file",
-        api_base, encode(message_id), encode(file_key)
+        api_base,
+        encode(message_id),
+        encode(file_key)
     );
     let resp = match client.get(&url).bearer_auth(token).send().await {
         Ok(r) => r,
@@ -2105,7 +2164,11 @@ pub async fn download_feishu_audio(
                     format!("{}.ogg", file_key),
                     "audio/ogg",
                     size,
-                    format!("size exceeded: {} exceeds {}", format_bytes(size), format_bytes(AUDIO_MAX_DOWNLOAD)),
+                    format!(
+                        "size exceeded: {} exceeds {}",
+                        format_bytes(size),
+                        format_bytes(AUDIO_MAX_DOWNLOAD)
+                    ),
                 );
             }
         }
@@ -2124,13 +2187,21 @@ pub async fn download_feishu_audio(
         }
     };
     if bytes.len() as u64 > AUDIO_MAX_DOWNLOAD {
-        tracing::warn!(file_key, size = bytes.len(), "feishu audio exceeds 25MB limit");
+        tracing::warn!(
+            file_key,
+            size = bytes.len(),
+            "feishu audio exceeds 25MB limit"
+        );
         return crate::schema::Attachment::rejected(
             "audio",
             format!("{}.ogg", file_key),
             "audio/ogg",
             bytes.len() as u64,
-            format!("size exceeded: {} exceeds {}", format_bytes(bytes.len() as u64), format_bytes(AUDIO_MAX_DOWNLOAD)),
+            format!(
+                "size exceeded: {} exceeds {}",
+                format_bytes(bytes.len() as u64),
+                format_bytes(AUDIO_MAX_DOWNLOAD)
+            ),
         );
     }
     tracing::debug!(file_key, size = bytes.len(), "feishu audio downloaded");
@@ -2180,7 +2251,10 @@ pub async fn send_post_message(
         )
     } else {
         (
-            format!("{}/open-apis/im/v1/messages?receive_id_type=chat_id", api_base),
+            format!(
+                "{}/open-apis/im/v1/messages?receive_id_type=chat_id",
+                api_base
+            ),
             serde_json::json!({
                 "receive_id": chat_id,
                 "msg_type": "post",
@@ -2315,13 +2389,18 @@ async fn add_reaction(adapter: &FeishuAdapter, message_id: &str, emoji: &str) {
     };
     let token = match adapter.token_cache.get_token(&adapter.client).await {
         Ok(t) => t,
-        Err(e) => { tracing::error!(err = %e, "feishu: cannot get token for reaction"); return; }
+        Err(e) => {
+            tracing::error!(err = %e, "feishu: cannot get token for reaction");
+            return;
+        }
     };
     let url = format!(
         "{}/open-apis/im/v1/messages/{}/reactions",
-        adapter.config.api_base(), message_id
+        adapter.config.api_base(),
+        message_id
     );
-    let _ = adapter.client
+    let _ = adapter
+        .client
         .post(&url)
         .bearer_auth(&token)
         .json(&serde_json::json!({"reaction_type": {"emoji_type": reaction_type}}))
@@ -2337,15 +2416,26 @@ async fn remove_reaction(adapter: &FeishuAdapter, message_id: &str, emoji: &str)
     };
     let token = match adapter.token_cache.get_token(&adapter.client).await {
         Ok(t) => t,
-        Err(e) => { tracing::error!(err = %e, "feishu: cannot get token for reaction"); return; }
+        Err(e) => {
+            tracing::error!(err = %e, "feishu: cannot get token for reaction");
+            return;
+        }
     };
     // Feishu remove reaction needs reaction_id. Simpler approach: delete by type.
     // GET reactions, find matching, DELETE by id.
     let list_url = format!(
         "{}/open-apis/im/v1/messages/{}/reactions?reaction_type={}",
-        adapter.config.api_base(), message_id, reaction_type
+        adapter.config.api_base(),
+        message_id,
+        reaction_type
     );
-    let resp = match adapter.client.get(&list_url).bearer_auth(&token).send().await {
+    let resp = match adapter
+        .client
+        .get(&list_url)
+        .bearer_auth(&token)
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(_) => return,
     };
@@ -2357,15 +2447,24 @@ async fn remove_reaction(adapter: &FeishuAdapter, message_id: &str, emoji: &str)
     if let Some(items) = body.pointer("/data/items").and_then(|v| v.as_array()) {
         let bot_id = adapter.bot_open_id.read().await;
         for item in items {
-            let is_ours = item.pointer("/operator/operator_id/open_id")
-                .and_then(|v| v.as_str()) == bot_id.as_deref();
+            let is_ours = item
+                .pointer("/operator/operator_id/open_id")
+                .and_then(|v| v.as_str())
+                == bot_id.as_deref();
             if is_ours {
                 if let Some(reaction_id) = item.get("reaction_id").and_then(|v| v.as_str()) {
                     let del_url = format!(
                         "{}/open-apis/im/v1/messages/{}/reactions/{}",
-                        adapter.config.api_base(), message_id, reaction_id
+                        adapter.config.api_base(),
+                        message_id,
+                        reaction_id
                     );
-                    let _ = adapter.client.delete(&del_url).bearer_auth(&token).send().await;
+                    let _ = adapter
+                        .client
+                        .delete(&del_url)
+                        .bearer_auth(&token)
+                        .send()
+                        .await;
                     return;
                 }
             }
@@ -2394,7 +2493,8 @@ fn check_thread_participated(
             // Intentionally recover from poisoned mutex — cache data loss is acceptable
             // and preferable to panicking the gateway.
             let c = cache.lock();
-            c.get(tid).is_some_and(|ts| ts.elapsed().as_secs() < session_ttl_secs)
+            c.get(tid)
+                .is_some_and(|ts| ts.elapsed().as_secs() < session_ttl_secs)
         })
         .unwrap_or(false)
 }
@@ -2417,9 +2517,8 @@ fn detect_and_mark_multibot(
     participated_threads: &Arc<parking_lot::Mutex<HashMap<String, Instant>>>,
     multibot_threads: &Arc<parking_lot::Mutex<HashMap<String, Instant>>>,
 ) -> bool {
-    let self_participated = check_thread_participated(
-        envelope, participated_threads, config.session_ttl_secs,
-    );
+    let self_participated =
+        check_thread_participated(envelope, participated_threads, config.session_ttl_secs);
 
     let thread_id_for_check = envelope
         .event
@@ -2438,14 +2537,15 @@ fn detect_and_mark_multibot(
                 .and_then(|m| m.mentions.as_ref());
             if let Some(mention_list) = mentions {
                 let bot_self_id = bot_open_id.unwrap_or("");
-                let mention_ids: Vec<_> = mention_list.iter().filter_map(|m| {
-                    m.id.as_ref().and_then(|id| id.open_id.as_deref())
-                }).collect();
+                let mention_ids: Vec<_> = mention_list
+                    .iter()
+                    .filter_map(|m| m.id.as_ref().and_then(|id| id.open_id.as_deref()))
+                    .collect();
 
                 let mentions_other_bot = if !config.trusted_bot_ids.is_empty() {
-                    mention_ids.iter().any(|oid| {
-                        config.trusted_bot_ids.iter().any(|bid| bid == oid)
-                    })
+                    mention_ids
+                        .iter()
+                        .any(|oid| config.trusted_bot_ids.iter().any(|bid| bid == oid))
                 } else if !config.allowed_users.is_empty() {
                     mention_ids.iter().any(|oid| {
                         *oid != bot_self_id && !config.allowed_users.iter().any(|u| u == oid)
@@ -2591,9 +2691,7 @@ pub async fn handle_reply(
                 // behavior). The card_message_id comes from our own session state
                 // (gateway-internal, trusted) so it bypasses the shape check.
                 let card_msg = {
-                    let mut reg = adapter
-                        .stream_sessions
-                        .lock();
+                    let mut reg = adapter.stream_sessions.lock();
                     reg.remove(&reply.reply_to).map(|s| s.card_message_id)
                 };
                 let target = card_msg.as_deref().unwrap_or(&reply.reply_to);
@@ -2647,7 +2745,9 @@ pub async fn handle_reply(
     }
 
     // quote_message_id (agent-controlled reply-to) takes priority over thread_id
-    let reply_target = reply.quote_message_id.as_deref()
+    let reply_target = reply
+        .quote_message_id
+        .as_deref()
         .or(reply.channel.thread_id.as_deref());
     let thread_id = reply.channel.thread_id.as_deref();
 
@@ -2656,11 +2756,27 @@ pub async fn handle_reply(
     // Use post (rich text) format for markdown rendering.
     // When in a thread (thread_id present), use reply API to stay in the same thread.
     if text.len() <= limit {
-        let result = send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, reply_target, text).await;
+        let result = send_post_message(
+            &adapter.client,
+            &api_base,
+            &token,
+            &reply.channel.id,
+            reply_target,
+            text,
+        )
+        .await;
         // Fallback: if quote_message_id caused failure, retry without it
         let result = if result.is_none() && reply.quote_message_id.is_some() {
             tracing::warn!(quote_message_id = ?reply.quote_message_id, channel_id = %reply.channel.id, "reply-to failed, falling back to plain send");
-            send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, thread_id, text).await
+            send_post_message(
+                &adapter.client,
+                &api_base,
+                &token,
+                &reply.channel.id,
+                thread_id,
+                text,
+            )
+            .await
         } else {
             result
         };
@@ -2669,7 +2785,11 @@ pub async fn handle_reply(
                 adapter.dedupe.is_duplicate(&msg_id);
                 // Record thread participation for mention bypass
                 if let Some(tid) = thread_id {
-                    record_participation(&adapter.participated_threads, tid, adapter.config.session_ttl_secs);
+                    record_participation(
+                        &adapter.participated_threads,
+                        tid,
+                        adapter.config.session_ttl_secs,
+                    );
                 }
                 // Send response with message_id back to OAB core (for streaming edit)
                 if let Some(ref req_id) = reply.request_id {
@@ -2714,7 +2834,16 @@ pub async fn handle_reply(
         let mut succeeded = 0usize;
         let mut last_msg_id: Option<String> = None;
         for chunk in &chunks {
-            if let Some(msg_id) = send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, reply_target, chunk).await {
+            if let Some(msg_id) = send_post_message(
+                &adapter.client,
+                &api_base,
+                &token,
+                &reply.channel.id,
+                reply_target,
+                chunk,
+            )
+            .await
+            {
                 adapter.dedupe.is_duplicate(&msg_id);
                 succeeded += 1;
                 last_msg_id = Some(msg_id);
@@ -2724,7 +2853,16 @@ pub async fn handle_reply(
         if succeeded == 0 && reply.quote_message_id.is_some() {
             tracing::warn!(quote_message_id = ?reply.quote_message_id, channel_id = %reply.channel.id, "chunked reply-to failed, falling back to plain send");
             for chunk in &chunks {
-                if let Some(msg_id) = send_post_message(&adapter.client, &api_base, &token, &reply.channel.id, thread_id, chunk).await {
+                if let Some(msg_id) = send_post_message(
+                    &adapter.client,
+                    &api_base,
+                    &token,
+                    &reply.channel.id,
+                    thread_id,
+                    chunk,
+                )
+                .await
+                {
                     adapter.dedupe.is_duplicate(&msg_id);
                     succeeded += 1;
                     last_msg_id = Some(msg_id);
@@ -2733,7 +2871,11 @@ pub async fn handle_reply(
         }
         if succeeded > 0 {
             if let Some(tid) = thread_id {
-                record_participation(&adapter.participated_threads, tid, adapter.config.session_ttl_secs);
+                record_participation(
+                    &adapter.participated_threads,
+                    tid,
+                    adapter.config.session_ttl_secs,
+                );
             }
         }
         // Report back to core. Success requires every chunk delivered — partial
@@ -2818,9 +2960,7 @@ async fn handle_card_edit(
         Active { card_id: String, seq: i64 },
     }
     let existing = {
-        let mut reg = adapter
-            .stream_sessions
-            .lock();
+        let mut reg = adapter.stream_sessions.lock();
         match reg.get_mut(&om_post) {
             None => Existing::None,
             Some(s) if s.finalized => Existing::Finalized,
@@ -2882,9 +3022,7 @@ async fn handle_card_edit(
                 // the full reply as a fresh message (reusing #1122 recovery).
                 feishu_card::CardOutcome::Failed { code, message } => {
                     let card_msg = {
-                        let mut reg = adapter
-                            .stream_sessions
-                            .lock();
+                        let mut reg = adapter.stream_sessions.lock();
                         reg.remove(&om_post).map(|s| s.card_message_id)
                     };
                     if adapter.config.card_fallback_to_post {
@@ -2963,15 +3101,17 @@ async fn promote_and_respond(
     };
 
     // 1. Create the card entity seeded with the current full text.
-    let card_id = match feishu_card::create_streaming_card(&adapter.client, &api_base, &token, text)
-        .await
-    {
-        Ok(id) => id,
-        Err(outcome) => {
-            tracing::warn!(?outcome, "feishu card promote: create failed; post-edit fallback");
-            return promote_fallback_post(reply, adapter, event_tx).await;
-        }
-    };
+    let card_id =
+        match feishu_card::create_streaming_card(&adapter.client, &api_base, &token, text).await {
+            Ok(id) => id,
+            Err(outcome) => {
+                tracing::warn!(
+                    ?outcome,
+                    "feishu card promote: create failed; post-edit fallback"
+                );
+                return promote_fallback_post(reply, adapter, event_tx).await;
+            }
+        };
 
     // 2. Send the interactive card message into the same thread.
     let reply_target = reply
@@ -3001,9 +3141,7 @@ async fn promote_and_respond(
     // 4. Register the session keyed by om_post (core stays oblivious). Seed
     //    last_text with the current full text for the finalize rebuild.
     {
-        let mut reg = adapter
-            .stream_sessions
-            .lock();
+        let mut reg = adapter.stream_sessions.lock();
         reg.promote(&om_post, card_id, card_msg_id, text.to_string());
     }
     tracing::info!(om_post = %om_post, "feishu reply promoted post → card");
@@ -3081,9 +3219,7 @@ async fn try_send_initial_card(
     // Session keyed by the card's own message_id — core edits this id directly,
     // so subsequent edit_message calls land on the Active path with no swap.
     {
-        let mut reg = adapter
-            .stream_sessions
-            .lock();
+        let mut reg = adapter.stream_sessions.lock();
         reg.promote(&card_msg_id, card_id, card_msg_id.clone(), text.to_string());
     }
     // Mirror the post path's self-echo dedupe + thread participation tracking.
@@ -3255,11 +3391,9 @@ fn verify_signature(
 fn decrypt_event(encrypt_key: &str, encrypted: &str) -> anyhow::Result<String> {
     use sha2::{Digest, Sha256};
     let key = Sha256::digest(encrypt_key.as_bytes());
-    let cipher_bytes = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        encrypted,
-    )
-    .map_err(|e| anyhow::anyhow!("base64 decode failed: {e}"))?;
+    let cipher_bytes =
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encrypted)
+            .map_err(|e| anyhow::anyhow!("base64 decode failed: {e}"))?;
 
     if cipher_bytes.len() < 16 {
         anyhow::bail!("encrypted data too short");
@@ -3308,7 +3442,10 @@ pub async fn webhook(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("unknown");
     if feishu.rate_limiter.check(ip) {
-        return (axum::http::StatusCode::TOO_MANY_REQUESTS, "rate limit exceeded")
+        return (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "rate limit exceeded",
+        )
             .into_response();
     }
 
@@ -3432,16 +3569,25 @@ pub async fn webhook(
 
     // Check participated threads and multibot detection for mention bypass
     let bypass_mention = detect_and_mark_multibot(
-        &envelope, bot_id_ref, &feishu.config,
-        &feishu.participated_threads, &feishu.multibot_threads,
+        &envelope,
+        bot_id_ref,
+        &feishu.config,
+        &feishu.participated_threads,
+        &feishu.multibot_threads,
     );
 
-    if let Some((mut gateway_event, media_refs)) = parse_message_event(&envelope, bot_id_ref, &feishu.config, bypass_mention) {
+    if let Some((mut gateway_event, media_refs)) =
+        parse_message_event(&envelope, bot_id_ref, &feishu.config, bypass_mention)
+    {
         if !feishu.dedupe.is_duplicate(&gateway_event.message_id) {
             let name = resolve_user_name(
-                &gateway_event.sender.id, &feishu.name_cache, &feishu.token_cache,
-                &feishu.client, &feishu.config.api_base(),
-            ).await;
+                &gateway_event.sender.id,
+                &feishu.name_cache,
+                &feishu.token_cache,
+                &feishu.client,
+                &feishu.config.api_base(),
+            )
+            .await;
             gateway_event.sender.name = name.clone();
             gateway_event.sender.display_name = name;
 
@@ -3451,14 +3597,46 @@ pub async fn webhook(
                     let api_base = feishu.config.api_base();
                     for media_ref in &media_refs {
                         let attachment = match media_ref {
-                            MediaRef::Image { message_id, image_key } => {
-                                download_feishu_image(&feishu.client, &api_base, &token, message_id, image_key).await
+                            MediaRef::Image {
+                                message_id,
+                                image_key,
+                            } => {
+                                download_feishu_image(
+                                    &feishu.client,
+                                    &api_base,
+                                    &token,
+                                    message_id,
+                                    image_key,
+                                )
+                                .await
                             }
-                            MediaRef::File { message_id, file_key, file_name } => {
-                                download_feishu_file(&feishu.client, &api_base, &token, message_id, file_key, file_name).await
+                            MediaRef::File {
+                                message_id,
+                                file_key,
+                                file_name,
+                            } => {
+                                download_feishu_file(
+                                    &feishu.client,
+                                    &api_base,
+                                    &token,
+                                    message_id,
+                                    file_key,
+                                    file_name,
+                                )
+                                .await
                             }
-                            MediaRef::Audio { message_id, file_key } => {
-                                download_feishu_audio(&feishu.client, &api_base, &token, message_id, file_key).await
+                            MediaRef::Audio {
+                                message_id,
+                                file_key,
+                            } => {
+                                download_feishu_audio(
+                                    &feishu.client,
+                                    &api_base,
+                                    &token,
+                                    message_id,
+                                    file_key,
+                                )
+                                .await
                             }
                         };
                         gateway_event.content.attachments.push(attachment);
@@ -3467,7 +3645,9 @@ pub async fn webhook(
             }
 
             // Skip if no text and no attachments (e.g. unsupported file type)
-            if gateway_event.content.text.trim().is_empty() && gateway_event.content.attachments.is_empty() {
+            if gateway_event.content.text.trim().is_empty()
+                && gateway_event.content.attachments.is_empty()
+            {
                 return axum::http::StatusCode::OK.into_response();
             }
 
@@ -3591,12 +3771,24 @@ mod tests {
 
     #[test]
     fn should_use_card_auto_promotes_on_code_fence() {
-        assert!(should_use_card("here:\n```\ncode\n```", StreamingMode::Auto, 4000));
-        assert!(should_use_card("```python\nprint(1)\n```", StreamingMode::Auto, 4000));
+        assert!(should_use_card(
+            "here:\n```\ncode\n```",
+            StreamingMode::Auto,
+            4000
+        ));
+        assert!(should_use_card(
+            "```python\nprint(1)\n```",
+            StreamingMode::Auto,
+            4000
+        ));
         // Indented fence (markdown_to_post trims leading whitespace too).
         assert!(should_use_card("  ```\ncode", StreamingMode::Auto, 4000));
         // Inline single backticks are NOT a fence.
-        assert!(!should_use_card("use `cargo` to build", StreamingMode::Auto, 4000));
+        assert!(!should_use_card(
+            "use `cargo` to build",
+            StreamingMode::Auto,
+            4000
+        ));
     }
 
     #[test]
@@ -3612,13 +3804,29 @@ mod tests {
 
     #[test]
     fn should_use_card_auto_plain_short_text_stays_post() {
-        assert!(!should_use_card("just a short reply", StreamingMode::Auto, 4000));
+        assert!(!should_use_card(
+            "just a short reply",
+            StreamingMode::Auto,
+            4000
+        ));
         // A line with a pipe but no delimiter row is not a table.
-        assert!(!should_use_card("a | b but not a table", StreamingMode::Auto, 4000));
+        assert!(!should_use_card(
+            "a | b but not a table",
+            StreamingMode::Auto,
+            4000
+        ));
         // Bullet list with dashes is not a table (no pipe).
-        assert!(!should_use_card("- item one\n- item two", StreamingMode::Auto, 4000));
+        assert!(!should_use_card(
+            "- item one\n- item two",
+            StreamingMode::Auto,
+            4000
+        ));
         // Thematic break (---) is not a table (no pipe).
-        assert!(!should_use_card("above\n\n---\n\nbelow", StreamingMode::Auto, 4000));
+        assert!(!should_use_card(
+            "above\n\n---\n\nbelow",
+            StreamingMode::Auto,
+            4000
+        ));
     }
 
     // --- Token tests ---
@@ -3866,7 +4074,7 @@ mod tests {
     fn parse_group_without_mention_filtered() {
         let env = make_envelope("group", "just chatting", "ou_user1", None);
         let cfg = test_config(); // require_mention = true
-        // Gateway-side mention gating: group message without bot mention is filtered
+                                 // Gateway-side mention gating: group message without bot mention is filtered
         assert!(parse_message_event(&env, Some("ou_bot"), &cfg, false).is_none());
     }
 
@@ -3882,7 +4090,13 @@ mod tests {
     #[test]
     fn parse_skips_bot_sender() {
         let mut env = make_envelope("p2p", "hello", "ou_bot", None);
-        env.event.as_mut().unwrap().sender.as_mut().unwrap().sender_type = Some("bot".into());
+        env.event
+            .as_mut()
+            .unwrap()
+            .sender
+            .as_mut()
+            .unwrap()
+            .sender_type = Some("bot".into());
         let cfg = test_config();
         assert!(parse_message_event(&env, Some("ou_bot"), &cfg, false).is_none());
     }
@@ -3897,7 +4111,13 @@ mod tests {
     #[test]
     fn parse_skips_non_text_message() {
         let mut env = make_envelope("p2p", "hello", "ou_user1", None);
-        env.event.as_mut().unwrap().message.as_mut().unwrap().message_type = Some("sticker".into());
+        env.event
+            .as_mut()
+            .unwrap()
+            .message
+            .as_mut()
+            .unwrap()
+            .message_type = Some("sticker".into());
         let cfg = test_config();
         assert!(parse_message_event(&env, Some("ou_bot"), &cfg, false).is_none());
     }
@@ -3991,11 +4211,25 @@ mod tests {
         let name_cache = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let client = reqwest::Client::new();
 
-        let name = resolve_user_name("ou_user1", &name_cache, &token_cache, &client, &server.uri()).await;
+        let name = resolve_user_name(
+            "ou_user1",
+            &name_cache,
+            &token_cache,
+            &client,
+            &server.uri(),
+        )
+        .await;
         assert_eq!(name, "Alice");
 
         // Second call should use cache (expect(1) above ensures no second API call)
-        let name2 = resolve_user_name("ou_user1", &name_cache, &token_cache, &client, &server.uri()).await;
+        let name2 = resolve_user_name(
+            "ou_user1",
+            &name_cache,
+            &token_cache,
+            &client,
+            &server.uri(),
+        )
+        .await;
         assert_eq!(name2, "Alice");
     }
 
@@ -4022,7 +4256,14 @@ mod tests {
         let name_cache = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let client = reqwest::Client::new();
 
-        let name = resolve_user_name("ou_unknown", &name_cache, &token_cache, &client, &server.uri()).await;
+        let name = resolve_user_name(
+            "ou_unknown",
+            &name_cache,
+            &token_cache,
+            &client,
+            &server.uri(),
+        )
+        .await;
         assert_eq!(name, "ou_unknown");
     }
 
@@ -4033,10 +4274,17 @@ mod tests {
         // If mention key appears in normal text too, only the first occurrence is removed
         let mentions = vec![FeishuMention {
             key: Some("@_user_1".into()),
-            id: Some(FeishuMentionId { open_id: Some("ou_bot".into()) }),
+            id: Some(FeishuMentionId {
+                open_id: Some("ou_bot".into()),
+            }),
             name: Some("Bot".into()),
         }];
-        let env = make_envelope("group", "@_user_1 tell me about @_user_1 patterns", "ou_user1", Some(mentions));
+        let env = make_envelope(
+            "group",
+            "@_user_1 tell me about @_user_1 patterns",
+            "ou_user1",
+            Some(mentions),
+        );
         let cfg = test_config();
         let (evt, _media) = parse_message_event(&env, Some("ou_bot"), &cfg, false).unwrap();
         // Only first @_user_1 removed, second preserved
@@ -4067,7 +4315,9 @@ mod tests {
     fn parse_allowed_groups_blocks_unlisted() {
         let mentions = vec![FeishuMention {
             key: Some("@_user_1".into()),
-            id: Some(FeishuMentionId { open_id: Some("ou_bot".into()) }),
+            id: Some(FeishuMentionId {
+                open_id: Some("ou_bot".into()),
+            }),
             name: Some("Bot".into()),
         }];
         let env = make_envelope("group", "@_user_1 hello", "ou_user1", Some(mentions));
@@ -4080,7 +4330,9 @@ mod tests {
     fn parse_allowed_groups_permits_listed() {
         let mentions = vec![FeishuMention {
             key: Some("@_user_1".into()),
-            id: Some(FeishuMentionId { open_id: Some("ou_bot".into()) }),
+            id: Some(FeishuMentionId {
+                open_id: Some("ou_bot".into()),
+            }),
             name: Some("Bot".into()),
         }];
         let env = make_envelope("group", "@_user_1 hello", "ou_user1", Some(mentions));
@@ -4141,7 +4393,13 @@ mod tests {
     #[test]
     fn parse_thread_id_from_root_id() {
         let mut env = make_envelope("p2p", "reply", "ou_user1", None);
-        env.event.as_mut().unwrap().message.as_mut().unwrap().root_id = Some("om_root".into());
+        env.event
+            .as_mut()
+            .unwrap()
+            .message
+            .as_mut()
+            .unwrap()
+            .root_id = Some("om_root".into());
         let cfg = test_config();
         let (evt, _media) = parse_message_event(&env, Some("ou_bot"), &cfg, false).unwrap();
         assert_eq!(evt.channel.thread_id, Some("om_root".into()));
@@ -4150,7 +4408,13 @@ mod tests {
     #[test]
     fn parse_thread_id_from_parent_id() {
         let mut env = make_envelope("p2p", "reply", "ou_user1", None);
-        env.event.as_mut().unwrap().message.as_mut().unwrap().parent_id = Some("om_parent".into());
+        env.event
+            .as_mut()
+            .unwrap()
+            .message
+            .as_mut()
+            .unwrap()
+            .parent_id = Some("om_parent".into());
         let cfg = test_config();
         let (evt, _media) = parse_message_event(&env, Some("ou_bot"), &cfg, false).unwrap();
         assert_eq!(evt.channel.thread_id, Some("om_parent".into()));
@@ -4175,9 +4439,15 @@ mod tests {
     #[test]
     fn participated_thread_bypasses_mention_gating() {
         let cfg = test_config(); // require_mention = true
-        // Build envelope with root_id (in a thread)
+                                 // Build envelope with root_id (in a thread)
         let mut env = make_envelope("group", "Hello", "ou_user1", None);
-        env.event.as_mut().unwrap().message.as_mut().unwrap().root_id = Some("root_123".into());
+        env.event
+            .as_mut()
+            .unwrap()
+            .message
+            .as_mut()
+            .unwrap()
+            .root_id = Some("root_123".into());
         // Without participation: no @mention → None
         assert!(parse_message_event(&env, Some("ou_bot"), &cfg, false).is_none());
         // With participation: no @mention → Some (bypass)
@@ -4190,7 +4460,7 @@ mod tests {
     #[test]
     fn participated_no_effect_without_thread() {
         let cfg = test_config(); // require_mention = true
-        // Message in main channel (no thread_id) — participated flag doesn't help
+                                 // Message in main channel (no thread_id) — participated flag doesn't help
         let env = make_envelope("group", "Hello", "ou_user1", None);
         assert!(parse_message_event(&env, Some("ou_bot"), &cfg, true).is_none());
     }
@@ -4216,7 +4486,13 @@ mod tests {
         let mut cfg = test_config();
         cfg.allow_user_messages = AllowUsers::MultibotMentions;
         let mut env = make_envelope("group", "Hello", "ou_user1", None);
-        env.event.as_mut().unwrap().message.as_mut().unwrap().root_id = Some("root_456".into());
+        env.event
+            .as_mut()
+            .unwrap()
+            .message
+            .as_mut()
+            .unwrap()
+            .root_id = Some("root_456".into());
         // participated + no other bot → bypass_mention_gating=true
         let result = parse_message_event(&env, Some("ou_bot"), &cfg, true);
         assert!(result.is_some());
@@ -4227,7 +4503,13 @@ mod tests {
         let mut cfg = test_config();
         cfg.allow_user_messages = AllowUsers::MultibotMentions;
         let mut env = make_envelope("group", "Hello", "ou_user1", None);
-        env.event.as_mut().unwrap().message.as_mut().unwrap().root_id = Some("root_456".into());
+        env.event
+            .as_mut()
+            .unwrap()
+            .message
+            .as_mut()
+            .unwrap()
+            .root_id = Some("root_456".into());
         // not participated → bypass_mention_gating=false
         assert!(parse_message_event(&env, Some("ou_bot"), &cfg, false).is_none());
     }
@@ -4237,7 +4519,13 @@ mod tests {
         let mut cfg = test_config();
         cfg.allow_user_messages = AllowUsers::Mentions;
         let mut env = make_envelope("group", "Hello", "ou_user1", None);
-        env.event.as_mut().unwrap().message.as_mut().unwrap().root_id = Some("root_789".into());
+        env.event
+            .as_mut()
+            .unwrap()
+            .message
+            .as_mut()
+            .unwrap()
+            .root_id = Some("root_789".into());
         // Even with bypass_mention_gating=true, Mentions mode never bypasses
         // (caller would pass false because Mentions mode always returns false)
         assert!(parse_message_event(&env, Some("ou_bot"), &cfg, false).is_none());
@@ -4245,7 +4533,7 @@ mod tests {
 
     #[test]
     fn quote_message_id_takes_priority_over_thread_id() {
-        use crate::schema::{GatewayReply, ReplyChannel, Content};
+        use crate::schema::{Content, GatewayReply, ReplyChannel};
         let reply = GatewayReply {
             schema: "openab.gateway.reply.v1".into(),
             reply_to: "evt_123".into(),
@@ -4264,14 +4552,16 @@ mod tests {
             quote_message_id: Some("om_specific".into()),
         };
         // quote_message_id should take priority
-        let reply_target = reply.quote_message_id.as_deref()
+        let reply_target = reply
+            .quote_message_id
+            .as_deref()
             .or(reply.channel.thread_id.as_deref());
         assert_eq!(reply_target, Some("om_specific"));
     }
 
     #[test]
     fn reply_target_falls_back_to_thread_id_when_no_quote() {
-        use crate::schema::{GatewayReply, ReplyChannel, Content};
+        use crate::schema::{Content, GatewayReply, ReplyChannel};
         let reply = GatewayReply {
             schema: "openab.gateway.reply.v1".into(),
             reply_to: "evt_123".into(),
@@ -4289,14 +4579,16 @@ mod tests {
             request_id: None,
             quote_message_id: None,
         };
-        let reply_target = reply.quote_message_id.as_deref()
+        let reply_target = reply
+            .quote_message_id
+            .as_deref()
             .or(reply.channel.thread_id.as_deref());
         assert_eq!(reply_target, Some("om_root"));
     }
 
     #[test]
     fn reply_target_is_none_when_both_absent() {
-        use crate::schema::{GatewayReply, ReplyChannel, Content};
+        use crate::schema::{Content, GatewayReply, ReplyChannel};
         let reply = GatewayReply {
             schema: "openab.gateway.reply.v1".into(),
             reply_to: "evt_123".into(),
@@ -4314,7 +4606,9 @@ mod tests {
             request_id: None,
             quote_message_id: None,
         };
-        let reply_target = reply.quote_message_id.as_deref()
+        let reply_target = reply
+            .quote_message_id
+            .as_deref()
             .or(reply.channel.thread_id.as_deref());
         assert_eq!(reply_target, None);
     }
@@ -4506,7 +4800,9 @@ mod tests {
 
     #[test]
     fn message_id_validation_accepts_valid_shapes() {
-        assert!(is_valid_feishu_message_id("om_dc13264520392907fcq2e6kpngacls"));
+        assert!(is_valid_feishu_message_id(
+            "om_dc13264520392907fcq2e6kpngacls"
+        ));
         assert!(is_valid_feishu_message_id("om_abc123"));
         assert!(is_valid_feishu_message_id("om_A_B_c_1_2_3"));
     }
@@ -4709,7 +5005,10 @@ mod tests {
             "report.pdf",
         )
         .await;
-        assert!(att.status.is_some(), "non-text extension must have status set");
+        assert!(
+            att.status.is_some(),
+            "non-text extension must have status set"
+        );
         let reason = att.status.unwrap();
         assert!(reason.contains("unsupported format"), "got: {reason}");
     }
@@ -4767,7 +5066,12 @@ mod tests {
         let adapter = FeishuAdapter::new(config);
         let (tx, mut rx) = tokio::sync::broadcast::channel(16);
 
-        handle_reply(&edit_reply("om_ph1", "short reply", None, Some("r1")), &adapter, &tx).await;
+        handle_reply(
+            &edit_reply("om_ph1", "short reply", None, Some("r1")),
+            &adapter,
+            &tx,
+        )
+        .await;
 
         assert!(
             adapter.stream_sessions.lock().is_empty(),
@@ -4921,7 +5225,10 @@ mod tests {
         );
         let resp: crate::schema::GatewayResponse =
             serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
-        assert!(!resp.success, "failure must surface so core finalize takes over");
+        assert!(
+            !resp.success,
+            "failure must surface so core finalize takes over"
+        );
     }
 
     /// Card mode: the FIRST reply (command=None) goes straight to a card with no
@@ -4974,7 +5281,9 @@ mod tests {
         // Session keyed by the card's own message_id (no post→card swap).
         {
             let reg = adapter.stream_sessions.lock();
-            let s = reg.get("om_cardZ").expect("session keyed by card message id");
+            let s = reg
+                .get("om_cardZ")
+                .expect("session keyed by card message id");
             assert_eq!(s.card_id, "cardZ");
         }
         let resp: crate::schema::GatewayResponse =
