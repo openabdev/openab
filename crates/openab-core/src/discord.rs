@@ -1,8 +1,10 @@
 use crate::acp::protocol::{ConfigOption, UsageReport};
 use crate::acp::ContentBlock;
 use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef, SenderContext};
+use crate::admission::{WorkAdmissionPort, WorkAdmissionRequest};
 use crate::bot_turns::{BotTurnTracker, TurnAction, TurnSeverity, BOT_TURN_LIMIT_WARNING_PREFIX};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
+use crate::control_plane;
 use crate::dispatch::DispatchTarget;
 use crate::format;
 use crate::media;
@@ -17,8 +19,12 @@ use serenity::builder::{
 };
 use serenity::http::Http;
 use serenity::model::application::ButtonStyle;
-use serenity::model::application::{Command, CommandOptionType, ComponentInteractionDataKind, Interaction};
-use serenity::model::channel::{AutoArchiveDuration, Message, MessageType, Reaction, ReactionType};
+use serenity::model::application::{
+    Command, CommandOptionType, ComponentInteractionDataKind, Interaction,
+};
+use serenity::model::channel::{
+    AutoArchiveDuration, Channel, Message, MessageType, Reaction, ReactionType,
+};
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId, UserId};
 use serenity::prelude::*;
@@ -64,17 +70,318 @@ const THREAD_EXPORT_MESSAGE_LIMIT: usize = 5000;
 
 pub struct DiscordAdapter {
     http: Arc<Http>,
+    diagnostic_client: Arc<dyn DiagnosticDiscordClient>,
+    adapter_instance_id: String,
+}
+
+/// Safe, bounded details from a Discord REST failure.
+///
+/// This deliberately excludes response bodies, authorization information, and
+/// query strings.  It is suitable for structured logs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscordHttpErrorDetails {
+    pub status: Option<u16>,
+    pub discord_code: Option<isize>,
+    pub method: Option<String>,
+    pub route: Option<String>,
+    pub message: String,
+}
+
+/// Read-only identity and target-channel evidence collected with one adapter's
+/// actual `Arc<Http>` instance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscordIdentityDiagnostic {
+    pub authenticated_user_id: Option<String>,
+    pub authenticated_username: Option<String>,
+    pub identity_error: Option<DiscordHttpErrorDetails>,
+    pub target_channel_id: String,
+    pub target_channel_access: bool,
+    pub target_channel_type: Option<String>,
+    pub target_channel_error: Option<DiscordHttpErrorDetails>,
+}
+
+/// The two bounded write variants used only to diagnose the control-plane
+/// Discord send path.  They deliberately do not include a reply/reference.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiscordSendDiagnosticVariant {
+    ContentOnly,
+    AllowedMentions,
+}
+
+impl DiscordSendDiagnosticVariant {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ContentOnly => "CONTENT_ONLY",
+            Self::AllowedMentions => "ALLOWED_MENTIONS",
+        }
+    }
+}
+
+/// Safe structured result for one bounded same-HTTP diagnostic send.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DiscordSendDiagnostic {
+    pub variant: DiscordSendDiagnosticVariant,
+    pub target_channel_id: String,
+    pub success: bool,
+    pub message_id: Option<String>,
+    pub error: Option<DiscordHttpErrorDetails>,
+    pub content_length_bytes: usize,
+    pub content_length_chars: usize,
+}
+
+/// Narrow read-only seam for startup diagnostics. Production uses the same
+/// `Arc<Http>` retained by `DiscordAdapter`; tests supply a recording fake.
+#[async_trait]
+trait DiagnosticDiscordClient: Send + Sync {
+    async fn diagnostic_current_user(&self) -> Result<(String, String), DiscordHttpErrorDetails>;
+
+    async fn diagnostic_target_channel(
+        &self,
+        target_channel_id: ChannelId,
+    ) -> Result<String, DiscordHttpErrorDetails>;
+
+    async fn diagnostic_send_message(
+        &self,
+        target_channel_id: ChannelId,
+        content: &str,
+        target_user_id: Option<UserId>,
+    ) -> Result<String, DiscordHttpErrorDetails>;
+}
+
+#[async_trait]
+impl DiagnosticDiscordClient for Http {
+    async fn diagnostic_current_user(&self) -> Result<(String, String), DiscordHttpErrorDetails> {
+        self.get_current_user()
+            .await
+            .map(|user| (user.id.to_string(), user.name.clone()))
+            .map_err(|error| serenity_http_error_details(&error))
+    }
+
+    async fn diagnostic_target_channel(
+        &self,
+        target_channel_id: ChannelId,
+    ) -> Result<String, DiscordHttpErrorDetails> {
+        self.get_channel(target_channel_id)
+            .await
+            .map(|channel| discord_channel_type(&channel))
+            .map_err(|error| serenity_http_error_details(&error))
+    }
+
+    async fn diagnostic_send_message(
+        &self,
+        target_channel_id: ChannelId,
+        content: &str,
+        target_user_id: Option<UserId>,
+    ) -> Result<String, DiscordHttpErrorDetails> {
+        let mut builder = serenity::builder::CreateMessage::new().content(content);
+        if let Some(user_id) = target_user_id {
+            // This is deliberately identical to send_message_targeted's
+            // mention builder: users only, no reply/reference.
+            builder = builder
+                .allowed_mentions(serenity::builder::CreateAllowedMentions::new().users([user_id]));
+        }
+        target_channel_id
+            .send_message(self, builder)
+            .await
+            .map(|message| message.id.to_string())
+            .map_err(|error| serenity_http_error_details(&error))
+    }
+}
+
+/// Extract only safe, actionable HTTP fields from a Serenity error.
+pub fn serenity_http_error_details(error: &serenity::Error) -> DiscordHttpErrorDetails {
+    match error {
+        serenity::Error::Http(serenity::http::HttpError::UnsuccessfulRequest(response)) => {
+            unsuccessful_request_details(
+                response.status_code.as_u16(),
+                response.error.code,
+                response.method.as_ref(),
+                &response.url,
+                &response.error.message,
+            )
+        }
+        _ => DiscordHttpErrorDetails {
+            status: None,
+            discord_code: None,
+            method: None,
+            route: None,
+            message: error.to_string(),
+        },
+    }
+}
+
+fn unsuccessful_request_details(
+    status: u16,
+    discord_code: isize,
+    method: &str,
+    url: &str,
+    message: &str,
+) -> DiscordHttpErrorDetails {
+    DiscordHttpErrorDetails {
+        status: Some(status),
+        discord_code: Some(discord_code),
+        method: Some(method.to_owned()),
+        route: Some(safe_discord_route(url)),
+        message: message.to_owned(),
+    }
+}
+
+fn safe_discord_route(url: &str) -> String {
+    if url.starts_with('/') {
+        return url.split('?').next().unwrap_or("/").to_owned();
+    }
+    let path_start = url
+        .find("//")
+        .and_then(|index| url[index + 2..].find('/').map(|path| index + 2 + path));
+    let path = path_start.map_or("/", |index| &url[index..]);
+    path.split('?').next().unwrap_or("/").to_owned()
+}
+
+fn safe_diagnostic_error_details(mut details: DiscordHttpErrorDetails) -> DiscordHttpErrorDetails {
+    details.route = details.route.as_deref().map(safe_discord_route);
+    let lower_message = details.message.to_ascii_lowercase();
+    if lower_message.contains("authorization") || lower_message.contains("bot ") {
+        details.message = "[redacted credential detail]".to_owned();
+    }
+    details
 }
 
 impl DiscordAdapter {
     pub fn new(http: Arc<Http>) -> Self {
-        Self { http }
+        Self {
+            diagnostic_client: http.clone(),
+            http,
+            adapter_instance_id: format!("discord-{}", uuid::Uuid::new_v4()),
+        }
+    }
+
+    /// Safe opaque identity for correlating startup diagnostics and the
+    /// concrete adapter that performs a production control-plane send.
+    pub fn adapter_instance_id(&self) -> &str {
+        &self.adapter_instance_id
+    }
+
+    #[cfg(test)]
+    fn with_diagnostic_client(
+        http: Arc<Http>,
+        diagnostic_client: Arc<dyn DiagnosticDiscordClient>,
+    ) -> Self {
+        Self {
+            http,
+            diagnostic_client,
+            adapter_instance_id: "discord-test-instance".to_owned(),
+        }
     }
 
     /// Resolve the effective Discord channel ID from a ChannelRef.
     /// Discord threads are channels, so prefer thread_id when set.
     fn resolve_channel(channel: &ChannelRef) -> &str {
         channel.thread_id.as_deref().unwrap_or(&channel.channel_id)
+    }
+
+    /// Prove the identity and target visibility of this adapter's exact HTTP
+    /// client. Both requests are read-only and deliberately independent so a
+    /// failed `/users/@me` does not suppress the target-channel evidence.
+    pub async fn diagnostic_identity(
+        &self,
+        target_channel_id: ChannelId,
+    ) -> DiscordIdentityDiagnostic {
+        let identity = self.diagnostic_client.diagnostic_current_user().await;
+        let target = self
+            .diagnostic_client
+            .diagnostic_target_channel(target_channel_id)
+            .await;
+
+        let (authenticated_user_id, authenticated_username, identity_error) = match identity {
+            Ok((user_id, username)) => (Some(user_id), Some(username), None),
+            Err(error) => (None, None, Some(safe_diagnostic_error_details(error))),
+        };
+        let (target_channel_access, target_channel_type, target_channel_error) = match target {
+            Ok(channel_type) => (true, Some(channel_type), None),
+            Err(error) => (false, None, Some(safe_diagnostic_error_details(error))),
+        };
+
+        DiscordIdentityDiagnostic {
+            authenticated_user_id,
+            authenticated_username,
+            identity_error,
+            target_channel_id: target_channel_id.to_string(),
+            target_channel_access,
+            target_channel_type,
+            target_channel_error,
+        }
+    }
+
+    /// Perform the Phase 5.5.2d-R6 bounded differential sends through the
+    /// same `Arc<Http>` retained by this adapter.  This bypasses neither the
+    /// Serenity client nor its request construction; it only removes the
+    /// RuntimeHandler/control-socket call context from the comparison.
+    pub async fn diagnostic_shared_http_sends(
+        &self,
+        target_channel_id: ChannelId,
+        target_user_id: UserId,
+    ) -> [DiscordSendDiagnostic; 2] {
+        const CONTENT_ONLY: &str = "P55_R6_SHARED_HTTP_CONTENT_ONLY";
+        const ALLOWED_MENTIONS: &str = "<@1536733602304499852> P55_R6_SHARED_HTTP_ALLOWED_MENTIONS";
+
+        let content_only = self
+            .diagnostic_send_result(
+                DiscordSendDiagnosticVariant::ContentOnly,
+                target_channel_id,
+                CONTENT_ONLY,
+                None,
+            )
+            .await;
+        let allowed_mentions = self
+            .diagnostic_send_result(
+                DiscordSendDiagnosticVariant::AllowedMentions,
+                target_channel_id,
+                ALLOWED_MENTIONS,
+                Some(target_user_id),
+            )
+            .await;
+        [content_only, allowed_mentions]
+    }
+
+    async fn diagnostic_send_result(
+        &self,
+        variant: DiscordSendDiagnosticVariant,
+        target_channel_id: ChannelId,
+        content: &str,
+        target_user_id: Option<UserId>,
+    ) -> DiscordSendDiagnostic {
+        match self
+            .diagnostic_client
+            .diagnostic_send_message(target_channel_id, content, target_user_id)
+            .await
+        {
+            Ok(message_id) => DiscordSendDiagnostic {
+                variant,
+                target_channel_id: target_channel_id.to_string(),
+                success: true,
+                message_id: Some(message_id),
+                error: None,
+                content_length_bytes: content.len(),
+                content_length_chars: content.chars().count(),
+            },
+            Err(error) => DiscordSendDiagnostic {
+                variant,
+                target_channel_id: target_channel_id.to_string(),
+                success: false,
+                message_id: None,
+                error: Some(safe_diagnostic_error_details(error)),
+                content_length_bytes: content.len(),
+                content_length_chars: content.chars().count(),
+            },
+        }
+    }
+}
+
+fn discord_channel_type(channel: &Channel) -> String {
+    match channel {
+        Channel::Guild(channel) => format!("{:?}", channel.kind),
+        Channel::Private(_) => "Private".to_owned(),
+        _ => "Unknown".to_owned(),
     }
 }
 
@@ -130,6 +437,94 @@ impl ChatAdapter for DiscordAdapter {
                 self.send_message(channel, content).await
             }
         }
+    }
+
+    async fn send_message_targeted(
+        &self,
+        channel: &ChannelRef,
+        content: &str,
+        target_user_id: Option<&str>,
+    ) -> anyhow::Result<MessageRef> {
+        let ch_id: u64 = Self::resolve_channel(channel).parse()?;
+        let request_id = control_plane::request_id();
+        tracing::info!(
+            event = "openab.discord.targeted_send_enter",
+            request_id = ?request_id,
+            adapter_instance_id = %self.adapter_instance_id,
+            thread_id = %ch_id,
+            target_user_id = ?target_user_id,
+            content_bytes = content.len(),
+            content_chars = content.chars().count(),
+            content_lines = content.lines().count(),
+            "Discord targeted send entered"
+        );
+        // Restricted ``allowed_mentions`` so Discord's REST API tags the
+        // message with ``mentions: [{user_id: <X>}]`` and the receiving
+        // bot's MultibotMentions check accepts the dispatch without the
+        // LLM authoring a raw Discord ID.
+        let mut builder = serenity::builder::CreateMessage::new().content(content);
+        if let Some(user_id_str) = target_user_id {
+            let target_id = match user_id_str.parse::<u64>() {
+                Ok(id) => serenity::model::id::UserId::new(id),
+                Err(e) => {
+                    tracing::warn!(
+                        event = "openab.discord.targeted_send_result",
+                        request_id = ?request_id,
+                        adapter_instance_id = %self.adapter_instance_id,
+                        thread_id = %ch_id,
+                        target_user_id = %user_id_str,
+                        status = "FAIL",
+                        discord_error_message = %e,
+                        "Discord targeted send rejected an invalid target user id"
+                    );
+                    return Err(anyhow::anyhow!(
+                        "send_message_targeted: invalid target_user_id {user_id_str:?}: {e}"
+                    ));
+                }
+            };
+            let allowed = serenity::builder::CreateAllowedMentions::new().users([target_id]);
+            builder = builder.allowed_mentions(allowed);
+        }
+        let msg = match ChannelId::new(ch_id)
+            .send_message(&self.http, builder)
+            .await
+        {
+            Ok(msg) => {
+                tracing::info!(
+                    event = "openab.discord.targeted_send_result",
+                    request_id = ?request_id,
+                    adapter_instance_id = %self.adapter_instance_id,
+                    thread_id = %ch_id,
+                    target_user_id = ?target_user_id,
+                    status = "PASS",
+                    message_id = %msg.id,
+                    "Discord targeted send completed"
+                );
+                msg
+            }
+            Err(error) => {
+                let details = serenity_http_error_details(&error);
+                tracing::warn!(
+                    event = "openab.discord.targeted_send_result",
+                    request_id = ?request_id,
+                    adapter_instance_id = %self.adapter_instance_id,
+                    thread_id = %ch_id,
+                    target_user_id = ?target_user_id,
+                    status = "FAIL",
+                    http_status = ?details.status,
+                    discord_error_code = ?details.discord_code,
+                    discord_error_message = %details.message,
+                    method = ?details.method,
+                    safe_route = ?details.route,
+                    "Discord targeted send failed"
+                );
+                return Err(anyhow::Error::new(error));
+            }
+        };
+        Ok(MessageRef {
+            channel: channel.clone(),
+            message_id: msg.id.to_string(),
+        })
     }
 
     async fn delete_message(&self, msg: &MessageRef) -> anyhow::Result<()> {
@@ -212,7 +607,11 @@ impl ChatAdapter for DiscordAdapter {
         let ch_id: u64 = Self::resolve_channel(channel).parse()?;
         // Truncate at char boundary to avoid panic on multi-byte chars (中文/Emoji).
         let truncated: &str = if title.chars().count() > 100 {
-            let end = title.char_indices().nth(100).map(|(i, _)| i).unwrap_or(title.len());
+            let end = title
+                .char_indices()
+                .nth(100)
+                .map(|(i, _)| i)
+                .unwrap_or(title.len());
             &title[..end]
         } else {
             title
@@ -242,6 +641,13 @@ pub struct Handler {
     pub allow_user_messages: AllowUsers,
     /// Role IDs that trigger the bot (same as direct @mention).
     pub allowed_role_ids: HashSet<u64>,
+    /// Role IDs that explicitly target a peer/agent bot account in this
+    /// deployment (NOT configured for THIS bot). See
+    /// `crate::config::DiscordConfig::peer_agent_role_ids`. Operator-
+    /// supplied; never inferred from role names, attachment body, or
+    /// LLM text. Empty = role-peer check is silent.
+    /// workflow 20260818-openab-discord-attachment-mention-admission
+    pub peer_agent_role_ids: HashSet<u64>,
     /// Positive-only cache: thread channel_id → cached_at for threads where bot has participated.
     pub participated_threads: tokio::sync::Mutex<HashMap<String, tokio::time::Instant>>,
     /// Positive-only cache: thread channel_id → cached_at for threads where other bots have posted.
@@ -259,6 +665,7 @@ pub struct Handler {
     pub allow_dm: bool,
     /// Per-thread dispatcher (Message mode uses cap=1 for FIFO; Thread/Lane use configured cap).
     pub dispatcher: Arc<crate::dispatch::Dispatcher>,
+    pub admission: Arc<dyn WorkAdmissionPort>,
     /// Ambient mode dispatcher for passive channel listening.
     pub ambient: Option<Arc<crate::ambient::AmbientDispatcher>>,
     /// Reminder store for /remind slash command.
@@ -268,6 +675,32 @@ pub struct Handler {
 }
 
 impl Handler {
+    /// Keep the self-message decision in one named gate so the EventHandler
+    /// path and its regression test cannot drift apart. This remains before
+    /// any admission work is constructed.
+    fn is_self_authored(author_id: UserId, bot_id: UserId) -> bool {
+        author_id == bot_id
+    }
+
+    /// The final production ingress seam after Discord's existing channel,
+    /// identity, bot, mention, and authorization gates have accepted a
+    /// message.  Keeping the self gate here as well makes the admission call
+    /// itself safe against a future call-site reordering, while the earlier
+    /// EventHandler return remains the cheap no-work path for self messages.
+    async fn admit_after_discord_gates(
+        admission: Arc<dyn WorkAdmissionPort>,
+        author_id: UserId,
+        bot_id: UserId,
+        request: WorkAdmissionRequest,
+    ) {
+        if Self::is_self_authored(author_id, bot_id) {
+            return;
+        }
+        if let Err(e) = admission.admit_work(request).await {
+            error!("work admission error: {e}");
+        }
+    }
+
     /// Check if the bot has participated in a Discord thread, and whether
     /// other bots have also posted in it.
     /// Returns `(involved, other_bot_present)`.
@@ -356,7 +789,9 @@ impl EventHandler for Handler {
             let key = msg.channel_id.to_string();
             {
                 let mut cache = self.multibot_threads.lock().await;
-                cache.entry(key.clone()).or_insert_with(tokio::time::Instant::now);
+                cache
+                    .entry(key.clone())
+                    .or_insert_with(tokio::time::Instant::now);
             }
             // Persist to disk — multibot is irreversible
             self.multibot_cache.mark_multibot(&key).await;
@@ -464,7 +899,7 @@ impl EventHandler for Handler {
         }
 
         // Ignore own messages (after counting toward bot turns above)
-        if msg.author.id == bot_id {
+        if Self::is_self_authored(msg.author.id, bot_id) {
             return;
         }
 
@@ -485,6 +920,16 @@ impl EventHandler for Handler {
                     .iter()
                     .any(|r| self.allowed_role_ids.contains(&r.get())));
 
+        // Explicit structured targeting of another bot in the original
+        // Discord message metadata — see `has_explicit_other_bot_target`.
+        // (workflow 20260818-openab-discord-attachment-mention-admission)
+        let explicit_other_bot_target = has_explicit_other_bot_target(
+            &msg,
+            bot_id,
+            &self.allowed_role_ids,
+            &self.peer_agent_role_ids,
+        );
+
         // Early-gating optimization for bot messages to avoid unnecessary
         // async/HTTP thread detection calls when ambient mode is inactive and
         // the bot would gate it out anyway. (#1197 regression safety)
@@ -499,11 +944,14 @@ impl EventHandler for Handler {
         // non-allowed channels. Moved before bot gating so ambient context
         // can be resolved early — bot messages in ambient contexts must bypass
         // discord-level bot gating (#1197).
-        let (in_thread, bot_owns_thread, thread_parent_id, is_dm, is_structural_thread, structural_parent_id) = match msg
-            .channel_id
-            .to_channel(&ctx.http)
-            .await
-        {
+        let (
+            in_thread,
+            bot_owns_thread,
+            thread_parent_id,
+            is_dm,
+            is_structural_thread,
+            structural_parent_id,
+        ) = match msg.channel_id.to_channel(&ctx.http).await {
             Ok(serenity::model::channel::Channel::Guild(gc)) => {
                 let parent = gc.parent_id.map(|id| id.get().to_string());
                 let has_thread_metadata = gc.thread_metadata.is_some();
@@ -532,7 +980,11 @@ impl EventHandler for Handler {
                     if has_thread_metadata { parent } else { None },
                     false,
                     has_thread_metadata,
-                    if has_thread_metadata { parent_u64 } else { None },
+                    if has_thread_metadata {
+                        parent_u64
+                    } else {
+                        None
+                    },
                 )
             }
             Ok(serenity::model::channel::Channel::Private(_)) => {
@@ -552,7 +1004,12 @@ impl EventHandler for Handler {
         // Check if message is in an ambient context (resolved early so bot
         // messages destined for ambient can bypass discord-level bot gating).
         let in_ambient_context = self.ambient.as_ref().is_some_and(|ambient| {
-            ambient.should_buffer(channel_id, is_structural_thread, bot_owns_thread, structural_parent_id)
+            ambient.should_buffer(
+                channel_id,
+                is_structural_thread,
+                bot_owns_thread,
+                structural_parent_id,
+            )
         });
 
         // --- Ambient early-route for bot messages ---
@@ -599,13 +1056,15 @@ impl EventHandler for Handler {
 
                     let target = Arc::clone(&self.router) as Arc<dyn DispatchTarget>;
                     debug!(channel_id = %msg.channel_id, bot_id = %msg.author.id, "ambient early-route: bot msg buffered");
-                    ambient.submit(
-                        &channel_id.to_string(),
-                        channel_ref,
-                        adapter.clone(),
-                        target,
-                        ambient_msg,
-                    ).await;
+                    ambient
+                        .submit(
+                            &channel_id.to_string(),
+                            channel_ref,
+                            adapter.clone(),
+                            target,
+                            ambient_msg,
+                        )
+                        .await;
                 }
             }
             return;
@@ -761,13 +1220,15 @@ impl EventHandler for Handler {
                     };
 
                     let target = Arc::clone(&self.router) as Arc<dyn DispatchTarget>;
-                    ambient.submit(
-                        &channel_id.to_string(),
-                        channel_ref,
-                        adapter.clone(),
-                        target,
-                        ambient_msg,
-                    ).await;
+                    ambient
+                        .submit(
+                            &channel_id.to_string(),
+                            channel_ref,
+                            adapter.clone(),
+                            target,
+                            ambient_msg,
+                        )
+                        .await;
                     return;
                 }
             }
@@ -780,11 +1241,53 @@ impl EventHandler for Handler {
         // MultibotMentions: same as Involved, but if other bots are also
         //   in the thread, require @mention to avoid all bots responding.
         // DMs are treated as implicit @mention (mirrors Slack behavior).
+        //
+        // Precedence rule (workflow 20260818-openab-discord-attachment-mention-admission):
+        // explicit structured targeting of ANOTHER bot outranks involved /
+        // MultibotMentions fallback. When the message @-mentions a different
+        // bot, the unmentioned involved bot here must NOT piggyback via the
+        // multibot-mentions fallback — its cache hasn't learned about the
+        // other bot yet (it only learns on the other bot's first reply).
         if !is_mentioned && !is_dm {
+            if explicit_other_bot_target {
+                tracing::info!(
+                    bot_id = %bot_id,
+                    message_id = %msg.id,
+                    channel_id = %msg.channel_id,
+                    is_mentioned,
+                    explicit_other_bot_target = true,
+                    decision = "reject",
+                    reason = "explicit_other_bot_target",
+                    "A12 user-message gate"
+                );
+                return;
+            }
             match self.allow_user_messages {
-                AllowUsers::Mentions => return,
+                AllowUsers::Mentions => {
+                    tracing::info!(
+                        bot_id = %bot_id,
+                        message_id = %msg.id,
+                        channel_id = %msg.channel_id,
+                        is_mentioned,
+                        explicit_other_bot_target,
+                        decision = "reject",
+                        reason = "mentions_mode_unmentioned",
+                        "A12 user-message gate"
+                    );
+                    return;
+                }
                 AllowUsers::Involved => {
                     if !in_thread {
+                        tracing::info!(
+                            bot_id = %bot_id,
+                            message_id = %msg.id,
+                            channel_id = %msg.channel_id,
+                            is_mentioned,
+                            explicit_other_bot_target,
+                            decision = "reject",
+                            reason = "involved_mode_not_in_thread",
+                            "A12 user-message gate"
+                        );
                         return;
                     }
                     let (involved, _) = if bot_owns_thread {
@@ -794,12 +1297,41 @@ impl EventHandler for Handler {
                             .await
                     };
                     if !involved {
-                        tracing::debug!(channel_id = %msg.channel_id, "bot not involved in thread, ignoring");
+                        tracing::info!(
+                            bot_id = %bot_id,
+                            message_id = %msg.id,
+                            channel_id = %msg.channel_id,
+                            is_mentioned,
+                            explicit_other_bot_target,
+                            decision = "reject",
+                            reason = "involved_mode_bot_not_participated",
+                            "A12 user-message gate"
+                        );
                         return;
                     }
+                    tracing::info!(
+                        bot_id = %bot_id,
+                        message_id = %msg.id,
+                        channel_id = %msg.channel_id,
+                        is_mentioned,
+                        explicit_other_bot_target,
+                        decision = "admit",
+                        reason = "involved_mode_bot_participated",
+                        "A12 user-message gate"
+                    );
                 }
                 AllowUsers::MultibotMentions => {
                     if !in_thread {
+                        tracing::info!(
+                            bot_id = %bot_id,
+                            message_id = %msg.id,
+                            channel_id = %msg.channel_id,
+                            is_mentioned,
+                            explicit_other_bot_target,
+                            decision = "reject",
+                            reason = "multibot_mentions_mode_not_in_thread",
+                            "A12 user-message gate"
+                        );
                         return;
                     }
                     let (involved, other_bot) = if bot_owns_thread {
@@ -813,15 +1345,69 @@ impl EventHandler for Handler {
                             .await
                     };
                     if !involved {
-                        tracing::debug!(channel_id = %msg.channel_id, "bot not involved in thread, ignoring");
+                        tracing::info!(
+                            bot_id = %bot_id,
+                            message_id = %msg.id,
+                            channel_id = %msg.channel_id,
+                            is_mentioned,
+                            explicit_other_bot_target,
+                            decision = "reject",
+                            reason = "multibot_mentions_mode_bot_not_participated",
+                            "A12 user-message gate"
+                        );
                         return;
                     }
                     if other_bot {
-                        tracing::debug!(channel_id = %msg.channel_id, "multi-bot thread, requiring @mention");
+                        tracing::info!(
+                            bot_id = %bot_id,
+                            message_id = %msg.id,
+                            channel_id = %msg.channel_id,
+                            is_mentioned,
+                            explicit_other_bot_target,
+                            other_bot_present = other_bot,
+                            decision = "reject",
+                            reason = "multibot_mentions_mode_other_bot_present",
+                            "A12 user-message gate"
+                        );
                         return;
                     }
+                    tracing::info!(
+                        bot_id = %bot_id,
+                        message_id = %msg.id,
+                        channel_id = %msg.channel_id,
+                        is_mentioned,
+                        explicit_other_bot_target,
+                        other_bot_present = other_bot,
+                        decision = "admit",
+                        reason = "multibot_mentions_mode_solo_bot_involved",
+                        "A12 user-message gate"
+                    );
                 }
             }
+        } else if !is_dm {
+            // is_mentioned=true AND not DM: A12 short-circuits to admit.
+            tracing::info!(
+                bot_id = %bot_id,
+                message_id = %msg.id,
+                channel_id = %msg.channel_id,
+                is_mentioned,
+                explicit_other_bot_target,
+                decision = "admit",
+                reason = "is_mentioned_true",
+                "A12 user-message gate"
+            );
+        } else {
+            // DM
+            tracing::info!(
+                bot_id = %bot_id,
+                message_id = %msg.id,
+                channel_id = %msg.channel_id,
+                is_mentioned,
+                explicit_other_bot_target,
+                decision = "admit",
+                reason = "dm_implicit_mention",
+                "A12 user-message gate"
+            );
         }
 
         if is_denied_user(
@@ -918,7 +1504,8 @@ impl EventHandler for Handler {
                 // be uploaded to S3, not inlined).
                 let attachment_size = u64::from(attachment.size);
                 #[cfg(feature = "filestore")]
-                let skip_cap = self.filestore.is_some() && attachment_size > crate::media::TEXT_INLINE_LIMIT;
+                let skip_cap =
+                    self.filestore.is_some() && attachment_size > crate::media::TEXT_INLINE_LIMIT;
                 #[cfg(not(feature = "filestore"))]
                 let skip_cap = false;
                 if !skip_cap && text_file_bytes + attachment_size > TEXT_TOTAL_CAP {
@@ -999,7 +1586,9 @@ impl EventHandler for Handler {
                                     attachment.content_type.as_deref(),
                                     None,
                                     fs,
-                                ).await {
+                                )
+                                .await
+                                {
                                     extra_blocks.push(block);
                                 }
                             }
@@ -1064,10 +1653,11 @@ impl EventHandler for Handler {
         let trigger_msg = discord_msg_ref(&msg);
 
         // Per-thread streaming: check if another bot is present in this thread
-        let other_bot_present_flag = {
-            let cache = self.multibot_threads.lock().await;
-            cache.contains_key(&msg.channel_id.to_string())
-        } || self.multibot_cache.is_multibot(&msg.channel_id.to_string());
+        let other_bot_present_flag =
+            {
+                let cache = self.multibot_threads.lock().await;
+                cache.contains_key(&msg.channel_id.to_string())
+            } || self.multibot_cache.is_multibot(&msg.channel_id.to_string());
 
         // Backfill thread_id: when OAB just created a new thread, the sender
         // was built before the thread existed. Patch it so the agent sees
@@ -1077,7 +1667,7 @@ impl EventHandler for Handler {
             sender.thread_id = Some(thread_channel.channel_id.clone());
         }
 
-        let dispatcher = self.dispatcher.clone();
+        let admission = self.admission.clone();
         let stt_cfg = self.stt_config.clone();
         let gate_router = self.router.clone();
 
@@ -1106,10 +1696,20 @@ impl EventHandler for Handler {
             // Running it on bots would wrongly drop trusted bot-to-bot messages
             // when allow_all_users=false (multi-agent). See PR #1270 review F1.
             // Phase 1c makes this authoritative and removes the scattered check.
+            //
+            // Phase 6.4.1E — Discord threads are separate channels whose own
+            // snowflake is not always in `allowed_channels`. The shared L2 gate
+            // is parent-aware via `gate_incoming_with_parent`: a thread is in
+            // scope when its `channel_id` OR its `parent_id` is in
+            // `allowed_channels`. `thread_channel.parent_id` is populated
+            // earlier from `gc.parent_id` (real Discord thread metadata,
+            // never parsed from `conversation_key`) or from
+            // `get_or_create_thread(...)` for OAB-created threads.
             if l3_gate_applies(sender.is_bot) {
-                let decision = gate_router.gate_incoming(
+                let decision = gate_router.gate_incoming_with_parent(
                     "discord",
                     &thread_channel.channel_id,
+                    thread_channel.parent_id.as_deref(),
                     is_dm,
                     &sender_id,
                 );
@@ -1117,6 +1717,7 @@ impl EventHandler for Handler {
                     tracing::info!(
                         sender = %sender_id,
                         channel = %thread_channel.channel_id,
+                        parent_id = ?thread_channel.parent_id,
                         ?decision,
                         "discord message denied by trust gate"
                     );
@@ -1124,7 +1725,6 @@ impl EventHandler for Handler {
                 }
             }
             let sender_json = serde_json::to_string(&sender).unwrap();
-            let thread_key = dispatcher.key("discord", &thread_channel.channel_id, &sender_id);
             let estimated_tokens = crate::dispatch::estimate_tokens(&prompt, &extra_blocks);
             let buf_msg = crate::dispatch::BufferedMessage {
                 sender_json,
@@ -1136,13 +1736,26 @@ impl EventHandler for Handler {
                 estimated_tokens,
                 other_bot_present: other_bot_present_flag,
                 recipient: None, // Slack-only (assistant mode); N/A for Discord
+                native_workflow: None,
             };
-            if let Err(e) = dispatcher
-                .submit(thread_key, thread_channel, adapter, buf_msg)
-                .await
-            {
-                error!("dispatcher submit error: {e}");
-            }
+            Handler::admit_after_discord_gates(
+                admission,
+                msg.author.id,
+                bot_id,
+                WorkAdmissionRequest {
+                    conversation: thread_channel,
+                    sender_id,
+                    adapter,
+                    message: buf_msg,
+                    native_workflow: None,
+                    // Phase 6.2.9: Discord callers never set a native
+                    // execution-session key — they continue to use the
+                    // legacy `discord:<channel>:<thread>` pool key so human
+                    // conversational sessions behave exactly as before.
+                    native_execution_session_key: None,
+                },
+            )
+            .await;
         });
     }
 
@@ -1236,24 +1849,30 @@ impl EventHandler for Handler {
                     if !in_allowed_thread {
                         return;
                     }
-                    (ChannelRef {
-                        platform: "discord".into(),
-                        channel_id: channel_id.get().to_string(),
-                        thread_id: None,
-                        parent_id: parent.map(|p| p.to_string()),
-                        origin_event_id: None,
-                    }, true)
+                    (
+                        ChannelRef {
+                            platform: "discord".into(),
+                            channel_id: channel_id.get().to_string(),
+                            thread_id: None,
+                            parent_id: parent.map(|p| p.to_string()),
+                            origin_event_id: None,
+                        },
+                        true,
+                    )
                 } else {
                     if !in_allowed_channel {
                         return;
                     }
-                    (ChannelRef {
-                        platform: "discord".into(),
-                        channel_id: channel_id.get().to_string(),
-                        thread_id: None,
-                        parent_id: None,
-                        origin_event_id: None,
-                    }, false)
+                    (
+                        ChannelRef {
+                            platform: "discord".into(),
+                            channel_id: channel_id.get().to_string(),
+                            thread_id: None,
+                            parent_id: None,
+                            origin_event_id: None,
+                        },
+                        false,
+                    )
                 }
             }
             _ => return,
@@ -1267,7 +1886,8 @@ impl EventHandler for Handler {
                 self.allow_user_messages,
                 AllowUsers::Involved | AllowUsers::MultibotMentions
             ) {
-            self.bot_participated_in_thread(&ctx.http, channel_id, bot_id).await
+            self.bot_participated_in_thread(&ctx.http, channel_id, bot_id)
+                .await
         } else {
             // For non-thread: still check multibot cache for dispatch info.
             let mb = {
@@ -1296,22 +1916,21 @@ impl EventHandler for Handler {
         let allowed_users = self.allowed_users.clone();
         let allow_bot_messages = self.allow_bot_messages;
         let trusted_bot_ids = self.trusted_bot_ids.clone();
-        let dispatcher = self.dispatcher.clone();
+        let admission = self.admission.clone();
         let http = ctx.http.clone();
 
         tokio::spawn(async move {
             // F2 fix: Fetch user info first, then apply user gating with confirmed bot status.
-            let (sender_name, display_name, is_bot_confirmed) =
-                match user_id.to_user(&http).await {
-                    Ok(user) => {
-                        let display = user.global_name.as_ref().unwrap_or(&user.name).clone();
-                        (user.name.clone(), display, user.bot)
-                    }
-                    Err(_) => {
-                        let fallback = user_id.to_string();
-                        (fallback.clone(), fallback, is_reactor_bot)
-                    }
-                };
+            let (sender_name, display_name, is_bot_confirmed) = match user_id.to_user(&http).await {
+                Ok(user) => {
+                    let display = user.global_name.as_ref().unwrap_or(&user.name).clone();
+                    (user.name.clone(), display, user.bot)
+                }
+                Err(_) => {
+                    let fallback = user_id.to_string();
+                    (fallback.clone(), fallback, is_reactor_bot)
+                }
+            };
 
             // Defense-in-depth: if to_user() reveals this is a bot but member was
             // None (rare edge case), re-apply bot gating retroactively.
@@ -1319,8 +1938,7 @@ impl EventHandler for Handler {
                 match allow_bot_messages {
                     AllowBots::Off | AllowBots::Mentions => return,
                     AllowBots::All => {
-                        if !trusted_bot_ids.is_empty()
-                            && !trusted_bot_ids.contains(&user_id.get())
+                        if !trusted_bot_ids.is_empty() && !trusted_bot_ids.contains(&user_id.get())
                         {
                             return;
                         }
@@ -1365,7 +1983,6 @@ impl EventHandler for Handler {
             let sender_id = sender.sender_id.clone();
             let sender_name_clone = sender.sender_name.clone();
             let sender_json = serde_json::to_string(&sender).unwrap();
-            let thread_key = dispatcher.key("discord", &thread_channel.channel_id, &sender_id);
             let estimated_tokens = crate::dispatch::estimate_tokens(&prompt, &[]);
             let buf_msg = crate::dispatch::BufferedMessage {
                 sender_json,
@@ -1377,13 +1994,24 @@ impl EventHandler for Handler {
                 estimated_tokens,
                 other_bot_present,
                 recipient: None,
+                native_workflow: None,
             };
 
-            if let Err(e) = dispatcher
-                .submit(thread_key, thread_channel, adapter, buf_msg)
+            if let Err(e) = admission
+                .admit_work(WorkAdmissionRequest {
+                    conversation: thread_channel,
+                    sender_id,
+                    adapter,
+                    message: buf_msg,
+                    native_workflow: None,
+                    // Phase 6.2.9: Discord callers continue to use the
+                    // legacy `discord:<channel>:<thread>` pool key so human
+                    // conversational sessions behave exactly as before.
+                    native_execution_session_key: None,
+                })
                 .await
             {
-                error!("reaction mapping dispatcher submit error: {e}");
+                error!("reaction mapping work admission error: {e}");
             }
         });
     }
@@ -1401,23 +2029,31 @@ impl EventHandler for Handler {
             CreateCommand::new("reset").description("Reset the conversation session"),
             CreateCommand::new("remind")
                 .description("Set a one-shot reminder to mention users/roles after a delay")
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "targets",
-                    "Users/roles to mention (e.g. @user1 @role1)",
-                ).required(true))
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "message",
-                    "Reminder message",
-                ).required(true))
-                .add_option(CreateCommandOption::new(
-                    CommandOptionType::String,
-                    "delay",
-                    "Delay before firing (e.g. 30m, 2h, 1d)",
-                ).required(true)),
-            CreateCommand::new("auth")
-                .description("Authenticate the backend agent (device flow)"),
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "targets",
+                        "Users/roles to mention (e.g. @user1 @role1)",
+                    )
+                    .required(true),
+                )
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "message",
+                        "Reminder message",
+                    )
+                    .required(true),
+                )
+                .add_option(
+                    CreateCommandOption::new(
+                        CommandOptionType::String,
+                        "delay",
+                        "Delay before firing (e.g. 30m, 2h, 1d)",
+                    )
+                    .required(true),
+                ),
+            CreateCommand::new("auth").description("Authenticate the backend agent (device flow)"),
             CreateCommand::new("usage")
                 .description("Show backend account usage and billing information"),
             CreateCommand::new("export-thread")
@@ -1693,7 +2329,9 @@ impl Handler {
         if !self.router.pool().has_active_session(&thread_key).await {
             let response = CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
-                    .content("⚠️ No active session. Start a conversation first by @mentioning the bot.")
+                    .content(
+                        "⚠️ No active session. Start a conversation first by @mentioning the bot.",
+                    )
                     .ephemeral(true),
             );
             if let Err(e) = cmd.create_response(&ctx.http, response).await {
@@ -1704,8 +2342,9 @@ impl Handler {
 
         // The ACP round-trip can exceed Discord's 3-second interaction
         // deadline — acknowledge with a deferred ephemeral response first.
-        let defer =
-            CreateInteractionResponse::Defer(CreateInteractionResponseMessage::new().ephemeral(true));
+        let defer = CreateInteractionResponse::Defer(
+            CreateInteractionResponseMessage::new().ephemeral(true),
+        );
         if let Err(e) = cmd.create_response(&ctx.http, defer).await {
             tracing::error!(error = %e, "failed to defer /usage response");
             return;
@@ -1842,15 +2481,18 @@ impl Handler {
 
         // Extract options
         let opts = &cmd.data.options;
-        let targets_raw = opts.iter()
+        let targets_raw = opts
+            .iter()
             .find(|o| o.name == "targets")
             .and_then(|o| o.value.as_str())
             .unwrap_or("");
-        let message = opts.iter()
+        let message = opts
+            .iter()
             .find(|o| o.name == "message")
             .and_then(|o| o.value.as_str())
             .unwrap_or("");
-        let delay_raw = opts.iter()
+        let delay_raw = opts
+            .iter()
             .find(|o| o.name == "delay")
             .and_then(|o| o.value.as_str())
             .unwrap_or("");
@@ -1912,7 +2554,10 @@ impl Handler {
         if targets.len() > remind::MAX_TARGETS {
             let response = CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
-                    .content(format!("⚠️ Too many targets (max {}). Use a @role instead.", remind::MAX_TARGETS))
+                    .content(format!(
+                        "⚠️ Too many targets (max {}). Use a @role instead.",
+                        remind::MAX_TARGETS
+                    ))
                     .ephemeral(true),
             );
             let _ = cmd.create_response(&ctx.http, response).await;
@@ -2012,7 +2657,9 @@ impl Handler {
         if AUTH_IN_PROGRESS.swap(true, std::sync::atomic::Ordering::Acquire) {
             let response = CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
-                    .content("⚠️ Authentication already in progress. Please wait for it to complete.")
+                    .content(
+                        "⚠️ Authentication already in progress. Please wait for it to complete.",
+                    )
                     .ephemeral(true),
             );
             let _ = cmd.create_response(&ctx.http, response).await;
@@ -2025,7 +2672,9 @@ impl Handler {
                 AUTH_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Release);
                 let response = CreateInteractionResponse::Message(
                     CreateInteractionResponseMessage::new()
-                        .content("⚠️ No auth command configured (`OPENAB_AGENT_AUTH_COMMAND` not set).")
+                        .content(
+                            "⚠️ No auth command configured (`OPENAB_AGENT_AUTH_COMMAND` not set).",
+                        )
                         .ephemeral(true),
                 );
                 let _ = cmd.create_response(&ctx.http, response).await;
@@ -2048,9 +2697,9 @@ impl Handler {
         let user_id = cmd.user.id.get();
 
         tokio::spawn(async move {
+            use std::sync::Arc;
             use tokio::io::AsyncBufReadExt;
             use tokio::process::Command as TokioCommand;
-            use std::sync::Arc;
 
             // Drop guard ensures AUTH_IN_PROGRESS is cleared even on panic.
             struct AuthGuard;
@@ -2074,13 +2723,15 @@ impl Handler {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!(error = %e, "/auth: failed to spawn auth command");
-                    let _ = http.create_followup_message(
-                        &token,
-                        &CreateInteractionResponseFollowup::new()
-                            .content(format!("❌ Failed to start auth command: {e}"))
-                            .ephemeral(true),
-                        Vec::new(),
-                    ).await;
+                    let _ = http
+                        .create_followup_message(
+                            &token,
+                            &CreateInteractionResponseFollowup::new()
+                                .content(format!("❌ Failed to start auth command: {e}"))
+                                .ephemeral(true),
+                            Vec::new(),
+                        )
+                        .await;
                     return;
                 }
             };
@@ -2099,7 +2750,10 @@ impl Handler {
                     let mut reader = tokio::io::BufReader::new(stdout).lines();
                     while let Ok(Some(line)) = reader.next_line().await {
                         let has_url = line.contains("http://") || line.contains("https://");
-                        lines_out.lock().unwrap_or_else(|e| e.into_inner()).push(line);
+                        lines_out
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(line);
                         if has_url {
                             url_found_out.notify_one();
                         }
@@ -2114,7 +2768,10 @@ impl Handler {
                     let mut reader = tokio::io::BufReader::new(stderr).lines();
                     while let Ok(Some(line)) = reader.next_line().await {
                         let has_url = line.contains("http://") || line.contains("https://");
-                        lines_err.lock().unwrap_or_else(|e| e.into_inner()).push(line);
+                        lines_err
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(line);
                         if has_url {
                             url_found_err.notify_one();
                         }
@@ -2144,12 +2801,8 @@ impl Handler {
             // Handle an early exit (the command terminated during the URL window).
             if let Some(res) = early_exit {
                 let _ = tokio::join!(stdout_task, stderr_task);
-                let collected = strip_ansi_codes(
-                    &lines
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .join("\n"),
-                );
+                let collected =
+                    strip_ansi_codes(&lines.lock().unwrap_or_else(|e| e.into_inner()).join("\n"));
                 let detail = if collected.trim().is_empty() {
                     String::new()
                 } else {
@@ -2169,13 +2822,15 @@ impl Handler {
                     }
                     Err(e) => format!("❌ Error waiting for auth command: {e}"),
                 };
-                let _ = http.create_followup_message(
-                    &token,
-                    &CreateInteractionResponseFollowup::new()
-                        .content(content)
-                        .ephemeral(true),
-                    Vec::new(),
-                ).await;
+                let _ = http
+                    .create_followup_message(
+                        &token,
+                        &CreateInteractionResponseFollowup::new()
+                            .content(content)
+                            .ephemeral(true),
+                        Vec::new(),
+                    )
+                    .await;
                 return;
             }
 
@@ -2206,13 +2861,15 @@ impl Handler {
             // `truncate_to_utf16_budget` for the testable implementation.
             let truncated = truncate_to_utf16_budget(&output, prefix, suffix, 2000);
             let msg = format!("{prefix}{truncated}{suffix}");
-            let _ = http.create_followup_message(
-                &token,
-                &CreateInteractionResponseFollowup::new()
-                    .content(msg)
-                    .ephemeral(true),
-                Vec::new(),
-            ).await;
+            let _ = http
+                .create_followup_message(
+                    &token,
+                    &CreateInteractionResponseFollowup::new()
+                        .content(msg)
+                        .ephemeral(true),
+                    Vec::new(),
+                )
+                .await;
 
             // Wait for the process to complete (user authorizes in browser).
             // Use 14min (not 15) to leave headroom for the Discord interaction token TTL.
@@ -2220,44 +2877,55 @@ impl Handler {
             match tokio::time::timeout(timeout, child.wait()).await {
                 Ok(Ok(status)) if status.success() => {
                     info!("/auth: authentication successful");
-                    let _ = http.create_followup_message(
-                        &token,
-                        &CreateInteractionResponseFollowup::new()
-                            .content("✅ Authentication successful!")
-                            .ephemeral(true),
-                        Vec::new(),
-                    ).await;
+                    let _ = http
+                        .create_followup_message(
+                            &token,
+                            &CreateInteractionResponseFollowup::new()
+                                .content("✅ Authentication successful!")
+                                .ephemeral(true),
+                            Vec::new(),
+                        )
+                        .await;
                 }
                 Ok(Ok(status)) => {
                     warn!(%status, "/auth: authentication failed");
-                    let _ = http.create_followup_message(
-                        &token,
-                        &CreateInteractionResponseFollowup::new()
-                            .content(format!("❌ Authentication failed (exit code: {}).", status))
-                            .ephemeral(true),
-                        Vec::new(),
-                    ).await;
+                    let _ = http
+                        .create_followup_message(
+                            &token,
+                            &CreateInteractionResponseFollowup::new()
+                                .content(format!(
+                                    "❌ Authentication failed (exit code: {}).",
+                                    status
+                                ))
+                                .ephemeral(true),
+                            Vec::new(),
+                        )
+                        .await;
                 }
                 Ok(Err(e)) => {
                     tracing::error!(error = %e, "/auth: error waiting for auth process");
-                    let _ = http.create_followup_message(
-                        &token,
-                        &CreateInteractionResponseFollowup::new()
-                            .content(format!("❌ Auth process error: {e}"))
-                            .ephemeral(true),
-                        Vec::new(),
-                    ).await;
+                    let _ = http
+                        .create_followup_message(
+                            &token,
+                            &CreateInteractionResponseFollowup::new()
+                                .content(format!("❌ Auth process error: {e}"))
+                                .ephemeral(true),
+                            Vec::new(),
+                        )
+                        .await;
                 }
                 Err(_) => {
                     warn!("/auth: timed out waiting for authorization");
                     let _ = child.kill().await;
-                    let _ = http.create_followup_message(
-                        &token,
-                        &CreateInteractionResponseFollowup::new()
-                            .content("⏰ Authentication timed out. Run `/auth` again to retry.")
-                            .ephemeral(true),
-                        Vec::new(),
-                    ).await;
+                    let _ = http
+                        .create_followup_message(
+                            &token,
+                            &CreateInteractionResponseFollowup::new()
+                                .content("⏰ Authentication timed out. Run `/auth` again to retry.")
+                                .ephemeral(true),
+                            Vec::new(),
+                        )
+                        .await;
                 }
             }
 
@@ -2304,9 +2972,7 @@ impl Handler {
                 );
                 (in_thread, gc.name.clone())
             }
-            Ok(serenity::model::channel::Channel::Private(_)) => {
-                (self.allow_dm, "dm".to_string())
-            }
+            Ok(serenity::model::channel::Channel::Private(_)) => (self.allow_dm, "dm".to_string()),
             Ok(_) => (false, "channel".to_string()),
             Err(e) => {
                 tracing::warn!(channel_id = %channel_id, error = %e, "failed to inspect channel for export");
@@ -2328,16 +2994,34 @@ impl Handler {
 
         // --- Parse and validate filter params (mutual exclusion) ---
         let opts = &cmd.data.options;
-        let limit_opt = opts.iter().find(|o| o.name == "limit").and_then(|o| o.value.as_i64());
-        let since_opt = opts.iter().find(|o| o.name == "since").and_then(|o| o.value.as_str());
-        let days_opt = opts.iter().find(|o| o.name == "days").and_then(|o| o.value.as_i64());
-        let all_opt = opts.iter().find(|o| o.name == "all").and_then(|o| o.value.as_bool()).unwrap_or(false);
+        let limit_opt = opts
+            .iter()
+            .find(|o| o.name == "limit")
+            .and_then(|o| o.value.as_i64());
+        let since_opt = opts
+            .iter()
+            .find(|o| o.name == "since")
+            .and_then(|o| o.value.as_str());
+        let days_opt = opts
+            .iter()
+            .find(|o| o.name == "days")
+            .and_then(|o| o.value.as_i64());
+        let all_opt = opts
+            .iter()
+            .find(|o| o.name == "all")
+            .and_then(|o| o.value.as_bool())
+            .unwrap_or(false);
 
-        let filter_count = limit_opt.is_some() as u8 + since_opt.is_some() as u8 + days_opt.is_some() as u8 + all_opt as u8;
+        let filter_count = limit_opt.is_some() as u8
+            + since_opt.is_some() as u8
+            + days_opt.is_some() as u8
+            + all_opt as u8;
         if filter_count > 1 {
             let response = CreateInteractionResponse::Message(
                 CreateInteractionResponseMessage::new()
-                    .content("⚠️ Please specify only one filter: `limit`, `since`, `days`, or `all`.")
+                    .content(
+                        "⚠️ Please specify only one filter: `limit`, `since`, `days`, or `all`.",
+                    )
                     .ephemeral(true),
             );
             let _ = cmd.create_response(&ctx.http, response).await;
@@ -2605,8 +3289,7 @@ fn format_usage_body(report: &UsageReport) -> (String, bool) {
 fn build_usage_reply(report: &UsageReport) -> (String, CreateEmbed) {
     let (body, over_limit) = format_usage_body(report);
     let content = format!("📊 **Usage — {}**\n{}", report.plan_name, body);
-    let mut embed =
-        CreateEmbed::new().colour(if over_limit { 0xE74C3C } else { 0x2ECC71 });
+    let mut embed = CreateEmbed::new().colour(if over_limit { 0xE74C3C } else { 0x2ECC71 });
     if let Some(reset) = &report.billing_cycle_reset {
         embed = embed.footer(CreateEmbedFooter::new(format!(
             "Billing cycle resets {reset}"
@@ -2776,7 +3459,10 @@ async fn export_channel_messages(
 
     let filename = export_filename(channel_id, channel_name);
     if attachment_size_limit < 2048 {
-        tracing::warn!(attachment_size_limit, "attachment_size_limit is very small; export will likely be truncated");
+        tracing::warn!(
+            attachment_size_limit,
+            "attachment_size_limit is very small; export will likely be truncated"
+        );
     }
     let max_bytes = usize::try_from(attachment_size_limit)
         .unwrap_or(8 * 1024 * 1024)
@@ -2846,10 +3532,7 @@ fn format_export_message(msg: &Message) -> String {
     let bot_marker = if msg.author.bot { " [bot]" } else { "" };
     let mut out = format!(
         "[{}] {}{} ({})\n",
-        msg.timestamp,
-        msg.author.name,
-        bot_marker,
-        msg.author.id
+        msg.timestamp, msg.author.name, bot_marker, msg.author.id
     );
 
     if msg.content.is_empty() {
@@ -3144,19 +3827,128 @@ fn should_skip_thread_creation(in_thread: bool, is_dm: bool) -> bool {
     in_thread || is_dm
 }
 
+/// Detect structured targeting of ANOTHER bot account in the original
+/// Discord message metadata.
+///
+/// Inspects ONLY structured `Message` fields Discord populates server-side
+/// (`Message::mentions` for `@user-id`, `Message::mention_roles` for
+/// `@role-id`). Does NOT inspect attachment body, code blocks, quoted
+/// content, or LLM-generated text (those can contain arbitrary `@user`
+/// strings and are not routing authority by policy).
+///
+/// Returns true iff EITHER:
+///
+/// 1. The message body contained at least one structured `@user-id` mention
+///    of a bot-flagged user that is NOT this bot AND is not a Discord
+///    system user — "the human explicitly addressed another bot here,
+///    not me"; OR
+///
+/// 2. The message body contained a structured `@role-id` mention whose
+///    ID is listed in `peer_agent_role_ids` (operator-supplied list of
+///    role IDs owned by sibling agents in this deployment) AND no role
+///    in the same message matches `self.allowed_role_ids` (so a
+///    legitimate self-role trigger is not shadowed). This closes the
+///    role-only multihop admit race before the multibot cache learns
+///    about the peer.
+///
+/// The peer list is operator-supplied; nothing here infers roles from
+/// role names, attachment text, prompt text, or LLM interpretation.
+///
+/// workflow 20260818-openab-discord-attachment-mention-admission
+fn has_explicit_other_bot_target(
+    msg: &Message,
+    bot_id: UserId,
+    self_allowed_role_ids: &HashSet<u64>,
+    peer_agent_role_ids: &HashSet<u64>,
+) -> bool {
+    // Signal 1: structured @user-id mention of another bot account.
+    if msg
+        .mentions
+        .iter()
+        .any(|u| u.bot && u.id != bot_id && !u.system)
+    {
+        return true;
+    }
+    // Signal 2: structured @role-id mention explicitly targeting a peer
+    // agent (operator-trusted list). A role in `self.allowed_role_ids`
+    // present in the same message would have short-circuited via the
+    // existing `is_mentioned` role check, so excluding self first keeps
+    // the two signals orthogonal.
+    if !msg.mention_roles.is_empty()
+        && !msg
+            .mention_roles
+            .iter()
+            .any(|r| self_allowed_role_ids.contains(&r.get()))
+        && msg
+            .mention_roles
+            .iter()
+            .any(|r| peer_agent_role_ids.contains(&r.get()))
+    {
+        return true;
+    }
+    false
+}
+
+/// Pure decision helper for the role-target precedence branch of
+/// [`has_explicit_other_bot_target`]. Exposed under `#[cfg(test)]` so
+/// the rule can be unit-tested without constructing a full
+/// `serenity::model::channel::Message`. Mirrors the inline logic:
+/// "the message carries a structured role mention that:
+///   - is NOT in this bot's own `allowed_role_ids`
+///     (otherwise `is_mentioned` would already short-circuit to ADMIT), AND
+///   - IS in `peer_agent_role_ids` (operator-trusted peer list)."
+///
+/// This rule rejects THIS bot before the MultibotMentions solo-involved
+/// fallback would otherwise admit it on a role-only mention that targets
+/// a sibling agent. Empty `peer_agent_role_ids` makes the rule silent —
+/// existing deployments without operator-listed peer roles keep current
+/// behavior. No heuristic role-name / attachment / LLM inference.
+///
+/// workflow 20260818-openab-discord-attachment-mention-admission
+#[cfg(test)]
+fn role_targets_other_agent(
+    mention_role_ids: &[u64],
+    self_allowed_role_ids: &HashSet<u64>,
+    peer_agent_role_ids: &HashSet<u64>,
+) -> bool {
+    !mention_role_ids.is_empty()
+        && !mention_role_ids
+            .iter()
+            .any(|r| self_allowed_role_ids.contains(r))
+        && mention_role_ids
+            .iter()
+            .any(|r| peer_agent_role_ids.contains(r))
+}
+
 /// Pure decision function: should this message be processed or ignored?
 /// Returns `true` if the message should be processed (bot responds).
 /// Extracted from the EventHandler::message gating logic for testability.
+///
+/// `explicit_other_bot_target` — see [`has_explicit_other_bot_target`].
+/// When true and the message does NOT mention this bot, this bot is
+/// rejected so it never falls through to the involved / MultibotMentions
+/// fallback. (workflow 20260818-openab-discord-attachment-mention-admission)
 #[cfg(test)]
 fn should_process_user_message(
     mode: AllowUsers,
     is_mentioned: bool,
+    explicit_other_bot_target: bool,
     in_thread: bool,
     involved: bool,
     other_bot_present: bool,
 ) -> bool {
     if is_mentioned {
         return true;
+    }
+    // Precedence rule (workflow 20260818-openab-discord-attachment-mention-admission):
+    // explicit structured targeting of ANOTHER bot outranks involved /
+    // MultibotMentions fallback. Without this guard, an unmentioned bot
+    // that has previously posted in the thread is admitted via
+    // multibot_mentions_mode_solo_bot_involved even when the message
+    // actually @-mentions a different bot — until the multibot cache
+    // learns about that other bot (only on its first reply).
+    if explicit_other_bot_target {
+        return false;
     }
     match mode {
         AllowUsers::Mentions => false,
@@ -3268,7 +4060,175 @@ fn truncate_to_utf16_budget(body: &str, prefix: &str, suffix: &str, limit: usize
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bot_turns::{TurnResult, HARD_BOT_TURN_LIMIT, BOT_TURN_LIMIT_WARNING_PREFIX};
+    use crate::acp::ContentBlock;
+    use crate::admission::{WorkAdmissionAck, WorkAdmissionError};
+    use crate::bot_turns::{TurnResult, BOT_TURN_LIMIT_WARNING_PREFIX, HARD_BOT_TURN_LIMIT};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    struct RecordingAdmissionPort(AtomicUsize);
+
+    #[async_trait]
+    impl WorkAdmissionPort for RecordingAdmissionPort {
+        async fn admit_work(
+            &self,
+            request: WorkAdmissionRequest,
+        ) -> Result<WorkAdmissionAck, WorkAdmissionError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(WorkAdmissionAck {
+                admission_id: "discord-ingress-test".into(),
+                conversation_key: request.conversation.session_pool_key(),
+                accepted: true,
+                native_workflow: None,
+            })
+        }
+    }
+
+    struct AdmissionTestAdapter;
+
+    #[async_trait]
+    impl ChatAdapter for AdmissionTestAdapter {
+        fn platform(&self) -> &'static str {
+            "discord"
+        }
+        fn message_limit(&self) -> usize {
+            2_000
+        }
+        async fn send_message(
+            &self,
+            channel: &ChannelRef,
+            _content: &str,
+        ) -> anyhow::Result<MessageRef> {
+            Ok(MessageRef {
+                channel: channel.clone(),
+                message_id: "reply".into(),
+            })
+        }
+        async fn create_thread(
+            &self,
+            channel: &ChannelRef,
+            _trigger: &MessageRef,
+            _title: &str,
+        ) -> anyhow::Result<ChannelRef> {
+            Ok(channel.clone())
+        }
+        async fn add_reaction(&self, _message: &MessageRef, _emoji: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn remove_reaction(&self, _message: &MessageRef, _emoji: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn use_streaming(&self, _other_bot_present: bool) -> bool {
+            false
+        }
+    }
+
+    fn discord_admission_request() -> WorkAdmissionRequest {
+        let conversation = ChannelRef {
+            platform: "discord".into(),
+            channel_id: "channel".into(),
+            thread_id: Some("thread".into()),
+            parent_id: None,
+            origin_event_id: None,
+        };
+        WorkAdmissionRequest {
+            adapter: Arc::new(AdmissionTestAdapter),
+            sender_id: "human".into(),
+            message: crate::dispatch::BufferedMessage {
+                sender_json: "{}".into(),
+                sender_name: "human".into(),
+                prompt: "accepted message".into(),
+                extra_blocks: Vec::<ContentBlock>::new(),
+                trigger_msg: MessageRef {
+                    channel: conversation.clone(),
+                    message_id: "event".into(),
+                },
+                arrived_at: Instant::now(),
+                estimated_tokens: 1,
+                other_bot_present: false,
+                recipient: None,
+                native_workflow: None,
+            },
+            conversation,
+            native_workflow: None,
+            // Discord callers never set a native execution-session key.
+            native_execution_session_key: None,
+        }
+    }
+
+    struct RecordingDiagnosticClient {
+        identity: Result<(String, String), DiscordHttpErrorDetails>,
+        target: Result<String, DiscordHttpErrorDetails>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl RecordingDiagnosticClient {
+        fn new(
+            identity: Result<(String, String), DiscordHttpErrorDetails>,
+            target: Result<String, DiscordHttpErrorDetails>,
+        ) -> Self {
+            Self {
+                identity,
+                target,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl DiagnosticDiscordClient for RecordingDiagnosticClient {
+        async fn diagnostic_current_user(
+            &self,
+        ) -> Result<(String, String), DiscordHttpErrorDetails> {
+            self.calls.lock().unwrap().push("current_user".to_owned());
+            self.identity.clone()
+        }
+
+        async fn diagnostic_target_channel(
+            &self,
+            target_channel_id: ChannelId,
+        ) -> Result<String, DiscordHttpErrorDetails> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("target:{}", target_channel_id));
+            self.target.clone()
+        }
+
+        async fn diagnostic_send_message(
+            &self,
+            target_channel_id: ChannelId,
+            content: &str,
+            target_user_id: Option<UserId>,
+        ) -> Result<String, DiscordHttpErrorDetails> {
+            self.calls.lock().unwrap().push(format!(
+                "send:{}:{}:{}:{}",
+                target_channel_id,
+                content,
+                target_user_id.map_or_else(|| "none".to_owned(), |id| id.to_string()),
+                content.chars().count(),
+            ));
+            Ok("diagnostic-message-id".to_owned())
+        }
+    }
+
+    fn diagnostic_adapter(client: Arc<RecordingDiagnosticClient>) -> DiscordAdapter {
+        DiscordAdapter::with_diagnostic_client(
+            Arc::new(Http::new("Bot diagnostic-test-token-marker")),
+            client,
+        )
+    }
+
+    fn missing_access_details() -> DiscordHttpErrorDetails {
+        unsuccessful_request_details(
+            403,
+            50001,
+            "GET",
+            "https://discord.com/api/v10/channels/1539923659345502208?authorization=Bot+secret",
+            "Missing Access",
+        )
+    }
 
     // --- truncate_for_discord (select menu option 100-char cap) ---
 
@@ -3347,7 +4307,10 @@ mod tests {
         assert!(content.contains("12781.64 / 10000"));
         assert!(content.contains("Overage charges: 111.27 USD"));
         let json = serde_json::to_value(&embed).expect("embed serializes");
-        assert!(json.get("description").is_none(), "body must not be in embed");
+        assert!(
+            json.get("description").is_none(),
+            "body must not be in embed"
+        );
         assert!(json.get("title").is_none(), "title must not be in embed");
         assert_eq!(json["color"], 0xE74C3C, "over limit → red strip");
         assert_eq!(json["footer"]["text"], "Billing cycle resets 2026-08-01");
@@ -3409,7 +4372,10 @@ mod tests {
     #[test]
     fn truncate_utf16_respects_prefix_suffix_budget() {
         // limit 10, prefix "pre" (3) + suffix "su" (2) = 5 → 5 ASCII units left.
-        assert_eq!(truncate_to_utf16_budget("abcdefghij", "pre", "su", 10), "abcde");
+        assert_eq!(
+            truncate_to_utf16_budget("abcdefghij", "pre", "su", 10),
+            "abcde"
+        );
     }
 
     /// A supplementary-plane scalar counts as TWO UTF-16 code units, not one.
@@ -3589,14 +4555,14 @@ mod tests {
     fn image_attachment_block_includes_url_and_metadata() {
         // Simulates the format string used in the image attachment handler.
         let filename = "screenshot.png";
-        let content_type = Some("image/png");
+        let content_type = "image/png";
         let size: u32 = 142048;
         let url = "https://cdn.discordapp.com/attachments/123/456/screenshot.png";
 
         let text = format!(
             "[Image attachment]\nfilename: {}\ncontent_type: {}\nsize_bytes: {}\nurl: {} (expires ~24h)",
             filename,
-            content_type.unwrap_or("unknown"),
+            content_type,
             size,
             url,
         );
@@ -3611,11 +4577,11 @@ mod tests {
 
     #[test]
     fn image_attachment_block_missing_content_type_falls_back() {
-        let content_type: Option<&str> = None;
+        let content_type = "unknown";
         let text = format!(
             "[Image attachment]\nfilename: {}\ncontent_type: {}\nsize_bytes: {}\nurl: {} (expires ~24h)",
             "photo.jpg",
-            content_type.unwrap_or("unknown"),
+            content_type,
             99999,
             "https://cdn.discordapp.com/attachments/1/2/photo.jpg",
         );
@@ -3812,6 +4778,7 @@ mod tests {
         assert!(should_process_user_message(
             AllowUsers::MultibotMentions,
             false, // is_mentioned
+            false, // explicit_other_bot_target (scenario C baseline)
             true,  // in_thread
             true,  // involved
             false, // other_bot_present
@@ -3827,6 +4794,7 @@ mod tests {
         assert!(!should_process_user_message(
             AllowUsers::MultibotMentions,
             false, // is_mentioned
+            false, // explicit_other_bot_target (other_bot_present drives rejection)
             true,  // in_thread
             true,  // involved
             true,  // other_bot_present ← another bot posted
@@ -3840,10 +4808,11 @@ mod tests {
     fn multibot_mentions_multi_bot_thread_with_mention() {
         assert!(should_process_user_message(
             AllowUsers::MultibotMentions,
-            true, // is_mentioned
-            true, // in_thread
-            true, // involved
-            true, // other_bot_present
+            true,  // is_mentioned
+            false, // explicit_other_bot_target (is_mentioned short-circuits)
+            true,  // in_thread
+            true,  // involved
+            true,  // other_bot_present
         ));
     }
 
@@ -3855,6 +4824,7 @@ mod tests {
         assert!(!should_process_user_message(
             AllowUsers::MultibotMentions,
             false, // is_mentioned
+            false, // explicit_other_bot_target
             false, // in_thread (main channel)
             false, // involved
             false, // other_bot_present
@@ -3869,6 +4839,7 @@ mod tests {
         assert!(!should_process_user_message(
             AllowUsers::MultibotMentions,
             false, // is_mentioned
+            false, // explicit_other_bot_target
             true,  // in_thread
             false, // involved ← bot hasn't posted here
             false, // other_bot_present
@@ -3883,6 +4854,7 @@ mod tests {
         assert!(should_process_user_message(
             AllowUsers::Involved,
             false, // is_mentioned
+            false, // explicit_other_bot_target
             true,  // in_thread
             true,  // involved
             true,  // other_bot_present ← ignored in involved mode
@@ -3897,6 +4869,7 @@ mod tests {
         assert!(!should_process_user_message(
             AllowUsers::Mentions,
             false, // is_mentioned
+            false, // explicit_other_bot_target
             true,  // in_thread
             true,  // involved
             false, // other_bot_present
@@ -4302,9 +5275,8 @@ mod tests {
         trusted_bot_ids: &HashSet<u64>,
         author_id: u64,
     ) -> bool {
-        let trusted_mention = is_mentioned
-            && !trusted_bot_ids.is_empty()
-            && trusted_bot_ids.contains(&author_id);
+        let trusted_mention =
+            is_mentioned && !trusted_bot_ids.is_empty() && trusted_bot_ids.contains(&author_id);
 
         if !trusted_mention {
             match allow_bot_messages {
@@ -4337,7 +5309,12 @@ mod tests {
     #[test]
     fn bot_admission_untrusted_mention_blocked_by_off() {
         let trusted = HashSet::from([42]);
-        assert!(!should_admit_bot_message(AllowBots::Off, true, &trusted, 99));
+        assert!(!should_admit_bot_message(
+            AllowBots::Off,
+            true,
+            &trusted,
+            99
+        ));
     }
 
     /// GIVEN: allow_bot_messages=Off, trusted bot without @mention
@@ -4345,7 +5322,12 @@ mod tests {
     #[test]
     fn bot_admission_trusted_no_mention_blocked_by_off() {
         let trusted = HashSet::from([42]);
-        assert!(!should_admit_bot_message(AllowBots::Off, false, &trusted, 42));
+        assert!(!should_admit_bot_message(
+            AllowBots::Off,
+            false,
+            &trusted,
+            42
+        ));
     }
 
     /// GIVEN: allow_bot_messages=Off, empty trusted_bot_ids, bot @mentions
@@ -4353,7 +5335,12 @@ mod tests {
     #[test]
     fn bot_admission_empty_trusted_ids_off_mode() {
         let trusted: HashSet<u64> = HashSet::new();
-        assert!(!should_admit_bot_message(AllowBots::Off, true, &trusted, 42));
+        assert!(!should_admit_bot_message(
+            AllowBots::Off,
+            true,
+            &trusted,
+            42
+        ));
     }
 
     /// GIVEN: allow_bot_messages=Mentions, trusted bot @mentions
@@ -4361,7 +5348,12 @@ mod tests {
     #[test]
     fn bot_admission_mentions_mode_trusted_mention() {
         let trusted = HashSet::from([42]);
-        assert!(should_admit_bot_message(AllowBots::Mentions, true, &trusted, 42));
+        assert!(should_admit_bot_message(
+            AllowBots::Mentions,
+            true,
+            &trusted,
+            42
+        ));
     }
 
     /// GIVEN: allow_bot_messages=All, untrusted bot (not in trusted_bot_ids)
@@ -4369,7 +5361,12 @@ mod tests {
     #[test]
     fn bot_admission_all_mode_untrusted_bot_rejected() {
         let trusted = HashSet::from([42]);
-        assert!(!should_admit_bot_message(AllowBots::All, false, &trusted, 99));
+        assert!(!should_admit_bot_message(
+            AllowBots::All,
+            false,
+            &trusted,
+            99
+        ));
     }
 
     // --- DM gating tests (#656) ---
@@ -4424,6 +5421,7 @@ mod tests {
         assert!(!should_process_user_message(
             AllowUsers::Involved,
             false, // is_mentioned (DMs don't have @mention)
+            false, // explicit_other_bot_target
             false, // in_thread (DMs are not threads)
             false, // involved
             false, // other_bot_present
@@ -4459,19 +5457,28 @@ mod tests {
 
     #[test]
     fn dedup_detects_existing_bot_warning() {
-        let msg = format!("{} (20/20). A human must reply.", BOT_TURN_LIMIT_WARNING_PREFIX);
+        let msg = format!(
+            "{} (20/20). A human must reply.",
+            BOT_TURN_LIMIT_WARNING_PREFIX
+        );
         assert!(turn_limit_warning_present(&[(true, &msg)]));
     }
 
     #[test]
     fn dedup_ignores_human_warning_text() {
-        let msg = format!("{} (20/20). A human must reply.", BOT_TURN_LIMIT_WARNING_PREFIX);
+        let msg = format!(
+            "{} (20/20). A human must reply.",
+            BOT_TURN_LIMIT_WARNING_PREFIX
+        );
         assert!(!turn_limit_warning_present(&[(false, &msg)]));
     }
 
     #[test]
     fn dedup_returns_false_when_no_warning() {
-        assert!(!turn_limit_warning_present(&[(true, "hello"), (false, "world")]));
+        assert!(!turn_limit_warning_present(&[
+            (true, "hello"),
+            (false, "world")
+        ]));
     }
 
     #[test]
@@ -4488,7 +5495,10 @@ mod tests {
     fn reaction_mentions_mode_always_rejected() {
         assert!(!should_process_reaction(
             AllowUsers::Mentions,
-            true, true, false, false,
+            true,
+            true,
+            false,
+            false,
         ));
     }
 
@@ -4500,7 +5510,8 @@ mod tests {
             AllowUsers::Involved,
             false, // is_thread
             false, // bot_involved (irrelevant for non-thread)
-            false, false,
+            false,
+            false,
         ));
     }
 
@@ -4512,7 +5523,8 @@ mod tests {
             AllowUsers::Involved,
             true,  // is_thread
             false, // bot_involved
-            false, false,
+            false,
+            false,
         ));
     }
 
@@ -4524,7 +5536,8 @@ mod tests {
             AllowUsers::Involved,
             true, // is_thread
             true, // bot_involved
-            false, false,
+            false,
+            false,
         ));
     }
 
@@ -4574,7 +5587,521 @@ mod tests {
         assert!(!should_process_reaction(
             AllowUsers::MultibotMentions,
             false, // is_thread
-            false, false, false,
+            false,
+            false,
+            false,
         ));
     }
+
+    // --- should_process_user_message: explicit-other-bot precedence rule ---
+    // workflow 20260818-openab-discord-attachment-mention-admission
+
+    /// Scenario A: involved Claude, Codex explicitly user-mentioned,
+    /// Codex has not spoken yet → Claude REJECT, Codex ADMIT.
+    /// Claude side: msg.mentions includes Codex (other bot) and not Claude.
+    /// MultibotMentions would have admitted via solo_bot_involved fallback
+    /// before this fix.
+    #[test]
+    fn explicit_other_bot_target_rejects_involved_bot_a() {
+        assert!(!should_process_user_message(
+            AllowUsers::MultibotMentions,
+            false, // is_mentioned (this bot is NOT mentioned)
+            true,  // explicit_other_bot_target (Codex mentioned via structured metadata)
+            true,  // in_thread
+            true,  // involved (this bot has posted before)
+            false, // other_bot_present (cache hasn't seen Codex reply yet)
+        ));
+    }
+
+    /// Scenario B: same case with an attachment.
+    /// Confirms that attachment presence does not influence the precedence
+    /// rule — the attachment body is not consulted as routing authority.
+    #[test]
+    fn explicit_other_bot_target_rejects_involved_bot_b_with_attachment() {
+        assert!(!should_process_user_message(
+            AllowUsers::MultibotMentions,
+            false, // is_mentioned
+            true,  // explicit_other_bot_target
+            true,  // in_thread
+            true,  // involved
+            false, // other_bot_present
+        ));
+    }
+
+    /// Scenario C: involved Claude, no explicit bot target.
+    /// Preserves the existing MultibotMentions involved+!other_bot fallback
+    /// when there is no structured @-mention of another bot.
+    #[test]
+    fn no_explicit_target_preserves_multibot_fallback_c() {
+        assert!(should_process_user_message(
+            AllowUsers::MultibotMentions,
+            false, // is_mentioned
+            false, // explicit_other_bot_target
+            true,  // in_thread
+            true,  // involved
+            false, // other_bot_present
+        ));
+    }
+
+    /// Scenario D: explicit @mention of this bot.
+    /// is_mentioned short-circuits to ADMIT — independent of any other
+    /// bot mention in the same message.
+    #[test]
+    fn is_mentioned_still_admits_d() {
+        assert!(should_process_user_message(
+            AllowUsers::MultibotMentions,
+            true, // is_mentioned (this bot mentioned)
+            true, // explicit_other_bot_target (other bot also mentioned)
+            true, // in_thread
+            true, // involved
+            true, // other_bot_present
+        ));
+    }
+
+    /// Scenario E: message explicitly mentions both Claude AND Codex.
+    /// Each bot sees itself as `is_mentioned=true` and admits. Multi-target
+    /// behavior is preserved by the existing is_mentioned short-circuit,
+    /// NOT by the new precedence rule.
+    #[test]
+    fn multi_target_admits_all_e() {
+        // Claude side: msg.mentions includes Claude + Codex.
+        assert!(should_process_user_message(
+            AllowUsers::MultibotMentions,
+            true, // is_mentioned (Claude in mentions list)
+            true, // explicit_other_bot_target (Codex also in mentions list)
+            true,
+            true,
+            true,
+        ));
+        // Codex side: msg.mentions includes Claude + Codex.
+        assert!(should_process_user_message(
+            AllowUsers::MultibotMentions,
+            true, // is_mentioned (Codex in mentions list)
+            true, // explicit_other_bot_target (Claude also in mentions list)
+            true,
+            true,
+            true,
+        ));
+    }
+
+    /// Scenario F: attachment body contains "@Claude" but the original
+    /// structured `msg.mentions` targets Codex only.
+    /// Routing decision depends ONLY on structured metadata; attachment
+    /// body text is never used as routing authority.
+    #[test]
+    fn attachment_text_does_not_grant_admission_f() {
+        // Claude side: msg.mentions has Codex, so explicit_other_bot_target=true;
+        // is_mentioned=false → REJECT.
+        assert!(!should_process_user_message(
+            AllowUsers::MultibotMentions,
+            false, // is_mentioned (Claude not in structured mentions)
+            true,  // explicit_other_bot_target (Codex is)
+            true,  // in_thread
+            true,  // involved (Claude posted before)
+            false, // other_bot_present
+        ));
+    }
+
+    /// Scenario G: original event has no structured bot target,
+    /// attachment body text contains "@Codex".
+    /// Attachment text must not grant admission for either bot.
+    /// For Codex: explicit_other_bot_target=false → depends on
+    /// (is_mentioned, in_thread, involved) → not admitted (D in this test).
+    #[test]
+    fn no_structured_target_attachment_text_ignored_g() {
+        // Codex side: msg.mentions is empty (no structured bot mention),
+        // even though attachment text contains "@Codex".
+        // involved=false because Codex has not posted in this thread.
+        assert!(!should_process_user_message(
+            AllowUsers::MultibotMentions,
+            false, // is_mentioned
+            false, // explicit_other_bot_target — attachment text is NOT authoritative
+            true,  // in_thread (message arrived in a thread)
+            false, // involved (Codex hasn't posted)
+            false, // other_bot_present
+        ));
+    }
+
+    /// Scenario H: role-based target regression.
+    /// Existing role-trigger semantics preserved: a role in this bot's
+    /// `allowed_role_ids` triggers this bot regardless of any other bot
+    /// mention in the same message. The new precedence rule does NOT
+    /// silence a role that is configured to trigger this bot.
+    #[test]
+    fn role_trigger_preserved_h() {
+        // is_mentioned becomes true via msg.mention_roles in
+        // allowed_role_ids; explicit_other_bot_target may also be true
+        // (some other bot mentioned). is_mentioned short-circuits to ADMIT.
+        assert!(should_process_user_message(
+            AllowUsers::MultibotMentions,
+            true, // is_mentioned (role in allowed_role_ids → trigger)
+            true, // explicit_other_bot_target (some other bot mentioned too)
+            true,
+            true,
+            true,
+        ));
+        // Sanity: in Mentions mode, the role still triggers this bot.
+        assert!(should_process_user_message(
+            AllowUsers::Mentions,
+            true,  // is_mentioned (role trigger)
+            false, // explicit_other_bot_target
+            true,
+            true,
+            true,
+        ));
+        // Without role trigger and without explicit bot target in
+        // `msg.mentions`, the Involved mode admits if the bot is involved
+        // (existing behavior — roles not in `allowed_role_ids` are ignored).
+        assert!(should_process_user_message(
+            AllowUsers::Involved,
+            false, // is_mentioned (no role in allowed list, no @mention)
+            false, // explicit_other_bot_target (no @mention of any bot)
+            true,  // in_thread
+            true,  // involved
+            true,  // other_bot_present
+        ));
+    }
+
+    // --- role_targets_other_agent (operator-trusted peer-role list) ---
+    // workflow 20260818-openab-discord-attachment-mention-admission
+    // These tests pin the role-only branch of has_explicit_other_bot_target.
+    // The matching integration assertion — that the resulting
+    // `explicit_other_bot_target=true` causes `should_process_user_message`
+    // to REJECT — lives in `verifier_role_targeting_peer_agent_rejected`
+    // below.
+
+    /// Verifier baseline: Claude's role and Codex's role from the live
+    /// discord config at `/home/arthur/openab/{claude,codex}/config.toml`.
+    const CLAUDE_ROLE: u64 = 1536737647253266445;
+    const CODEX_ROLE: u64 = 1536737398191300661;
+
+    /// Role-only mention, role is in the operator's peer list, role is
+    /// NOT in self's list → true. This is the verifier scenario.
+    #[test]
+    fn role_targets_other_agent_detects_peer_role_only() {
+        let self_list: HashSet<u64> = [CLAUDE_ROLE].into_iter().collect();
+        let peer_list: HashSet<u64> = [CODEX_ROLE].into_iter().collect();
+        assert!(role_targets_other_agent(
+            &[CODEX_ROLE],
+            &self_list,
+            &peer_list
+        ));
+    }
+
+    /// Self-role only → false. This role belongs to self, not a peer;
+    /// is_mentioned short-circuits via the existing role check.
+    #[test]
+    fn role_targets_other_agent_ignores_self_role() {
+        let self_list: HashSet<u64> = [CLAUDE_ROLE].into_iter().collect();
+        let peer_list: HashSet<u64> = [CODEX_ROLE].into_iter().collect();
+        assert!(!role_targets_other_agent(
+            &[CLAUDE_ROLE],
+            &self_list,
+            &peer_list
+        ));
+    }
+
+    /// Self role + peer role in the same message → false. Self's role
+    /// short-circuits `is_mentioned=true` → admit. The peer role alone
+    /// must not overrule that.
+    #[test]
+    fn role_targets_other_agent_self_role_alongside_peer_role_admits() {
+        let self_list: HashSet<u64> = [CLAUDE_ROLE].into_iter().collect();
+        let peer_list: HashSet<u64> = [CODEX_ROLE].into_iter().collect();
+        assert!(!role_targets_other_agent(
+            &[CLAUDE_ROLE, CODEX_ROLE],
+            &self_list,
+            &peer_list
+        ));
+    }
+
+    /// Unrelated role (not in self, not in peer) → false. Heuristic
+    /// "anything-not-self is peer" is forbidden by spec; only operator-
+    /// listed role IDs trigger the reject.
+    #[test]
+    fn role_targets_other_agent_unrelated_role_returns_false() {
+        let self_list: HashSet<u64> = [CLAUDE_ROLE].into_iter().collect();
+        let peer_list: HashSet<u64> = [CODEX_ROLE].into_iter().collect();
+        assert!(!role_targets_other_agent(
+            &[999_999_999_999],
+            &self_list,
+            &peer_list
+        ));
+    }
+
+    /// Empty peer list (operator did not enumerate) → false.
+    /// Preserves existing deployments that don't use role-based peer
+    /// routing.
+    #[test]
+    fn role_targets_other_agent_empty_peer_list_returns_false() {
+        let self_list: HashSet<u64> = [CLAUDE_ROLE].into_iter().collect();
+        let peer_list: HashSet<u64> = HashSet::new();
+        assert!(!role_targets_other_agent(
+            &[CODEX_ROLE],
+            &self_list,
+            &peer_list
+        ));
+    }
+
+    /// Empty mention_roles (no role mentions) → false.
+    #[test]
+    fn role_targets_other_agent_empty_mentions_returns_false() {
+        let self_list: HashSet<u64> = [CLAUDE_ROLE].into_iter().collect();
+        let peer_list: HashSet<u64> = [CODEX_ROLE].into_iter().collect();
+        assert!(!role_targets_other_agent(&[], &self_list, &peer_list));
+    }
+
+    /// Verifier scenario end-to-end through the pure decision function:
+    /// the role-peer signal computes to true (verified by
+    /// `role_targets_other_agent_detects_peer_role_only` above), and
+    /// the resulting `explicit_other_bot_target=true` (as the helper
+    /// would set it) causes `should_process_user_message` to REJECT
+    /// before the MultibotMentions solo-involved fallback.
+    #[test]
+    fn verifier_role_targeting_peer_agent_rejected() {
+        // Helper computes explicit_other_bot_target=true for this input
+        // via the role-peer branch (peer role in msg.mention_roles,
+        // not in self.allowed_role_ids). Here we assert the same
+        // outcome via the pure decision function.
+        assert!(!should_process_user_message(
+            AllowUsers::MultibotMentions,
+            false, // is_mentioned (no @Claude, no role in Claude's list)
+            true,  // explicit_other_bot_target (role-peer signal true)
+            true,  // in_thread
+            true,  // involved (Claude posted before)
+            false, // other_bot_present (Codex has not yet posted)
+        ));
+    }
+
+    /// Exact confirmed-state repro from workflow 20260818-...
+    /// observed on message 1539241048075935744:
+    ///   is_mentioned = false
+    ///   in_thread    = true
+    ///   involved     = true
+    ///   other_bot_present = false
+    ///   explicit_other_bot_target = true
+    /// Expected: REJECT before multibot_mentions_mode_solo_bot_involved.
+    #[test]
+    fn exact_confirmed_state_rejected() {
+        assert!(!should_process_user_message(
+            AllowUsers::MultibotMentions,
+            false, // is_mentioned (Claude not mentioned)
+            true,  // explicit_other_bot_target (Codex mentioned)
+            true,  // in_thread
+            true,  // involved (Claude has posted before)
+            false, // other_bot_present (cache hasn't seen Codex reply yet)
+        ));
+    }
+
+    #[test]
+    fn safe_discord_route_omits_host_and_query() {
+        assert_eq!(
+            safe_discord_route("https://discord.com/api/v10/channels/42/messages?wait=true"),
+            "/api/v10/channels/42/messages"
+        );
+    }
+
+    #[test]
+    fn unsuccessful_request_details_include_safe_structured_fields() {
+        assert_eq!(
+            unsuccessful_request_details(
+                403,
+                50001,
+                "POST",
+                "https://discord.com/api/v10/channels/1539923659345502208/messages?wait=true",
+                "Missing Access",
+            ),
+            DiscordHttpErrorDetails {
+                status: Some(403),
+                discord_code: Some(50001),
+                method: Some("POST".to_owned()),
+                route: Some("/api/v10/channels/1539923659345502208/messages".to_owned()),
+                message: "Missing Access".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn structured_error_details_never_include_a_token() {
+        let details = unsuccessful_request_details(
+            403,
+            50001,
+            "POST",
+            "https://discord.com/api/v10/channels/42/messages?authorization=Bot+secret-token",
+            "Missing Access",
+        );
+        assert!(!format!("{details:?}").contains("secret-token"));
+    }
+
+    #[tokio::test]
+    async fn diagnostic_identity_uses_adapter_client_and_preserves_target_id() {
+        let client = Arc::new(RecordingDiagnosticClient::new(
+            Ok(("1536733602304499852".to_owned(), "ArthurClaude".to_owned())),
+            Ok("12".to_owned()),
+        ));
+        let diagnostic = diagnostic_adapter(client.clone())
+            .diagnostic_identity(ChannelId::new(1539923659345502208))
+            .await;
+
+        assert_eq!(
+            diagnostic.authenticated_user_id.as_deref(),
+            Some("1536733602304499852")
+        );
+        assert_eq!(
+            diagnostic.authenticated_username.as_deref(),
+            Some("ArthurClaude")
+        );
+        assert_eq!(diagnostic.target_channel_id, "1539923659345502208");
+        assert!(diagnostic.target_channel_access);
+        assert_eq!(diagnostic.target_channel_type.as_deref(), Some("12"));
+        assert_eq!(
+            *client.calls.lock().unwrap(),
+            vec![
+                "current_user".to_owned(),
+                "target:1539923659345502208".to_owned(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostic_identity_reports_target_missing_access_without_secret() {
+        let client = Arc::new(RecordingDiagnosticClient::new(
+            Ok(("1536733602304499852".to_owned(), "ArthurClaude".to_owned())),
+            Err(missing_access_details()),
+        ));
+        let diagnostic = diagnostic_adapter(client)
+            .diagnostic_identity(ChannelId::new(1539923659345502208))
+            .await;
+
+        assert_eq!(
+            diagnostic.authenticated_username.as_deref(),
+            Some("ArthurClaude")
+        );
+        assert!(!diagnostic.target_channel_access);
+        assert_eq!(diagnostic.target_channel_type, None);
+        assert_eq!(
+            diagnostic.target_channel_error,
+            Some(DiscordHttpErrorDetails {
+                status: Some(403),
+                discord_code: Some(50001),
+                method: Some("GET".to_owned()),
+                route: Some("/api/v10/channels/1539923659345502208".to_owned()),
+                message: "Missing Access".to_owned(),
+            })
+        );
+        assert!(!format!("{diagnostic:?}").contains("Bot "));
+        assert!(!format!("{diagnostic:?}").contains("authorization"));
+        assert!(!format!("{diagnostic:?}").contains("secret"));
+    }
+
+    #[tokio::test]
+    async fn diagnostic_identity_reports_identity_failure_and_still_checks_target() {
+        let client = Arc::new(RecordingDiagnosticClient::new(
+            Err(DiscordHttpErrorDetails {
+                status: Some(401),
+                discord_code: None,
+                method: Some("GET".to_owned()),
+                route: Some("https://discord.com/api/v10/users/@me?Authorization=Bot+diagnostic-test-token-marker".to_owned()),
+                message: "Authorization: Bot diagnostic-test-token-marker".to_owned(),
+            }),
+            Ok("12".to_owned()),
+        ));
+        let diagnostic = diagnostic_adapter(client.clone())
+            .diagnostic_identity(ChannelId::new(1539923659345502208))
+            .await;
+
+        assert_eq!(diagnostic.authenticated_user_id, None);
+        assert_eq!(diagnostic.authenticated_username, None);
+        assert_eq!(diagnostic.target_channel_type.as_deref(), Some("12"));
+        assert!(diagnostic.target_channel_access);
+        assert_eq!(
+            diagnostic
+                .identity_error
+                .as_ref()
+                .map(|error| error.message.as_str()),
+            Some("[redacted credential detail]")
+        );
+        let rendered = format!("{diagnostic:?}");
+        assert!(!rendered.contains("Bot "));
+        assert!(!rendered.contains("Authorization"));
+        assert!(!rendered.contains("diagnostic-test-token-marker"));
+        assert_eq!(
+            *client.calls.lock().unwrap(),
+            vec![
+                "current_user".to_owned(),
+                "target:1539923659345502208".to_owned(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_http_send_diagnostic_uses_adapter_client_for_both_variants() {
+        let client = Arc::new(RecordingDiagnosticClient::new(
+            Ok(("1536733602304499852".to_owned(), "ArthurClaude".to_owned())),
+            Ok("PrivateThread".to_owned()),
+        ));
+        let results = diagnostic_adapter(client.clone())
+            .diagnostic_shared_http_sends(
+                ChannelId::new(1539923659345502208),
+                UserId::new(1536733602304499852),
+            )
+            .await;
+
+        assert_eq!(
+            results[0].variant,
+            DiscordSendDiagnosticVariant::ContentOnly
+        );
+        assert!(results[0].success);
+        assert_eq!(
+            results[0].message_id.as_deref(),
+            Some("diagnostic-message-id")
+        );
+        assert_eq!(results[0].content_length_chars, 31);
+        assert_eq!(
+            results[1].variant,
+            DiscordSendDiagnosticVariant::AllowedMentions
+        );
+        assert!(results[1].success);
+        assert_eq!(results[1].content_length_chars, 58);
+        assert_eq!(
+            *client.calls.lock().unwrap(),
+            vec![
+                "send:1539923659345502208:P55_R6_SHARED_HTTP_CONTENT_ONLY:none:31".to_owned(),
+                "send:1539923659345502208:<@1536733602304499852> P55_R6_SHARED_HTTP_ALLOWED_MENTIONS:1536733602304499852:58".to_owned(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn discord_accepted_event_admits_exactly_once_through_production_ingress_seam() {
+        let recorder = Arc::new(RecordingAdmissionPort(AtomicUsize::new(0)));
+        Handler::admit_after_discord_gates(
+            recorder.clone(),
+            UserId::new(100),
+            UserId::new(200),
+            discord_admission_request(),
+        )
+        .await;
+        assert_eq!(recorder.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn discord_self_event_is_rejected_before_admission_through_production_ingress_seam() {
+        let recorder = Arc::new(RecordingAdmissionPort(AtomicUsize::new(0)));
+        let bot_id = UserId::new(200);
+        Handler::admit_after_discord_gates(
+            recorder.clone(),
+            bot_id,
+            bot_id,
+            discord_admission_request(),
+        )
+        .await;
+        assert_eq!(recorder.0.load(Ordering::SeqCst), 0);
+    }
+}
+#[test]
+fn self_authored_message_is_rejected_before_admission() {
+    let bot_id = UserId::new(777);
+    assert!(Handler::is_self_authored(bot_id, bot_id));
+    assert!(!Handler::is_self_authored(UserId::new(778), bot_id));
 }

@@ -111,9 +111,10 @@ fn write_temp_script(name: &str, content: &str) -> anyhow::Result<PathBuf> {
 
     let mut f = builder.tempfile()?;
     f.write_all(content.as_bytes())?;
-    let path = f.into_temp_path().keep().map_err(|e| {
-        anyhow::anyhow!("failed to persist temp script: {}", e.error)
-    })?;
+    let path = f
+        .into_temp_path()
+        .keep()
+        .map_err(|e| anyhow::anyhow!("failed to persist temp script: {}", e.error))?;
     Ok(path)
 }
 
@@ -128,9 +129,7 @@ async fn fetch_and_verify(url: &str, expected_hex: &str) -> anyhow::Result<Strin
     }
     let content_length = resp.content_length().unwrap_or(0) as usize;
     if content_length > MAX_SCRIPT_SIZE {
-        anyhow::bail!(
-            "hook script too large: {content_length} bytes (max {MAX_SCRIPT_SIZE})"
-        );
+        anyhow::bail!("hook script too large: {content_length} bytes (max {MAX_SCRIPT_SIZE})");
     }
     let body = resp.bytes().await?;
     if body.len() > MAX_SCRIPT_SIZE {
@@ -384,8 +383,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_script_file_success() {
-        let dir = std::env::temp_dir();
-        let path = dir.join("openab-test-hook-success.sh");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("openab-test-hook-success.sh");
         std::fs::write(&path, "#!/bin/sh\nexit 0").unwrap();
         #[cfg(unix)]
         {
@@ -394,7 +393,6 @@ mod tests {
         }
         let hook = hook_with_script(path.to_str().unwrap());
         let result = run_hook("test", &hook).await;
-        let _ = std::fs::remove_file(&path);
         assert!(result.is_ok());
     }
 

@@ -133,7 +133,8 @@ fn default_mcp_listen() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct AgentCoreConfig {    /// AgentCore Runtime ARN (required)
+pub struct AgentCoreConfig {
+    /// AgentCore Runtime ARN (required)
     pub runtime_arn: String,
     /// ACP agent command to run in the PTY shell (default: kiro-cli acp --trust-all-tools)
     #[serde(default = "default_agentcore_shell_command")]
@@ -264,6 +265,20 @@ pub struct Config {
     pub hooks: HooksConfig,
     #[serde(default)]
     pub workspace: WorkspaceConfig,
+    /// OpenAB-native three-agent coding workflow configuration
+    /// (`[workflow]` table). Absent = empty defaults (no Tech Lead
+    /// bypass). See [`WorkflowConfig`].
+    #[serde(default)]
+    pub workflow: WorkflowConfig,
+    /// Phase 6.4: deterministic OpenAB → AAP autonomous ingress routing.
+    /// Absent = no autonomous routing; ordinary ACP conversation wins
+    /// (legacy behavior, current production). When present, the A13
+    /// gate consults the AAP Runtime `/v1/integrations/openab/autonomous_ingress`
+    /// endpoint before falling back to ordinary ACP for human-authored
+    /// messages addressed to a declared agent.
+    /// See [`AutonomousIngressConfig`].
+    #[serde(default)]
+    pub autonomous_ingress: Option<AutonomousIngressConfig>,
     #[serde(default)]
     pub secrets: SecretsConfig,
     #[serde(default)]
@@ -279,6 +294,165 @@ pub struct WorkspaceConfig {
     /// Used with `[[ws:@alias]]` control directives.
     #[serde(default)]
     pub aliases: std::collections::HashMap<String, String>,
+}
+
+/// OpenAB-native three-agent coding workflow configuration
+/// (`[workflow]` table). Two identity-bearing surfaces:
+///
+/// - `tech_lead_user_ids` — explicit Discord user IDs authorised to
+///   bypass the A13 workflow-role gate for debugging, recovery, and
+///   reassignment.
+/// - `bot_user_ids` — trusted deployment-level mapping from logical
+///   agent name (`ArthurClaude`, `ArthurCodex`, `ArthurGemini`) to
+///   Discord numeric user id. Phase 4's `WorkflowService` resolves
+///   the next bot in a transition via this map; the agent never
+///   authors the numeric id.
+///
+/// `assignment.authorized_by` is NOT consulted — that field is
+/// audit/display metadata only.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct WorkflowConfig {
+    /// Discord numeric user IDs of explicitly authorised Tech Lead
+    /// identities. Empty = no Tech Lead bypass available (the gate
+    /// falls through to normal workflow role semantics for everyone,
+    /// human or bot).
+    #[serde(default)]
+    pub tech_lead_user_ids: Vec<String>,
+
+    /// Trusted deployment-level Discord user IDs for each logical
+    /// agent identity. Keys are the canonical names
+    /// ([`crate::workflow::identity::AgentIdentity`] string form);
+    /// values are decimal Discord numeric user IDs as strings
+    /// (parsed via the same `parse::<u64>()` path used for Tech
+    /// Lead entries so deployments stay typed).
+    ///
+    /// Phase 4 reads this map at the assignment-transition
+    /// boundary to resolve the next agent's Discord user ID for
+    /// the targeted `<workflow_activation>` message. **Production
+    /// IDs MUST live here**, not inside the workflow state
+    /// machine. Tests may inject synthetic maps; the production
+    /// wiring reads from `config.toml`.
+    #[serde(default)]
+    pub bot_user_ids: std::collections::HashMap<String, String>,
+}
+
+impl WorkflowConfig {
+    /// Parse `tech_lead_user_ids` into a `HashSet<u64>`. Invalid
+    /// entries are silently skipped — the A13 gate treats unknown
+    /// IDs as not-authorised and falls through to normal role
+    /// semantics. Empty input returns an empty set.
+    pub fn parsed_tech_lead_user_ids(&self) -> std::collections::HashSet<u64> {
+        self.tech_lead_user_ids
+            .iter()
+            .filter_map(|s| s.parse::<u64>().ok())
+            .collect()
+    }
+
+    /// Parse `bot_user_ids` into a `HashMap<String, u64>` of
+    /// `logical_agent_name → Discord numeric user id`. Invalid
+    /// entries are silently skipped. Empty input returns an empty
+    /// map.
+    pub fn parsed_bot_user_ids(&self) -> std::collections::HashMap<String, u64> {
+        self.bot_user_ids
+            .iter()
+            .filter_map(|(k, v)| v.parse::<u64>().ok().map(|u| (k.clone(), u)))
+            .collect()
+    }
+}
+
+/// Phase 6.4: deterministic OpenAB → AAP autonomous ingress routing
+/// configuration (`[autonomous_ingress]` table).
+///
+/// Presence of this section is the opt-in signal: when absent, the A13
+/// gate preserves legacy `WORKFLOW_ASSIGNMENT_MISSING` ordinary-ACP
+/// behavior and human Discord messages flow into the existing ACP
+/// session pool exactly as before.
+///
+/// When present, the gate consults AAP Runtime **before** any ordinary
+/// ACP dispatch for human-authored messages addressed to a logical agent
+/// listed in [`Self::aap_agents`]. The decision is deterministic — it
+/// does not consult prompt content, the LLM, or any free-form NLP
+/// keyword matching. The configuration fields are the entire routing
+/// contract.
+///
+/// Per the AGENTS.md critical architecture rule for Phase 6.3/6.4: the
+/// LLM must never become the workflow-routing authority. This config
+/// keeps the routing decision at the deterministic OpenAB ingress seam.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AutonomousIngressConfig {
+    /// Logical agent names that are AAP-autonomous capable. When the
+    /// daemon resolves to one of these names (via `ARTHUR_AGENT_NAME`),
+    /// human-authored messages from a Tech-Lead-authorized sender in a
+    /// Discord channel — or any sender when `aap_universal_humans = true`
+    /// — are routed to AAP Runtime autonomous ingress.
+    ///
+    /// Matching is exact case-sensitive against the canonical
+    /// [`crate::workflow::identity::AgentIdentity`] string form
+    /// (e.g. `ArthurClaude`, `ArthurCodex`, `ArthurGemini`).
+    #[serde(default)]
+    pub aap_agents: Vec<String>,
+
+    /// HTTP base URL for the AAP Runtime autonomous ingress endpoint,
+    /// e.g. `http://127.0.0.1:8000`. The gate calls
+    /// `{aap_runtime_url}/v1/integrations/openab/autonomous_ingress`.
+    #[serde(default = "default_autonomous_runtime_url")]
+    pub aap_runtime_url: String,
+
+    /// Environment variable name holding the AAP Runtime credential.
+    /// Defaults to the canonical `ARTHUR_AGENT_KEY_OPENAB`. The actual
+    /// credential value is read at request time and never logged.
+    #[serde(default = "default_autonomous_credential_env")]
+    pub aap_credential_env: String,
+
+    /// AAP project ID supplied to the Runtime for authority checks
+    /// (must match a configured project, e.g. `arthur-ai-platform`).
+    #[serde(default = "default_autonomous_project_id")]
+    pub project_id: String,
+
+    /// HTTP request timeout in seconds. Default 30.
+    #[serde(default = "default_autonomous_timeout_seconds")]
+    pub request_timeout_seconds: u64,
+
+    /// When `true`, ANY non-bot human sender (not just Tech Lead) routes
+    /// to AAP for a declared agent. Default `false` (Tech-Lead-only).
+    /// This keeps Tech Lead as the default authority while allowing
+    /// narrow per-deployment expansion through configuration, never
+    /// through prompt content.
+    #[serde(default)]
+    pub aap_universal_humans: bool,
+}
+
+fn default_autonomous_runtime_url() -> String {
+    "http://127.0.0.1:8000".to_string()
+}
+
+fn default_autonomous_credential_env() -> String {
+    "ARTHUR_AGENT_KEY_OPENAB".to_string()
+}
+
+fn default_autonomous_project_id() -> String {
+    "arthur-ai-platform".to_string()
+}
+
+fn default_autonomous_timeout_seconds() -> u64 {
+    30
+}
+
+impl AutonomousIngressConfig {
+    /// Whether the daemon's logical agent identity is declared as
+    /// AAP-autonomous capable. This is the entire `aap_agents`
+    /// membership check — deterministic, machine-testable, no LLM.
+    pub fn declares_agent(&self, agent: &str) -> bool {
+        self.aap_agents.iter().any(|name| name == agent)
+    }
+
+    /// Resolve the Runtime credential from the configured env var.
+    /// Missing or empty credential fails closed at the caller.
+    pub fn resolve_credential(&self) -> Option<String> {
+        std::env::var(&self.aap_credential_env)
+            .ok()
+            .filter(|v| !v.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -533,6 +707,25 @@ pub struct DiscordConfig {
     /// Empty (default) = role mentions do not trigger the bot.
     #[serde(default)]
     pub allowed_role_ids: Vec<String>,
+    /// Role IDs that explicitly target a peer agent bot account in this
+    /// deployment (NOT configured for THIS bot). Used only by the A12
+    /// role-target precedence check in `EventHandler::message` to reject
+    /// this bot when the original Discord message carries a role mention
+    /// that targets another configured agent — so we don't piggyback via
+    /// the MultibotMentions solo-involved fallback before the multibot
+    /// cache learns about the peer.
+    ///
+    /// Operator-supplied list. Never inferred from role names, role
+    /// display strings, attachment body text, prompt text, or LLM
+    /// interpretation. Empty (default) means the role-peer check is
+    /// silent: deployments that don't use role-based peer routing keep
+    /// their existing behavior. Empty peer list + role mention alone
+    /// does NOT auto-reject — the operator must enumerate the peer
+    /// roles they trust.
+    ///
+    /// workflow 20260818-openab-discord-attachment-mention-admission
+    #[serde(default)]
+    pub peer_agent_role_ids: Vec<String>,
     /// Allow the bot to respond to Discord direct messages (DMs).
     /// Default: false (opt-in). `allowed_users` still applies in DMs.
     #[serde(default)]
@@ -3991,5 +4184,64 @@ cancel_strategy = "noop"
         file_key.private_key_file = Some(tmp.to_string_lossy().into_owned());
         assert!(file_key.resolve().is_complete());
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    // ---- Phase 4 production config-wiring tests (Section 19) ----
+
+    #[test]
+    fn workflow_config_parses_tech_lead_user_ids() {
+        let cfg = parse_config_str(
+            "[workflow]\ntech_lead_user_ids = [\"645496545805991947\"]\n",
+            "test",
+        )
+        .unwrap();
+        let parsed: std::collections::HashSet<u64> = cfg.workflow.parsed_tech_lead_user_ids();
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed.contains(&645496545805991947u64));
+    }
+
+    #[test]
+    fn workflow_config_parses_bot_user_ids() {
+        let cfg = parse_config_str(
+            "[workflow.bot_user_ids]\n\
+             ArthurClaude = \"1536733602304499852\"\n\
+             ArthurCodex = \"1536734779607879700\"\n\
+             ArthurGemini = \"1536737891231866971\"\n",
+            "test",
+        )
+        .unwrap();
+        let parsed = cfg.workflow.parsed_bot_user_ids();
+        assert_eq!(parsed.get("ArthurClaude"), Some(&1536733602304499852u64));
+        assert_eq!(parsed.get("ArthurCodex"), Some(&1536734779607879700u64));
+        assert_eq!(parsed.get("ArthurGemini"), Some(&1536737891231866971u64));
+    }
+
+    #[test]
+    fn workflow_config_skips_invalid_u64_entries() {
+        // Garbage non-numeric IDs are silently skipped — the
+        // production path treats the missing entry as "not in
+        // set", not as a fatal config error.
+        let cfg = parse_config_str(
+            "[workflow]\n\
+             tech_lead_user_ids = [\"645496545805991947\", \"not-an-integer\"]\n\
+             [workflow.bot_user_ids]\n\
+             ArthurClaude = \"bad-id\"\n\
+             ArthurCodex = \"1536734779607879700\"\n",
+            "test",
+        )
+        .unwrap();
+        let tech = cfg.workflow.parsed_tech_lead_user_ids();
+        assert_eq!(tech.len(), 1);
+        assert!(tech.contains(&645496545805991947u64));
+        let bots = cfg.workflow.parsed_bot_user_ids();
+        assert!(!bots.contains_key("ArthurClaude"));
+        assert_eq!(bots.get("ArthurCodex"), Some(&1536734779607879700u64));
+    }
+
+    #[test]
+    fn workflow_config_default_is_empty() {
+        let cfg = parse_config_str("[discord]\nbot_token = \"x\"\n", "test").unwrap();
+        assert!(cfg.workflow.parsed_tech_lead_user_ids().is_empty());
+        assert!(cfg.workflow.parsed_bot_user_ids().is_empty());
     }
 }

@@ -35,7 +35,6 @@ pub trait AcpMcpTunnel: Send + Sync {
         params: Option<Value>,
     ) -> Result<Value, String>;
 
-
     /// Resolve a declared server NAME to the `server_id` the registry keys that tunnel by, for one
     /// channel.
     ///
@@ -70,10 +69,6 @@ pub trait AcpMcpTunnel: Send + Sync {
     fn attached_server_names(&self, channel_id: &str) -> Vec<String>;
 }
 
-
-
-
-
 /// Write `value` to `path` atomically, owner-only.
 ///
 /// Same-directory temp file created `0600` *before* any bytes reach it, then `rename`. Writing in
@@ -96,7 +91,9 @@ async fn write_json_atomic(path: &std::path::Path, value: &Value) -> std::io::Re
     static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tmp = dir.join(format!(
         ".{}.openab-tmp.{}.{}",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("mcp.json"),
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("mcp.json"),
         std::process::id(),
         TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
@@ -150,9 +147,6 @@ async fn write_json_atomic(path: &std::path::Path, value: &Value) -> std::io::Re
     }
 }
 
-
-
-
 /// Author the static `openab` facade entry into the one file openab owns
 /// (Facade mode). The entry is byte-identical for every session — the bridge it used to be
 /// compared against here was removed with the rest of Option C, so the comparison is gone
@@ -191,9 +185,10 @@ pub async fn write_facade_mcp_config(workdir: &str, facade_url: &str) -> std::io
 /// pass it and identifies no vendor at spawn time (D-21). openab never puts the entry in
 /// place itself either (D-15).
 pub fn facade_config_path(workdir: &str) -> std::path::PathBuf {
-    std::path::Path::new(workdir).join(".openab").join("mcp-facade.json")
+    std::path::Path::new(workdir)
+        .join(".openab")
+        .join("mcp-facade.json")
 }
-
 
 /// Broker-side session credential hook (Facade mode). Implemented by the root
 /// (closing over the facade's `SessionTokens` registry — core stays free of
@@ -263,8 +258,6 @@ pub fn report_facade_status(mcp_configured: bool, workdir: &str) {
     }
 }
 
-
-
 /// The destructive cases for the facade config writer — the one file openab owns,
 /// `.openab/mcp-facade.json`. It touches a user's `mcp.json` nowhere at all any more; the
 /// boundary test below is what asserts that.
@@ -293,9 +286,11 @@ mod facade_config_writer {
 
         let path = facade_config_path(wd.to_str().unwrap());
         assert_eq!(path, wd.join(".openab").join("mcp-facade.json"));
-        let v: Value =
-            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
-        assert_eq!(v["mcpServers"]["openab"]["url"], json!("http://127.0.0.1:8848/mcp"));
+        let v: Value = serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        assert_eq!(
+            v["mcpServers"]["openab"]["url"],
+            json!("http://127.0.0.1:8848/mcp")
+        );
         // The token is never in the file — the literal is, and the agent's env supplies the value.
         assert_eq!(
             v["mcpServers"]["openab"]["headers"]["Authorization"],
@@ -320,7 +315,9 @@ mod facade_config_writer {
         let kiro = wd.join(".kiro").join("settings").join("mcp.json");
         let agent = wd.join(".kiro").join("agents").join("terra.json");
         for f in [&cursor, &kiro, &agent] {
-            tokio::fs::create_dir_all(f.parent().unwrap()).await.unwrap();
+            tokio::fs::create_dir_all(f.parent().unwrap())
+                .await
+                .unwrap();
         }
         // Deliberately including a `//` comment: the shape that the old merge path destroyed.
         let cursor_body = "{\n  // mine\n  \"mcpServers\": {\"mine\": {\"command\": \"x\"}}\n}";
@@ -338,7 +335,10 @@ mod facade_config_writer {
         // longer retires those — see the PR body: that cleanup became operator-performed, and it
         // is a policy bypass rather than a convenience, so it is stated rather than silently
         // dropped.
-        assert_eq!(tokio::fs::read_to_string(&cursor).await.unwrap(), cursor_body);
+        assert_eq!(
+            tokio::fs::read_to_string(&cursor).await.unwrap(),
+            cursor_body
+        );
         assert_eq!(tokio::fs::read_to_string(&kiro).await.unwrap(), kiro_body);
         assert_eq!(tokio::fs::read_to_string(&agent).await.unwrap(), agent_body);
         let _ = tokio::fs::remove_dir_all(&wd).await;
@@ -379,7 +379,10 @@ mod facade_config_writer {
         let v: Value =
             serde_json::from_slice(&tokio::fs::read(facade_config_path(&w)).await.unwrap())
                 .unwrap();
-        assert_eq!(v["mcpServers"]["openab"]["url"], json!("http://127.0.0.1:8848/mcp"));
+        assert_eq!(
+            v["mcpServers"]["openab"]["url"],
+            json!("http://127.0.0.1:8848/mcp")
+        );
         let _ = tokio::fs::remove_dir_all(&wd).await;
     }
 
@@ -393,24 +396,22 @@ mod facade_config_writer {
             .await
             .unwrap();
         let path = facade_config_path(wd.to_str().unwrap());
-        let mode = tokio::fs::metadata(&path).await.unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "0600 must be set at creation, not chmod'd after");
+        let mode = tokio::fs::metadata(&path)
+            .await
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "0600 must be set at creation, not chmod'd after"
+        );
         let _ = tokio::fs::remove_dir_all(&wd).await;
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-    };
-
-
-
-
-
-
-
-
 
     /// Unique throwaway workdir with a `.kiro/agents/` tree.
     async fn tmp_workdir(tag: &str) -> std::path::PathBuf {
@@ -425,19 +426,5 @@ mod tests {
         dir
     }
 
-
-
-
-
-
-
-
-
-
-
-
-
     const INIT_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"t","version":"1"}}}"#;
-
-
 }

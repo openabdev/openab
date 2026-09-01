@@ -413,7 +413,11 @@ mod tests {
         let chunks = split_message(line, 20);
         assert_length_invariant(&chunks, 20);
         assert!(chunks.len() > 1);
-        let rejoined = chunks.iter().map(|c| c.trim()).collect::<Vec<_>>().join(" ");
+        let rejoined = chunks
+            .iter()
+            .map(|c| c.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
         assert_eq!(
             rejoined.split_whitespace().collect::<Vec<_>>(),
             line.split_whitespace().collect::<Vec<_>>(),
@@ -434,7 +438,7 @@ mod tests {
     #[test]
     fn fenced_hard_split_grapheme_safe() {
         // Emoji inside a code fence: grapheme-safe, all content preserved.
-        let content: String = std::iter::repeat("🎉❤️你").take(20).collect();
+        let content = "🎉❤️你".repeat(20);
         let text = format!("```\n{content}\n```");
         let chunks = split_message(&text, 20);
         assert_length_invariant(&chunks, 20);
