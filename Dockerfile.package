@@ -345,6 +345,11 @@ ENV AGY_VERSION=1.1.13
 # (which the packaged-pin parity check asserts byte-for-byte). When empty, the
 # pinned AGY_VERSION is used; the nightly lane passes the resolved latest.
 ARG AGY_VERSION_OVERRIDE=
+# Effective installed version, surfaced as image metadata so `inspect` reflects
+# what was actually installed (the ENV above stays pinned for parity). Nightly
+# passes the resolved version here; otherwise it mirrors the pinned default.
+ARG AGY_EFFECTIVE_VERSION=1.1.13
+LABEL dev.openab.agy.version="${AGY_EFFECTIVE_VERSION}"
 ARG AGY_SHA256_AMD64=edc7c32b5ab4fc2e4da03381fee83ed566dea6b56b56f9329cd13cd77947a1d9
 ARG AGY_SHA256_ARM64=a9fdd2a386770c27dbf784436bd4de70d4d4901c832d5ec6abf27758d5c370f8
 RUN ARCH=$(dpkg --print-architecture) && \

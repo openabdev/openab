@@ -15,8 +15,8 @@ name: Nightly Build
 #   - Freshness over cohort atomicity: each variant publishes independently
 #     (fail-fast: false), so one vendor breaking their latest does not hold back
 #     the rest. A failed variant keeps yesterday's tag; the red job is the alert.
-#   - nightly-<variant> is the moving tag; nightly-YYYYMMDD-<run-id>-<variant>
-#     is the immutable rollback point.
+#   - nightly-<variant> is the moving tag; nightly-YYYYMMDD-<run-id>.<attempt>-<variant>
+#     is the immutable rollback point (the attempt suffix keeps re-runs distinct).
 #   - Release (v*) and pre-beta-* tags and their build path are untouched.
 #
 # native + agentcore are intentionally absent: they carry no coding CLI by
@@ -45,7 +45,11 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   # Every agent-CLI variant. native + agentcore excluded: no CLI to freshen.
-  ALL_VARIANTS: 'kiro,claude,codex,copilot,cursor,devin,gemini,grok,hermes,kimi,mimocode,opencode,antigravity,pi'
+  # pi is excluded too: its package/unified target sets
+  # OPENAB_AGENT_COMMAND=openab-agent but does not ship that binary (a
+  # pre-existing bug across all lanes — see follow-up issue), so a nightly-pi
+  # tag would publish a runtime-broken image. Re-add once the pi target is fixed.
+  ALL_VARIANTS: 'kiro,claude,codex,copilot,cursor,devin,gemini,grok,hermes,kimi,mimocode,opencode,antigravity'
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -66,17 +70,30 @@ jobs:
             VARIANTS="$ALL_VARIANTS"
           else
             VARIANTS="$INPUT_VARIANTS"
-            for v in $(echo "$VARIANTS" | tr ',' ' '); do
-              v=$(echo "$v" | xargs)
-              if ! echo ",$ALL_VARIANTS," | grep -qF -- ",$v,"; then
-                echo "::error::Unknown or unsupported nightly variant: $v (allowed: $ALL_VARIANTS)"
-                exit 1
-              fi
-            done
           fi
-          JSON=$(echo "$VARIANTS" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | jq -R . | jq -sc .)
+
+          # Parse once into a normalized, validated, de-duplicated list. This is
+          # the single source the matrix JSON is built from, so empty fields
+          # (kiro,,claude) and duplicates (kiro,kiro) cannot leak through into
+          # empty matrix legs or artifact-name collisions.
+          SELECTED=""
+          IFS=','
+          for raw in $VARIANTS; do
+            v=$(echo "$raw" | xargs)                       # trim surrounding whitespace
+            [ -n "$v" ] || { echo "::error::empty variant entry in: $INPUT_VARIANTS"; exit 1; }
+            echo ",$ALL_VARIANTS," | grep -qF -- ",$v," || {
+              echo "::error::Unknown or unsupported nightly variant: $v (allowed: $ALL_VARIANTS)"; exit 1; }
+            case ",$SELECTED," in
+              *",$v,"*) echo "::error::duplicate variant: $v"; exit 1 ;;
+            esac
+            SELECTED="${SELECTED:+$SELECTED,}$v"
+          done
+          unset IFS
+          [ -n "$SELECTED" ] || { echo "::error::no variants selected"; exit 1; }
+
+          JSON=$(printf '%s' "$SELECTED" | tr ',' '\n' | jq -R . | jq -sc .)
           echo "variants=${JSON}" >> "$GITHUB_OUTPUT"
-          echo "Building: $VARIANTS"
+          echo "Building: $SELECTED"
 
   # ---------------------------------------------------------------------------
   # Compile openab (and openab-agent, agy-acp) once per architecture.
@@ -266,6 +283,7 @@ jobs:
               V=$(curl -fsSL --retry 3 https://api.github.com/repos/google-antigravity/antigravity-cli/releases/latest | jq -r .tag_name)
               check_ver "$V"; REPORT="antigravity $V"
               BUILD_ARGS="AGY_VERSION_OVERRIDE=$V
+          AGY_EFFECTIVE_VERSION=$V
           AGY_SHA256_AMD64=
           AGY_SHA256_ARM64=" ;;
             hermes)
@@ -322,6 +340,10 @@ jobs:
   # ---------------------------------------------------------------------------
   build:
     needs: [matrix, compile, resolve]
+    # Canonical nightly-* tags may only be published from the default branch.
+    # A workflow_dispatch from a feature branch still runs matrix/compile/resolve
+    # (dry validation) but must not push under the canonical namespace.
+    if: github.ref == 'refs/heads/main'
     strategy:
       fail-fast: false
       matrix:
@@ -406,6 +428,13 @@ jobs:
   # ---------------------------------------------------------------------------
   tag:
     needs: [matrix, resolve, build]
+    # Independent publication: run even if a sibling variant's build failed
+    # (fail-fast: false already lets siblings finish, but a skipped tag job
+    # would still withhold the ones that succeeded). Each variant tags only if
+    # its own two digests are present; the digest-count check below fails just
+    # that variant's tag when its build did not produce both arches. Restricted
+    # to the default branch for the same reason as build.
+    if: ${{ always() && !cancelled() && github.ref == 'refs/heads/main' }}
     strategy:
       fail-fast: false
       matrix:
@@ -438,9 +467,9 @@ jobs:
 
       - name: Validate digest count
         run: |
-          COUNT=$(ls -1 /tmp/digests/ | wc -l)
+          COUNT=$(ls -1 /tmp/digests/ 2>/dev/null | wc -l | tr -d ' ')
           if [ "$COUNT" -ne 2 ]; then
-            echo "::error::Expected 2 digests (amd64 + arm64) for ${{ matrix.variant }}, got $COUNT"
+            echo "::error::No complete image for ${{ matrix.variant }} (expected 2 digests amd64+arm64, got $COUNT) — its build leg likely failed. This variant is not published; siblings are unaffected."
             exit 1
           fi
           for f in /tmp/digests/*; do
@@ -456,7 +485,9 @@ jobs:
           IMAGE="${REGISTRY}/${IMAGE_NAME}"
           DATE=$(date -u +%Y%m%d)
           MOVING="${IMAGE}:nightly-${VARIANT}"
-          IMMUTABLE="${IMAGE}:nightly-${DATE}-${GITHUB_RUN_ID}-${VARIANT}"
+          # Include the run attempt so a re-run (which re-resolves mutable
+          # vendor versions) cannot move a tag documented as immutable.
+          IMMUTABLE="${IMAGE}:nightly-${DATE}-${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}-${VARIANT}"
           DIGESTS=$(printf "${IMAGE}@sha256:%s " $(ls /tmp/digests/))
 
           docker buildx imagetools create -t "$MOVING" -t "$IMMUTABLE" ${DIGESTS}
