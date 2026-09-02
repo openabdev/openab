@@ -68,7 +68,7 @@ jobs:
             VARIANTS="$INPUT_VARIANTS"
             for v in $(echo "$VARIANTS" | tr ',' ' '); do
               v=$(echo "$v" | xargs)
-              if ! echo ",$ALL_VARIANTS," | grep -q ",$v,"; then
+              if ! echo ",$ALL_VARIANTS," | grep -qF -- ",$v,"; then
                 echo "::error::Unknown or unsupported nightly variant: $v (allowed: $ALL_VARIANTS)"
                 exit 1
               fi
@@ -138,42 +138,27 @@ jobs:
           retention-days: 1
 
   # ---------------------------------------------------------------------------
-  # Package: resolve the vendor's latest CLI version, then build a lightweight
-  # image per variant (no Rust compilation) with the resolved version passed as
-  # a build-arg override.
+  # Resolve each vendor's latest CLI version ONCE per variant (not per arch), so
+  # amd64 and arm64 build the same version even if a vendor publishes mid-run.
+  # Emits a per-variant artifact holding the build-arg overrides + a human
+  # report, consumed by the build and tag jobs.
   # ---------------------------------------------------------------------------
-  build:
-    needs: [matrix, compile]
+  resolve:
+    needs: matrix
     strategy:
       fail-fast: false
       matrix:
         variant: ${{ fromJson(needs.matrix.outputs.variants) }}
-        platform:
-          - { os: linux/amd64, runner: ubuntu-latest, arch: amd64 }
-          - { os: linux/arm64, runner: ubuntu-24.04-arm, arch: arm64 }
-    runs-on: ${{ matrix.platform.runner }}
+    runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
     steps:
-      - uses: actions/checkout@v6
-
-      - name: Download pre-built binaries
-        uses: actions/download-artifact@v4
-        with:
-          name: nightly-bins-${{ matrix.platform.arch }}
-          path: bin
-
-      - name: Make binaries executable
-        run: chmod +x bin/*
-
       - name: Resolve the vendor's latest CLI version
-        id: resolve
         env:
-          # Used only for the Hermes cross-repo Contents API request. An
-          # authenticated fetch avoids the shared-runner 429s seen on
-          # raw.githubusercontent.com, while the resolved commit keeps the
-          # installer immutable.
+          # Used for the cross-repo GitHub API requests (hermes, antigravity).
+          # An authenticated fetch avoids the shared-runner 429s seen on
+          # api/raw.githubusercontent.com, while the resolved commit/tag keeps
+          # the installer immutable.
           GH_TOKEN: ${{ github.token }}
           VARIANT: ${{ matrix.variant }}
         run: |
@@ -268,18 +253,15 @@ jobs:
               MANIFEST=$(curl -fsSL --retry 3 https://static.devin.ai/cli/current/manifest.json)
               V=$(echo "$MANIFEST" | jq -r .version)
               check_ver "$V"; REPORT="devin $V"
-              # Vendor publishes per-arch sha256; keep the check enabled by
-              # passing the resolved digest for this arch to both args (only the
-              # matching-arch one is consulted by the Dockerfile case).
-              if [ "${{ matrix.platform.arch }}" = "arm64" ]; then
-                SHA=$(echo "$MANIFEST" | jq -r '.platforms["aarch64-unknown-linux"].sha256')
-                BUILD_ARGS="DEVIN_VERSION=$V
-          DEVIN_SHA256_ARM64=$SHA"
-              else
-                SHA=$(echo "$MANIFEST" | jq -r '.platforms["x86_64-unknown-linux"].sha256')
-                BUILD_ARGS="DEVIN_VERSION=$V
-          DEVIN_SHA256_AMD64=$SHA"
-              fi ;;
+              # Vendor publishes per-arch sha256; resolve BOTH and pass both args
+              # so amd64 and arm64 builds each verify their own binary. The
+              # Dockerfile's case selects the matching-arch one at build time.
+              SHA_AMD=$(echo "$MANIFEST" | jq -r '.platforms["x86_64-unknown-linux"].sha256')
+              SHA_ARM=$(echo "$MANIFEST" | jq -r '.platforms["aarch64-unknown-linux"].sha256')
+              echo "$SHA_AMD$SHA_ARM" | grep -qE '^[0-9a-f]{128}$' || { echo "::error::devin manifest missing per-arch sha256"; exit 1; }
+              BUILD_ARGS="DEVIN_VERSION=$V
+          DEVIN_SHA256_AMD64=$SHA_AMD
+          DEVIN_SHA256_ARM64=$SHA_ARM" ;;
             antigravity)
               V=$(curl -fsSL --retry 3 https://api.github.com/repos/google-antigravity/antigravity-cli/releases/latest | jq -r .tag_name)
               check_ver "$V"; REPORT="antigravity $V"
@@ -303,8 +285,12 @@ jobs:
               done
               [ "$REF_TYPE" = "commit" ] || { echo "::error::hermes $TAG did not resolve to a commit"; exit 1; }
               echo "$COMMIT" | grep -qE '^[0-9a-f]{40}$' || { echo "::error::invalid hermes commit: $COMMIT"; exit 1; }
-              INSTALL_SHA=$(curl -fsSL --retry 3 \
-                "https://raw.githubusercontent.com/NousResearch/hermes-agent/${COMMIT}/scripts/install.sh" \
+              # Hash the installer via the authenticated Contents API (raw+json)
+              # for the resolved commit — same reason as the release fetch above:
+              # dodges the shared-runner 429s on raw.githubusercontent.com. The
+              # Dockerfile still fetches+verifies against this SHA at build time.
+              INSTALL_SHA=$(github_api -H 'Accept: application/vnd.github.raw+json' \
+                "https://api.github.com/repos/NousResearch/hermes-agent/contents/scripts/install.sh?ref=${COMMIT}" \
                 | sha256sum | cut -d' ' -f1)
               echo "$INSTALL_SHA" | grep -qE '^[0-9a-f]{64}$' || { echo "::error::could not hash hermes installer"; exit 1; }
               REPORT="hermes $TAG @ $COMMIT"
@@ -315,17 +301,66 @@ jobs:
           esac
 
           echo "Resolved $VARIANT -> $REPORT"
-          echo "report=$REPORT" >> "$GITHUB_OUTPUT"
+          mkdir -p resolved
           # The BUILD_ARGS literals above are indented for readability; strip any
           # leading whitespace so each emitted line is a clean KEY=VALUE that
           # build-push-action's build-args parser accepts. Drop blank lines too.
-          CLEAN_ARGS=$(printf '%s\n' "$BUILD_ARGS" | sed 's/^[[:space:]]*//' | grep -v '^$')
-          # Multi-line output for the build-args block.
+          printf '%s\n' "$BUILD_ARGS" | sed 's/^[[:space:]]*//' | grep -v '^$' > resolved/build_args
+          printf '%s\n' "$REPORT" > resolved/report
+
+      - name: Upload resolved build args
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-resolve-${{ matrix.variant }}
+          path: resolved/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Package: build a lightweight image per variant×arch (no Rust compilation),
+  # feeding the once-resolved build-arg overrides so both arches share a version.
+  # ---------------------------------------------------------------------------
+  build:
+    needs: [matrix, compile, resolve]
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJson(needs.matrix.outputs.variants) }}
+        platform:
+          - { os: linux/amd64, runner: ubuntu-latest, arch: amd64 }
+          - { os: linux/arm64, runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.platform.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download pre-built binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: nightly-bins-${{ matrix.platform.arch }}
+          path: bin
+
+      - name: Make binaries executable
+        run: chmod +x bin/*
+
+      - name: Download resolved build args
+        uses: actions/download-artifact@v4
+        with:
+          name: nightly-resolve-${{ matrix.variant }}
+          path: resolved
+
+      - name: Load resolved build args
+        id: resolve
+        run: |
+          set -euo pipefail
           {
             echo "build_args<<__BUILD_ARGS_EOF__"
-            echo "$CLEAN_ARGS"
+            cat resolved/build_args
             echo "__BUILD_ARGS_EOF__"
           } >> "$GITHUB_OUTPUT"
+          echo "Building $(cat resolved/report)"
 
       - uses: docker/setup-buildx-action@v3
 
@@ -370,7 +405,7 @@ jobs:
   # Create the multi-arch manifest and apply the nightly tags per variant.
   # ---------------------------------------------------------------------------
   tag:
-    needs: [matrix, build]
+    needs: [matrix, resolve, build]
     strategy:
       fail-fast: false
       matrix:
@@ -394,6 +429,12 @@ jobs:
           path: /tmp/digests
           pattern: nightly-digests-${{ matrix.variant }}-*
           merge-multiple: true
+
+      - name: Download resolved report
+        uses: actions/download-artifact@v4
+        with:
+          name: nightly-resolve-${{ matrix.variant }}
+          path: /tmp/resolved
 
       - name: Validate digest count
         run: |
@@ -427,6 +468,8 @@ jobs:
             echo "$MOVING"
             echo "$IMMUTABLE"
             echo '```'
+            echo
+            echo "CLI: $(cat /tmp/resolved/report 2>/dev/null || echo 'n/a')"
             echo
             echo "Drop-in image tracking the vendor's latest CLI. No compatibility guarantee."
           } >> "$GITHUB_STEP_SUMMARY"
