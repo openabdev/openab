@@ -1,0 +1,432 @@
+name: Nightly Build
+
+# Daily builds carrying the *latest* coding CLI for each agent variant.
+#
+# The release and pre-beta channels cannot do this: every variant pins its CLI
+# version as an ARG (and, for binary downloads, a SHA256) inside
+# Dockerfile.package, so rebuilding from main republishes the same CLI however
+# often it runs. This lane compiles the same openab binary from main, then
+# overwrites the agent CLI ARGs with the version each vendor published most
+# recently.
+#
+# Channel contract, deliberately different from pre-beta-build.yml:
+#   - Drop-in, no compatibility guarantee. These images track vendor latest and
+#     may break at any time; they are not a release.
+#   - Freshness over cohort atomicity: each variant publishes independently
+#     (fail-fast: false), so one vendor breaking their latest does not hold back
+#     the rest. A failed variant keeps yesterday's tag; the red job is the alert.
+#   - nightly-<variant> is the moving tag; nightly-YYYYMMDD-<run-id>-<variant>
+#     is the immutable rollback point.
+#   - Release (v*) and pre-beta-* tags and their build path are untouched.
+#
+# native + agentcore are intentionally absent: they carry no coding CLI by
+# definition, so there is nothing to freshen.
+
+on:
+  schedule:
+    # Off-peak, offset from the hour to dodge the scheduler rush.
+    - cron: '23 6 * * *'
+  workflow_dispatch:
+    inputs:
+      variants:
+        description: 'Variants to build (comma-separated, or "all")'
+        required: false
+        type: string
+        default: 'all'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-build
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  # Every agent-CLI variant. native + agentcore excluded: no CLI to freshen.
+  ALL_VARIANTS: 'kiro,claude,codex,copilot,cursor,devin,gemini,grok,hermes,kimi,mimocode,opencode,antigravity,pi'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Resolve the variant matrix.
+  # ---------------------------------------------------------------------------
+  matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      variants: ${{ steps.resolve.outputs.variants }}
+    steps:
+      - name: Resolve variant matrix
+        id: resolve
+        env:
+          INPUT_VARIANTS: ${{ inputs.variants }}
+        run: |
+          set -euo pipefail
+          if [ "$INPUT_VARIANTS" = "all" ] || [ -z "$INPUT_VARIANTS" ]; then
+            VARIANTS="$ALL_VARIANTS"
+          else
+            VARIANTS="$INPUT_VARIANTS"
+            for v in $(echo "$VARIANTS" | tr ',' ' '); do
+              v=$(echo "$v" | xargs)
+              if ! echo ",$ALL_VARIANTS," | grep -q ",$v,"; then
+                echo "::error::Unknown or unsupported nightly variant: $v (allowed: $ALL_VARIANTS)"
+                exit 1
+              fi
+            done
+          fi
+          JSON=$(echo "$VARIANTS" | tr ',' '\n' | sed 's/^ *//;s/ *$//' | jq -R . | jq -sc .)
+          echo "variants=${JSON}" >> "$GITHUB_OUTPUT"
+          echo "Building: $VARIANTS"
+
+  # ---------------------------------------------------------------------------
+  # Compile openab (and openab-agent, agy-acp) once per architecture.
+  # Identical to pre-beta-build.yml — the openab binary is built from main; only
+  # the agent CLI layer is freshened. Uploads binaries as artifacts.
+  # ---------------------------------------------------------------------------
+  compile:
+    needs: matrix
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { os: linux/amd64, runner: ubuntu-latest, arch: amd64 }
+          - { os: linux/arm64, runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.platform.runner }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable (2026-07-13)
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: nightly-compile-${{ matrix.platform.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            nightly-compile-${{ matrix.platform.arch }}-
+
+      - name: Build openab
+        run: cargo build --release --features unified
+
+      - name: Build openab-agent
+        run: cd openab-agent && printf '\n[workspace]\n' >> Cargo.toml && cargo build --release
+
+      # agy-acp/Cargo.toml already declares [workspace] permanently, so no runtime
+      # injection is needed here — unlike openab-agent above.
+      - name: Build agy-acp
+        run: cd agy-acp && cargo build --release
+
+      - name: Collect binaries
+        run: |
+          mkdir -p bins
+          cp target/release/openab bins/
+          cp openab-agent/target/release/openab-agent bins/
+          cp agy-acp/target/release/agy-acp bins/
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-bins-${{ matrix.platform.arch }}
+          path: bins/
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Package: resolve the vendor's latest CLI version, then build a lightweight
+  # image per variant (no Rust compilation) with the resolved version passed as
+  # a build-arg override.
+  # ---------------------------------------------------------------------------
+  build:
+    needs: [matrix, compile]
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJson(needs.matrix.outputs.variants) }}
+        platform:
+          - { os: linux/amd64, runner: ubuntu-latest, arch: amd64 }
+          - { os: linux/arm64, runner: ubuntu-24.04-arm, arch: arm64 }
+    runs-on: ${{ matrix.platform.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download pre-built binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: nightly-bins-${{ matrix.platform.arch }}
+          path: bin
+
+      - name: Make binaries executable
+        run: chmod +x bin/*
+
+      - name: Resolve the vendor's latest CLI version
+        id: resolve
+        env:
+          # Used only for the Hermes cross-repo Contents API request. An
+          # authenticated fetch avoids the shared-runner 429s seen on
+          # raw.githubusercontent.com, while the resolved commit keeps the
+          # installer immutable.
+          GH_TOKEN: ${{ github.token }}
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          set -euo pipefail
+
+          # BUILD_ARGS accumulates the --build-arg overrides fed to buildx.
+          # For SHA-pinned variants we deliberately pass empty SHAs: the
+          # Dockerfile.package check is skipped when the SHA arg is empty
+          # (release/pre-beta still pass their pinned SHAs and stay verified).
+          BUILD_ARGS=""
+
+          github_api() {
+            curl -fsSL --retry 3 --retry-all-errors \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H 'X-GitHub-Api-Version: 2022-11-28' "$@"
+          }
+
+          # Validate a resolved version string before it reaches a build-arg.
+          check_ver() {
+            case "$1" in
+              ''|null|*[!A-Za-z0-9._+-]*)
+                echo "::error::invalid CLI version for $VARIANT: '$1'"; exit 1 ;;
+            esac
+          }
+
+          case "$VARIANT" in
+            kiro)
+              # No public version index; the vendor serves a `latest` path that
+              # the existing stable/${VERSION}/ URL template resolves to. Version
+              # is learned from the built image, not ahead of time.
+              REPORT="latest (resolved by vendor)"
+              BUILD_ARGS="KIRO_CLI_VERSION=latest
+          KIRO_SHA256_AMD64=
+          KIRO_SHA256_ARM64=" ;;
+            claude)
+              ACP=$(curl -fsSL --retry 3 https://registry.npmjs.org/@agentclientprotocol/claude-agent-acp/latest | jq -r .version)
+              CODE=$(curl -fsSL --retry 3 https://registry.npmjs.org/@anthropic-ai/claude-code/latest | jq -r .version)
+              check_ver "$ACP"; check_ver "$CODE"
+              REPORT="claude-agent-acp $ACP + claude-code $CODE"
+              BUILD_ARGS="CLAUDE_AGENT_ACP_VERSION=$ACP
+          CLAUDE_CODE_VERSION=$CODE" ;;
+            codex)
+              ACP=$(curl -fsSL --retry 3 https://registry.npmjs.org/@agentclientprotocol/codex-acp/latest | jq -r .version)
+              CODE=$(curl -fsSL --retry 3 https://registry.npmjs.org/@openai/codex/latest | jq -r .version)
+              check_ver "$ACP"; check_ver "$CODE"
+              REPORT="codex-acp $ACP + codex $CODE"
+              BUILD_ARGS="CODEX_ACP_VERSION=$ACP
+          CODEX_VERSION=$CODE" ;;
+            copilot)
+              V=$(curl -fsSL --retry 3 https://registry.npmjs.org/@github/copilot/latest | jq -r .version)
+              check_ver "$V"; REPORT="copilot $V"
+              BUILD_ARGS="COPILOT_VERSION=$V" ;;
+            gemini)
+              V=$(curl -fsSL --retry 3 https://registry.npmjs.org/@google/gemini-cli/latest | jq -r .version)
+              check_ver "$V"; REPORT="gemini-cli $V"
+              BUILD_ARGS="GEMINI_CLI_VERSION=$V" ;;
+            kimi)
+              V=$(curl -fsSL --retry 3 https://registry.npmjs.org/@moonshot-ai/kimi-code/latest | jq -r .version)
+              check_ver "$V"; REPORT="kimi-code $V"
+              BUILD_ARGS="KIMI_CODE_VERSION=$V" ;;
+            mimocode)
+              V=$(curl -fsSL --retry 3 https://registry.npmjs.org/@mimo-ai/cli/latest | jq -r .version)
+              check_ver "$V"; REPORT="mimo-code $V"
+              BUILD_ARGS="MIMOCODE_VERSION=$V" ;;
+            opencode)
+              V=$(curl -fsSL --retry 3 https://registry.npmjs.org/opencode-ai/latest | jq -r .version)
+              check_ver "$V"; REPORT="opencode $V"
+              BUILD_ARGS="OPENCODE_VERSION=$V" ;;
+            pi)
+              ACP=$(curl -fsSL --retry 3 https://registry.npmjs.org/pi-acp/latest | jq -r .version)
+              CODE=$(curl -fsSL --retry 3 https://registry.npmjs.org/@earendil-works/pi-coding-agent/latest | jq -r .version)
+              check_ver "$ACP"; check_ver "$CODE"
+              REPORT="pi-acp $ACP + pi-coding-agent $CODE"
+              BUILD_ARGS="PI_ACP_VERSION=$ACP
+          PI_CODING_AGENT_VERSION=$CODE" ;;
+            cursor)
+              # The install script embeds the version it would install; there is
+              # no separate version index. Anchored to the download URL shape so
+              # an unrelated mention of the domain cannot match.
+              V=$(curl -fsSL --retry 3 https://cursor.com/install \
+                | grep -oE 'downloads\.cursor\.com/lab/[^/]+/' | head -1 \
+                | sed 's|downloads.cursor.com/lab/||; s|/$||')
+              check_ver "$V"; REPORT="cursor-agent $V"
+              BUILD_ARGS="CURSOR_VERSION=$V" ;;
+            grok)
+              V=$(curl -fsSL --retry 3 https://storage.googleapis.com/grok-build-public-artifacts/cli/stable | tr -d '[:space:]')
+              check_ver "$V"; REPORT="grok $V"
+              BUILD_ARGS="GROK_VERSION=$V
+          GROK_SHA256_AMD64=
+          GROK_SHA256_ARM64=" ;;
+            devin)
+              MANIFEST=$(curl -fsSL --retry 3 https://static.devin.ai/cli/current/manifest.json)
+              V=$(echo "$MANIFEST" | jq -r .version)
+              check_ver "$V"; REPORT="devin $V"
+              # Vendor publishes per-arch sha256; keep the check enabled by
+              # passing the resolved digest for this arch to both args (only the
+              # matching-arch one is consulted by the Dockerfile case).
+              if [ "${{ matrix.platform.arch }}" = "arm64" ]; then
+                SHA=$(echo "$MANIFEST" | jq -r '.platforms["aarch64-unknown-linux"].sha256')
+                BUILD_ARGS="DEVIN_VERSION=$V
+          DEVIN_SHA256_ARM64=$SHA"
+              else
+                SHA=$(echo "$MANIFEST" | jq -r '.platforms["x86_64-unknown-linux"].sha256')
+                BUILD_ARGS="DEVIN_VERSION=$V
+          DEVIN_SHA256_AMD64=$SHA"
+              fi ;;
+            antigravity)
+              V=$(curl -fsSL --retry 3 https://api.github.com/repos/google-antigravity/antigravity-cli/releases/latest | jq -r .tag_name)
+              check_ver "$V"; REPORT="antigravity $V"
+              BUILD_ARGS="AGY_VERSION_OVERRIDE=$V
+          AGY_SHA256_AMD64=
+          AGY_SHA256_ARM64=" ;;
+            hermes)
+              # Resolve the release, dereference an annotated tag to its immutable
+              # commit, then pin both the install commit and the installer SHA so
+              # the Dockerfile's SHA check stays enabled.
+              RELEASE=$(github_api https://api.github.com/repos/NousResearch/hermes-agent/releases/latest)
+              TAG=$(echo "$RELEASE" | jq -r .tag_name)
+              REF=$(github_api "https://api.github.com/repos/NousResearch/hermes-agent/git/ref/tags/${TAG}")
+              REF_TYPE=$(echo "$REF" | jq -r .object.type)
+              COMMIT=$(echo "$REF" | jq -r .object.sha)
+              for _ in 1 2 3; do
+                [ "$REF_TYPE" = "tag" ] || break
+                REF=$(github_api "https://api.github.com/repos/NousResearch/hermes-agent/git/tags/${COMMIT}")
+                REF_TYPE=$(echo "$REF" | jq -r .object.type)
+                COMMIT=$(echo "$REF" | jq -r .object.sha)
+              done
+              [ "$REF_TYPE" = "commit" ] || { echo "::error::hermes $TAG did not resolve to a commit"; exit 1; }
+              echo "$COMMIT" | grep -qE '^[0-9a-f]{40}$' || { echo "::error::invalid hermes commit: $COMMIT"; exit 1; }
+              INSTALL_SHA=$(curl -fsSL --retry 3 \
+                "https://raw.githubusercontent.com/NousResearch/hermes-agent/${COMMIT}/scripts/install.sh" \
+                | sha256sum | cut -d' ' -f1)
+              echo "$INSTALL_SHA" | grep -qE '^[0-9a-f]{64}$' || { echo "::error::could not hash hermes installer"; exit 1; }
+              REPORT="hermes $TAG @ $COMMIT"
+              BUILD_ARGS="HERMES_INSTALL_COMMIT=$COMMIT
+          HERMES_INSTALL_SHA256=$INSTALL_SHA" ;;
+            *)
+              echo "::error::no resolver for variant $VARIANT"; exit 1 ;;
+          esac
+
+          echo "Resolved $VARIANT -> $REPORT"
+          echo "report=$REPORT" >> "$GITHUB_OUTPUT"
+          # The BUILD_ARGS literals above are indented for readability; strip any
+          # leading whitespace so each emitted line is a clean KEY=VALUE that
+          # build-push-action's build-args parser accepts. Drop blank lines too.
+          CLEAN_ARGS=$(printf '%s\n' "$BUILD_ARGS" | sed 's/^[[:space:]]*//' | grep -v '^$')
+          # Multi-line output for the build-args block.
+          {
+            echo "build_args<<__BUILD_ARGS_EOF__"
+            echo "$CLEAN_ARGS"
+            echo "__BUILD_ARGS_EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.package
+          target: ${{ matrix.variant }}
+          build-contexts: bins=bin
+          platforms: ${{ matrix.platform.os }}
+          build-args: ${{ steps.resolve.outputs.build_args }}
+          # Freshness lane: don't reuse the agent-CLI layer across days, or a
+          # cached layer would defeat the point. The compile stage's binaries
+          # are already built; this only rebuilds the thin CLI layer.
+          no-cache: true
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-digests-${{ matrix.variant }}-${{ matrix.platform.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Create the multi-arch manifest and apply the nightly tags per variant.
+  # ---------------------------------------------------------------------------
+  tag:
+    needs: [matrix, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJson(needs.matrix.outputs.variants) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: nightly-digests-${{ matrix.variant }}-*
+          merge-multiple: true
+
+      - name: Validate digest count
+        run: |
+          COUNT=$(ls -1 /tmp/digests/ | wc -l)
+          if [ "$COUNT" -ne 2 ]; then
+            echo "::error::Expected 2 digests (amd64 + arm64) for ${{ matrix.variant }}, got $COUNT"
+            exit 1
+          fi
+          for f in /tmp/digests/*; do
+            name=$(basename "$f")
+            echo "$name" | grep -qE '^[a-f0-9]{64}$' || { echo "::error::invalid digest: $name"; exit 1; }
+          done
+
+      - name: Create manifest and tag
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/${IMAGE_NAME}"
+          DATE=$(date -u +%Y%m%d)
+          MOVING="${IMAGE}:nightly-${VARIANT}"
+          IMMUTABLE="${IMAGE}:nightly-${DATE}-${GITHUB_RUN_ID}-${VARIANT}"
+          DIGESTS=$(printf "${IMAGE}@sha256:%s " $(ls /tmp/digests/))
+
+          docker buildx imagetools create -t "$MOVING" -t "$IMMUTABLE" ${DIGESTS}
+
+          {
+            echo "### 📦 nightly \`${VARIANT}\`"
+            echo
+            echo '```'
+            echo "$MOVING"
+            echo "$IMMUTABLE"
+            echo '```'
+            echo
+            echo "Drop-in image tracking the vendor's latest CLI. No compatibility guarantee."
+          } >> "$GITHUB_STEP_SUMMARY"

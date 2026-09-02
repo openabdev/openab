@@ -57,7 +57,7 @@ RUN ARCH=$(dpkg --print-architecture) && \
       SHA256="$KIRO_SHA256_AMD64"; \
     fi && \
     curl --proto '=https' --tlsv1.2 -sSf --retry 3 --retry-delay 5 "$URL" -o /tmp/kirocli.zip && \
-    echo "$SHA256  /tmp/kirocli.zip" | sha256sum -c - && \
+    { [ -z "$SHA256" ] || echo "$SHA256  /tmp/kirocli.zip" | sha256sum -c -; } && \
     unzip /tmp/kirocli.zip -d /tmp && \
     cp /tmp/kirocli/bin/* /usr/local/bin/ && \
     chmod +x /usr/local/bin/kiro-cli* && \
@@ -218,7 +218,7 @@ RUN set -eux; \
     esac; \
     curl -fsSL "https://storage.googleapis.com/grok-build-public-artifacts/cli/grok-${GROK_VERSION}-linux-${arch}" \
       -o /tmp/grok && \
-    echo "${sha}  /tmp/grok" | sha256sum -c - && \
+    { [ -z "$sha" ] || echo "${sha}  /tmp/grok" | sha256sum -c -; } && \
     install -m 0755 /tmp/grok /usr/local/bin/grok && \
     rm /tmp/grok
 ENV HOME=/home/agent
@@ -320,7 +320,7 @@ RUN set -eux; \
     esac; \
     curl -fsSL "https://static.devin.ai/cli/${DEVIN_VERSION}/devin-${DEVIN_VERSION}-${arch}.tar.gz" \
       -o /tmp/devin.tar.gz && \
-    echo "${sha}  /tmp/devin.tar.gz" | sha256sum -c - && \
+    { [ -z "$sha" ] || echo "${sha}  /tmp/devin.tar.gz" | sha256sum -c -; } && \
     tar xzf /tmp/devin.tar.gz -C /tmp && \
     install -m 0755 /tmp/bin/devin /usr/local/bin/devin && \
     rm -rf /tmp/devin* /tmp/bin /tmp/share
@@ -341,9 +341,14 @@ CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
 # =============================================================================
 FROM base-debian AS antigravity
 ENV AGY_VERSION=1.1.13
+# Nightly builds override the version without touching the pinned ENV above
+# (which the packaged-pin parity check asserts byte-for-byte). When empty, the
+# pinned AGY_VERSION is used; the nightly lane passes the resolved latest.
+ARG AGY_VERSION_OVERRIDE=
 ARG AGY_SHA256_AMD64=edc7c32b5ab4fc2e4da03381fee83ed566dea6b56b56f9329cd13cd77947a1d9
 ARG AGY_SHA256_ARM64=a9fdd2a386770c27dbf784436bd4de70d4d4901c832d5ec6abf27758d5c370f8
 RUN ARCH=$(dpkg --print-architecture) && \
+    AGY_VERSION="${AGY_VERSION_OVERRIDE:-$AGY_VERSION}" && \
     case "$ARCH" in \
       amd64) ASSET="agy_cli_linux_x64.tar.gz"; sha="${AGY_SHA256_AMD64}" ;; \
       arm64) ASSET="agy_cli_linux_arm64.tar.gz"; sha="${AGY_SHA256_ARM64}" ;; \
@@ -351,7 +356,7 @@ RUN ARCH=$(dpkg --print-architecture) && \
     esac && \
     curl -fsSL "https://github.com/google-antigravity/antigravity-cli/releases/download/${AGY_VERSION}/${ASSET}" \
       -o /tmp/agy.tar.gz && \
-    echo "${sha}  /tmp/agy.tar.gz" | sha256sum -c - && \
+    { [ -z "$sha" ] || echo "${sha}  /tmp/agy.tar.gz" | sha256sum -c -; } && \
     tar -xzf /tmp/agy.tar.gz -C /usr/local/bin && \
     rm /tmp/agy.tar.gz && \
     mv /usr/local/bin/antigravity /usr/local/bin/agy && \
