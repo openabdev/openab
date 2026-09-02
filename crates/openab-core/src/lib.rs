@@ -3,6 +3,8 @@ pub mod acp;
 pub mod acp_mcp;
 pub mod adapter;
 pub mod admission;
+pub mod agent_lease_heartbeat;
+pub mod agent_lease_heartbeat_compose;
 pub mod autonomous_ingress;
 pub mod bot_turns;
 pub mod completion_bridge;

@@ -1064,6 +1064,126 @@ async fn main() -> anyhow::Result<()> {
     // Shutdown signal for Slack adapter
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
+    // Phase 6.4.x — production composition for the OpenAB-native agent
+    // lease heartbeat producer. Built once at startup and injected into
+    // every per-platform Dispatcher so accepted native dispatches start
+    // a heartbeat task at the canonical seam.
+    //
+    // ## Single source of authority — Round 3 correction
+    //
+    // The heartbeat producer's URL and bearer credential MUST be
+    // derived from the canonical `[aap_control_plane]` config —
+    // the shared AAP Runtime **control-plane** transport authority.
+    // The optional `[agent_lease_heartbeat]` table only supplies
+    // cadence / retry / timeout overrides; it MUST NOT duplicate
+    // URL or credential authority.
+    //
+    // Round 2 wired the composer to `[autonomous_ingress]`, but
+    // `[autonomous_ingress]` is the A13 *human / direct ingress*
+    // routing authority (Tech-Lead Discord messages) — NOT the
+    // AAP scheduler control-plane authority. Every native daemon
+    // (``openab-claude`` / ``openab-codex`` / ``openab-gemini``)
+    // unconditionally builds ``RuntimeHandler::handle_agent_work``
+    // and accepts lease-bound ``agent.work`` regardless of whether
+    // `[autonomous_ingress]` is present. The prior composition
+    // rule therefore caused ``codex`` / ``gemini`` (no
+    // `[autonomous_ingress]`) to accept native work with no
+    // heartbeat producer — the exact production defect that
+    // motivates this module.
+    //
+    // ## Fail-closed rule
+    //
+    // ```text
+    // native work enabled = [aap_control_plane] is present
+    //                       AND enabled = true
+    // AND heartbeat cannot be derived (credential missing,
+    //                                cadence invalid, etc.)
+    // → FAIL CLOSED at startup
+    // ```
+    //
+    // The composition MUST NOT return ``Ok(None)`` while native
+    // work is enabled. A daemon that can accept native
+    // ``agent.work`` but cannot heartbeat is the exact defect that
+    // motivates this composition — the dispatcher would otherwise
+    // hold an AAP assignment without any lease-renewal relay.
+    // Native work disabled (``[aap_control_plane]`` absent OR
+    // ``enabled = false``) correctly composes to ``Disabled`` and
+    // the dispatcher's defense-in-depth seam in
+    // ``RuntimeHandler::handle_agent_work`` rejects any
+    // lease-bound ``agent.work`` that might arrive.
+    use openab_core::agent_lease_heartbeat::HeartbeatProducer;
+    use openab_core::agent_lease_heartbeat_compose::{
+        compose_production_heartbeat, HeartbeatComposeError, HeartbeatComposeOutcome,
+    };
+    let heartbeat_producer: Option<Arc<HeartbeatProducer>> = match compose_production_heartbeat(
+        cfg.aap_control_plane.as_ref(),
+        cfg.agent_lease_heartbeat.as_ref(),
+    ) {
+        Ok(HeartbeatComposeOutcome::Enabled(producer)) => {
+            info!(
+                event = "Phase 6.4.x OpenAB-native heartbeat producer wired into composition",
+                cadence_seconds = producer.config().heartbeat_interval_seconds,
+                retry_max = producer.config().retry_max,
+                aap_runtime_url = %producer.config().aap_runtime_url,
+                credential_source = "aap_control_plane",
+            );
+            Some(producer)
+        }
+        Ok(HeartbeatComposeOutcome::Disabled) => {
+            info!(
+                event = "Phase 6.4.x heartbeat producer correctly disabled",
+                reason = "native work not enabled for this daemon",
+            );
+            None
+        }
+        Err(HeartbeatComposeError::CredentialMissing { credential_env }) => {
+            error!(
+                event = "Phase 6.4.x heartbeat composition FAILED — credential missing",
+                credential_env = %credential_env,
+                "native work is enabled ([aap_control_plane] present with enabled=true) \
+                 but the AAP credential environment variable is missing or empty. \
+                 Refusing to start a dispatcher that could accept native `agent.work` \
+                 without a heartbeat producer — this is the production cause of \"Native \
+                 agent long-running execution causes AgentLease TTL expiry and duplicate \
+                 redispatch.\"",
+            );
+            return Err(anyhow::anyhow!(
+                "Phase 6.4.x startup error: native work enabled but heartbeat \
+                 credential env `{}` is missing or empty; refusing fail-open \
+                 startup.",
+                credential_env,
+            ));
+        }
+        Err(HeartbeatComposeError::CadenceTooLong {
+            cadence_seconds,
+            ttl_seconds,
+        }) => {
+            error!(
+                event = "Phase 6.4.x heartbeat composition FAILED — cadence too long",
+                cadence_seconds,
+                ttl_seconds,
+                "heartbeat cadence must be strictly less than the AAP lease TTL; \
+                 refuse to underprovision heartbeat which would reproduce the \
+                 duplicate-redispatch defect.",
+            );
+            return Err(anyhow::anyhow!(
+                "Phase 6.4.x startup error: heartbeat cadence {cadence_seconds}s is \
+                 not strictly less than the {ttl_seconds}s lease TTL.",
+            ));
+        }
+        Err(HeartbeatComposeError::ProducerBuildFailed) => {
+            error!(
+                event = "Phase 6.4.x heartbeat composition FAILED — producer build failed",
+                "HeartbeatProducer::build_production returned None for a non-credential \
+                 reason; this is a programming defect, not a deployable configuration.",
+            );
+            return Err(anyhow::anyhow!(
+                "Phase 6.4.x startup error: heartbeat producer build failed \
+                 despite a non-empty credential; investigate compose_production_heartbeat.",
+            ));
+        }
+    };
+
     let dispatchers: Arc<Mutex<Vec<Arc<dispatch::Dispatcher>>>> = Arc::new(Mutex::new(Vec::new()));
 
     // Spawn cleanup task
@@ -1262,7 +1382,12 @@ async fn main() -> anyhow::Result<()> {
                     // PlatformTrustConfigs into the ctl RuntimeHandler
                     // so the outbound `surface_allowed_for_outbound`
                     // gate can fail-closed on unlisted channels.
-                    .with_trust_configs(gateway_trust.clone()),
+                    .with_trust_configs(gateway_trust.clone())
+                    // Phase 6.4.x Round 3 — wire the same heartbeat
+                    // producer into the ctl RuntimeHandler so the
+                    // admission seam can fail-closed on lease-bound
+                    // agent.work when no producer is available.
+                    .with_heartbeat_producer(heartbeat_producer.clone()),
             )))
         }
     };
@@ -1323,13 +1448,16 @@ async fn main() -> anyhow::Result<()> {
             &slack_cfg.message_processing_mode,
             slack_cfg.max_buffered_messages,
         );
-        let slack_dispatcher = Arc::new(dispatch::Dispatcher::with_idle_timeout(
-            router.clone(),
-            slack_cap,
-            slack_cfg.max_batch_tokens,
-            slack_grouping,
-            slack_idle,
-        ));
+        let slack_dispatcher = Arc::new(
+            dispatch::Dispatcher::with_idle_timeout(
+                router.clone(),
+                slack_cap,
+                slack_cfg.max_batch_tokens,
+                slack_grouping,
+                slack_idle,
+            )
+            .with_heartbeat_producer(heartbeat_producer.clone()),
+        );
         dispatchers.lock().unwrap().push(slack_dispatcher.clone());
         let slack_allowed_users: std::collections::HashSet<String> =
             slack_cfg.allowed_users.into_iter().collect();
@@ -1375,13 +1503,16 @@ async fn main() -> anyhow::Result<()> {
             &gw_cfg.message_processing_mode,
             gw_cfg.max_buffered_messages,
         );
-        let gw_dispatcher = Arc::new(dispatch::Dispatcher::with_idle_timeout(
-            router.clone(),
-            gw_cap,
-            gw_cfg.max_batch_tokens,
-            gw_grouping,
-            gw_idle,
-        ));
+        let gw_dispatcher = Arc::new(
+            dispatch::Dispatcher::with_idle_timeout(
+                router.clone(),
+                gw_cap,
+                gw_cfg.max_batch_tokens,
+                gw_grouping,
+                gw_idle,
+            )
+            .with_heartbeat_producer(heartbeat_producer.clone()),
+        );
         dispatchers.lock().unwrap().push(gw_dispatcher.clone());
         let params = gateway::GatewayParams {
             url: gw_cfg.url,
@@ -1450,13 +1581,16 @@ async fn main() -> anyhow::Result<()> {
                 std::env::var("GATEWAY_LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".into());
 
             // Create a dedicated dispatcher for unified gateway events
-            let unified_dispatcher = Arc::new(dispatch::Dispatcher::with_idle_timeout(
-                router.clone(),
-                1,
-                24_000,
-                dispatch::BatchGrouping::Thread,
-                dispatch::PER_MESSAGE_CONSUMER_IDLE_TIMEOUT,
-            ));
+            let unified_dispatcher = Arc::new(
+                dispatch::Dispatcher::with_idle_timeout(
+                    router.clone(),
+                    1,
+                    24_000,
+                    dispatch::BatchGrouping::Thread,
+                    dispatch::PER_MESSAGE_CONSUMER_IDLE_TIMEOUT,
+                )
+                .with_heartbeat_producer(heartbeat_producer.clone()),
+            );
             dispatchers.lock().unwrap().push(unified_dispatcher.clone());
 
             // Bridge: reuse gateway crate's AppState + webhook handlers.
@@ -1953,13 +2087,16 @@ async fn main() -> anyhow::Result<()> {
             &discord_cfg.message_processing_mode,
             discord_cfg.max_buffered_messages,
         );
-        let discord_dispatcher = Arc::new(dispatch::Dispatcher::with_idle_timeout(
-            router.clone(),
-            discord_cap,
-            discord_cfg.max_batch_tokens,
-            discord_grouping,
-            discord_idle,
-        ));
+        let discord_dispatcher = Arc::new(
+            dispatch::Dispatcher::with_idle_timeout(
+                router.clone(),
+                discord_cap,
+                discord_cfg.max_batch_tokens,
+                discord_grouping,
+                discord_idle,
+            )
+            .with_heartbeat_producer(heartbeat_producer.clone()),
+        );
         #[cfg(unix)]
         if discord_admission_handle
             .install(Arc::new(

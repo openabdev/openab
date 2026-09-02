@@ -22,6 +22,7 @@ use crate::workflow::identity::AgentIdentity;
 use crate::acp::ContentBlock;
 use crate::acp::ProjectContext;
 use crate::adapter::{AdapterRouter, ChannelRef, ChatAdapter, MessageRef};
+use crate::agent_lease_heartbeat::{HeartbeatHandle, HeartbeatProducer};
 use crate::config::ReactionsConfig;
 use crate::error_display::format_user_error;
 use crate::reactions::StatusReactionController;
@@ -394,6 +395,16 @@ pub struct Dispatcher {
     max_batch_tokens: usize,
     grouping: BatchGrouping,
     idle_timeout: Duration,
+    /// Phase 6.4.x — OpenAB-native agent lease heartbeat producer.
+    /// ``None`` keeps the legacy behavior (no heartbeat, AAP TTL
+    /// recovery is the only lease lifetime authority). When set,
+    /// the dispatcher starts a heartbeat task at the "native
+    /// dispatch turn starting" boundary for every accepted
+    /// native dispatch and stops it at every terminal path
+    /// (completion / failure / cancellation) so a finished turn
+    /// cannot keep the lease alive past the scheduler's reclaim
+    /// window.
+    heartbeat_producer: Option<Arc<HeartbeatProducer>>,
 }
 
 impl Dispatcher {
@@ -415,7 +426,29 @@ impl Dispatcher {
             max_batch_tokens,
             grouping,
             idle_timeout,
+            heartbeat_producer: None,
         }
+    }
+
+    /// Attach a heartbeat producer. Production wiring calls this
+    /// once at composition time when the AAP runtime URL +
+    /// credential are both present. The dispatcher drops the
+    /// reference if ``producer`` is ``None`` (legacy behavior).
+    pub fn with_heartbeat_producer(mut self, producer: Option<Arc<HeartbeatProducer>>) -> Self {
+        self.heartbeat_producer = producer;
+        self
+    }
+
+    /// Phase 6.4.x — start a heartbeat for a native dispatch.
+    /// ``None`` producer → no-op (legacy behavior).
+    #[allow(dead_code)]
+    fn start_native_heartbeat(
+        &self,
+        metadata: &crate::admission::NativeWorkflowMetadata,
+    ) -> Option<HeartbeatHandle> {
+        self.heartbeat_producer
+            .as_ref()
+            .map(|producer| producer.start(metadata))
     }
 
     /// Narrow test-only ownership proof: the dispatcher must retain the exact
@@ -502,6 +535,7 @@ impl Dispatcher {
                     thread_channel.clone(),
                     rx,
                     Arc::clone(&target),
+                    self.heartbeat_producer.clone(),
                     Arc::clone(&adapter),
                     cap,
                     max_tokens,
@@ -546,6 +580,7 @@ impl Dispatcher {
                         thread_channel.clone(),
                         rx,
                         Arc::clone(&target),
+                        self.heartbeat_producer.clone(),
                         Arc::clone(&adapter),
                         cap,
                         max_tokens,
@@ -684,6 +719,7 @@ async fn consumer_loop(
     thread_channel: ChannelRef,
     mut rx: tokio::sync::mpsc::Receiver<BufferedMessage>,
     target: Arc<dyn DispatchTarget>,
+    heartbeat_producer: Option<Arc<HeartbeatProducer>>,
     adapter: Arc<dyn ChatAdapter>,
     max_batch: usize,
     max_tokens: usize,
@@ -779,6 +815,7 @@ async fn consumer_loop(
             &thread_key,
             &thread_channel,
             &target,
+            heartbeat_producer.as_ref(),
             &adapter,
             batch,
             bot_present,
@@ -923,6 +960,7 @@ async fn dispatch_batch(
     thread_key: &str,
     thread_channel: &ChannelRef,
     target: &Arc<dyn DispatchTarget>,
+    heartbeat_producer: Option<&Arc<HeartbeatProducer>>,
     adapter: &Arc<dyn ChatAdapter>,
     batch: Vec<BufferedMessage>,
     other_bot_present: bool,
@@ -1010,6 +1048,17 @@ async fn dispatch_batch(
     // every observation site. No prompt / raw assistant text / credentials
     // are logged here — the goal is diagnostic correlation, not payload
     // capture.
+    //
+    // Phase 6.4.x — start the OpenAB-native agent lease heartbeat
+    // task at the "accepted native dispatch" boundary so a
+    // long-running turn does not let AAP's ``expire_stale`` sweep
+    // reclaim the lease mid-execution and trigger a duplicate
+    // redispatch. The handle is dropped into
+    // ``native_heartbeat_handle`` and stopped at every terminal
+    // path below (completion / failure / cancellation) so a
+    // finished turn cannot keep the lease alive past the
+    // scheduler's reclaim window.
+    let mut native_heartbeat_handle: Option<HeartbeatHandle> = None;
     if let Some(metadata) = native_workflow.as_ref() {
         info!(
             workflow_run_id   = %metadata.workflow_run_id,
@@ -1018,6 +1067,7 @@ async fn dispatch_batch(
             role              = %metadata.role,
             "native dispatch turn starting"
         );
+        native_heartbeat_handle = heartbeat_producer.map(|producer| producer.start(metadata));
     }
 
     // Anchor reactions on the last message in the batch (before consuming).
@@ -1431,6 +1481,19 @@ async fn dispatch_batch(
                 );
             }
         }
+    }
+
+    // Phase 6.4.x — stop the heartbeat at every terminal path
+    // (Ok(Some(hook)), Ok(None), and Err). The canonical
+    // completion flow drives ``AgentLeaseService.release`` on the
+    // AAP side independently of this stop; we only need the
+    // heartbeat to fall silent so a finished turn cannot keep the
+    // lease alive past the scheduler's reclaim window. We
+    // ``take`` the handle so the subsequent ``Drop`` impl does
+    // not redundantly signal stop after ``await`` returns — the
+    // task is already joined.
+    if let Some(handle) = native_heartbeat_handle.take() {
+        handle.stop().await;
     }
 
     // In assistant status mode, all status is conveyed via
@@ -2493,6 +2556,7 @@ mod tests {
             make_channel("T"),
             rx,
             target,
+            None,
             adapter,
             max_batch,
             max_tokens,
@@ -2856,6 +2920,7 @@ mod tests {
             },
             rx,
             target,
+            None,
             adapter,
             10,
             24_000,
@@ -2894,6 +2959,7 @@ mod tests {
             make_channel("T"),
             rx,
             target,
+            None,
             adapter,
             10,
             24_000,
@@ -3400,6 +3466,7 @@ mod tests {
                 make_channel("T"),
                 rx,
                 mock_inner,
+                None,
                 adapter_inner,
                 10,
                 24_000,
@@ -3457,6 +3524,7 @@ mod tests {
                 make_channel("T"),
                 rx,
                 mock_inner,
+                None,
                 adapter_inner,
                 10,
                 24_000,
@@ -3506,6 +3574,7 @@ mod tests {
                 make_channel("T"),
                 rx,
                 mock_inner,
+                None,
                 adapter_inner,
                 10,
                 24_000,
@@ -3556,6 +3625,7 @@ mod tests {
                 make_channel("T"),
                 rx,
                 mock_inner,
+                None,
                 adapter_inner,
                 10,
                 24_000,
@@ -3880,6 +3950,7 @@ mod tests {
             make_channel("T"),
             rx,
             target,
+            None,
             adapter,
             10,
             24_000,
@@ -4117,6 +4188,7 @@ mod tests {
             make_channel("T"),
             rx,
             target,
+            None,
             adapter,
             1,
             100,

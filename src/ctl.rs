@@ -575,6 +575,39 @@ pub fn spawn_server(handler: std::sync::Arc<dyn CtlHandler>) -> tokio::task::Joi
     spawn_server_at(socket_path(), handler)
 }
 
+/// Phase 6.4.x Round 3 — defense-in-depth heartbeat availability
+/// shared by ``RuntimeHandler`` instances.
+///
+/// ``Some(producer)`` enables lease-bound ``agent.work``
+/// admission. ``None`` makes the canonical ``handle_agent_work``
+/// admission seam reject with ``HEARTBEAT_UNAVAILABLE`` so the
+/// dispatcher never accepts native execution it cannot heartbeat.
+///
+/// Wrapped in ``Arc`` so future ``clone()`` of the handler
+/// shares the same authority — the production invariant
+/// `accept + execute + no heartbeat` MUST NEVER happen.
+#[cfg(unix)]
+#[derive(Default)]
+struct HeartbeatAvailability {
+    inner: std::sync::Mutex<Option<Arc<openab_core::agent_lease_heartbeat::HeartbeatProducer>>>,
+}
+
+#[cfg(unix)]
+impl HeartbeatAvailability {
+    fn new(producer: Option<Arc<openab_core::agent_lease_heartbeat::HeartbeatProducer>>) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(producer),
+        }
+    }
+
+    /// ``true`` iff a heartbeat producer is wired. The canonical
+    /// ``handle_agent_work`` admission seam consults this and
+    /// rejects when ``false``.
+    fn is_available(&self) -> bool {
+        self.inner.lock().unwrap().is_some()
+    }
+}
+
 /// Start the control socket server at a specific path.
 #[cfg(unix)]
 pub fn spawn_server_at(
@@ -739,6 +772,23 @@ pub struct RuntimeHandler {
     /// `PlatformTrustConfigs::default()` so legacy tests that do not
     /// opt in behave identically (L2 open, all channels allowed).
     trust_configs: Arc<openab_core::trust::PlatformTrustConfigs>,
+    /// Phase 6.4.x Round 3 — defense-in-depth heartbeat availability.
+    ///
+    /// `None` means the dispatcher has no heartbeat producer
+    /// wired; the canonical ``handle_agent_work`` admission seam
+    /// MUST then reject lease-bound `agent.work` so the daemon
+    /// cannot accept native execution it cannot heartbeat.
+    ///
+    /// Startup composition is the primary fail-closed layer
+    /// (``compose_production_heartbeat`` aborts when
+    /// `[aap_control_plane]` is enabled but the producer cannot
+    /// be derived); this field is the **backstop** for the
+    /// production invariant
+    /// `accept + execute + no heartbeat` MUST NEVER happen.
+    ///
+    /// Ordinary ACP admission is unaffected by this field — only
+    /// the lease-bound `agent.work` path consults it.
+    heartbeat_availability: Arc<HeartbeatAvailability>,
 }
 
 #[cfg(unix)]
@@ -760,6 +810,7 @@ impl RuntimeHandler {
                 order: VecDeque::new(),
             })),
             trust_configs: Arc::new(openab_core::trust::PlatformTrustConfigs::new()),
+            heartbeat_availability: Arc::new(HeartbeatAvailability::default()),
         }
     }
 
@@ -798,6 +849,27 @@ impl RuntimeHandler {
         trust_configs: Arc<openab_core::trust::PlatformTrustConfigs>,
     ) -> Self {
         self.trust_configs = trust_configs;
+        self
+    }
+
+    /// Phase 6.4.x Round 3 — defense-in-depth heartbeat wiring.
+    ///
+    /// ``Some(producer)`` enables the canonical ``agent.work``
+    /// admission path; ``None`` tells ``handle_agent_work`` to
+    /// reject any lease-bound ``agent.work`` that arrives (the
+    /// production invariant
+    /// `accept + execute + no heartbeat` MUST NEVER happen).
+    ///
+    /// Wired by `src/main.rs` from the same
+    /// ``compose_production_heartbeat`` outcome that
+    /// ``Dispatcher::with_heartbeat_producer`` consumes, so the
+    /// admission backstop and the dispatcher's per-turn heartbeat
+    /// task are derived from one source.
+    pub fn with_heartbeat_producer(
+        mut self,
+        producer: Option<Arc<openab_core::agent_lease_heartbeat::HeartbeatProducer>>,
+    ) -> Self {
+        self.heartbeat_availability = Arc::new(HeartbeatAvailability::new(producer));
         self
     }
 
@@ -1325,6 +1397,25 @@ impl CtlHandler for RuntimeHandler {
         let error = validate_agent_work(request);
         if let Some(reason) = error {
             return agent_work_error("INVALID_AGENT_WORK_REQUEST", reason);
+        }
+        // Phase 6.4.x Round 3 — defense-in-depth heartbeat
+        // admission. The canonical ``handle_agent_work`` seam
+        // rejects any lease-bound ``agent.work`` when the
+        // dispatcher was constructed without a heartbeat
+        // producer. Startup composition is the primary
+        // fail-closed layer; this check is the **backstop** so
+        // the production invariant
+        // `accept + execute + no heartbeat` can never be
+        // reproduced by a legacy or misconfigured daemon.
+        //
+        // Ordinary ACP admission is unaffected — only the
+        // lease-bound ``agent.work`` path consults
+        // ``heartbeat_availability``.
+        if !self.heartbeat_availability.is_available() {
+            return agent_work_error(
+                "HEARTBEAT_UNAVAILABLE",
+                "lease-bound agent.work rejected: no heartbeat producer wired",
+            );
         }
         let key = format!(
             "{}:{}:{}",
@@ -1949,7 +2040,58 @@ mod tests {
         // fixtures exercise). Production code paths always use
         // ``with_trust_configs(...)`` (see ``main.rs``) and are
         // unaffected.
-        native_work_handler_with_trust(admission, Some(trust_allowing_all_for("discord")))
+        //
+        // Phase 6.4.x Round 3 — wire a fake heartbeat producer so the
+        // legacy fixtures still pass the new ``HEARTBEAT_UNAVAILABLE``
+        // defense-in-depth admission seam. The producer's transport
+        // is a no-op; only ``is_available()`` matters here.
+        let mut handler =
+            native_work_handler_with_trust(admission, Some(trust_allowing_all_for("discord")));
+        handler =
+            handler.with_heartbeat_producer(Some(Arc::new(fake_heartbeat_producer_for_tests())));
+        handler
+    }
+
+    /// Test-only `HeartbeatProducer` whose transport is irrelevant —
+    /// the tests just need ``is_available() == true`` so the
+    /// ``HEARTBEAT_UNAVAILABLE`` admission seam does NOT reject the
+    /// fixture. No HTTP call ever leaves this producer under the
+    /// legacy fixtures because the dispatcher is a
+    /// ``RecordingAdapter`` and the heartbeat path only fires from a
+    /// real per-platform ``Dispatcher::submit`` flow, which the ctl
+    /// admission seam never starts.
+    fn fake_heartbeat_producer_for_tests() -> openab_core::agent_lease_heartbeat::HeartbeatProducer
+    {
+        use openab_core::agent_lease_heartbeat::{HeartbeatProducer, ResolvedHeartbeatConfig};
+        struct NoopHeartbeatTransport;
+        #[async_trait::async_trait]
+        impl openab_core::agent_lease_heartbeat::AgentLeaseHeartbeatTransport for NoopHeartbeatTransport {
+            async fn post_json(
+                &self,
+                _url: String,
+                _bearer_token: String,
+                _timeout: std::time::Duration,
+                _body: String,
+            ) -> Result<(u16, String), openab_core::agent_lease_heartbeat::AgentLeaseHeartbeatError>
+            {
+                Ok((
+                    200,
+                    r#"{"disposition":"ACCEPTED","reason":"RENEWED"}"#.into(),
+                ))
+            }
+        }
+        HeartbeatProducer::new(
+            ResolvedHeartbeatConfig {
+                aap_runtime_url: "http://127.0.0.1:8000".into(),
+                bearer_token: "ctl-test-fixture-token".into(),
+                heartbeat_interval_seconds: 60,
+                request_timeout_seconds: 5,
+                retry_max: 0,
+                retry_backoff_ms: 1,
+                ttl_seconds: None,
+            },
+            Arc::new(NoopHeartbeatTransport),
+        )
     }
 
     /// Phase 6.4.1D — extended test helper that lets a test inject a
@@ -1968,6 +2110,15 @@ mod tests {
             Arc::new(std::sync::OnceLock::new()),
         )
         .with_admission(admission)
+        // Phase 6.4.x Round 3 — defense-in-depth: every test that
+        // exercises the lease-bound `handle_agent_work` admission
+        // seam needs a heartbeat producer wired or the new
+        // `HEARTBEAT_UNAVAILABLE` rejection fires first. The fake
+        // producer's transport is a no-op; only `is_available()`
+        // matters. Real heartbeat firing is NOT exercised here —
+        // ctl admission tests never start a per-platform
+        // `Dispatcher::submit` flow.
+        .with_heartbeat_producer(Some(Arc::new(fake_heartbeat_producer_for_tests())))
         .with_native_delivery_target(ChannelRef {
             platform: "discord".into(),
             channel_id: "1539923659345502208".into(),
@@ -2002,6 +2153,117 @@ mod tests {
         assert_eq!(ack["role"], request.role);
         assert_eq!(ack["conversation_key"], request.conversation_key);
         assert_eq!(ack["admission_id"], "admission-1");
+    }
+
+    // ── Phase 6.4.x Round 3 — heartbeat defense-in-depth admission ─────
+
+    /// Round 3 invariant: lease-bound ``agent.work`` MUST be
+    /// rejected at the admission seam (``HEARTBEAT_UNAVAILABLE``)
+    /// when the dispatcher is constructed without a heartbeat
+    /// producer, so ``accept + execute + no heartbeat`` can never
+    /// be reproduced by a legacy or misconfigured daemon.
+    #[tokio::test]
+    async fn ctl_lease_bound_agent_work_rejected_when_no_heartbeat_producer() {
+        let admission = Arc::new(RecordingAdmissionPort::new("admission-no-hb"));
+        // Build a handler WITHOUT a heartbeat producer — production
+        // invariant: accept + execute + no heartbeat MUST NEVER
+        // happen. We must NOT use ``native_work_handler_with_trust``
+        // here because that helper deliberately wires the fake
+        // heartbeat producer so the legacy trust / outbound fixtures
+        // can pass the defense-in-depth seam under test.
+        let adapter: Arc<dyn ChatAdapter> = Arc::new(RecordingAdapter::default());
+        let handler = RuntimeHandler::new(
+            HashMap::from([("discord".into(), adapter)]),
+            Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            Arc::new(std::sync::OnceLock::new()),
+        )
+        .with_admission(admission.clone())
+        .with_trust_configs(trust_allowing_all_for("discord"))
+        .with_native_delivery_target(ChannelRef {
+            platform: "discord".into(),
+            channel_id: "1539923659345502208".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: None,
+        });
+        let request = native_work_request();
+
+        let response = handler.handle_agent_work(Some(&request)).await;
+
+        assert!(!response.ok, "must reject: {response:?}");
+        assert!(
+            response.message.contains("HEARTBEAT_UNAVAILABLE"),
+            "expected HEARTBEAT_UNAVAILABLE error code; got {}",
+            response.message
+        );
+        // Admission port was NEVER consulted — the rejection
+        // happens at the defense-in-depth seam before any work is
+        // admitted.
+        assert_eq!(
+            admission.calls(),
+            0,
+            "rejected dispatch MUST NOT consult admission port"
+        );
+    }
+
+    /// Round 3 invariant: a daemon wired with a heartbeat
+    /// producer accepts lease-bound ``agent.work`` exactly as
+    /// before. The defense-in-depth seam is permissive when the
+    /// producer is available.
+    #[tokio::test]
+    async fn ctl_lease_bound_agent_work_admitted_when_heartbeat_producer_present() {
+        let admission = Arc::new(RecordingAdmissionPort::new("admission-hb-ok"));
+        let mut handler = native_work_handler_with_trust(
+            admission.clone(),
+            Some(trust_allowing_all_for("discord")),
+        );
+        handler =
+            handler.with_heartbeat_producer(Some(Arc::new(fake_heartbeat_producer_for_tests())));
+        let request = native_work_request();
+
+        let response = handler.handle_agent_work(Some(&request)).await;
+
+        assert!(response.ok, "must accept with producer: {response:?}");
+        assert_eq!(response.message, "WORK_ACCEPTED");
+        assert_eq!(admission.calls(), 1);
+    }
+
+    /// Round 3 invariant: ordinary ACP admission is unaffected by
+    /// the heartbeat defense-in-depth seam. The seam only
+    /// consults the heartbeat availability on the
+    /// ``handle_agent_work`` path; the legacy
+    /// ``handle_set`` / ``handle_get`` / ``handle_thread_*``
+    /// paths MUST remain operational when no heartbeat producer
+    /// is wired.
+    #[tokio::test]
+    async fn ctl_ordinary_acp_admission_unaffected_by_heartbeat_availability() {
+        let admission = Arc::new(RecordingAdmissionPort::new("admission-acp"));
+        // No heartbeat producer — but the test exercises an
+        // ordinary ACP-style `handle_set` call, NOT
+        // `handle_agent_work`. The legacy path MUST remain
+        // operational.
+        let handler = native_work_handler_with_trust(
+            admission.clone(),
+            Some(trust_allowing_all_for("discord")),
+        );
+        let response = handler
+            .handle_set(
+                Some("1539923659345502208"),
+                "thread.message",
+                "test body",
+                Some("1536733602304499852"),
+                None,
+            )
+            .await;
+        assert!(
+            response.ok,
+            "ordinary ACP MUST remain operational without a heartbeat producer: {response:?}"
+        );
+        assert_eq!(
+            admission.calls(),
+            0,
+            "ordinary ACP MUST NOT consult the agent.work admission port"
+        );
     }
 
     // ── Phase 6.2.9 native ACP session isolation tests ───────────────────────

@@ -279,6 +279,54 @@ pub struct Config {
     /// See [`AutonomousIngressConfig`].
     #[serde(default)]
     pub autonomous_ingress: Option<AutonomousIngressConfig>,
+    /// Phase 6.4.x — OpenAB-native agent lease heartbeat producer.
+    /// Absent = heartbeat is disabled; AAP's ``expire_stale``
+    /// sweep is the only lease lifetime authority (legacy
+    /// behavior). When present, the dispatcher spawns a
+    /// periodic heartbeat task for every accepted native
+    /// dispatch and stops it at every terminal path
+    /// (completion / failure / cancellation). The heartbeat
+    /// re-presents the same authoritative dispatch metadata
+    /// AAP minted at claim time so the runtime scheduler's
+    /// ``expire_stale`` sweep does not reclaim a still-live
+    /// lease (production defect: "Native agent long-running
+    /// execution causes AgentLease TTL expiry and duplicate
+    /// redispatch"). See [`AgentLeaseHeartbeatConfig`].
+    #[serde(default)]
+    pub agent_lease_heartbeat: Option<AgentLeaseHeartbeatConfig>,
+    /// Phase 6.4.x — Shared AAP Runtime **control-plane**
+    /// transport authority (`[aap_control_plane]` table).
+    ///
+    /// This is the **single canonical source** for the
+    /// heartbeat producer's URL / credential authority. It is
+    /// deliberately distinct from [`Self::autonomous_ingress`]:
+    ///
+    /// * ``autonomous_ingress`` is the **human / direct
+    ///   ingress** A13 routing decision — whether a Tech-Lead
+    ///   Discord message to a declared agent routes to AAP
+    ///   Runtime BEFORE ordinary ACP. It is independent of
+    ///   whether the daemon accepts lease-bound ``agent.work``
+    ///   from the AAP scheduler control plane.
+    /// * ``aap_control_plane`` is the **scheduler control-plane**
+    ///   authority — the URL / credential the daemon uses to
+    ///   keep the AAP lease warm while a long-running native
+    ///   turn is in flight. Every production daemon
+    ///   (``openab-claude`` / ``openab-codex`` / ``openab-gemini``)
+    ///   builds with ``RuntimeHandler::handle_agent_work`` and
+    ///   therefore MUST have heartbeat authority; absence of
+    ///   this section is itself the production defect (the
+    ///   daemon accepts ``agent.work`` but cannot heartbeat,
+    ///   so the lease silently expires after 300s and the
+    ///   scheduler redispatches as a fresh generation while
+    ///   the original worker is still producing).
+    ///
+    /// Presence of this section is the **native-work
+    /// capability signal** for the heartbeat composer;
+    /// ``enabled = false`` opts the daemon out of accepting
+    /// lease-bound ``agent.work`` (ordinary ACP-only mode).
+    /// See [`AapControlPlaneConfig`].
+    #[serde(default)]
+    pub aap_control_plane: Option<AapControlPlaneConfig>,
     #[serde(default)]
     pub secrets: SecretsConfig,
     #[serde(default)]
@@ -446,6 +494,195 @@ impl AutonomousIngressConfig {
         self.aap_agents.iter().any(|name| name == agent)
     }
 
+    /// Resolve the Runtime credential from the configured env var.
+    /// Missing or empty credential fails closed at the caller.
+    pub fn resolve_credential(&self) -> Option<String> {
+        std::env::var(&self.aap_credential_env)
+            .ok()
+            .filter(|v| !v.is_empty())
+    }
+}
+
+/// Phase 6.4.x — OpenAB-native agent lease heartbeat producer
+/// configuration. The producer mirrors
+/// [`AutonomousIngressConfig`] so the same `aap_runtime_url` /
+/// bearer credential triple covers both the ingress routing and
+/// the heartbeat relay — the producer does NOT introduce a
+/// parallel authority surface.
+///
+/// Cadence MUST be strictly shorter than AAP's
+/// `DEFAULT_LEASE_TTL_SECONDS` (300s); the spec narrows the
+/// band to 60–100s so a transient network blip cannot let the
+/// lease expire between two heartbeats.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentLeaseHeartbeatConfig {
+    /// HTTP base URL of the AAP Runtime. The producer calls
+    /// `{aap_runtime_url}/v1/integrations/openab/agent/heartbeat`.
+    #[serde(default = "default_heartbeat_runtime_url")]
+    pub aap_runtime_url: String,
+    /// Bearer credential sent as `Authorization: Bearer <token>`.
+    /// The actual value is read at producer-construction time
+    /// from this environment variable name. A missing or empty
+    /// env var disables the heartbeat producer (the
+    /// `Option<...>` field on `Config` is the parse-time
+    /// presence signal; the credential resolution is the
+    /// runtime signal).
+    #[serde(default = "default_heartbeat_credential_env")]
+    pub aap_credential_env: String,
+    /// Cadence in seconds at which the producer re-presents the
+    /// dispatch metadata. Default 80 (mid of the 60–100s band).
+    #[serde(default = "default_heartbeat_interval_seconds")]
+    pub heartbeat_interval_seconds: u64,
+    /// Per-request HTTP timeout for one heartbeat POST in
+    /// seconds. Default 5.
+    #[serde(default = "default_heartbeat_request_timeout_seconds")]
+    pub request_timeout_seconds: u64,
+    /// Maximum number of retry attempts per tick when the
+    /// transport fails or AAP returns 5xx. Default 3.
+    #[serde(default = "default_heartbeat_retry_max")]
+    pub retry_max: u32,
+    /// Initial backoff in milliseconds between retry attempts
+    /// on the same tick; doubled per attempt. Default 250ms.
+    #[serde(default = "default_heartbeat_retry_backoff_ms")]
+    pub retry_backoff_ms: u64,
+    /// Optional TTL override forwarded to AAP on every
+    /// heartbeat. `None` lets AAP use its canonical
+    /// `DEFAULT_LEASE_TTL_SECONDS` (300s).
+    #[serde(default)]
+    pub ttl_seconds: Option<u64>,
+}
+
+fn default_heartbeat_runtime_url() -> String {
+    "http://127.0.0.1:8000".to_string()
+}
+
+fn default_heartbeat_credential_env() -> String {
+    "ARTHUR_AGENT_KEY_OPENAB".to_string()
+}
+
+fn default_heartbeat_interval_seconds() -> u64 {
+    80
+}
+
+fn default_heartbeat_request_timeout_seconds() -> u64 {
+    5
+}
+
+fn default_heartbeat_retry_max() -> u32 {
+    3
+}
+
+fn default_heartbeat_retry_backoff_ms() -> u64 {
+    250
+}
+
+impl AgentLeaseHeartbeatConfig {
+    /// Resolve the Runtime credential from the configured env var.
+    /// Missing or empty credential fails closed at the caller —
+    /// the production composer must treat ``None`` as
+    /// "heartbeat disabled, AAP TTL recovery is the only lease
+    /// lifetime authority".
+    pub fn resolve_credential(&self) -> Option<String> {
+        std::env::var(&self.aap_credential_env)
+            .ok()
+            .filter(|v| !v.is_empty())
+    }
+}
+
+/// Phase 6.4.x — Shared AAP Runtime **control-plane** transport
+/// authority (`[aap_control_plane]` table).
+///
+/// This is the canonical authority for the heartbeat
+/// producer's URL / credential. It is **separate** from
+/// [`AutonomousIngressConfig`] because the two surfaces have
+/// different semantics:
+///
+/// * ``autonomous_ingress`` gates the A13 *human / direct
+///   ingress* routing decision (Discord messages addressed to
+///   a declared agent). The presence or absence of that
+///   section tells the A13 gate whether to consult AAP
+///   Runtime BEFORE ordinary ACP for a human message.
+/// * ``aap_control_plane`` is the **scheduler control-plane**
+///   transport that the daemon uses to keep an AAP lease warm
+///   while native execution is in flight. The RuntimeHandler
+///   ``handle_agent_work`` admission seam accepts lease-bound
+///   ``agent.work`` whenever the daemon binary is built; this
+///   section is the canonical authority for whether heartbeat
+///   is **available** for that work.
+///
+/// ## Production invariant
+///
+/// ```text
+/// for every daemon that accepts AAP lease-bound agent.work:
+///     heartbeat producer is available OR agent.work is rejected
+/// ```
+///
+/// This invariant is enforced at TWO layers:
+/// 1. **Startup composition** — `compose_production_heartbeat`
+///    fails closed if the section is present but the credential
+///    resolves empty or cadence is invalid.
+/// 2. **Admission defense-in-depth** —
+///    ``RuntimeHandler::handle_agent_work`` rejects lease-bound
+///    ``agent.work`` if the producer is unavailable, even when
+///    startup composition somehow let a daemon past with no
+///    producer (e.g. legacy configuration). Ordinary ACP
+///    admission is unaffected.
+///
+/// ## Deployed defaults
+///
+/// All three production daemons (``openab-claude``,
+/// ``openab-codex``, ``openab-gemini``) accept lease-bound
+/// ``agent.work``. They all share the canonical
+/// ``http://127.0.0.1:8000`` AAP Runtime URL and read the
+/// bearer credential from the shared
+/// ``ARTHUR_AGENT_KEY_OPENAB`` environment variable — which
+/// each daemon's systemd ``EnvironmentFile`` already exports.
+/// Adding this section (or relying on its defaults) is
+/// therefore sufficient to enable the heartbeat producer for
+/// every native daemon without parallel per-daemon URL /
+/// credential configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AapControlPlaneConfig {
+    /// HTTP base URL for the AAP Runtime control-plane
+    /// transport. The heartbeat producer POSTs to
+    /// ``{aap_runtime_url}/v1/integrations/openab/agent/heartbeat``;
+    /// the AAP ``autonomous_ingress`` and ``completion`` flows
+    /// also use this URL. Default ``http://127.0.0.1:8000``.
+    #[serde(default = "default_aap_control_plane_url")]
+    pub aap_runtime_url: String,
+
+    /// Environment variable name holding the AAP Runtime bearer
+    /// credential. Default ``ARTHUR_AGENT_KEY_OPENAB`` —
+    /// matches the credential used by the
+    /// ``[autonomous_ingress]`` path and the
+    /// ``HttpNativeCompletionPort`` so a single env var covers
+    /// every AAP-bound transport on the host.
+    #[serde(default = "default_aap_control_plane_credential_env")]
+    pub aap_credential_env: String,
+
+    /// Opt-in signal: ``true`` (default) means this daemon
+    /// accepts lease-bound AAP ``agent.work`` and therefore
+    /// requires a heartbeat producer. ``false`` makes the
+    /// heartbeat composer resolve to ``Disabled`` and tells the
+    /// defense-in-depth admission seam to reject lease-bound
+    /// ``agent.work`` so the daemon stays ACP-only.
+    #[serde(default = "default_aap_control_plane_enabled")]
+    pub enabled: bool,
+}
+
+fn default_aap_control_plane_url() -> String {
+    "http://127.0.0.1:8000".to_string()
+}
+
+fn default_aap_control_plane_credential_env() -> String {
+    "ARTHUR_AGENT_KEY_OPENAB".to_string()
+}
+
+fn default_aap_control_plane_enabled() -> bool {
+    true
+}
+
+impl AapControlPlaneConfig {
     /// Resolve the Runtime credential from the configured env var.
     /// Missing or empty credential fails closed at the caller.
     pub fn resolve_credential(&self) -> Option<String> {
@@ -3600,6 +3837,56 @@ command = "echo"
         assert_eq!(cfg.agent.command, "echo");
         assert_eq!(cfg.pool.max_sessions, 10);
         assert!(cfg.reactions.enabled);
+    }
+
+    // ── Phase 6.4.x Round 3 — `[aap_control_plane]` config ────────────
+
+    #[test]
+    fn parse_aap_control_plane_section_with_defaults() {
+        let cfg = parse_config(
+            r#"
+[discord]
+bot_token = "x"
+
+[aap_control_plane]
+"#,
+            "test",
+        )
+        .unwrap();
+        let aap_cp = cfg.aap_control_plane.expect("section must parse");
+        assert_eq!(aap_cp.aap_runtime_url, "http://127.0.0.1:8000");
+        assert_eq!(aap_cp.aap_credential_env, "ARTHUR_AGENT_KEY_OPENAB");
+        assert!(aap_cp.enabled, "default enabled must be true");
+    }
+
+    #[test]
+    fn parse_aap_control_plane_section_with_explicit_values() {
+        let cfg = parse_config(
+            r#"
+[discord]
+bot_token = "x"
+
+[aap_control_plane]
+aap_runtime_url = "http://10.0.0.1:9999"
+aap_credential_env = "OPENAB_KEY_QQQ"
+enabled = false
+"#,
+            "test",
+        )
+        .unwrap();
+        let aap_cp = cfg.aap_control_plane.expect("section must parse");
+        assert_eq!(aap_cp.aap_runtime_url, "http://10.0.0.1:9999");
+        assert_eq!(aap_cp.aap_credential_env, "OPENAB_KEY_QQQ");
+        assert!(!aap_cp.enabled, "explicit enabled=false must round-trip");
+    }
+
+    #[test]
+    fn parse_aap_control_plane_absent_is_none() {
+        let cfg = parse_config(MINIMAL_TOML, "test").unwrap();
+        assert!(
+            cfg.aap_control_plane.is_none(),
+            "absent [aap_control_plane] must round-trip as None"
+        );
     }
 
     #[test]
