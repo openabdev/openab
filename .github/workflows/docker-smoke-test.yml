@@ -179,6 +179,9 @@ jobs:
           assert_line 'ARG DEVIN_VERSION=3000.2.17' Dockerfile.devin Dockerfile.package Dockerfile.unified
           assert_line 'ARG DEVIN_SHA256_AMD64=f0e1e9363afc6ee68c4ef87bab4aeb7ff5cc08a5fa838350ef3ceefdbb2a2be2' Dockerfile.devin Dockerfile.package Dockerfile.unified
           assert_line 'ARG DEVIN_SHA256_ARM64=116dc71ef085a922bc3ff0ea0377d4b26c529a431d58246e36572913e2d25624' Dockerfile.devin Dockerfile.package Dockerfile.unified
+          assert_occurrences 1 '--retry 6 --retry-all-errors --retry-delay 10 --retry-max-time 120' Dockerfile.hermes
+          assert_occurrences 1 '--retry 6 --retry-all-errors --retry-delay 10 --retry-max-time 120' Dockerfile.package
+          assert_occurrences 1 '--retry 6 --retry-all-errors --retry-delay 10 --retry-max-time 120' Dockerfile.unified
           assert_line 'ENV AGY_VERSION=1.1.13' Dockerfile.antigravity Dockerfile.unified Dockerfile.final Dockerfile.ci
           assert_line 'ARG AGY_VERSION=1.1.13' Dockerfile.package
           assert_line 'ENV AGY_VERSION="${AGY_VERSION}"' Dockerfile.package

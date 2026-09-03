@@ -266,7 +266,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 ARG HERMES_INSTALL_COMMIT=2bd1977d8fad185c9b4be47884f7e87f1add0ce3
 ARG HERMES_INSTALL_SHA256=dbd9d555ed4ac67bd1fc71ba6a39b410cf2af0ebcfd8f4889e086af78c9ddcaa
-RUN curl -fsSL "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_INSTALL_COMMIT}/scripts/install.sh" \
+# Shared CI runners can be throttled by raw.githubusercontent.com; retry
+# transient failures while the pinned SHA256 still verifies the response body.
+RUN curl -fsSL --retry 6 --retry-all-errors --retry-delay 10 --retry-max-time 120 \
+      "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_INSTALL_COMMIT}/scripts/install.sh" \
       -o /tmp/install-hermes.sh && \
     echo "${HERMES_INSTALL_SHA256}  /tmp/install-hermes.sh" | sha256sum -c - && \
     HERMES_HOME=/home/agent/.hermes bash /tmp/install-hermes.sh && \
