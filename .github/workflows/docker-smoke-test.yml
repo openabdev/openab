@@ -158,14 +158,14 @@ jobs:
               grep -Fx "$expected" "$file"
             done
           }
-          assert_count() {
+          assert_occurrences() {
             local expected_count="$1"
-            local expected_line="$2"
+            local needle="$2"
             local file="$3"
             local actual_count
-            actual_count=$(grep -Fxc "$expected_line" "$file" || true)
+            actual_count=$(grep -Fc -- "$needle" "$file" || true)
             [ "$actual_count" -eq "$expected_count" ] || {
-              echo "Expected $expected_count copies of '$expected_line' in $file, found $actual_count" >&2
+              echo "Expected $expected_count occurrences of '$needle' in $file, found $actual_count" >&2
               exit 1
             }
           }
@@ -187,10 +187,27 @@ jobs:
           assert_line 'ARG AGY_SHA256_ARM64=a9fdd2a386770c27dbf784436bd4de70d4d4901c832d5ec6abf27758d5c370f8' Dockerfile.antigravity Dockerfile.package Dockerfile.unified Dockerfile.final Dockerfile.ci
 
           # Nightly checksum relaxation must be explicit and limited to the two
-          # TLS-only vendor paths. Kiro instead requires a resolved strong ETag;
-          # Devin remains unconditionally checksum-verified.
-          assert_count 2 'ARG ALLOW_UNVERIFIED_NIGHTLY_DOWNLOADS=false' Dockerfile.package
-          assert_count 2 '          ALLOW_UNVERIFIED_NIGHTLY_DOWNLOADS=true" ;;' .github/workflows/nightly-build.yml
-          assert_count 2 '    elif [ "$ALLOW_UNVERIFIED_NIGHTLY_DOWNLOADS" != "true" ]; then \' Dockerfile.package
-          assert_line '    elif [ -z "$ETAG" ]; then \' Dockerfile.package
-          assert_line '    echo "${sha}  /tmp/devin.tar.gz" | sha256sum -c - && \' Dockerfile.package
+          # TLS-only vendor paths. These substring checks intentionally ignore
+          # indentation, line continuations, and BUILD_ARGS ordering.
+          assert_occurrences 2 'ARG ALLOW_UNVERIFIED_NIGHTLY_DOWNLOADS=false' Dockerfile.package
+          assert_occurrences 2 'elif [ "$ALLOW_UNVERIFIED_NIGHTLY_DOWNLOADS" != "true" ]; then' Dockerfile.package
+          assert_occurrences 1 'elif [ -z "$ETAG" ]; then' Dockerfile.package
+          assert_occurrences 1 'echo "${sha}  /tmp/devin.tar.gz" | sha256sum -c -' Dockerfile.package
+
+          # Parse the resolver case arms so a third variant cannot silently opt
+          # in even if the workflow is reformatted or BUILD_ARGS are reordered.
+          OPT_IN_VARIANTS=$(awk '
+            /^[[:space:]]*[[:alnum:]_-]+\)$/ {
+              variant=$1
+              sub(/\)$/, "", variant)
+            }
+            index($0, "ALLOW_UNVERIFIED_NIGHTLY_DOWNLOADS=true") {
+              print variant
+            }
+          ' .github/workflows/nightly-build.yml | sort)
+          EXPECTED_OPT_IN_VARIANTS=$(printf 'antigravity\ngrok')
+          [ "$OPT_IN_VARIANTS" = "$EXPECTED_OPT_IN_VARIANTS" ] || {
+            echo "Expected only antigravity and grok nightly opt-ins; found:" >&2
+            printf '%s\n' "$OPT_IN_VARIANTS" >&2
+            exit 1
+          }
