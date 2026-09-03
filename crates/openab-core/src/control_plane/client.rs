@@ -52,6 +52,11 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Inbound WS message/frame ceiling, mirroring the CP server's own
 /// `max_frame_bytes` default (1 MiB). Outbound frames are already capped at
 /// the executor; this closes the other direction.
+///
+/// Note (F51): The server default is 1 MiB but configurable hub-side. If the
+/// hub is configured with a larger ceiling, frames exceeding 1 MiB are
+/// rejected at the transport layer; future protocol revisions may negotiate
+/// effective limits in `RegisterAck`.
 const MAX_INBOUND_FRAME_BYTES: usize = 1024 * 1024;
 
 /// Bound on the wait for the `cp/register` ack, mirroring the CP's own
@@ -519,6 +524,13 @@ enum FrameAction {
 
 async fn send(sink: &mut WsSink, frame: &JsonRpcRequest) -> anyhow::Result<()> {
     let text = serde_json::to_string(frame)?;
+    if text.len() > MAX_INBOUND_FRAME_BYTES {
+        anyhow::bail!(
+            "outbound frame ({} bytes) exceeds transport limit ({} bytes)",
+            text.len(),
+            MAX_INBOUND_FRAME_BYTES
+        );
+    }
     sink.send(Message::Text(text)).await?;
     Ok(())
 }

@@ -8,10 +8,10 @@
 //!   session pool. The CP already fast-fails on its own accounting; this is
 //!   the runtime's own last word on its capacity, and it must be cheap.
 //! - **One fresh session per delegation.** The session key is derived from
-//!   `(instance_id, delegation_id)`, so no delegation can observe another's
-//!   conversation, and a replayed id after a reconnect cannot resume a stale
-//!   one. The session is discarded on every terminal outcome — nothing
-//!   accumulates in the pool.
+//!   `(instance_id, delegation_id, admission)`, so no delegation can observe
+//!   another's conversation, and a re-admission of the same reusable id cannot
+//!   resume an earlier admission's session. The session is discarded on every
+//!   terminal outcome — nothing accumulates in the pool.
 //! - **Exactly one result per admitted delegation.** Every path through
 //!   [`DelegationExecutor::serve`] returns a `DelegateResultParams`; the
 //!   client is what decides whether it can still be sent (on a dead socket it
@@ -317,12 +317,13 @@ impl DelegationExecutor {
                 failed(id, forward.admission, error)
             }
             Ok(Ok(outcome)) => {
-                self.bounded_discard(&session_key).await;
                 if let Some(error) = outcome.error {
+                    self.bounded_discard(&session_key).await;
                     warn!(delegation_id = %id, %error, "delegation ended in an agent error");
                     return failed(id, forward.admission, error);
                 }
                 if outcome.silent_failure {
+                    self.bounded_discard(&session_key).await;
                     warn!(delegation_id = %id, "delegation produced an empty turn (silent failure)");
                     return failed(
                         id,
@@ -331,6 +332,12 @@ impl DelegationExecutor {
                          likely a provider/model/auth failure",
                     );
                 }
+                // Turn completed cleanly. Spawn discard off the critical path
+                // so a slow or wedged discard does not delay result delivery to
+                // the initiator (F53). With admission-scoped session keys, a
+                // deferred discard is safe: a subsequent admission of the same
+                // delegation id gets a distinct session key.
+                self.spawn_discard(session_key);
                 info!(delegation_id = %id, bytes = outcome.text.len(), "delegation completed");
                 DelegateResultParams {
                     delegation_id: id.clone(),
@@ -345,11 +352,25 @@ impl DelegationExecutor {
 
     /// Best-effort, BOUNDED session teardown: `session/cancel` writes to the
     /// agent's stdin, which can wedge (dead child, full pipe), and the pool's
-    /// discard takes its write lock, which can be starved. Both are bounded so
-    /// a wedged teardown cannot burn the client's disconnect drain window.
+    /// discard takes its write lock, which can be starved. Both share ONE
+    /// deadline so a wedged teardown cannot burn the client's disconnect drain window (F52).
     async fn cancel_and_discard(&self, session_key: &str) {
-        let _ = tokio::time::timeout(TEARDOWN_BOUND, self.runner.cancel(session_key)).await;
-        self.bounded_discard(session_key).await;
+        let deadline = tokio::time::Instant::now() + TEARDOWN_BOUND;
+        let _ = tokio::time::timeout_at(deadline, self.runner.cancel(session_key)).await;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            warn!(
+                session_key,
+                "session cancel consumed the teardown bound; leaving discard to pool cleanup"
+            );
+            return;
+        }
+        if tokio::time::timeout_at(deadline, self.runner.discard(session_key))
+            .await
+            .is_err()
+        {
+            warn!(session_key, "session discard exceeded its bound; leaving it to pool cleanup");
+        }
     }
 
     /// Discard with the same bound as cancel; on overrun the session is left
@@ -361,6 +382,22 @@ impl DelegationExecutor {
         {
             warn!(session_key, "session discard exceeded its bound; leaving it to pool cleanup");
         }
+    }
+
+    /// Spawn discard off the critical path on success (F53).
+    fn spawn_discard(&self, session_key: String) {
+        let runner = Arc::clone(&self.runner);
+        tokio::spawn(async move {
+            if tokio::time::timeout(TEARDOWN_BOUND, runner.discard(&session_key))
+                .await
+                .is_err()
+            {
+                warn!(
+                    session_key = %session_key,
+                    "session discard exceeded its bound; leaving it to pool cleanup"
+                );
+            }
+        });
     }
 }
 
@@ -386,18 +423,47 @@ const MAX_RESULT_BYTES: usize = 512 * 1024;
 /// success path.
 const MAX_ERROR_BYTES: usize = 64 * 1024;
 
+/// Returns the byte length of `s` when serialized inside a JSON string literal.
+///
+/// In JSON (RFC 8259), `"` and `\` become 2 bytes (`\"`, `\\`), control
+/// characters 0x00..=0x1f become 2 bytes (`\b`, `\t`, `\n`, `\f`, `\r`) or
+/// 6 bytes (`\u00xx`), and all other UTF-8 bytes pass through unchanged (1 byte
+/// each).
+pub(crate) fn json_escaped_len(s: &str) -> usize {
+    s.bytes()
+        .map(|b| match b {
+            b'\"' | b'\\' => 2,
+            b'\x08' | b'\t' | b'\n' | b'\x0c' | b'\r' => 2,
+            c if c < 0x20 => 6,
+            _ => 1,
+        })
+        .sum()
+}
+
 fn cap_text(text: String, budget: usize) -> String {
-    if text.len() <= budget {
+    if json_escaped_len(&text) <= budget {
         return text;
     }
     let marker = format!(
-        "\n…[truncated by worker: {} bytes total exceeded the transport budget]",
+        "\n...[truncated by worker: {} bytes total exceeded the transport budget]",
         text.len()
     );
-    let keep = budget.saturating_sub(marker.len());
-    let mut cut = keep.min(text.len());
-    while cut > 0 && !text.is_char_boundary(cut) {
-        cut -= 1;
+    let marker_escaped_len = json_escaped_len(&marker);
+    let keep_escaped = budget.saturating_sub(marker_escaped_len);
+    let mut cut = 0;
+    let mut current_escaped = 0;
+    for (idx, ch) in text.char_indices() {
+        let ch_escaped = match ch {
+            '\"' | '\\' => 2,
+            '\x08' | '\t' | '\n' | '\x0c' | '\r' => 2,
+            c if (c as u32) < 0x20 => 6,
+            c => c.len_utf8(),
+        };
+        if current_escaped + ch_escaped > keep_escaped {
+            break;
+        }
+        current_escaped += ch_escaped;
+        cut = idx + ch.len_utf8();
     }
     let mut out = String::with_capacity(cut + marker.len());
     out.push_str(&text[..cut]);
@@ -650,6 +716,10 @@ mod tests {
         silent_failure: bool,
         /// If set, `run` sleeps this long before answering.
         delay: Option<Duration>,
+        /// If set, `cancel` sleeps this long before answering.
+        cancel_delay: Option<Duration>,
+        /// If set, `discard` sleeps this long before answering.
+        discard_delay: Option<Duration>,
         started: AtomicUsize,
         cancelled: Mutex<Vec<String>>,
         discarded: Mutex<Vec<String>>,
@@ -667,6 +737,16 @@ mod tests {
         }
         fn discarded(&self) -> Vec<String> {
             self.discarded.lock().unwrap().clone()
+        }
+        async fn wait_discarded(&self, expected_len: usize) -> Vec<String> {
+            for _ in 0..100 {
+                let d = self.discarded();
+                if d.len() >= expected_len {
+                    return d;
+                }
+                tokio::task::yield_now().await;
+            }
+            self.discarded()
         }
         fn cancelled(&self) -> Vec<String> {
             self.cancelled.lock().unwrap().clone()
@@ -695,10 +775,16 @@ mod tests {
         }
 
         async fn cancel(&self, session_key: &str) {
+            if let Some(d) = self.cancel_delay {
+                tokio::time::sleep(d).await;
+            }
             self.cancelled.lock().unwrap().push(session_key.to_string());
         }
 
         async fn discard(&self, session_key: &str) {
+            if let Some(d) = self.discard_delay {
+                tokio::time::sleep(d).await;
+            }
             self.discarded.lock().unwrap().push(session_key.to_string());
         }
     }
@@ -721,7 +807,7 @@ mod tests {
         assert_eq!(res.result.as_deref(), Some("here you go"));
         assert!(res.error.is_none());
         assert_eq!(
-            runner.discarded(),
+            runner.wait_discarded(1).await,
             vec![delegation_session_key("i-test", "d-1", 1)],
             "a fresh-per-delegation session must not survive its delegation"
         );
@@ -1036,5 +1122,80 @@ mod tests {
         let result = task.await.unwrap();
         assert_eq!(result.status, DelegationStatus::Cancelled);
         assert_eq!(result.admission, 42, "the terminal frame names B");
+    }
+
+    #[test]
+    fn json_escaped_len_matches_serde_json() {
+        let test_cases = vec![
+            "",
+            "hello world",
+            "escapes: \x08 \t \n \x0c \r",
+            "control: \x00 \x1b \x1f",
+            "quotes and slashes: \" \\ \"",
+            "multibyte: 🦀 日本語 \u{1F980}",
+        ];
+        for case in test_cases {
+            let expected = serde_json::to_string(case).unwrap().len() - 2;
+            assert_eq!(
+                json_escaped_len(case),
+                expected,
+                "mismatch for case: {:?}",
+                case
+            );
+        }
+    }
+
+    #[test]
+    fn escape_heavy_results_cannot_inflate_past_the_transport_budget() {
+        // 500 KiB of ESC characters (\x1b) has raw len <= 512 KiB, but JSON
+        // serializes each as \u001b (6 bytes), inflating to ~3 MiB.
+        // Unchecked, this exceeds the CP's pre-parse max_frame_bytes (1 MiB),
+        // causing the CP to close the WebSocket and kill every co-inflight
+        // delegation (F46).
+        let escapes = "\x1b".repeat(500 * 1024);
+        let capped = cap_result(escapes);
+        let serialized = serde_json::to_string(&capped).unwrap();
+        // The serialized JSON string (including quotes) must remain within
+        // the transport budget (MAX_RESULT_BYTES + 2 for quotes).
+        assert!(
+            serialized.len() <= MAX_RESULT_BYTES + 2,
+            "serialized length {} exceeds budget",
+            serialized.len()
+        );
+        assert!(capped.ends_with("bytes total exceeded the transport budget]"));
+
+        // Strings with quotes and backslashes also inflate (2x) and must be bounded.
+        let slashes = "\\\"".repeat(300 * 1024);
+        let capped_slashes = cap_result(slashes);
+        let serialized_slashes = serde_json::to_string(&capped_slashes).unwrap();
+        assert!(
+            serialized_slashes.len() <= MAX_RESULT_BYTES + 2,
+            "serialized slashes length {} exceeds budget",
+            serialized_slashes.len()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_cancel_and_stalled_discard_share_one_teardown_bound() {
+        // Both cancel and discard can wedge (dead agent process, starved pool lock).
+        // cancel_and_discard must bound the SUM of both to TEARDOWN_BOUND (5s),
+        // not 5s each (~10s total), which would exceed the client's DRAIN_TIMEOUT (5s) (F52).
+        let runner = Arc::new(FakeRunner {
+            cancel_delay: Some(Duration::from_secs(10)),
+            discard_delay: Some(Duration::from_secs(10)),
+            ..Default::default()
+        });
+        let ex = executor(Arc::clone(&runner), 1);
+        let start = tokio::time::Instant::now();
+        ex.cancel_and_discard("s-wedged").await;
+        let elapsed = start.elapsed();
+        assert_eq!(
+            elapsed, TEARDOWN_BOUND,
+            "teardown must complete at the shared 5s bound"
+        );
+        assert!(
+            runner.discarded().is_empty(),
+            "discard must be skipped when cancel consumes the entire bound"
+        );
     }
 }
