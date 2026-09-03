@@ -205,10 +205,10 @@ fn has_unified_platform(cfg: &config::Config) -> bool {
 ///   the facade alongside, so `mcp + CP` runs both rather than only one.
 /// - `[mcp]` alone stays exactly what it was: the facade in the foreground.
 ///
-/// `type = "primary"` deliberately does NOT unlock a headless boot. A primary is
-/// the *initiating* side of a delegation; its prompts come from a chat platform,
-/// so a primary with no adapter has no way to be given work and is a
-/// misconfiguration worth failing on.
+/// `type = "primary"` alone (without `[mcp]`) deliberately does NOT unlock a
+/// headless boot. A primary is the *initiating* side of a delegation; its
+/// prompts come from a chat platform, so an adapter-less primary has no way to
+/// be given work and is a misconfiguration worth failing on.
 #[derive(Debug, PartialEq, Eq)]
 enum HeadlessMode {
     ControlPlaneWorker,

@@ -241,8 +241,7 @@ impl ControlPlaneClient {
         };
         let frame =
             JsonRpcRequest::new(id, methods::REGISTER, Some(serde_json::to_value(&params)?));
-        sink.send(Message::Text(serde_json::to_string(&frame)?))
-            .await?;
+        send(sink, &frame).await?;
 
         // Anything other than the ack to this id is a protocol violation at
         // this point: registration is the first frame in both directions.
