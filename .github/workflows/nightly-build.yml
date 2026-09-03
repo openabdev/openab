@@ -20,7 +20,8 @@ name: Nightly Build
 #   - Release (v*) and pre-beta-* tags and their build path are untouched.
 #
 # native + agentcore are intentionally absent: they carry no coding CLI by
-# definition, so there is nothing to freshen.
+# definition, so there is nothing to freshen. pi is temporarily absent because
+# its existing package target does not ship its configured adapter (#1520).
 
 on:
   schedule:
@@ -71,6 +72,15 @@ jobs:
           else
             VARIANTS="$INPUT_VARIANTS"
           fi
+
+          # Bash field splitting discards a trailing empty field, so reject the
+          # raw delimiter shapes before splitting. Whitespace-only elements are
+          # caught after trimming in the loop below.
+          case "$VARIANTS" in
+            ,*|*,|*,,*)
+              echo "::error::empty variant entry in: $INPUT_VARIANTS"
+              exit 1 ;;
+          esac
 
           # Parse once into a normalized, validated, de-duplicated list. This is
           # the single source the matrix JSON is built from, so empty fields
@@ -203,11 +213,23 @@ jobs:
 
           case "$VARIANT" in
             kiro)
-              # No public version index; the vendor serves a `latest` path that
-              # the existing stable/${VERSION}/ URL template resolves to. Version
-              # is learned from the built image, not ahead of time.
-              REPORT="latest (resolved by vendor)"
+              # Kiro exposes no version index, but its latest objects have strong
+              # ETags and honor If-Match. Resolve both content identifiers once;
+              # Dockerfile.package enforces them during each architecture build.
+              # The tag job additionally requires the installed versions to
+              # match before it creates the multi-arch manifest.
+              kiro_etag() {
+                curl -fsSI --retry 3 --retry-all-errors "$1" \
+                  | sed -n 's/^etag: *//Ip' | tail -1 | tr -d '\r"' | tr '[:upper:]' '[:lower:]'
+              }
+              ETAG_AMD=$(kiro_etag https://prod.download.cli.kiro.dev/stable/latest/kirocli-x86_64-linux.zip)
+              ETAG_ARM=$(kiro_etag https://prod.download.cli.kiro.dev/stable/latest/kirocli-aarch64-linux.zip)
+              echo "$ETAG_AMD" | grep -qE '^[0-9a-f]{32}$' || { echo "::error::invalid Kiro amd64 ETag: $ETAG_AMD"; exit 1; }
+              echo "$ETAG_ARM" | grep -qE '^[0-9a-f]{32}$' || { echo "::error::invalid Kiro arm64 ETag: $ETAG_ARM"; exit 1; }
+              REPORT="latest @ amd64:$ETAG_AMD arm64:$ETAG_ARM"
               BUILD_ARGS="KIRO_CLI_VERSION=latest
+          KIRO_ETAG_AMD64=$ETAG_AMD
+          KIRO_ETAG_ARM64=$ETAG_ARM
           KIRO_SHA256_AMD64=
           KIRO_SHA256_ARM64=" ;;
             claude)
@@ -280,7 +302,8 @@ jobs:
           DEVIN_SHA256_AMD64=$SHA_AMD
           DEVIN_SHA256_ARM64=$SHA_ARM" ;;
             antigravity)
-              V=$(curl -fsSL --retry 3 https://api.github.com/repos/google-antigravity/antigravity-cli/releases/latest | jq -r .tag_name)
+              RELEASE=$(github_api https://api.github.com/repos/google-antigravity/antigravity-cli/releases/latest)
+              V=$(echo "$RELEASE" | jq -r .tag_name)
               check_ver "$V"; REPORT="antigravity $V"
               BUILD_ARGS="AGY_VERSION_OVERRIDE=$V
           AGY_EFFECTIVE_VERSION=$V
@@ -340,10 +363,12 @@ jobs:
   # ---------------------------------------------------------------------------
   build:
     needs: [matrix, compile, resolve]
+    # A failed vendor resolver must not suppress successful siblings. Override
+    # the default needs-success condition, but still require the shared matrix
+    # and compilation prerequisites. A build child whose own resolve artifact
+    # is absent fails at its exact-name download while other variants continue.
     # Canonical nightly-* tags may only be published from the default branch.
-    # A workflow_dispatch from a feature branch still runs matrix/compile/resolve
-    # (dry validation) but must not push under the canonical namespace.
-    if: github.ref == 'refs/heads/main'
+    if: ${{ always() && !cancelled() && github.ref == 'refs/heads/main' && needs.matrix.result == 'success' && needs.compile.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:
@@ -408,6 +433,30 @@ jobs:
           no-cache: true
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
 
+      - name: Verify and report installed Kiro version
+        if: matrix.variant == 'kiro'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          ARCH: ${{ matrix.platform.arch }}
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
+          docker pull "$IMAGE"
+          VERSION=$(docker run --rm --entrypoint /usr/local/bin/kiro-cli "$IMAGE" --version | tr -d '\r' | tail -1)
+          [ -n "$VERSION" ] || { echo "::error::Kiro returned an empty version"; exit 1; }
+          mkdir -p /tmp/kiro-versions
+          printf '%s\n' "$VERSION" > "/tmp/kiro-versions/${ARCH}"
+          echo "Kiro ${ARCH}: $VERSION"
+
+      - name: Upload installed Kiro version
+        if: matrix.variant == 'kiro'
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-kiro-version-${{ matrix.platform.arch }}
+          path: /tmp/kiro-versions/*
+          if-no-files-found: error
+          retention-days: 1
+
       - name: Export digest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
@@ -465,9 +514,17 @@ jobs:
           name: nightly-resolve-${{ matrix.variant }}
           path: /tmp/resolved
 
+      - name: Download installed Kiro versions
+        if: matrix.variant == 'kiro'
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/kiro-versions
+          pattern: nightly-kiro-version-*
+          merge-multiple: true
+
       - name: Validate digest count
         run: |
-          COUNT=$(ls -1 /tmp/digests/ 2>/dev/null | wc -l | tr -d ' ')
+          COUNT=$(find /tmp/digests -maxdepth 1 -type f -print 2>/dev/null | wc -l | tr -d ' ')
           if [ "$COUNT" -ne 2 ]; then
             echo "::error::No complete image for ${{ matrix.variant }} (expected 2 digests amd64+arm64, got $COUNT) — its build leg likely failed. This variant is not published; siblings are unaffected."
             exit 1
@@ -476,6 +533,21 @@ jobs:
             name=$(basename "$f")
             echo "$name" | grep -qE '^[a-f0-9]{64}$' || { echo "::error::invalid digest: $name"; exit 1; }
           done
+
+      - name: Validate installed Kiro versions match
+        if: matrix.variant == 'kiro'
+        run: |
+          set -euo pipefail
+          [ -f /tmp/kiro-versions/amd64 ] || { echo "::error::missing Kiro amd64 version report"; exit 1; }
+          [ -f /tmp/kiro-versions/arm64 ] || { echo "::error::missing Kiro arm64 version report"; exit 1; }
+          AMD=$(cat /tmp/kiro-versions/amd64)
+          ARM=$(cat /tmp/kiro-versions/arm64)
+          [ "$AMD" = "$ARM" ] || {
+            echo "::error::Kiro architecture version mismatch: amd64='$AMD', arm64='$ARM'"
+            exit 1
+          }
+          printf 'kiro %s\n' "$AMD" > /tmp/resolved/report
+          echo "Kiro versions match: $AMD"
 
       - name: Create manifest and tag
         env:
@@ -488,9 +560,12 @@ jobs:
           # Include the run attempt so a re-run (which re-resolves mutable
           # vendor versions) cannot move a tag documented as immutable.
           IMMUTABLE="${IMAGE}:nightly-${DATE}-${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}-${VARIANT}"
-          DIGESTS=$(printf "${IMAGE}@sha256:%s " $(ls /tmp/digests/))
+          DIGESTS=()
+          for f in /tmp/digests/*; do
+            DIGESTS+=("${IMAGE}@sha256:$(basename "$f")")
+          done
 
-          docker buildx imagetools create -t "$MOVING" -t "$IMMUTABLE" ${DIGESTS}
+          docker buildx imagetools create -t "$MOVING" -t "$IMMUTABLE" "${DIGESTS[@]}"
 
           {
             echo "### 📦 nightly \`${VARIANT}\`"
