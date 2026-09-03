@@ -224,8 +224,13 @@ jobs:
               }
               ETAG_AMD=$(kiro_etag https://prod.download.cli.kiro.dev/stable/latest/kirocli-x86_64-linux.zip)
               ETAG_ARM=$(kiro_etag https://prod.download.cli.kiro.dev/stable/latest/kirocli-aarch64-linux.zip)
-              echo "$ETAG_AMD" | grep -qE '^[0-9a-f]{32}$' || { echo "::error::invalid Kiro amd64 ETag: $ETAG_AMD"; exit 1; }
-              echo "$ETAG_ARM" | grep -qE '^[0-9a-f]{32}$' || { echo "::error::invalid Kiro arm64 ETag: $ETAG_ARM"; exit 1; }
+              # Accept both single-part (32-hex) and multipart (<md5>-<partcount>)
+              # ETags: the ~586MB latest object sits at the S3 multipart boundary,
+              # so a future re-upload can flip its ETag to the suffixed form. Both
+              # shapes are valid If-Match preconditions, so don't hard-reject the
+              # multipart one — that would break every nightly-kiro build opaquely.
+              echo "$ETAG_AMD" | grep -qE '^[0-9a-f]{32}(-[0-9]+)?$' || { echo "::error::invalid Kiro amd64 ETag: $ETAG_AMD"; exit 1; }
+              echo "$ETAG_ARM" | grep -qE '^[0-9a-f]{32}(-[0-9]+)?$' || { echo "::error::invalid Kiro arm64 ETag: $ETAG_ARM"; exit 1; }
               REPORT="latest @ amd64:$ETAG_AMD arm64:$ETAG_ARM"
               BUILD_ARGS="KIRO_CLI_VERSION=latest
           KIRO_ETAG_AMD64=$ETAG_AMD
@@ -277,8 +282,12 @@ jobs:
               # The install script embeds the version it would install; there is
               # no separate version index. Anchored to the download URL shape so
               # an unrelated mention of the domain cannot match.
+              # `grep -m1` stops after the first match and exits 0, avoiding the
+              # SIGPIPE (exit 141) that `grep | head -1` can trigger under pipefail
+              # when head closes the pipe early — which could surface as a
+              # spurious red job.
               V=$(curl -fsSL --retry 3 https://cursor.com/install \
-                | grep -oE 'downloads\.cursor\.com/lab/[^/]+/' | head -1 \
+                | grep -oE -m1 'downloads\.cursor\.com/lab/[^/]+/' \
                 | sed 's|downloads.cursor.com/lab/||; s|/$||')
               check_ver "$V"; REPORT="cursor-agent $V"
               BUILD_ARGS="CURSOR_VERSION=$V" ;;
@@ -428,9 +437,12 @@ jobs:
           build-contexts: bins=bin
           platforms: ${{ matrix.platform.os }}
           build-args: ${{ steps.resolve.outputs.build_args }}
-          # Freshness lane: don't reuse the agent-CLI layer across days, or a
-          # cached layer would defeat the point. The compile stage's binaries
-          # are already built; this only rebuilds the thin CLI layer.
+          # Freshness lane: no build cache at all, so the agent-CLI layer is
+          # never reused across days (a cached CLI layer would defeat the point).
+          # This rebuilds every Dockerfile.package layer for this variant — base
+          # image, apt/node setup, and the CLI install — not just the CLI layer;
+          # the openab binary itself is not recompiled (it comes prebuilt from
+          # the compile stage via the bins= build context).
           no-cache: true
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
 
