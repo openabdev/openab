@@ -69,7 +69,11 @@ RUN ARCH=$(dpkg --print-architecture) && \
       curl --proto '=https' --tlsv1.2 -sSf --retry 3 --retry-delay 5 \
         "$URL" -o /tmp/kirocli.zip; \
     fi && \
-    { [ -z "$SHA256" ] || echo "$SHA256  /tmp/kirocli.zip" | sha256sum -c -; } && \
+    if [ -n "$SHA256" ]; then \
+      echo "$SHA256  /tmp/kirocli.zip" | sha256sum -c -; \
+    elif [ -z "$ETAG" ]; then \
+      echo "Kiro download requires SHA256 or a strong ETag" >&2; exit 1; \
+    fi && \
     unzip /tmp/kirocli.zip -d /tmp && \
     cp /tmp/kirocli/bin/* /usr/local/bin/ && \
     chmod +x /usr/local/bin/kiro-cli* && \
@@ -221,6 +225,9 @@ FROM base-debian AS grok
 ARG GROK_VERSION=0.1.220
 ARG GROK_SHA256_AMD64=98d331d64dfc4fb1dae862475218cccdd195f76839b8361a0678af2fd388364b
 ARG GROK_SHA256_ARM64=3b15efc258f4219d01736acee70c575a8167f970cb4d497a3b0c218440db58ff
+# Explicit opt-in for the nightly TLS-only path. Empty SHA values fail closed
+# for every other caller, including release and pre-beta builds.
+ARG ALLOW_UNVERIFIED_NIGHTLY_DOWNLOADS=false
 ARG TARGETPLATFORM
 RUN set -eux; \
     case "${TARGETPLATFORM:-linux/amd64}" in \
@@ -230,7 +237,11 @@ RUN set -eux; \
     esac; \
     curl -fsSL "https://storage.googleapis.com/grok-build-public-artifacts/cli/grok-${GROK_VERSION}-linux-${arch}" \
       -o /tmp/grok && \
-    { [ -z "$sha" ] || echo "${sha}  /tmp/grok" | sha256sum -c -; } && \
+    if [ -n "$sha" ]; then \
+      echo "${sha}  /tmp/grok" | sha256sum -c -; \
+    elif [ "$ALLOW_UNVERIFIED_NIGHTLY_DOWNLOADS" != "true" ]; then \
+      echo "Grok download requires SHA256 unless the nightly-only opt-in is true" >&2; exit 1; \
+    fi && \
     install -m 0755 /tmp/grok /usr/local/bin/grok && \
     rm /tmp/grok
 ENV HOME=/home/agent
@@ -332,7 +343,7 @@ RUN set -eux; \
     esac; \
     curl -fsSL "https://static.devin.ai/cli/${DEVIN_VERSION}/devin-${DEVIN_VERSION}-${arch}.tar.gz" \
       -o /tmp/devin.tar.gz && \
-    { [ -z "$sha" ] || echo "${sha}  /tmp/devin.tar.gz" | sha256sum -c -; } && \
+    echo "${sha}  /tmp/devin.tar.gz" | sha256sum -c - && \
     tar xzf /tmp/devin.tar.gz -C /tmp && \
     install -m 0755 /tmp/bin/devin /usr/local/bin/devin && \
     rm -rf /tmp/devin* /tmp/bin /tmp/share
@@ -352,20 +363,16 @@ CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
 # Target: antigravity
 # =============================================================================
 FROM base-debian AS antigravity
-ENV AGY_VERSION=1.1.13
-# Nightly builds override the version without touching the pinned ENV above
-# (which the packaged-pin parity check asserts byte-for-byte). When empty, the
-# pinned AGY_VERSION is used; the nightly lane passes the resolved latest.
-ARG AGY_VERSION_OVERRIDE=
-# Effective installed version, surfaced as image metadata so `inspect` reflects
-# what was actually installed (the ENV above stays pinned for parity). Nightly
-# passes the resolved version here; otherwise it mirrors the pinned default.
-ARG AGY_EFFECTIVE_VERSION=1.1.13
-LABEL dev.openab.agy.version="${AGY_EFFECTIVE_VERSION}"
+# One overridable pin drives the download and all persisted image metadata.
+ARG AGY_VERSION=1.1.13
+ENV AGY_VERSION="${AGY_VERSION}"
+LABEL dev.openab.agy.version="${AGY_VERSION}"
 ARG AGY_SHA256_AMD64=edc7c32b5ab4fc2e4da03381fee83ed566dea6b56b56f9329cd13cd77947a1d9
 ARG AGY_SHA256_ARM64=a9fdd2a386770c27dbf784436bd4de70d4d4901c832d5ec6abf27758d5c370f8
+# Explicit opt-in for the nightly TLS-only path. Empty SHA values fail closed
+# for every other caller, including release and pre-beta builds.
+ARG ALLOW_UNVERIFIED_NIGHTLY_DOWNLOADS=false
 RUN ARCH=$(dpkg --print-architecture) && \
-    AGY_VERSION="${AGY_VERSION_OVERRIDE:-$AGY_VERSION}" && \
     case "$ARCH" in \
       amd64) ASSET="agy_cli_linux_x64.tar.gz"; sha="${AGY_SHA256_AMD64}" ;; \
       arm64) ASSET="agy_cli_linux_arm64.tar.gz"; sha="${AGY_SHA256_ARM64}" ;; \
@@ -373,7 +380,11 @@ RUN ARCH=$(dpkg --print-architecture) && \
     esac && \
     curl -fsSL "https://github.com/google-antigravity/antigravity-cli/releases/download/${AGY_VERSION}/${ASSET}" \
       -o /tmp/agy.tar.gz && \
-    { [ -z "$sha" ] || echo "${sha}  /tmp/agy.tar.gz" | sha256sum -c -; } && \
+    if [ -n "$sha" ]; then \
+      echo "${sha}  /tmp/agy.tar.gz" | sha256sum -c -; \
+    elif [ "$ALLOW_UNVERIFIED_NIGHTLY_DOWNLOADS" != "true" ]; then \
+      echo "Antigravity download requires SHA256 unless the nightly-only opt-in is true" >&2; exit 1; \
+    fi && \
     tar -xzf /tmp/agy.tar.gz -C /usr/local/bin && \
     rm /tmp/agy.tar.gz && \
     mv /usr/local/bin/antigravity /usr/local/bin/agy && \

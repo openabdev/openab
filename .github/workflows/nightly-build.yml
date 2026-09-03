@@ -192,9 +192,9 @@ jobs:
           set -euo pipefail
 
           # BUILD_ARGS accumulates the --build-arg overrides fed to buildx.
-          # For SHA-pinned variants we deliberately pass empty SHAs: the
-          # Dockerfile.package check is skipped when the SHA arg is empty
-          # (release/pre-beta still pass their pinned SHAs and stay verified).
+          # Kiro binds empty-SHA downloads to strong ETags. Grok and Antigravity
+          # have no usable digest and must pass the explicit nightly-only opt-in;
+          # release/pre-beta keep pinned SHAs and fail closed if one is missing.
           BUILD_ARGS=""
 
           github_api() {
@@ -287,7 +287,8 @@ jobs:
               check_ver "$V"; REPORT="grok $V"
               BUILD_ARGS="GROK_VERSION=$V
           GROK_SHA256_AMD64=
-          GROK_SHA256_ARM64=" ;;
+          GROK_SHA256_ARM64=
+          ALLOW_UNVERIFIED_NIGHTLY_DOWNLOADS=true" ;;
             devin)
               MANIFEST=$(curl -fsSL --retry 3 https://static.devin.ai/cli/current/manifest.json)
               V=$(echo "$MANIFEST" | jq -r .version)
@@ -305,10 +306,10 @@ jobs:
               RELEASE=$(github_api https://api.github.com/repos/google-antigravity/antigravity-cli/releases/latest)
               V=$(echo "$RELEASE" | jq -r .tag_name)
               check_ver "$V"; REPORT="antigravity $V"
-              BUILD_ARGS="AGY_VERSION_OVERRIDE=$V
-          AGY_EFFECTIVE_VERSION=$V
+              BUILD_ARGS="AGY_VERSION=$V
           AGY_SHA256_AMD64=
-          AGY_SHA256_ARM64=" ;;
+          AGY_SHA256_ARM64=
+          ALLOW_UNVERIFIED_NIGHTLY_DOWNLOADS=true" ;;
             hermes)
               # Resolve the release, dereference an annotated tag to its immutable
               # commit, then pin both the install commit and the installer SHA so

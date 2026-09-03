@@ -158,6 +158,17 @@ jobs:
               grep -Fx "$expected" "$file"
             done
           }
+          assert_count() {
+            local expected_count="$1"
+            local expected_line="$2"
+            local file="$3"
+            local actual_count
+            actual_count=$(grep -Fxc "$expected_line" "$file" || true)
+            [ "$actual_count" -eq "$expected_count" ] || {
+              echo "Expected $expected_count copies of '$expected_line' in $file, found $actual_count" >&2
+              exit 1
+            }
+          }
 
           assert_line 'ARG KIRO_CLI_VERSION=2.13.0' Dockerfile Dockerfile.package Dockerfile.unified
           assert_line 'ARG KIRO_SHA256_AMD64=d8c5277358b4a82b2d9a9ed2d52e110862536dc82b9e32c3719fc5f5a9834c94' Dockerfile Dockerfile.package Dockerfile.unified
@@ -168,6 +179,18 @@ jobs:
           assert_line 'ARG DEVIN_VERSION=3000.2.17' Dockerfile.devin Dockerfile.package Dockerfile.unified
           assert_line 'ARG DEVIN_SHA256_AMD64=f0e1e9363afc6ee68c4ef87bab4aeb7ff5cc08a5fa838350ef3ceefdbb2a2be2' Dockerfile.devin Dockerfile.package Dockerfile.unified
           assert_line 'ARG DEVIN_SHA256_ARM64=116dc71ef085a922bc3ff0ea0377d4b26c529a431d58246e36572913e2d25624' Dockerfile.devin Dockerfile.package Dockerfile.unified
-          assert_line 'ENV AGY_VERSION=1.1.13' Dockerfile.antigravity Dockerfile.package Dockerfile.unified Dockerfile.final Dockerfile.ci
+          assert_line 'ENV AGY_VERSION=1.1.13' Dockerfile.antigravity Dockerfile.unified Dockerfile.final Dockerfile.ci
+          assert_line 'ARG AGY_VERSION=1.1.13' Dockerfile.package
+          assert_line 'ENV AGY_VERSION="${AGY_VERSION}"' Dockerfile.package
+          assert_line 'LABEL dev.openab.agy.version="${AGY_VERSION}"' Dockerfile.package
           assert_line 'ARG AGY_SHA256_AMD64=edc7c32b5ab4fc2e4da03381fee83ed566dea6b56b56f9329cd13cd77947a1d9' Dockerfile.antigravity Dockerfile.package Dockerfile.unified Dockerfile.final Dockerfile.ci
           assert_line 'ARG AGY_SHA256_ARM64=a9fdd2a386770c27dbf784436bd4de70d4d4901c832d5ec6abf27758d5c370f8' Dockerfile.antigravity Dockerfile.package Dockerfile.unified Dockerfile.final Dockerfile.ci
+
+          # Nightly checksum relaxation must be explicit and limited to the two
+          # TLS-only vendor paths. Kiro instead requires a resolved strong ETag;
+          # Devin remains unconditionally checksum-verified.
+          assert_count 2 'ARG ALLOW_UNVERIFIED_NIGHTLY_DOWNLOADS=false' Dockerfile.package
+          assert_count 2 '          ALLOW_UNVERIFIED_NIGHTLY_DOWNLOADS=true" ;;' .github/workflows/nightly-build.yml
+          assert_count 2 '    elif [ "$ALLOW_UNVERIFIED_NIGHTLY_DOWNLOADS" != "true" ]; then \' Dockerfile.package
+          assert_line '    elif [ -z "$ETAG" ]; then \' Dockerfile.package
+          assert_line '    echo "${sha}  /tmp/devin.tar.gz" | sha256sum -c - && \' Dockerfile.package
