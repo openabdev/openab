@@ -1,7 +1,7 @@
 use crate::markdown::TableMode;
 use regex::Regex;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 /// Controls how incoming messages are dispatched to ACP turns.
@@ -132,6 +132,75 @@ fn default_mcp_listen() -> String {
     "127.0.0.1:8848".to_string()
 }
 
+/// `[control_plane]` — enrol this runtime with an OpenAB Agent Control Plane
+/// (`docs/adr/agent-control-plane.md`). Presence is the opt-in signal, exactly
+/// like [`McpFacadeConfig`]: absent section = no outbound connection, no
+/// delegation serving, no behaviour change. There is deliberately **no cargo
+/// feature** for it — the config section is the switch, so one binary and one
+/// image serve both plain chat brokers and control-plane members.
+///
+/// **Strict.** An unknown key here is a hard startup failure rather than a
+/// silently-defaulted one: a mistyped `max_delegated_sessions` would otherwise
+/// look effective while the runtime advertised the default budget of 1.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlPlaneConfig {
+    /// CP WebSocket endpoint, e.g. `wss://cp.internal:9800/cp`. The server
+    /// mounts the socket at `/cp`.
+    pub url: String,
+    /// Bearer key presented on the upgrade request. The CP maps it to the
+    /// immutable identity claims below and rejects any mismatch, so this value
+    /// is the whole credential: it is never logged, and never reaches the
+    /// agent subprocess (the child env is `env_clear()`ed and this key is not
+    /// in `[agent].env`).
+    pub auth_key: String,
+    /// Asserted namespace. Verified against the key's bound claims by the CP.
+    pub namespace: String,
+    /// Asserted logical agent name. Verified against the key's bound claims.
+    pub name: String,
+    /// Asserted role. Only `primary` and `worker` are constructible here:
+    /// `observer` is a read-only lobby client (a separate, non-runtime
+    /// consumer of the same protocol), so an OAB runtime must never be able to
+    /// register as one by editing its own config.
+    #[serde(rename = "type")]
+    pub agent_type: CpAgentType,
+    /// Advertised selector labels (e.g. `backend = "kiro"`), used by
+    /// `cp/delegate` label targeting.
+    #[serde(default)]
+    pub labels: BTreeMap<String, String>,
+    /// Concurrency budget advertised at registration. The CP may clamp it
+    /// (the ack may return a lower value); the runtime enforces whatever the
+    /// ack returns.
+    #[serde(default = "default_max_delegated_sessions")]
+    pub max_delegated_sessions: u32,
+}
+
+/// Runtime-side agent role for `[control_plane].type`.
+///
+/// Intentionally NOT `openab_cp::proto::AgentType`: that enum also has
+/// `Observer`, which a runtime must not be able to claim. Keeping a separate,
+/// smaller enum makes that unrepresentable in config instead of relying on a
+/// validation check somebody can delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CpAgentType {
+    Primary,
+    Worker,
+}
+
+impl std::fmt::Display for CpAgentType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Primary => write!(f, "primary"),
+            Self::Worker => write!(f, "worker"),
+        }
+    }
+}
+
+fn default_max_delegated_sessions() -> u32 {
+    1
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AgentCoreConfig {    /// AgentCore Runtime ARN (required)
     pub runtime_arn: String,
@@ -248,6 +317,10 @@ pub struct Config {
     /// OAB MCP Facade (`[mcp]` — OAB MCP Adapter ADR §6.2/§6.3). Presence is
     /// the opt-in signal: absent = no facade, no listener, no new behavior.
     pub mcp: Option<McpFacadeConfig>,
+    /// Agent Control Plane membership (`[control_plane]` — Agent Control Plane
+    /// ADR). Presence is the opt-in signal: absent = no CP connection, no
+    /// delegation serving, no new behavior.
+    pub control_plane: Option<ControlPlaneConfig>,
     #[serde(default)]
     pub agent: AgentConfig,
     #[serde(default)]
@@ -2327,6 +2400,30 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
         "pool.liveness_check_secs must be > 0 (zero would spin the recv loop)"
     );
 
+    // `[control_plane]`: every field is load-bearing at registration time, and
+    // the CP rejects a mismatch by closing the socket — which the client then
+    // retries forever. Failing here turns that silent reconnect loop into one
+    // startup error naming the empty field. `auth_key` is checked for emptiness
+    // only; its value is never echoed.
+    if let Some(ref cp) = config.control_plane {
+        for (field, value) in [
+            ("url", &cp.url),
+            ("auth_key", &cp.auth_key),
+            ("namespace", &cp.namespace),
+            ("name", &cp.name),
+        ] {
+            anyhow::ensure!(
+                !value.trim().is_empty(),
+                "control_plane.{field} must not be empty"
+            );
+        }
+        anyhow::ensure!(
+            cp.max_delegated_sessions > 0,
+            "control_plane.max_delegated_sessions must be > 0 \
+             (zero would advertise capacity the runtime can never serve)"
+        );
+    }
+
     Ok(config)
 }
 
@@ -2540,6 +2637,146 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cfg.mcp.unwrap().listen, "127.0.0.1:9000");
+    }
+
+    // --- [control_plane] (Agent Control Plane ADR) ---
+
+    /// The whole opt-in contract: no section, no membership.
+    #[test]
+    fn control_plane_absent_by_default() {
+        let cfg = parse_config_str("[discord]\nbot_token = \"x\"\n", "test").unwrap();
+        assert!(cfg.control_plane.is_none());
+    }
+
+    #[test]
+    fn control_plane_full_section_parses_with_the_type_rename() {
+        std::env::set_var("AB_TEST_CP_KEY", "s3cr3t-from-env");
+        let cfg = parse_config(
+            r#"
+[discord]
+bot_token = "x"
+
+[control_plane]
+url = "wss://cp.internal:9800/cp"
+auth_key = "${AB_TEST_CP_KEY}"
+namespace = "prod"
+name = "worker-1"
+type = "worker"
+max_delegated_sessions = 4
+
+[control_plane.labels]
+backend = "kiro"
+tier = "batch"
+"#,
+            "test",
+        )
+        .unwrap();
+        std::env::remove_var("AB_TEST_CP_KEY");
+        let cp = cfg
+            .control_plane
+            .expect("[control_plane] presence is the opt-in");
+        assert_eq!(cp.url, "wss://cp.internal:9800/cp");
+        // `${ENV}` expansion comes free with the shared loader — the config file
+        // itself never has to hold the credential.
+        assert_eq!(cp.auth_key, "s3cr3t-from-env");
+        assert_eq!(cp.namespace, "prod");
+        assert_eq!(cp.name, "worker-1");
+        assert_eq!(cp.agent_type, CpAgentType::Worker);
+        assert_eq!(cp.max_delegated_sessions, 4);
+        assert_eq!(cp.labels.get("backend").map(String::as_str), Some("kiro"));
+        assert_eq!(cp.labels.get("tier").map(String::as_str), Some("batch"));
+    }
+
+    #[test]
+    fn control_plane_defaults_are_conservative() {
+        let cfg = parse_config_str(
+            "[discord]\nbot_token = \"x\"\n[control_plane]\nurl = \"ws://cp:9800/cp\"\n\
+             auth_key = \"k\"\nnamespace = \"prod\"\nname = \"koudu\"\ntype = \"primary\"\n",
+            "test",
+        )
+        .unwrap();
+        let cp = cfg.control_plane.unwrap();
+        assert_eq!(cp.agent_type, CpAgentType::Primary);
+        assert!(cp.labels.is_empty(), "no labels unless asked for");
+        assert_eq!(
+            cp.max_delegated_sessions, 1,
+            "one at a time until an operator says otherwise"
+        );
+    }
+
+    /// `observer` is a read-only lobby client, not a runtime role. A config
+    /// claiming it must fail loudly rather than registering as something else.
+    #[test]
+    fn control_plane_refuses_the_observer_role() {
+        let err = parse_config_str(
+            "[control_plane]\nurl = \"ws://cp:9800/cp\"\nauth_key = \"k\"\n\
+             namespace = \"prod\"\nname = \"lobby\"\ntype = \"observer\"\n",
+            "test",
+        )
+        .expect_err("observer is not a runtime role");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("observer") || msg.contains("primary"),
+            "the error must name the offending value, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn control_plane_unknown_key_is_a_hard_failure() {
+        let err = parse_config_str(
+            "[control_plane]\nurl = \"ws://cp:9800/cp\"\nauth_key = \"k\"\n\
+             namespace = \"prod\"\nname = \"w\"\ntype = \"worker\"\nmax_delegated_session = 4\n",
+            "test",
+        )
+        .expect_err("a mistyped key must not default silently");
+        assert!(err.to_string().contains("max_delegated_session"));
+    }
+
+    #[test]
+    fn control_plane_empty_fields_are_rejected_by_name() {
+        for (field, body) in [
+            (
+                "url",
+                "url = \"\"\nauth_key = \"k\"\nnamespace = \"p\"\nname = \"w\"\ntype = \"worker\"",
+            ),
+            (
+                "auth_key",
+                "url = \"ws://c/cp\"\nauth_key = \"  \"\nnamespace = \"p\"\nname = \"w\"\ntype = \"worker\"",
+            ),
+            (
+                "namespace",
+                "url = \"ws://c/cp\"\nauth_key = \"k\"\nnamespace = \"\"\nname = \"w\"\ntype = \"worker\"",
+            ),
+            (
+                "name",
+                "url = \"ws://c/cp\"\nauth_key = \"k\"\nnamespace = \"p\"\nname = \"\"\ntype = \"worker\"",
+            ),
+        ] {
+            let err = parse_config_str(&format!("[control_plane]\n{body}\n"), "test").expect_err(
+                "an empty identity field would fail at registration and reconnect forever",
+            );
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("control_plane.{field}")),
+                "the error must name the empty field; got: {msg}"
+            );
+            // An unexpanded `${VAR}` for a secret that is not set expands to the
+            // empty string, which is exactly this case.
+            assert!(msg.contains("must not be empty"), "got: {msg}");
+        }
+    }
+
+    #[test]
+    fn control_plane_zero_capacity_is_rejected() {
+        let err = parse_config_str(
+            "[control_plane]\nurl = \"ws://c/cp\"\nauth_key = \"k\"\nnamespace = \"p\"\n\
+             name = \"w\"\ntype = \"worker\"\nmax_delegated_sessions = 0\n",
+            "test",
+        )
+        .expect_err("advertising zero capacity would make every delegation fail on arrival");
+        assert!(err
+            .to_string()
+            .contains("control_plane.max_delegated_sessions must be > 0"));
     }
     use std::io::Write;
 

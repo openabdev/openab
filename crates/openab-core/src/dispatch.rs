@@ -194,6 +194,10 @@ impl DispatchTarget for AdapterRouter {
             recipient,
         )
         .await
+        // `DispatchTarget` is the platform-facing seam: keep it at
+        // `Result<()>` so every existing implementor (and its mock) is
+        // untouched by the executor's need for the turn summary.
+        .map(|_| ())
     }
 }
 
