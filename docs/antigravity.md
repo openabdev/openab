@@ -75,3 +75,28 @@ agents:
 
 - **No streaming**: `agy -p` returns the full response at once; the adapter sends it as a single `agent_message_chunk` notification.
 - **Cancel is a no-op**: `agy -p` runs to completion; `session/cancel` acknowledges but cannot interrupt.
+
+## Model Selection
+
+The Discord `/models` dropdown is supported. `agy-acp` returns model
+`configOptions` when a session is created or loaded. It fetches the available
+models from `agy models` and caches a successful result. If the live fetch fails,
+the adapter uses the cache and then falls back to this static list when no cache
+is available:
+
+- Gemini 3.5 Flash (Medium)
+- Gemini 3.5 Flash (High)
+- Gemini 3.5 Flash (Low)
+- Gemini 3.1 Pro (Low)
+- Gemini 3.1 Pro (High)
+
+When a user selects a model with `/models`, OpenAB sends
+`session/set_config_option`. `agy-acp` stores the selected model for that session
+and adds `--model <model_id>` to subsequent `agy` invocations.
+
+To select a default model for every new session, set `default_config_options`:
+
+```toml
+[pool]
+default_config_options = { model = "Gemini 3.5 Flash (Medium)" }
+```

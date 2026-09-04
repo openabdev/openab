@@ -2,6 +2,13 @@
 
 Gemini CLI supports ACP natively via the `--acp` flag — no adapter needed.
 
+> **Migration notice:** Since June 18, 2026, Gemini CLI no longer serves Google AI
+> Pro, Google AI Ultra, or free-tier individual accounts. Google recommends
+> migrating those users to Antigravity CLI. Enterprise users with Gemini Code
+> Assist licenses and API-key authentication remain supported. See Google's
+> [transition announcement](https://github.com/google-gemini/gemini-cli/discussions/27274)
+> and [June 18 update](https://github.com/google-gemini/gemini-cli/discussions/28017).
+
 ## Docker Image
 
 ```bash
@@ -58,7 +65,12 @@ env = { GEMINI_API_KEY = "${GEMINI_API_KEY}" }
 
 ## Authentication
 
-Gemini supports Google OAuth or an API key:
+Gemini CLI authentication depends on the account type:
 
-- **API key**: Set `GEMINI_API_KEY` environment variable
-- **OAuth**: Run Google OAuth flow inside the pod
+- **API key**: Set the `GEMINI_API_KEY` environment variable.
+- **Enterprise or Google Cloud OAuth**: Run the Google OAuth flow inside the pod
+  using an organizational account with supported Gemini Code Assist or Google
+  Cloud access.
+- **Individual OAuth**: Google AI Pro, Google AI Ultra, and free-tier individual
+  accounts are no longer served by Gemini CLI. Migrate these users to
+  Antigravity CLI.

@@ -105,7 +105,9 @@ default_config_options = { model = "swe-1-6" }
 
 Available model values include: `adaptive`, `swe-1-6`, `swe-1-6-fast`, `claude-opus-4-8-medium`,
 `glm-5-2`, `gpt-5-5-medium`, `kimi-k2-7`, and many more. The full list is reported by the
-agent at session creation and visible via the Discord `/model` slash command.
+agent as ACP `configOptions` at session creation, making it available in the Discord `/models`
+dropdown once a session is active. This behavior is based on ACP client evidence; a live OpenAB
+session capture is still pending.
 
 > **Note:** The `--model` flag and `DEVIN_MODEL` env var are **ignored** in ACP mode.
 > Use `default_config_options` instead.

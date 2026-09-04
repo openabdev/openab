@@ -40,7 +40,10 @@ When the user picks an option, OpenAB sends `session/set_config_option` to the A
 | kiro-cli | ✅ Returns available models via `models` fallback | ✅ Returns modes (`kiro_default`, `kiro_planner`) via `modes` fallback |
 | claude-code | ❌ No `configOptions` emitted | ❌ |
 | codex | ❌ | ❌ |
-| gemini | ❌ | ❌ |
+| gemini | ❌ No `configOptions` emitted; see [Gemini CLI account migration guidance](gemini.md) | ❌ |
+| antigravity | ✅ Returns available models via `configOptions`; `agy-acp` fetches them from `agy models`, with cache and static fallback | ❌ |
+| opencode | ✅ Emits model `configOptions` at session creation in OpenCode 1.17.9 (source-confirmed; live OpenAB session capture pending) | ❌ |
+| devin | ✅ Emits model `configOptions` at session creation (ACP client evidence; live OpenAB session capture pending) | ❌ |
 | cursor-agent | ❌ (tracking: #493) | ❌ |
 | copilot | ❌ (tracking: #496) | ❌ |
 

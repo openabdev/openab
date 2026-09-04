@@ -114,15 +114,19 @@ The bot will reply in a thread. After that, just type in the thread — no @ment
 
 openab supports `/models`, `/agents`, and `/cancel` on **Discord**, but **not on Slack**. If you previously configured these commands in your Slack app's **Slash Commands** page, you can safely delete them — the Slack adapter ignores both `slash_commands` and `interactive` envelope types.
 
-The root cause is a combination of three Slack-specific platform constraints, none of which is fixable from openab's side:
+The root cause is a combination of two Slack-specific platform constraints, neither of which is fixable from openab's side:
 
 1. **Slack blocks third-party slash commands inside threads.** Invoking `/models` from a thread's reply composer returns the Slack error `"/models is not supported in threads. Sorry!"`. This is enforced by the Slack client itself, not by any app setting — enabling Interactivity, Socket Mode, or reinstalling the app does not bypass it. Slack's built-in commands (`/remind`, `/shrug`, etc.) get special treatment that custom apps cannot.
 
 2. **Channel-level slash command payloads have no thread context.** If the user types `/models` in the channel's main composer instead of a thread, Slack delivers the command but the payload carries no `thread_ts`. Since openab keys each ACP session by thread (`slack:<thread_ts>` or `slack:<trigger_ts>`), the command cannot be routed to the right session. Sessions are never keyed by `channel_id` alone, so there's no workaround on the adapter side.
 
-3. **Most ACP agents don't expose a model-switch surface.** Even when routing succeeded, `/models` reads the session's `configOptions` from the ACP `initialize` response. Only `kiro-cli` emits these in the expected format (via its `models`/`modes` fallback). `claude-code`, `codex`, `gemini`, `cursor-agent`, and `opencode` do not, so the menu would be empty for those backends — the user would see `"⚠️ No model options available"` with no recourse.
+Backend model-selection support also varies; see the current
+[slash-command compatibility table](slash-commands.md#models-and-agents). This
+does not change Slack support: the two routing constraints above prevent the
+menu from reaching the correct session even when a backend emits model
+`configOptions`.
 
-On Discord, none of these apply: slash commands work in thread-channels, the channel ID *is* the thread key, and users typically stay within a single agent per deployment anyway.
+On Discord, neither constraint applies: slash commands work in thread-channels, the channel ID *is* the thread key, and users typically stay within a single agent per deployment anyway.
 
 ### If you need to switch models or agents with a Slack deployment
 
