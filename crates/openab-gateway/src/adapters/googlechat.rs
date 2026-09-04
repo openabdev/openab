@@ -1127,9 +1127,16 @@ impl MetadataTokenSource {
             metadata_base,
             iam_credentials_base,
             client: reqwest::Client::builder()
+                // The metadata bearer must never follow a redirect onto a third
+                // host, nor traverse a proxy (the plaintext metadata token would
+                // then transit an operator/attacker-controlled hop). Fail loud
+                // at construction rather than silently falling back to a default
+                // client that does both — a default client here would defeat the
+                // guarantee this source exists to uphold.
                 .redirect(reqwest::redirect::Policy::none())
+                .no_proxy()
                 .build()
-                .unwrap_or_default(),
+                .expect("no-redirect, no-proxy metadata client must build"),
         }
     }
 
