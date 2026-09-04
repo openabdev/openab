@@ -269,6 +269,42 @@ impl Registry {
         handle
     }
 
+    /// [`Registry::register_conn`], but refused when the instance is an
+    /// observer and its namespace already holds `max_observers_per_namespace`
+    /// observer registrations. Count and insert happen under ONE write-lock
+    /// acquisition, so two racing observer registrations cannot both squeeze
+    /// under the cap. Agents (primary/worker) are never refused here.
+    ///
+    /// The cap is what makes the delegation path's fan-out work bounded by
+    /// configuration instead of by operational hope: observer fan-out runs
+    /// inside the router's in-flight critical section (see its lock
+    /// hierarchy note), so the number of observers is a latency budget.
+    pub fn register_conn_capped(
+        &self,
+        mut inst: Instance,
+        shutdown: ShutdownTx,
+        max_observers_per_namespace: usize,
+    ) -> Result<u64, usize> {
+        let mut g = self.inner.write();
+        if inst.agent_type == AgentType::Observer {
+            let observers = g
+                .values()
+                .filter(|e| {
+                    e.inst.agent_type == AgentType::Observer && e.inst.namespace == inst.namespace
+                })
+                .count();
+            if observers >= max_observers_per_namespace {
+                return Err(observers);
+            }
+        }
+        // Allocated only after the cap check: a refused registration must
+        // not consume a handle id.
+        let handle = self.next_handle.fetch_add(1, Ordering::Relaxed) + 1;
+        inst.handle = handle;
+        g.insert(handle, Entry { inst, shutdown });
+        Ok(handle)
+    }
+
     /// Register an instance with a detached shutdown signal (no connection
     /// task is listening). For tests and non-WS callers.
     pub fn register(&self, inst: Instance) -> u64 {
@@ -327,7 +363,8 @@ impl Registry {
 
     /// Select a serving instance within `namespace` by exact name or labels.
     ///
-    /// Unsaturated matches only. Ordering:
+    /// Observers are never selectable: they are read-only lobby clients,
+    /// not delegation targets. Unsaturated matches only. Ordering:
     /// - exact-name selection → replicas of one logical agent: newest
     ///   registration first (rolling-deploy rule), load as tie-breaker
     /// - label selection → across logical agents: least loaded first,
@@ -342,6 +379,7 @@ impl Registry {
         let mut matches: Vec<&Instance> = g
             .values()
             .map(|e| &e.inst)
+            .filter(|i| i.agent_type != AgentType::Observer)
             .filter(|i| i.namespace == namespace)
             .filter(|i| match name {
                 Some(n) => i.name == n,
@@ -391,6 +429,17 @@ impl Registry {
             .values()
             .map(|e| &e.inst)
             .filter(|i| i.namespace == namespace)
+            .cloned()
+            .collect()
+    }
+
+    /// Observer connections in one namespace — the `cp/event` fan-out set.
+    pub fn observers(&self, namespace: &str) -> Vec<Instance> {
+        self.inner
+            .read()
+            .values()
+            .map(|e| &e.inst)
+            .filter(|i| i.agent_type == AgentType::Observer && i.namespace == namespace)
             .cloned()
             .collect()
     }
@@ -588,6 +637,55 @@ mod tests {
         assert!(!r.heartbeat(h + 999));
         std::thread::sleep(Duration::from_millis(2));
         assert_eq!(r.expired(Duration::ZERO), vec![h]);
+    }
+
+    #[test]
+    fn observer_cap_refuses_observers_but_never_agents() {
+        // Review round-10 F51 (facet d): the per-namespace observer ceiling
+        // is enforced atomically at registration — count and insert under one
+        // write-lock acquisition — and never applies to agents.
+        let r = Registry::new();
+        let cap = 2;
+        for i in 0..cap {
+            let mut ob = inst("prod", &format!("lobby-{i}"), &format!("o-{i}"), 0);
+            ob.agent_type = AgentType::Observer;
+            assert!(r.register_conn_capped(ob, shutdown_signal(), cap).is_ok());
+        }
+        // The next observer in the same namespace is refused with the count.
+        let mut over = inst("prod", "lobby-x", "o-x", 0);
+        over.agent_type = AgentType::Observer;
+        assert_eq!(
+            r.register_conn_capped(over, shutdown_signal(), cap),
+            Err(cap)
+        );
+        // A different namespace has its own budget.
+        let mut other_ns = inst("dev", "lobby-0", "o-d", 0);
+        other_ns.agent_type = AgentType::Observer;
+        assert!(r
+            .register_conn_capped(other_ns, shutdown_signal(), cap)
+            .is_ok());
+        // Agents are never subject to the observer cap.
+        assert!(r
+            .register_conn_capped(inst("prod", "w-extra", "i-w", 1), shutdown_signal(), cap)
+            .is_ok());
+    }
+
+    #[test]
+    fn observers_never_selectable_but_listed() {
+        let r = Registry::new();
+        let mut ob = inst("prod", "lobby", "i-app", 0);
+        ob.agent_type = AgentType::Observer;
+        r.register(ob);
+        // Even an exact-name selection cannot route to an observer.
+        assert!(matches!(
+            r.select("prod", Some("lobby"), None),
+            Err(SelectError::NoTarget)
+        ));
+        // Observer fan-out set is namespace-scoped.
+        assert_eq!(r.observers("prod").len(), 1);
+        assert!(r.observers("dev").is_empty());
+        // list() still shows it (lobby sees itself in the roster).
+        assert_eq!(r.list("prod").len(), 1);
     }
 
     #[test]

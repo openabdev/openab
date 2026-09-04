@@ -157,8 +157,19 @@ pub mod codes {
     pub const POLICY_DENIED: i64 = -32003;
     /// No registered, healthy runtime matches the target selector.
     pub const NO_TARGET: i64 = -32004;
-    /// Matching targets exist but all are at their advertised capacity.
-    /// Explicit fast-fail: the CP never queues (v1 has no durable state).
+    /// A capacity ceiling is exhausted. Explicit fast-fail: the CP never
+    /// queues (v1 has no durable state).
+    ///
+    /// Deliberately ONE code for three capacity domains — all matching
+    /// targets at their advertised capacity, the CP at its global
+    /// `max_inflight_delegations` ceiling, or a namespace at its
+    /// `max_observers_per_namespace` ceiling (registration refusal). Every
+    /// message names the exhausted bound and, where applicable, the config
+    /// knob, so a human can attribute the refusal; a client's reaction is
+    /// the same in all three cases (back off / retry / raise the bound), so
+    /// splitting the code would grow the wire surface without changing any
+    /// client decision. Revisit if machine-readable attribution is ever
+    /// needed for alerting.
     pub const SATURATED: i64 = -32005;
     // -32006 is deliberately unassigned. It held a `DEADLINE_EXCEEDED` code
     // that nothing could ever emit: a deadline already in the past is
@@ -188,6 +199,10 @@ pub mod codes {
 pub enum AgentType {
     Primary,
     Worker,
+    /// Read-only lobby client (Phase 1 of the observer/lobby roadmap): it
+    /// receives `cp/event` notifications and may call `cp/list_agents`, but
+    /// can never initiate, serve, cancel, or complete delegations.
+    Observer,
 }
 
 impl std::fmt::Display for AgentType {
@@ -195,6 +210,7 @@ impl std::fmt::Display for AgentType {
         match self {
             AgentType::Primary => write!(f, "primary"),
             AgentType::Worker => write!(f, "worker"),
+            AgentType::Observer => write!(f, "observer"),
         }
     }
 }
@@ -444,6 +460,179 @@ pub struct CancelParams {
     pub reason: String,
 }
 
+// --- cp/event (CP → observer, JSON-RPC notification) ---
+
+/// JSON-RPC 2.0 **notification** (no id): observers never reply to events.
+#[derive(Debug, Serialize)]
+pub struct JsonRpcNotification {
+    pub jsonrpc: &'static str,
+    pub method: String,
+    pub params: Value,
+}
+
+impl JsonRpcNotification {
+    pub fn new(method: impl Into<String>, params: Value) -> Self {
+        Self {
+            jsonrpc: "2.0",
+            method: method.into(),
+            params,
+        }
+    }
+}
+
+/// Envelope of one `cp/event` notification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventParams {
+    /// **Per-namespace** monotonic sequence number: an observer sees a dense
+    /// `n, n+1, n+2, …` stream for its own namespace, so a discontinuity means
+    /// frames were dropped (saturated queue) or the CP restarted, and the
+    /// observer resynchronizes via `cp/list_agents`. A process-global counter
+    /// would show false gaps caused purely by activity in other namespaces.
+    ///
+    /// Client contract: the **first frame received sets the baseline** — an
+    /// observer joining mid-stream may see any starting value (events already
+    /// flowed to earlier observers), and only a gap *after* that first frame
+    /// signals loss. A `seq` lower than the last seen value means the CP
+    /// restarted; treat it as a new baseline and resync. Not durable across
+    /// CP restarts.
+    pub seq: u64,
+    pub ts: chrono::DateTime<chrono::Utc>,
+    /// Namespace this event is scoped to (matches the observer's own).
+    pub namespace: String,
+    #[serde(flatten)]
+    pub event: CpEvent,
+}
+
+/// Why an instance left the registry.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeregisterReason {
+    /// The WebSocket closed (graceful close, transport error, or a peer that
+    /// could not drain its outbound queue).
+    Disconnect,
+    /// Heartbeats stopped arriving and the lease window elapsed.
+    LeaseExpired,
+}
+
+impl std::fmt::Display for DeregisterReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeregisterReason::Disconnect => write!(f, "disconnect"),
+            DeregisterReason::LeaseExpired => write!(f, "lease_expired"),
+        }
+    }
+}
+
+/// Lobby-visible control-plane events. Prompt/result bodies are carried as
+/// bounded excerpts (`max_event_excerpt_bytes`): the lobby is an audit
+/// surface, not a second delivery path for full payloads. Namespaces marked
+/// `metadata_only` omit those excerpts entirely.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum CpEvent {
+    AgentRegistered {
+        /// Logical id, `namespace/name`.
+        agent: String,
+        #[serde(rename = "type")]
+        agent_type: AgentType,
+        instance_id: String,
+        labels: std::collections::BTreeMap<String, String>,
+    },
+    AgentDeregistered {
+        agent: String,
+        instance_id: String,
+        reason: DeregisterReason,
+    },
+    DelegationRequested {
+        delegation_id: String,
+        /// Admission token of this admission of `delegation_id`. A delegation
+        /// id is legally reusable (cancel-then-retry re-admits the same id),
+        /// so observers MUST correlate lifecycle events on the composite key
+        /// `(namespace, delegation_id, admission)` — the token is what ties a
+        /// terminal event to the exact admission it ends, mirroring the wire
+        /// frames (ack/result/cancel), which all carry it.
+        admission: AdmissionToken,
+        from: String,
+        to: String,
+        /// Absent when the namespace is `metadata_only`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_excerpt: Option<String>,
+        deadline: chrono::DateTime<chrono::Utc>,
+        chain: Vec<String>,
+    },
+    DelegationCompleted {
+        delegation_id: String,
+        /// Admission token this terminal event ends — correlate on
+        /// `(namespace, delegation_id, admission)`, never on the reusable id
+        /// alone. First terminal event for a given admission wins; later ones
+        /// for that admission are duplicates.
+        admission: AdmissionToken,
+        from: String,
+        to: String,
+        status: DelegationStatus,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        result_excerpt: Option<String>,
+        /// Bounded excerpt of the terminal error text, when there is one.
+        /// Its `metadata_only` behavior depends on who wrote it: a
+        /// worker-reported error (`failed` results) is agent content and is
+        /// suppressed (key absent) exactly like `result_excerpt`, while a
+        /// CP-synthesized diagnostic (`timeout`, `target_disconnected`) is
+        /// metadata the CP composed and survives the knob — mirroring
+        /// `DelegationCancelled::reason`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    DelegationCancelled {
+        delegation_id: String,
+        /// Admission token this terminal event ends — correlate on
+        /// `(namespace, delegation_id, admission)`, never on the reusable id
+        /// alone. First terminal event for a given admission wins; later ones
+        /// for that admission are duplicates.
+        admission: AdmissionToken,
+        /// Initiator of the cancelled delegation (`namespace/name`) — an
+        /// observer that missed `delegation_requested` still gets full
+        /// attribution.
+        from: String,
+        /// Serving instance of the cancelled delegation (`namespace/name`).
+        to: String,
+        /// Who cancelled: the initiator's logical id, or `"control-plane"`
+        /// for deadline/disconnect synthesis.
+        by: String,
+        /// Bounded excerpt of the cancel reason. An initiator-supplied reason
+        /// is agent content: it is suppressed entirely (key absent) when the
+        /// namespace is `metadata_only`, exactly like prompt/result excerpts.
+        /// CP-synthesized reasons (disconnect/deadline diagnostics) are
+        /// metadata and survive the knob.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+}
+
+// --- cp/list_agents ---
+
+/// Params of `cp/list_agents`. v1 takes no arguments (the caller's
+/// authenticated namespace is the scope); the struct exists so the params
+/// object can grow filters without a wire break.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ListAgentsParams {}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSummary {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub agent_type: AgentType,
+    pub instance_id: String,
+    pub labels: std::collections::BTreeMap<String, String>,
+    pub active_sessions: u32,
+    pub max_delegated_sessions: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListAgentsResult {
+    pub namespace: String,
+    pub agents: Vec<AgentSummary>,
+}
+
 // --- method names ---
 
 pub mod methods {
@@ -452,6 +641,10 @@ pub mod methods {
     pub const DELEGATE: &str = "cp/delegate";
     pub const DELEGATE_RESULT: &str = "cp/delegate_result";
     pub const CANCEL: &str = "cp/cancel";
+    /// CP → observer notification carrying an [`EventParams`] payload.
+    pub const EVENT: &str = "cp/event";
+    /// Namespace-scoped registry snapshot (any registered client).
+    pub const LIST_AGENTS: &str = "cp/list_agents";
 }
 
 #[cfg(test)]
@@ -740,6 +933,114 @@ mod tests {
         let resp: JsonRpcMessage =
             serde_json::from_str(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#).unwrap();
         assert!(resp.method.is_none() && resp.result.is_some());
+    }
+
+    #[test]
+    fn observer_type_roundtrip() {
+        let json = serde_json::json!({
+            "protocol_version": 1,
+            "namespace": "prod",
+            "name": "lobby-app",
+            "type": "observer",
+            "instance_id": "i-app"
+        });
+        let p: RegisterParams = serde_json::from_value(json).unwrap();
+        assert_eq!(p.agent_type, AgentType::Observer);
+        assert_eq!(serde_json::to_value(&p.agent_type).unwrap(), "observer");
+    }
+
+    #[test]
+    fn event_notification_has_no_id_and_flattens_event() {
+        let ev = EventParams {
+            seq: 7,
+            ts: chrono::Utc::now(),
+            namespace: "prod".into(),
+            event: CpEvent::DelegationRequested {
+                delegation_id: "d-1".into(),
+                admission: 1,
+                from: "prod/koudu".into(),
+                to: "prod/worker-1".into(),
+                prompt_excerpt: Some("do it".into()),
+                deadline: chrono::Utc::now(),
+                chain: vec!["prod/koudu".into()],
+            },
+        };
+        let n = JsonRpcNotification::new(methods::EVENT, serde_json::to_value(&ev).unwrap());
+        let v = serde_json::to_value(&n).unwrap();
+        assert_eq!(v["method"], "cp/event");
+        assert!(v.get("id").is_none(), "notifications carry no id");
+        assert_eq!(v["params"]["event"], "delegation_requested");
+        assert_eq!(v["params"]["seq"], 7);
+        assert_eq!(v["params"]["from"], "prod/koudu");
+    }
+
+    #[test]
+    fn event_tag_snake_case() {
+        let ev = CpEvent::AgentDeregistered {
+            agent: "prod/w1".into(),
+            instance_id: "i-1".into(),
+            reason: DeregisterReason::LeaseExpired,
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["event"], "agent_deregistered");
+        let back: CpEvent = serde_json::from_value(v).unwrap();
+        assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn deregister_reason_serde_roundtrip() {
+        for (reason, wire) in [
+            (DeregisterReason::Disconnect, "disconnect"),
+            (DeregisterReason::LeaseExpired, "lease_expired"),
+        ] {
+            let v = serde_json::to_value(reason).unwrap();
+            assert_eq!(v, serde_json::json!(wire));
+            assert_eq!(
+                serde_json::from_value::<DeregisterReason>(v).unwrap(),
+                reason
+            );
+            assert_eq!(reason.to_string(), wire);
+        }
+    }
+
+    #[test]
+    fn delegation_cancelled_carries_from_and_to() {
+        let ev = CpEvent::DelegationCancelled {
+            delegation_id: "d-1".into(),
+            admission: 3,
+            from: "prod/koudu".into(),
+            to: "prod/worker-1".into(),
+            by: "control-plane".into(),
+            reason: Some("deadline exceeded".into()),
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert_eq!(v["event"], "delegation_cancelled");
+        assert_eq!(v["from"], "prod/koudu");
+        assert_eq!(v["to"], "prod/worker-1");
+        assert_eq!(v["by"], "control-plane");
+        let back: CpEvent = serde_json::from_value(v).unwrap();
+        assert_eq!(back, ev);
+    }
+
+    #[test]
+    fn absent_prompt_excerpt_is_omitted_from_the_wire() {
+        let ev = CpEvent::DelegationRequested {
+            delegation_id: "d-1".into(),
+            admission: 1,
+            from: "prod/koudu".into(),
+            to: "prod/worker-1".into(),
+            prompt_excerpt: None,
+            deadline: chrono::Utc::now(),
+            chain: vec!["prod/koudu".into()],
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        assert!(
+            v.get("prompt_excerpt").is_none(),
+            "metadata-only events carry no excerpt key"
+        );
+        // ... and the omission deserializes back to None.
+        let back: CpEvent = serde_json::from_value(v).unwrap();
+        assert_eq!(back, ev);
     }
 
     #[test]

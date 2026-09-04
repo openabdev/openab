@@ -40,10 +40,11 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::config::{AgentIdentity, CpConfig};
+use crate::events::EventHub;
 use crate::proto::{
-    codes, methods, CancelParams, DelegateParams, DelegateResultParams, ErrorObject,
-    JsonRpcErrorResponse, JsonRpcMessage, JsonRpcResponse, RegisterAck, RegisterParams,
-    PROTOCOL_VERSION,
+    codes, methods, AgentSummary, AgentType, CancelParams, CpEvent, DelegateParams,
+    DelegateResultParams, DeregisterReason, ErrorObject, JsonRpcErrorResponse, JsonRpcMessage,
+    JsonRpcResponse, ListAgentsResult, RegisterAck, RegisterParams, PROTOCOL_VERSION,
 };
 use crate::registry::{outbound_channel, shutdown_signal, Instance, Registry};
 use crate::router::{CompleteOutcome, DelegateOutcome, Router};
@@ -52,6 +53,8 @@ pub struct AppState {
     pub cfg: CpConfig,
     pub registry: Registry,
     pub router: Router,
+    /// Observer fan-out (`cp/event`) with per-namespace sequence numbers.
+    pub events: EventHub,
     rpc_id: AtomicU64,
     /// Live connections per identity (`namespace/name`), counted from the
     /// upgrade so pre-registration sockets are bounded too.
@@ -61,6 +64,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(cfg: CpConfig) -> Self {
         Self {
+            events: EventHub::new(&cfg),
             cfg,
             registry: Registry::new(),
             router: Router::new(),
@@ -322,7 +326,11 @@ async fn handle_connection(
         .effective_max_sessions(&identity, reg.max_delegated_sessions);
     // The registry assigns the CP-generated handle: ownership
     // and teardown never key on the client-supplied instance_id.
-    let handle = state.registry.register_conn(
+    // Observers are additionally bounded per namespace: fan-out does
+    // bounded per-observer work inside the delegation path's in-flight
+    // critical section, so the observer count is a configured latency
+    // budget, not an open-ended population.
+    let handle = match state.registry.register_conn_capped(
         Instance {
             handle: 0,
             namespace: identity.namespace.clone(),
@@ -337,7 +345,38 @@ async fn handle_connection(
             tx: tx.clone(),
         },
         Arc::clone(&shutdown),
-    );
+        state.cfg.max_observers_per_namespace,
+    ) {
+        Ok(h) => h,
+        Err(current) => {
+            warn!(
+                agent = %format!("{}/{}", identity.namespace, identity.name),
+                observers = current,
+                max = state.cfg.max_observers_per_namespace,
+                "registration refused: namespace is at its observer cap"
+            );
+            let resp = JsonRpcErrorResponse::new(
+                reg_rpc_id,
+                ErrorObject::new(
+                    codes::SATURATED,
+                    format!(
+                        "namespace is at its observer cap \
+                         (max_observers_per_namespace = {}); retry later or \
+                         raise the cap",
+                        state.cfg.max_observers_per_namespace
+                    ),
+                ),
+            );
+            let _ = send_bounded(
+                &mut sink,
+                Message::Text(serde_json::to_string(&resp).expect("serializable").into()),
+                write_timeout,
+                &mut shutdown_rx,
+            )
+            .await;
+            return;
+        }
+    };
     // From here on, teardown is owned by an RAII guard rather than the return
     // path: a panic anywhere below (the `expect("serializable")` sites are on
     // production paths) would otherwise skip deregistration and leave this
@@ -393,6 +432,13 @@ async fn handle_connection(
         // `_registered` runs teardown on the way out.
         return;
     }
+
+    // The lobby learns about every arrival — observers included, so one
+    // lobby client sees the others. Announced only after a successful ack:
+    // if the ack send fails, teardown emits an `agent_deregistered` with no
+    // matching `agent_registered` — roster clients must treat removal of an
+    // unknown agent as a no-op (they may have joined mid-stream anyway).
+    announce_registration(&state, handle);
 
     // --- Main loop: interleave inbound frames, outbound channel, shutdown ---
     //
@@ -509,35 +555,77 @@ struct RegistrationGuard {
 impl Drop for RegistrationGuard {
     fn drop(&mut self) {
         // Must not panic: a panic here during an unwind aborts the process.
-        // Everything it touches is lock-guarded map mutation and non-blocking
-        // sends — no `expect`, no allocation-dependent invariants. parking_lot
-        // locks are not poisoned and are released by the unwind itself, so a
-        // panic taken while holding one cannot deadlock this call.
+        // Teardown is lock-guarded map mutation, non-blocking sends, and
+        // FAIL-SOFT frame/event serialization. This Drop chain reaches
+        // `fail_instance` and `EventHub::emit`; the teardown-adjacent
+        // `sweep_deadlines` (called from the lease sweeper task, not from
+        // here) shares the same fail-soft discipline. All three drop a frame
+        // with an error log instead of panicking on a serialization error
+        // (see `synthesized_frame` and `emit`), so no `expect`/`unwrap` lies
+        // on this path. parking_lot locks are not poisoned and are released
+        // by the unwind itself, so a panic taken while holding one cannot
+        // deadlock this call.
         teardown(&self.state, self.handle, &self.identity);
     }
 }
 
-/// Deregister this connection's own registration (by handle — cannot touch
-/// another connection's entry) and fail its in-flight delegations.
+/// Announce a fresh registration to the namespace's observers.
+fn announce_registration(state: &Arc<AppState>, handle: u64) {
+    if let Some(i) = state.registry.get(handle) {
+        state.events.emit(
+            &state.registry,
+            &i.namespace,
+            CpEvent::AgentRegistered {
+                agent: i.logical_id(),
+                agent_type: i.agent_type.clone(),
+                instance_id: i.instance_id,
+                labels: i.labels,
+            },
+        );
+    }
+}
+
+/// Deregister an instance, announce it to the lobby, and fail its in-flight
+/// delegations. Shared by socket teardown and lease expiry — the only
+/// difference an observer sees is the [`DeregisterReason`].
 ///
 /// Invoked from [`RegistrationGuard::drop`], so it runs on the normal return
 /// path and on an unwind alike.
 ///
 /// Deliberately idempotent with the sweeper: when `sweep_leases` already ran
-/// `deregister` + `fail_instance` for this handle, both calls here find
-/// nothing (the registry entry and the in-flight entries are gone) and are
-/// no-ops. That idempotency is a contract — `fail_instance` releases
-/// capacity only for entries it actually removes, so a second pass can never
-/// double-release (see the capacity note in `Router::delegate`'s rollback).
-fn teardown(state: &Arc<AppState>, handle: u64, identity: &AgentIdentity) {
-    state.registry.deregister(handle);
+/// this for the handle, the `deregister` finds nothing (so no second
+/// announcement is emitted) and `fail_instance` finds no in-flight entries —
+/// both calls are no-ops. That idempotency is a contract: `fail_instance`
+/// releases capacity only for entries it actually removes, so a second pass
+/// can never double-release (see the capacity note in `Router::delegate`'s
+/// rollback).
+fn deregister_and_announce(state: &Arc<AppState>, handle: u64, reason: DeregisterReason) {
+    if let Some(i) = state.registry.deregister(handle) {
+        // Emitted after removal: a dying connection is never a fan-out target.
+        state.events.emit(
+            &state.registry,
+            &i.namespace,
+            CpEvent::AgentDeregistered {
+                agent: i.logical_id(),
+                instance_id: i.instance_id,
+                reason,
+            },
+        );
+    }
     let mut next = || state.next_rpc_id();
-    for (inst, frame) in state
-        .router
-        .fail_instance(&state.registry, handle, &mut next)
+    for (inst, frame) in
+        state
+            .router
+            .fail_instance(&state.registry, &state.events, handle, &mut next)
     {
         let _ = inst.tx.try_send(frame);
     }
+}
+
+/// Deregister this connection's own registration (by handle — cannot touch
+/// another connection's entry) and fail its in-flight delegations.
+fn teardown(state: &Arc<AppState>, handle: u64, identity: &AgentIdentity) {
+    deregister_and_announce(state, handle, DeregisterReason::Disconnect);
     info!(
         agent = %format!("{}/{}", identity.namespace, identity.name),
         handle,
@@ -668,6 +756,27 @@ fn handle_frame(state: &Arc<AppState>, handle: u64, text: &str) -> Option<String
         }
     };
 
+    // Observers are read-only. Policy already denies their delegations and
+    // ownership checks drop their results/cancels; rejecting up front turns a
+    // silent drop into an actionable error.
+    if me.agent_type == AgentType::Observer
+        && (method == methods::DELEGATE
+            || method == methods::DELEGATE_RESULT
+            || method == methods::CANCEL)
+    {
+        let resp = JsonRpcErrorResponse::new(
+            rpc_id,
+            ErrorObject::new(
+                codes::POLICY_DENIED,
+                format!(
+                    "{method} is not available to observers: they are read-only \
+                     (cp/heartbeat, cp/list_agents, and cp/event only)"
+                ),
+            ),
+        );
+        return Some(serde_json::to_string(&resp).expect("serializable"));
+    }
+
     macro_rules! params_or_err {
         ($ty:ty) => {
             match msg
@@ -712,6 +821,7 @@ fn handle_frame(state: &Arc<AppState>, handle: u64, text: &str) -> Option<String
             let outcome = state.router.delegate(
                 &state.cfg,
                 &state.registry,
+                &state.events,
                 &me.namespace,
                 &me.name,
                 &me.agent_type,
@@ -734,50 +844,47 @@ fn handle_frame(state: &Arc<AppState>, handle: u64, text: &str) -> Option<String
             let p = params_or_err!(DelegateResultParams);
             match state.router.complete(
                 &state.registry,
+                &state.events,
                 handle,
                 p,
                 state.cfg.max_result_bytes,
                 state.next_rpc_id(),
             ) {
-                CompleteOutcome::InitiatorStalled { initiator_handle } => {
-                    // The initiator cannot drain its bounded queue: per the
-                    // queue contract it is treated as disconnected, never
-                    // silently skipped. Its teardown fails the delegation
-                    // over the fail_instance path (capacity released once,
-                    // cp/cancel to this serving runtime). Do NOT ack the
-                    // result as delivered — the serving side must know its
-                    // result did not reach the initiator.
-                    state
-                        .registry
-                        .signal_shutdown(initiator_handle, REASON_BACKPRESSURE);
-                    let resp = JsonRpcErrorResponse::new(
-                        rpc_id,
-                        ErrorObject::new(
-                            codes::TARGET_DISCONNECTED,
-                            "initiator cannot receive the result; the delegation will be cancelled",
-                        ),
-                    );
-                    Some(serde_json::to_string(&resp).expect("serializable"))
-                }
-                // The result reached the initiator, which is what the serving
-                // side is being acked for. Whether THIS frame also committed
-                // the state transition is a CP-internal matter: a concurrent
-                // cancel/sweep/disconnect may have ended the delegation
-                // first, and the initiator resolves competing terminal frames
-                // by "first one wins" (see the ADR wire contract).
-                CompleteOutcome::Delivered { committed } => {
-                    if !committed {
+                CompleteOutcome::Completed {
+                    delivered,
+                    stalled_initiator,
+                } => {
+                    if let Some(initiator_handle) = stalled_initiator {
+                        // The initiator cannot drain its bounded queue: per
+                        // the queue contract it is treated as disconnected,
+                        // never silently skipped. The delegation itself
+                        // already committed (entry removed, capacity
+                        // released, terminal emitted), so the teardown finds
+                        // nothing to fail and synthesizes nothing.
+                        state
+                            .registry
+                            .signal_shutdown(initiator_handle, REASON_BACKPRESSURE);
+                    }
+                    if !delivered {
                         info!(
                             handle,
-                            "terminal result delivered, but the delegation had already been \
-                             ended (or its id re-admitted) — no state change"
+                            "delegation completed and committed, but the terminal \
+                             frame did not reach the initiator (gone or stalled)"
                         );
                     }
+                    // The commit is what the serving side is acked for: its
+                    // work is done and the delegation is over. Whether the
+                    // initiator's connection survived long enough to receive
+                    // the frame is a CP-internal matter, and the ack stays
+                    // byte-identical to the dropped case so the reply is
+                    // never an oracle for initiator liveness.
                     let resp = JsonRpcResponse::new(rpc_id, serde_json::json!({"ok": true}));
                     Some(serde_json::to_string(&resp).expect("serializable"))
                 }
-                // Dropped as unknown/foreign; each case is logged in the
-                // router (late results after a CP restart are expected).
+                // Dropped as unknown/foreign/stale, or a concurrent path
+                // (cancel, sweep, disconnect) ended the delegation first and
+                // owns its terminals; each case is logged in the router (late
+                // results after a CP restart are expected).
                 CompleteOutcome::Dropped => {
                     let resp = JsonRpcResponse::new(rpc_id, serde_json::json!({"ok": true}));
                     Some(serde_json::to_string(&resp).expect("serializable"))
@@ -785,11 +892,26 @@ fn handle_frame(state: &Arc<AppState>, handle: u64, text: &str) -> Option<String
             }
         }
         methods::CANCEL => {
-            let p = params_or_err!(CancelParams);
-            match state
-                .router
-                .cancel(&state.registry, handle, &p, state.next_rpc_id())
-            {
+            let mut p = params_or_err!(CancelParams);
+            // Defence in depth on initiator free text. The event path already
+            // redacts this string in `metadata_only` namespaces and truncates
+            // it elsewhere, but capping at the entry keeps an oversized reason
+            // from being carried through the router and the forwarded frame at
+            // all — the same posture `max_prompt_bytes` takes on the delegate
+            // path, one layer earlier than the excerpt cap.
+            if p.reason.len() > state.cfg.max_event_excerpt_bytes {
+                p.reason = crate::router::truncate_with_marker(
+                    &p.reason,
+                    state.cfg.max_event_excerpt_bytes,
+                );
+            }
+            match state.router.cancel(
+                &state.registry,
+                &state.events,
+                handle,
+                &p,
+                state.next_rpc_id(),
+            ) {
                 Ok(forward) => {
                     if let Some((target, frame)) = forward {
                         let _ = target.tx.try_send(frame);
@@ -802,6 +924,32 @@ fn handle_frame(state: &Arc<AppState>, handle: u64, text: &str) -> Option<String
                         .expect("serializable"),
                 ),
             }
+        }
+        // Namespace-scoped roster. Open to any registered client (observers
+        // included) — the scope is the caller's authenticated namespace, never
+        // a frame-supplied one. v1 takes no params, so an absent or empty
+        // params object is equally acceptable.
+        methods::LIST_AGENTS => {
+            let agents: Vec<AgentSummary> = state
+                .registry
+                .list(&me.namespace)
+                .into_iter()
+                .map(|i| AgentSummary {
+                    name: i.name,
+                    agent_type: i.agent_type,
+                    instance_id: i.instance_id,
+                    labels: i.labels,
+                    active_sessions: i.active_sessions,
+                    max_delegated_sessions: i.max_delegated_sessions,
+                })
+                .collect();
+            let result = ListAgentsResult {
+                namespace: me.namespace.clone(),
+                agents,
+            };
+            let resp =
+                JsonRpcResponse::new(rpc_id, serde_json::to_value(&result).expect("serializable"));
+            Some(serde_json::to_string(&resp).expect("serializable"))
         }
         other => {
             let resp = JsonRpcErrorResponse::new(
@@ -821,6 +969,8 @@ fn handle_frame(state: &Arc<AppState>, handle: u64, text: &str) -> Option<String
 /// a registration that no longer exists — every later frame (heartbeats
 /// included) is answered `NOT_REGISTERED` at best, and the client cannot
 /// re-register because registration is first-frame-only.
+///
+/// `lease` is a parameter so tests can sweep with a zero window.
 pub fn sweep_leases(state: &Arc<AppState>, lease: Duration) {
     for handle in state.registry.expired(lease) {
         warn!(
@@ -829,14 +979,9 @@ pub fn sweep_leases(state: &Arc<AppState>, lease: Duration) {
         );
         // Signal first: `deregister` drops the registry's side of the signal.
         state.registry.signal_shutdown(handle, REASON_LEASE_EXPIRED);
-        state.registry.deregister(handle);
-        let mut next = || state.next_rpc_id();
-        for (inst, frame) in state
-            .router
-            .fail_instance(&state.registry, handle, &mut next)
-        {
-            let _ = inst.tx.try_send(frame);
-        }
+        // Removal, the `lease_expired` announcement, and in-flight failure
+        // all live in one place, shared with socket teardown.
+        deregister_and_announce(state, handle, DeregisterReason::LeaseExpired);
     }
 }
 
@@ -844,18 +989,20 @@ pub fn sweep_leases(state: &Arc<AppState>, lease: Duration) {
 pub async fn run_sweeper(state: Arc<AppState>) {
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let lease = Duration::from_secs(state.cfg.lease_expiry_secs);
     loop {
         tick.tick().await;
 
-        sweep_leases(&state, Duration::from_secs(state.cfg.lease_expiry_secs));
+        sweep_leases(&state, lease);
 
         // Deadline sweep.
         let mut next = || state.next_rpc_id();
-        for (inst, frame) in
-            state
-                .router
-                .sweep_deadlines(&state.registry, chrono::Utc::now(), &mut next)
-        {
+        for (inst, frame) in state.router.sweep_deadlines(
+            &state.registry,
+            &state.events,
+            chrono::Utc::now(),
+            &mut next,
+        ) {
             let _ = inst.tx.try_send(frame);
         }
     }
@@ -1109,8 +1256,17 @@ mod tests {
         let state = state_with("");
         let (h_i, _rx_i) = register_test_instance(&state, "koudu", AgentType::Primary, 4);
         let (h_w, mut rx_w) = register_test_instance(&state, "worker-1", AgentType::Worker, 1);
+        // An observer is attached so the unwind exercises the FULL teardown
+        // emit surface — the deregister announcement and the per-admission
+        // terminal — which must be fail-soft: this Drop may already be
+        // unwinding, where a second panic aborts the process (review
+        // round-10 F62).
+        let (h_o, mut rx_o) = register_test_instance(&state, "lobby", AgentType::Observer, 0);
+        let _ = h_o;
         delegate_through_handler(&state, h_i, "d-1", "worker-1");
         rx_w.try_recv().expect("worker received the forward");
+        // Drain the events the delegation produced so far.
+        while rx_o.try_recv().is_ok() {}
         assert_eq!(state.registry.get(h_w).unwrap().active_sessions, 1);
         assert_eq!(state.router.inflight_count(), 1);
 
@@ -1147,6 +1303,17 @@ mod tests {
         // ...and the serving runtime is told to stop working.
         let cancel = rx_w.try_recv().expect("downstream cancel was queued");
         assert!(cancel.contains("cp/cancel") && cancel.contains("d-1"));
+        // The observer received the teardown's whole emit surface — produced
+        // during the unwind without a second panic: the deregister
+        // announcement and the delegation's terminal.
+        let mut saw_deregistered = false;
+        let mut saw_cancelled = false;
+        while let Ok(f) = rx_o.try_recv() {
+            saw_deregistered |= f.contains("agent_deregistered");
+            saw_cancelled |= f.contains("delegation_cancelled");
+        }
+        assert!(saw_deregistered, "deregister announcement emitted in Drop");
+        assert!(saw_cancelled, "delegation terminal emitted in Drop");
     }
 
     #[test]
@@ -1311,11 +1478,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stalled_initiator_is_disconnected_and_serving_side_not_falsely_acked() {
-        // The bounded-queue contract for the one frame that matters most:
-        // when the initiator's queue refuses the terminal result, the
-        // serving side must NOT receive `ok: true`, and the initiator must
-        // be closed (treated as disconnected) rather than silently skipped.
+    async fn stalled_initiator_is_disconnected_and_result_still_commits() {
+        // The bounded-queue contract for the terminal result under
+        // commit-first: the commit ends the delegation before delivery, so
+        // the serving side is acked for the commit (`ok: true`, its work is
+        // done), the stalled initiator is closed (treated as disconnected)
+        // rather than silently skipped, and its teardown finds nothing —
+        // capacity was already released exactly once by the commit.
         let state = state_with("");
 
         // Initiator whose outbound byte budget one filler frame exhausts —
@@ -1393,26 +1562,342 @@ mod tests {
         .to_string();
         let reply: serde_json::Value =
             serde_json::from_str(&handle_frame(&state, h_w, &res).expect("answered")).unwrap();
-        assert_eq!(
-            reply["error"]["code"],
-            codes::TARGET_DISCONNECTED,
-            "the serving side must not be acked as delivered"
+        assert!(
+            reply.get("error").is_none(),
+            "the commit ended the delegation; the serving side is acked for it"
         );
-        assert_eq!(reply["id"], 2, "the error must correlate with the request");
+        assert_eq!(reply["result"]["ok"], true);
+        assert_eq!(reply["id"], 2, "the ack must correlate with the request");
 
         // The initiator is told to close, with the backpressure reason.
         observer.changed().await.unwrap();
         assert_eq!(*observer.borrow(), Some(REASON_BACKPRESSURE));
 
-        // The delegation is still in flight: teardown of the stalled
-        // initiator resolves it through fail_instance (capacity released
-        // once, cp/cancel to the serving runtime).
-        assert_eq!(state.router.inflight_count(), 1);
-        let mut next = || 9;
-        let frames = state.router.fail_instance(&state.registry, h_i, &mut next);
-        assert_eq!(frames.len(), 1);
-        assert!(frames[0].1.contains("cp/cancel"));
-        assert_eq!(state.registry.get(h_w).unwrap().active_sessions, 0);
+        // The commit already ended the delegation and released capacity:
+        // teardown of the stalled initiator finds nothing to fail, so no
+        // second terminal and no double release can occur.
         assert_eq!(state.router.inflight_count(), 0);
+        assert_eq!(state.registry.get(h_w).unwrap().active_sessions, 0);
+        let mut next = || 9;
+        let frames = state
+            .router
+            .fail_instance(&state.registry, &state.events, h_i, &mut next);
+        assert!(frames.is_empty());
+        assert_eq!(state.registry.get(h_w).unwrap().active_sessions, 0);
+    }
+
+    // --- observer / lobby wiring (Phase 1) ---
+
+    fn join(
+        state: &Arc<AppState>,
+        ns: &str,
+        name: &str,
+        ty: AgentType,
+    ) -> (u64, crate::registry::FrameRx) {
+        join_at(state, ns, name, ty, Instant::now())
+    }
+
+    fn join_at(
+        state: &Arc<AppState>,
+        ns: &str,
+        name: &str,
+        ty: AgentType,
+        last_heartbeat: Instant,
+    ) -> (u64, crate::registry::FrameRx) {
+        let (tx, rx) = crate::registry::outbound_channel(64 * 1024 * 1024);
+        let handle = state.registry.register(Instance {
+            handle: 0,
+            namespace: ns.into(),
+            name: name.into(),
+            agent_type: ty,
+            instance_id: format!("i-{name}"),
+            labels: Default::default(),
+            max_delegated_sessions: 2,
+            active_sessions: 0,
+            registered_at: Instant::now(),
+            last_heartbeat,
+            tx,
+        });
+        (handle, rx)
+    }
+
+    fn events_of(rx: &mut crate::registry::FrameRx) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        while let Ok(text) = rx.try_recv() {
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(v["method"], "cp/event");
+            out.push(v["params"].clone());
+        }
+        out
+    }
+
+    fn call(state: &Arc<AppState>, handle: u64, method: &str, params: serde_json::Value) -> String {
+        let frame = serde_json::json!({
+            "jsonrpc": "2.0", "id": 42, "method": method, "params": params
+        })
+        .to_string();
+        handle_frame(state, handle, &frame).expect("a reply")
+    }
+
+    #[test]
+    fn registration_is_announced_to_observers_including_other_observers() {
+        let state = state_with("");
+        let (_, mut lobby) = join(&state, "prod", "lobby", AgentType::Observer);
+        let (h_lobby2, mut lobby2) = join(&state, "prod", "lobby-2", AgentType::Observer);
+        let (h_worker, _w_rx) = join(&state, "prod", "worker-1", AgentType::Worker);
+
+        // An observer's own arrival is visible to the lobby (itself included).
+        announce_registration(&state, h_lobby2);
+        announce_registration(&state, h_worker);
+
+        let seen = events_of(&mut lobby);
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0]["event"], "agent_registered");
+        assert_eq!(seen[0]["agent"], "prod/lobby-2");
+        assert_eq!(seen[0]["type"], "observer");
+        assert_eq!(seen[0]["seq"], 1);
+        assert_eq!(seen[1]["agent"], "prod/worker-1");
+        assert_eq!(seen[1]["type"], "worker");
+        assert_eq!(seen[1]["instance_id"], "i-worker-1");
+        assert_eq!(seen[1]["seq"], 2);
+        assert_eq!(events_of(&mut lobby2).len(), 2);
+    }
+
+    #[test]
+    fn disconnect_and_lease_expiry_announce_distinct_reasons() {
+        let state = state_with("");
+        let (_, mut lobby) = join(&state, "prod", "lobby", AgentType::Observer);
+        let (h_a, _rx_a) = join(&state, "prod", "worker-a", AgentType::Worker);
+        // worker-b stopped heartbeating five minutes ago; the lobby and
+        // worker-a are current, so only worker-b's lease is overdue.
+        let (h_b, _rx_b) = join_at(
+            &state,
+            "prod",
+            "worker-b",
+            AgentType::Worker,
+            Instant::now() - std::time::Duration::from_secs(300),
+        );
+
+        teardown(&state, h_a, &identity());
+        sweep_leases(&state, std::time::Duration::from_secs(60));
+
+        let seen = events_of(&mut lobby);
+        assert_eq!(seen.len(), 2, "one disconnect + one lease expiry: {seen:?}");
+        assert_eq!(seen[0]["event"], "agent_deregistered");
+        assert_eq!(seen[0]["agent"], "prod/worker-a");
+        assert_eq!(seen[0]["reason"], "disconnect");
+        assert_eq!(seen[0]["seq"], 1);
+        assert_eq!(seen[1]["agent"], "prod/worker-b");
+        assert_eq!(seen[1]["reason"], "lease_expired");
+        assert_eq!(seen[1]["instance_id"], "i-worker-b");
+        assert_eq!(seen[1]["seq"], 2);
+        assert!(state.registry.get(h_a).is_none());
+        assert!(state.registry.get(h_b).is_none());
+        assert_eq!(
+            state.registry.observers("prod").len(),
+            1,
+            "the current observer keeps its registration"
+        );
+    }
+
+    #[test]
+    fn list_agents_returns_the_callers_namespace_roster() {
+        let state = state_with("");
+        let (h_primary, _p) = join(&state, "prod", "koudu", AgentType::Primary);
+        let (h_lobby, _l) = join(&state, "prod", "lobby", AgentType::Observer);
+        join(&state, "dev", "other", AgentType::Worker);
+
+        for handle in [h_primary, h_lobby] {
+            let reply = call(&state, handle, methods::LIST_AGENTS, serde_json::json!({}));
+            let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
+            assert_eq!(v["id"], 42);
+            assert_eq!(v["result"]["namespace"], "prod");
+            let agents = v["result"]["agents"].as_array().unwrap();
+            assert_eq!(agents.len(), 2, "dev/other must not leak: {agents:?}");
+            let names: Vec<&str> = agents.iter().map(|a| a["name"].as_str().unwrap()).collect();
+            assert!(names.contains(&"koudu") && names.contains(&"lobby"));
+            let lobby = agents.iter().find(|a| a["name"] == "lobby").unwrap();
+            assert_eq!(lobby["type"], "observer");
+            assert_eq!(lobby["instance_id"], "i-lobby");
+            assert_eq!(lobby["active_sessions"], 0);
+            assert_eq!(lobby["max_delegated_sessions"], 2);
+        }
+
+        // v1 takes no params: an absent params object is accepted too.
+        let frame =
+            serde_json::json!({"jsonrpc": "2.0", "id": 7, "method": "cp/list_agents"}).to_string();
+        let reply = handle_frame(&state, h_primary, &frame).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(v["result"]["namespace"], "prod");
+    }
+
+    #[test]
+    fn observers_are_rejected_from_the_delegation_methods() {
+        let state = state_with("");
+        let (h_lobby, _l) = join(&state, "prod", "lobby", AgentType::Observer);
+        let (h_worker, _w) = join(&state, "prod", "worker-1", AgentType::Worker);
+
+        for (method, params) in [
+            (
+                methods::DELEGATE,
+                serde_json::json!({
+                    "delegation_id": "d-1",
+                    "target": {"name": "worker-1"},
+                    "prompt": "do it",
+                    "deadline": (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339()
+                }),
+            ),
+            (
+                methods::DELEGATE_RESULT,
+                serde_json::json!({"delegation_id": "d-1", "status": "completed"}),
+            ),
+            (
+                methods::CANCEL,
+                serde_json::json!({"delegation_id": "d-1", "reason": "no"}),
+            ),
+        ] {
+            let reply = call(&state, h_lobby, method, params);
+            let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
+            assert_eq!(
+                v["error"]["code"],
+                codes::POLICY_DENIED,
+                "{method} must be denied for observers: {v}"
+            );
+            assert!(v["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("read-only"));
+        }
+
+        // Heartbeat and list_agents remain available to observers.
+        let hb = call(
+            &state,
+            h_lobby,
+            methods::HEARTBEAT,
+            serde_json::json!({"instance_id": "i-lobby"}),
+        );
+        assert!(hb.contains("\"ok\":true"));
+        // A non-observer is unaffected by the guard.
+        let reply = call(
+            &state,
+            h_worker,
+            methods::CANCEL,
+            serde_json::json!({"delegation_id": "d-nope", "admission": 1, "reason": "x"}),
+        );
+        let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        // The router's own refusal for an unknown id is a byte-identical
+        // POLICY_DENIED (review round-3 F3), so the code alone cannot tell
+        // the two denials apart — the message can: only the guard says
+        // "read-only".
+        assert_eq!(v["error"]["code"], codes::POLICY_DENIED, "{v}");
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(
+            !msg.contains("read-only") && msg.contains("not in flight for this instance"),
+            "worker reaches the router, not the observer guard: {msg}"
+        );
+    }
+
+    #[test]
+    fn delegate_through_handle_frame_emits_lobby_events() {
+        let state = state_with("");
+        let (h_primary, _p) = join(&state, "prod", "koudu", AgentType::Primary);
+        let (h_worker, mut w_rx) = join(&state, "prod", "worker-1", AgentType::Worker);
+        let (_, mut lobby) = join(&state, "prod", "lobby", AgentType::Observer);
+
+        let reply = call(
+            &state,
+            h_primary,
+            methods::DELEGATE,
+            serde_json::json!({
+                "delegation_id": "d-1",
+                "target": {"name": "worker-1"},
+                "prompt": "ship it",
+                "deadline": (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339()
+            }),
+        );
+        let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(v["result"]["assigned_to"], "prod/worker-1", "{v}");
+        let admission = v["result"]["admission"]
+            .as_u64()
+            .expect("ack carries the token");
+        let forwarded = w_rx.try_recv().unwrap();
+        assert!(forwarded.contains("cp/delegate"));
+
+        let reply = call(
+            &state,
+            h_worker,
+            methods::DELEGATE_RESULT,
+            serde_json::json!({
+                "delegation_id": "d-1",
+                "admission": admission,
+                "status": "completed",
+                "result": "ok"
+            }),
+        );
+        assert!(reply.contains("\"ok\":true"));
+
+        let seen = events_of(&mut lobby);
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0]["event"], "delegation_requested");
+        assert_eq!(seen[0]["prompt_excerpt"], "ship it");
+        assert_eq!(seen[1]["event"], "delegation_completed");
+        assert_eq!(seen[1]["result_excerpt"], "ok");
+        assert_eq!(seen[0]["seq"], 1);
+        assert_eq!(seen[1]["seq"], 2);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_cancel_reason_is_capped_at_the_entry() {
+        // Initiator free text is capped before the router or the forwarded
+        // frame ever sees it. The event path redacts/truncates too, but this
+        // keeps a multi-megabyte reason from riding through the CP at all.
+        let state = state_with("max_event_excerpt_bytes = 256");
+        let (h_primary, _p_rx) = join(&state, "prod", "koudu", AgentType::Primary);
+        let (_h_worker, mut w_rx) = join(&state, "prod", "worker-1", AgentType::Worker);
+
+        let ack = call(
+            &state,
+            h_primary,
+            methods::DELEGATE,
+            serde_json::json!({
+                "delegation_id": "d-cap",
+                "target": {"name": "worker-1"},
+                "prompt": "work",
+                "deadline": (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339()
+            }),
+        );
+        let v: serde_json::Value = serde_json::from_str(&ack).unwrap();
+        let admission = v["result"]["admission"]
+            .as_u64()
+            .expect("ack carries the token");
+        w_rx.try_recv().expect("forwarded");
+
+        let huge = "A".repeat(64 * 1024);
+        let reply = call(
+            &state,
+            h_primary,
+            methods::CANCEL,
+            serde_json::json!({
+                "delegation_id": "d-cap",
+                "admission": admission,
+                "reason": huge
+            }),
+        );
+        assert!(
+            reply.contains("\"ok\":true"),
+            "the cancel itself succeeds: {reply}"
+        );
+
+        // The forwarded cp/cancel carries the capped reason, not 64 KiB.
+        let forwarded = w_rx.try_recv().expect("cancel forwarded to the worker");
+        assert!(
+            forwarded.len() < 2048,
+            "the forwarded cancel must not carry the untruncated reason ({} bytes)",
+            forwarded.len()
+        );
+        assert!(
+            forwarded.contains("truncated by control plane"),
+            "the cap leaves its marker: {forwarded}"
+        );
     }
 }

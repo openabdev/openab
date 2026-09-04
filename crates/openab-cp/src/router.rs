@@ -21,29 +21,31 @@
 //!
 //! Ending a delegation is a two-sided event: a frame goes out on the wire and
 //! CP state is committed. The commit is exact — it claims the one admission it
-//! delivered a result for (key + serving handle + [`InFlight::generation`]) or
-//! nothing at all — so CP state stays consistent under any interleaving. The
-//! same admission stamp is protocol-visible as
+//! is ending (key + serving handle + [`InFlight::generation`]) or nothing at
+//! all — so CP state stays consistent under any interleaving. The same
+//! admission stamp is protocol-visible as
 //! [`crate::proto::AdmissionToken`]: the serving runtime echoes it in
 //! `cp/delegate_result` and a frame naming a stale admission is dropped before
 //! anything is delivered, so exactness does not stop at the CP boundary.
 //!
-//! The wire is a different matter: a `completed` result racing the deadline
-//! sweep's synthesized `timeout` can put TWO terminal frames on the wire for
-//! one admission. v1 resolves that by contract instead of CP-side suppression
-//! (which would need per-id terminal state the CP deliberately does not
-//! keep): **the first terminal frame for an admission token wins**, and
-//! initiators MUST ignore later ones for that token. Because every
-//! initiator-bound terminal frame carries the token, a frame for a superseded
-//! admission is distinguishable from — and cannot mask — the live one. See the
-//! v1 contract amendments in `docs/adr/agent-control-plane.md`.
+//! Delivery is commit-gated: only the path that removed the entry —
+//! completion commit, cancel claim, deadline sweep, disconnect teardown, or
+//! the forward rollback — may put an initiator-bound terminal frame on the
+//! wire or emit the observer terminal event for that admission. A result
+//! whose commit loses the race is discarded undelivered, so the CP itself
+//! produces at most ONE initiator-bound terminal and exactly one observer
+//! terminal per announced admission, and the two always agree. The client
+//! contract — **the first terminal frame for an admission token wins**, later
+//! ones for that token are ignored — is retained as defence in depth (e.g.
+//! frames straddling a CP restart), not as the primary mechanism. See the v1
+//! contract amendments in `docs/adr/agent-control-plane.md`.
 //!
 //! # Lock hierarchy
 //!
 //! The router holds two locks and acquires them in ONE order only:
 //!
 //! ```text
-//! admission  →  inflight        (never the reverse)
+//! admission  →  inflight  →  registry (read)  →  event stream
 //! ```
 //!
 //! `admission` serializes the whole delegate admission sequence; `inflight`
@@ -56,10 +58,19 @@
 //! (`complete`, `cancel`, `fail_instance`, `sweep_deadlines`, `chain_of`)
 //! take `inflight` alone and never touch `admission`.
 //!
-//! Registry access is a third, independent lock owned by [`Registry`]. It is
-//! always acquired and released *outside* an `inflight` critical section
-//! (e.g. `registry.get(...)` completes before the table is locked), so it
-//! does not participate in this hierarchy.
+//! The two right-hand positions exist for exactly one code path:
+//! `delegate`'s announce/forward critical section holds `inflight` across one
+//! [`EventHub::emit`] (which takes a registry read snapshot and then the
+//! per-namespace event stream lock) and one non-blocking `try_send` to the
+//! target. That hold is what makes announcement and forwarding atomic with
+//! respect to entry removal — a teardown's terminal event can never precede
+//! the `requested` it terminates, and its best-effort `cp/cancel` can never
+//! be enqueued before the forward it cancels. The work under the hold is
+//! bounded (one serialization plus non-blocking sends). Every other path
+//! acquires and releases `registry` or the stream locks strictly OUTSIDE any
+//! `inflight` critical section, and neither the registry nor the event hub
+//! ever calls back into the router while holding its own lock, so the order
+//! above is total and acyclic.
 
 use std::collections::BTreeMap;
 
@@ -68,9 +79,10 @@ use parking_lot::Mutex;
 use tracing::{info, warn};
 
 use crate::config::CpConfig;
+use crate::events::EventHub;
 use crate::policy::{self, PolicyInput};
 use crate::proto::{
-    codes, methods, AgentType, CancelParams, DelegateAck, DelegateForward, DelegateParams,
+    codes, methods, AgentType, CancelParams, CpEvent, DelegateAck, DelegateForward, DelegateParams,
     DelegateResultParams, DelegationStatus, ErrorObject, JsonRpcRequest,
 };
 use crate::registry::{Instance, Registry, SelectError};
@@ -83,15 +95,12 @@ use crate::registry::{Instance, Registry, SelectError};
 pub struct InFlight {
     /// Namespace that owns this delegation — part of its identity, not just a
     /// lookup key: `delegation_id` is client-supplied and only unique within
-    /// the namespace that produced it.
-    ///
-    /// Stored on the entry because the delegation outlives the request that
-    /// created it, and the paths that end it without a client request —
-    /// `fail_instance` and `sweep_deadlines` — have no namespace of their own
-    /// to work from. Its consumer is the observer event layer added by the
-    /// next PR in this stack (per-namespace `cp/event` fan-out reads
-    /// `e.namespace` in exactly those two paths), so the field is part of the
-    /// entry's contract rather than an unused remnant.
+    /// the namespace that produced it. Both endpoints share it (v1 delegation
+    /// is same-namespace only), so it is also the scope of the `cp/event`
+    /// fan-out for this delegation: the paths that end a delegation without a
+    /// client request — `fail_instance` and `sweep_deadlines` — read
+    /// `e.namespace` to emit their terminal events. Always the authenticated
+    /// initiator's namespace — the same value as the in-flight key's.
     pub namespace: String,
     pub delegation_id: String,
     /// Authenticated initiator (`namespace/name`) and its registration handle.
@@ -126,6 +135,20 @@ pub struct InFlight {
     /// another's delegation volume. Commit matching only needs never-reuse per
     /// `(namespace, delegation_id)` key, which per-namespace counters give.
     pub generation: u64,
+    /// Whether this admission has been announced to observers
+    /// (`delegation_requested` emitted) and its forward attempted. Inserted
+    /// `false` and flipped to `true` inside `delegate`'s announce/forward
+    /// critical section — under the same in-flight lock acquisition that
+    /// sends the forward.
+    ///
+    /// Teardown paths (`fail_instance`, `sweep_deadlines`) that remove an
+    /// entry still `false` must emit NO observer terminal and send NO
+    /// synthesized wire frames for it: the admission was never announced to
+    /// observers and never forwarded to the worker, so a terminal would dangle
+    /// without a `requested` and a synthesized result would reach an initiator
+    /// whose `cp/delegate` call is itself about to return an error. Capacity
+    /// release still applies — the reservation was made at insert.
+    pub announced: bool,
 }
 
 /// In-flight table key: `(namespace, delegation_id)`.
@@ -181,6 +204,37 @@ pub enum DelegateOutcome {
     Rejected(ErrorObject),
 }
 
+/// Outcome of resolving a `cp/delegate`'s parent reference, read under the one
+/// admission-time in-flight acquisition.
+///
+/// A parent reference is the coupled `(parent_delegation_id, parent_admission)`
+/// pair: a delegation id alone is reusable and cannot identify the admission a
+/// caller was actually forwarded, so half a pair is a client bug and the three
+/// failure shapes below stay distinct *internally* while collapsing to one wire
+/// refusal (see `delegate`).
+enum ParentRef {
+    /// Both halves present and they name a live admission this caller serves.
+    Resolved {
+        chain: Vec<String>,
+        deadline: DateTime<Utc>,
+    },
+    /// Neither half present: a root delegation.
+    Root,
+    /// Both halves present but they name no live admission this caller serves
+    /// — unknown id, wrong serving handle, or a superseded admission. Kept as
+    /// one variant because the wire must not distinguish them.
+    Unresolved,
+    /// `parent_delegation_id` present without `parent_admission` — malformed:
+    /// an id alone is reusable and cannot identify an admission, and treating
+    /// it as a wildcard would silently grant whatever admission wears the id
+    /// now.
+    IdWithoutToken,
+    /// `parent_admission` present without `parent_delegation_id` — malformed:
+    /// rejected rather than ignored so a client that dropped the id sees its
+    /// bug instead of getting an unintended root delegation.
+    TokenWithoutId,
+}
+
 /// Result of looking up an in-flight delegation on behalf of its claimed
 /// initiator and removing it if the claim holds.
 ///
@@ -199,8 +253,8 @@ pub enum DelegateOutcome {
 /// against whatever it last observed, and by the time it arrives the id may
 /// legitimately hold a different admission. Atomicity keeps the CP's table
 /// consistent; the [`AdmissionToken`] the caller must name keeps the operation
-/// aimed at the admission it meant. Both are required, and the two-phase
-/// completion path needs the token for the additional reason that it has a
+/// aimed at the admission it meant. Both are required, and the completion
+/// path needs the token for the additional reason that it has a
 /// peek-to-commit window of its own.
 ///
 /// `cp/cancel` is this helper's only caller.
@@ -290,35 +344,37 @@ enum Commit {
 }
 
 /// Outcome of a `cp/delegate_result` frame (see [`Router::complete`]).
-///
-/// Wire delivery and state commit are distinct events: the initiator can have
-/// received the result while the CP's own bookkeeping was concluded by
-/// somebody else (a concurrent cancel, sweep, or disconnect). Collapsing the
-/// two hid whether this frame is the one that ended the delegation.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CompleteOutcome {
-    /// The result reached the initiator's queue.
-    Delivered {
-        /// Whether THIS frame also committed the state transition — removed
-        /// the in-flight entry it peeked and released the serving instance's
-        /// capacity. `false` means a concurrent path had already ended the
-        /// delegation (or its id was re-admitted), so nothing was changed
-        /// here; the frame was still delivered.
-        committed: bool,
+    /// THIS frame ended the delegation: the in-flight entry was removed, the
+    /// serving instance's capacity released, and `delegation_completed`
+    /// emitted — before any delivery was attempted, so the observer terminal
+    /// and the initiator-bound wire frame can never disagree about the
+    /// outcome.
+    Completed {
+        /// Whether the terminal frame reached the initiator's queue. `false`
+        /// means the initiator was already gone or its bounded queue refused
+        /// the frame — either way the initiator is disconnected (or about to
+        /// be) and loses the result, exactly as it would have lost a result
+        /// computed a moment after its death. The delegation still truthfully
+        /// completed: the worker did the work.
+        delivered: bool,
+        /// Set when the initiator's bounded outbound queue refused the frame:
+        /// per the queue contract the caller must treat that initiator as
+        /// disconnected and close its connection. Its teardown finds no
+        /// in-flight entry (this frame already committed it), so no
+        /// conflicting terminal is ever produced.
+        stalled_initiator: Option<u64>,
     },
     /// The frame was refused or the delegation is unknown (wrong owner,
-    /// unknown id, unregistered caller, or the initiator is gone). Nothing
-    /// changed; each case is logged.
+    /// unknown id, stale admission, unregistered caller, or a concurrent
+    /// path ended the delegation first). Nothing was changed and nothing was
+    /// delivered; each case is logged. The concurrent-removal case is the
+    /// important one: whoever removed the entry owns BOTH terminals — the
+    /// initiator-bound wire frame and the observer event — so this result is
+    /// discarded rather than delivered against a terminal that already
+    /// happened.
     Dropped,
-    /// The initiator's bounded outbound queue refused the terminal result.
-    /// The entry is still in flight: the caller must treat the initiator as
-    /// disconnected (close its connection), whose teardown then fails the
-    /// delegation through `fail_instance` — capacity is released exactly
-    /// once and the serving runtime receives `cp/cancel`.
-    InitiatorStalled {
-        /// Registration handle of the stalled initiator.
-        initiator_handle: u64,
-    },
 }
 
 impl Router {
@@ -330,11 +386,20 @@ impl Router {
     }
 
     /// Handle `cp/delegate` from an authenticated, registered initiator.
+    /// Once admission is committed the announce/forward critical section —
+    /// outside the admission lock, under one in-flight acquisition — emits
+    /// `delegation_requested` and forwards to the target atomically with
+    /// respect to entry removal, so no terminal can precede its `requested`
+    /// and no teardown cancel can overtake the forward. A forward that is
+    /// refused emits a matching `delegation_cancelled` terminal, so the
+    /// stream never carries a `requested` without a terminal; an admission
+    /// removed before the section runs announces and forwards nothing.
     #[allow(clippy::too_many_arguments)]
     pub fn delegate(
         &self,
         cfg: &CpConfig,
         registry: &Registry,
+        events: &EventHub,
         from_namespace: &str,
         from_name: &str,
         from_type: &AgentType,
@@ -356,7 +421,49 @@ impl Router {
         // namespace is a different delegation, so it neither collides here
         // nor leaks its existence.
         let key = DelegationKey::new(from_namespace, &params.delegation_id);
-        if self.inflight.lock().contains_key(&key) {
+
+        // ONE in-flight acquisition covers all three admission-time reads:
+        // the duplicate check, the global bound, and parent resolution. They
+        // are adjacent by design. The insert further down is a second,
+        // deliberate acquisition rather than a missed merge — target
+        // selection, policy evaluation and frame serialization sit between
+        // the two, and holding the in-flight lock across a registry scan and
+        // a 256 KiB serialization would trade three cheap round-trips for a
+        // long hold on the table every other path also needs. Atomicity of
+        // "check duplicate, then insert" does not come from one in-flight
+        // acquisition anyway: it comes from the admission guard spanning both.
+        //
+        // Nothing formats or logs inside the scope: the refusal paths below
+        // read their values back out and report after the guard is released.
+        let (duplicate, live, parent) = {
+            let inflight = self.inflight.lock();
+            let duplicate = inflight.contains_key(&key);
+            let live = inflight.len();
+            let parent = match (&params.parent_delegation_id, params.parent_admission) {
+                (Some(pid), Some(padmission)) => {
+                    let parent_key = DelegationKey::new(from_namespace, pid);
+                    // The chain and deadline are read from the very entry that
+                    // was validated — the `p` binding, not a second lookup. A
+                    // re-lookup after validation would reintroduce the race the
+                    // admission token closes.
+                    match inflight.get(&parent_key) {
+                        Some(p) if p.to_handle == from_handle && p.generation == padmission => {
+                            ParentRef::Resolved {
+                                chain: p.chain.clone(),
+                                deadline: p.deadline,
+                            }
+                        }
+                        _ => ParentRef::Unresolved,
+                    }
+                }
+                (Some(_), None) => ParentRef::IdWithoutToken,
+                (None, Some(_)) => ParentRef::TokenWithoutId,
+                (None, None) => ParentRef::Root,
+            };
+            (duplicate, live, parent)
+        };
+
+        if duplicate {
             return DelegateOutcome::Rejected(ErrorObject::new(
                 codes::DUPLICATE_DELEGATION,
                 format!("delegation {} is already in flight", params.delegation_id),
@@ -374,7 +481,6 @@ impl Router {
         // the send-failure rollback all remove the entry, and the count
         // follows by construction. A parallel counter would be one refactor
         // away from drifting, and a drifted global bound wedges the whole CP.
-        let live = self.inflight.lock().len();
         if live >= cfg.max_inflight_delegations {
             warn!(
                 live,
@@ -392,6 +498,45 @@ impl Router {
             ));
         }
 
+        // A parent reference is the coupled (id, admission) pair — see
+        // `ParentRef`. Unknown, unauthorized (wrong serving handle) and stale
+        // (superseded admission) parents all return the SAME error — one
+        // refusal shape, no enumeration. A distinguishable stale refusal would
+        // be an oracle telling the caller whether the id it references is
+        // currently re-admitted, which is CP scheduling state no frame reports.
+        // A half-filled pair is rejected rather than silently ignored, so a
+        // client that drops one half sees its bug instead of getting an
+        // unintended root delegation.
+        let (parent_chain, parent_deadline) = match parent {
+            ParentRef::Resolved { chain, deadline } => (chain, Some(deadline)),
+            ParentRef::Root => (Vec::new(), None),
+            ParentRef::Unresolved => {
+                let pid = params
+                    .parent_delegation_id
+                    .as_deref()
+                    .expect("Unresolved implies a parent id was supplied");
+                return DelegateOutcome::Rejected(ErrorObject::new(
+                    codes::INVALID_PARAMS,
+                    format!("parent delegation {pid} is not in flight for this instance"),
+                ));
+            }
+            ParentRef::IdWithoutToken => {
+                return DelegateOutcome::Rejected(ErrorObject::new(
+                    codes::INVALID_PARAMS,
+                    "parent_delegation_id requires parent_admission: name the \
+                     admission token this instance was forwarded for that parent \
+                     (a delegation id alone is reusable and cannot identify it)",
+                ))
+            }
+            ParentRef::TokenWithoutId => {
+                return DelegateOutcome::Rejected(ErrorObject::new(
+                    codes::INVALID_PARAMS,
+                    "parent_admission is meaningless without parent_delegation_id: \
+                     omit both for a root delegation, or send both",
+                ))
+            }
+        };
+
         // Selector sanity: exactly one of name/labels.
         let (sel_name, sel_labels) = (params.target.name.as_deref(), params.target.labels.as_ref());
         if sel_name.is_some() == sel_labels.is_some() {
@@ -400,79 +545,6 @@ impl Router {
                 "target must set exactly one of `name` or `labels`",
             ));
         }
-
-        // Parent linkage: chain and deadline derive from the CP's own table,
-        // never from the client. Three things must hold together, and the
-        // admission token is the one that makes the other two sufficient:
-        //
-        // 1. the parent lives in the CALLER's namespace (scoped lookup);
-        // 2. the caller IS the instance serving it (`to_handle`) — otherwise
-        //    any runtime knowing a live id could borrow its trusted chain and
-        //    deadline budget;
-        // 3. the caller names the SPECIFIC admission it is serving. Without
-        //    this, "currently serving that parent" degrades to "holds the
-        //    connection that serves whatever wears this id now": once parent
-        //    admission A ends (cancel, completion, or sweep) and the id is
-        //    re-admitted as B — with a single replica, to the same worker — a
-        //    residual child request composed against A satisfies 1 and 2
-        //    against B and inherits B's CP-constructed chain and B's remaining
-        //    deadline budget, so depth, cycle, and parent-budget are evaluated
-        //    for the wrong admission. Cancels are best effort, so the CP
-        //    cannot delegate policing of this to the worker: a buggy or
-        //    malicious runtime holding the serving connection could trigger it
-        //    deliberately.
-        //
-        // The id and the token are a coupled pair, enforced here because this
-        // is where parent presence is decided. An id without a token is
-        // malformed, never a wildcard; a token without an id is malformed too,
-        // rather than silently ignored, so a client that drops the id sees its
-        // bug instead of getting an unintended root delegation.
-        //
-        // Unknown, unauthorized (wrong serving handle) and stale (superseded
-        // admission) parents all return the SAME error — one refusal shape, no
-        // enumeration. A distinguishable stale refusal would be an oracle
-        // telling the caller whether the id it references is currently
-        // re-admitted, which is CP scheduling state no frame reports.
-        let (parent_chain, parent_deadline) =
-            match (&params.parent_delegation_id, params.parent_admission) {
-                (Some(pid), Some(padmission)) => {
-                    let parent_key = DelegationKey::new(from_namespace, pid);
-                    // ONE acquisition of the in-flight lock resolves the parent and
-                    // validates all three conditions, and the chain and deadline
-                    // below are read from the very entry that was validated — the
-                    // `p` binding, not a second lookup. A re-lookup after
-                    // validation would reintroduce the race the token closes.
-                    match self.inflight.lock().get(&parent_key) {
-                        Some(p) if p.to_handle == from_handle && p.generation == padmission => {
-                            (p.chain.clone(), Some(p.deadline))
-                        }
-                        _ => {
-                            return DelegateOutcome::Rejected(ErrorObject::new(
-                                codes::INVALID_PARAMS,
-                                format!(
-                                    "parent delegation {pid} is not in flight for this instance"
-                                ),
-                            ))
-                        }
-                    }
-                }
-                (Some(_), None) => {
-                    return DelegateOutcome::Rejected(ErrorObject::new(
-                        codes::INVALID_PARAMS,
-                        "parent_delegation_id requires parent_admission: name the \
-                     admission token this instance was forwarded for that parent \
-                     (a delegation id alone is reusable and cannot identify it)",
-                    ))
-                }
-                (None, Some(_)) => {
-                    return DelegateOutcome::Rejected(ErrorObject::new(
-                        codes::INVALID_PARAMS,
-                        "parent_admission is meaningless without parent_delegation_id: \
-                     omit both for a root delegation, or send both",
-                    ))
-                }
-                (None, None) => (Vec::new(), None),
-            };
 
         // Resolve target within the initiator's namespace (v1 boundary).
         let target = match registry.select(from_namespace, sel_name, sel_labels) {
@@ -579,32 +651,141 @@ impl Router {
             // distinguishable from every other in this namespace for the life
             // of the process.
             generation,
+            // Flipped inside the announce/forward section below; a teardown
+            // that removes the entry before then treats the admission as
+            // never-announced (no observer terminal, no synthesized frames).
+            announced: false,
         };
         self.inflight.lock().insert(key.clone(), entry.clone());
 
-        if target.tx.try_send(text).is_err() {
-            // Disconnected or backpressured beyond its queue: roll back.
-            //
-            // Roll back only what this call still owns. `fail_instance` and
-            // `sweep_deadlines` take the in-flight lock without the admission
-            // lock, so they can remove this very entry between the insert
-            // above and this branch — and whoever removes an entry also
-            // releases its capacity reservation. Decrementing here after a
-            // concurrent removal would double-release: the saturating math
-            // hides the underflow and `saturated()` then admits new work to
-            // an instance that is actually full.
-            //
-            // Matched on the generation, not just the key: the admission lock
-            // happens to rule out a re-admission of this id while we are
-            // here, but the rollback does not need that argument to be
-            // correct — it removes the exact entry it inserted or nothing.
-            if self.remove_generation(&key, entry.generation).is_some() {
-                registry.adjust_sessions(target.handle, -1);
+        // Admission is committed: the token is minted, capacity is reserved,
+        // and the entry is inserted — the duplicate check rides the in-flight
+        // table, so nothing below needs the admission guard. Dropping it here
+        // keeps the announce/forward critical section below out of the
+        // admission lock: that section holds the (also global) in-flight
+        // lock across the requested-emit and the forward — see the lock
+        // hierarchy note for why, and F51 in the review record for the
+        // acknowledged latency tradeoff. What dropping the guard buys is
+        // that new admissions in other connections are not serialized behind
+        // this delegation's fan-out.
+        drop(admission);
+
+        // Everything expensive that does not need the table lock is computed
+        // BEFORE taking it: the prompt excerpt scans up to max_prompt_bytes
+        // of client input, and the forward frame was serialized above. The
+        // critical section below performs only the generation re-check, the
+        // announce flag, one bounded event emission, and non-blocking sends.
+        let prompt_excerpt = events.excerpt(from_namespace, &forward.prompt);
+
+        // Announce/forward critical section. One in-flight lock acquisition
+        // covers three things that must be atomic with respect to entry
+        // removal (see the module-level lock hierarchy note):
+        //
+        // 1. `announced = true` — from here on, whoever removes this entry
+        //    owns an observer terminal for it.
+        // 2. The `delegation_requested` emit — under the table lock, so a
+        //    teardown's terminal emit (which requires removing the entry,
+        //    which requires this lock) can never reach the stream before the
+        //    `requested` it terminates. Emitting outside the lock allowed
+        //    `delegation_cancelled` to win the per-namespace seq race against
+        //    `delegation_requested` — a terminal before its `requested`, an
+        //    invalid transition for observer state machines.
+        // 3. The forward `try_send` — under the same lock, so a teardown's
+        //    best-effort `cp/cancel` (sent only after its removal, which
+        //    needs this lock) can never be enqueued to the worker before the
+        //    forward it cancels. Outside the lock, the worker could receive
+        //    the cancel first (ignored: unknown admission) and then the
+        //    forward — and run work every other party had already recorded
+        //    as cancelled, with its capacity reservation already released.
+        //
+        // Work under the lock: one event serialization (excerpt precomputed
+        // above, body bounded by the validated max_event_excerpt_bytes
+        // ceiling), one non-blocking `try_send` per observer (population
+        // bounded by max_observers_per_namespace at registration), and one
+        // non-blocking `try_send` to the target — bounded by configuration,
+        // not merely by expectation. If a teardown or the deadline sweep
+        // removed the entry first, the admission is over before it was ever
+        // announced: emit nothing, forward nothing, report the loss to the
+        // initiator (whose own teardown is usually what removed it).
+        enum Forward {
+            Sent,
+            SendFailed(InFlight),
+            Gone,
+        }
+        let forwarded = {
+            let mut g = self.inflight.lock();
+            match g.get_mut(&key) {
+                Some(e) if e.generation == generation => {
+                    e.announced = true;
+                    events.emit(
+                        registry,
+                        from_namespace,
+                        CpEvent::DelegationRequested {
+                            delegation_id: entry.delegation_id.clone(),
+                            admission: entry.generation,
+                            from: entry.from_logical.clone(),
+                            to: entry.to_logical.clone(),
+                            prompt_excerpt,
+                            deadline: entry.deadline,
+                            chain: entry.chain.clone(),
+                        },
+                    );
+                    if target.tx.try_send(text).is_err() {
+                        // Disconnected or backpressured beyond its queue:
+                        // roll back under the same lock that verified the
+                        // generation — the rollback removes the exact entry
+                        // it inserted, and no other path can interleave.
+                        let removed = g.remove(&key).expect("present under the same lock");
+                        Forward::SendFailed(removed)
+                    } else {
+                        Forward::Sent
+                    }
+                }
+                // A teardown (initiator or target death) or the deadline
+                // sweep removed the entry between insert and this section.
+                // Whoever removed it released the capacity reservation and,
+                // because the entry was not yet announced, emitted no
+                // observer terminal and sent no synthesized frames.
+                _ => Forward::Gone,
             }
-            return DelegateOutcome::Rejected(ErrorObject::new(
-                codes::TARGET_DISCONNECTED,
-                "target disconnected or unresponsive during routing",
-            ));
+        };
+
+        match forwarded {
+            Forward::Sent => {}
+            Forward::SendFailed(removed) => {
+                registry.adjust_sessions(target.handle, -1);
+                // Same thread as the `requested` emit above, so the terminal
+                // lands after it in the stream: no dangling `requested`.
+                events.emit(
+                    registry,
+                    from_namespace,
+                    CpEvent::DelegationCancelled {
+                        delegation_id: removed.delegation_id.clone(),
+                        admission: removed.generation,
+                        from: removed.from_logical.clone(),
+                        to: removed.to_logical.clone(),
+                        by: "control-plane".to_string(),
+                        reason: Some(events.cp_diagnostic("target disconnected during routing")),
+                    },
+                );
+                return DelegateOutcome::Rejected(ErrorObject::new(
+                    codes::TARGET_DISCONNECTED,
+                    "target disconnected or unresponsive during routing",
+                ));
+            }
+            Forward::Gone => {
+                warn!(
+                    delegation = %entry.delegation_id,
+                    admission = entry.generation,
+                    "admission ended by a concurrent teardown before it was \
+                     announced or forwarded — nothing was sent"
+                );
+                return DelegateOutcome::Rejected(ErrorObject::new(
+                    codes::TARGET_DISCONNECTED,
+                    "delegation ended during routing (initiator disconnect or \
+                     deadline expiry won the race); nothing was forwarded",
+                ));
+            }
         }
 
         info!(
@@ -622,17 +803,6 @@ impl Router {
             admission: generation,
             assigned_to: target.logical_id(),
         })
-    }
-
-    /// Remove `key` only if it still holds `generation` — the exact admission
-    /// the caller is acting for — under one lock acquisition. Any other entry
-    /// (or none) is left untouched.
-    fn remove_generation(&self, key: &DelegationKey, generation: u64) -> Option<InFlight> {
-        let mut g = self.inflight.lock();
-        match g.get(key) {
-            Some(e) if e.generation == generation => g.remove(key),
-            _ => None,
-        }
     }
 
     /// Look up `delegation_id` in the caller's namespace, assert the caller
@@ -718,7 +888,8 @@ impl Router {
         }
     }
 
-    /// Phase 2 of a completion: end the delegation `peeked` describes.
+    /// The commit step of `complete`'s peek -> cap -> commit -> emit ->
+    /// deliver sequence: end the delegation `peeked` describes.
     ///
     /// Under ONE in-flight lock acquisition, the entry is removed and the
     /// serving instance's capacity released only if the live entry is still
@@ -757,64 +928,73 @@ impl Router {
 
     /// Handle `cp/delegate_result` from the serving runtime.
     ///
-    /// The terminal result is the one frame that must never be silently
-    /// dropped, so delivery happens in two phases:
+    /// Commit-first: the state transition that ends the delegation happens
+    /// BEFORE the initiator-bound frame is built or sent.
     ///
     /// 1. **Peek** — validate ownership AND the echoed admission token under
-    ///    one in-flight lock acquisition without removing the entry
-    ///    ([`Router::peek_for_completion`]), then build and `try_send` the
-    ///    initiator-bound frame.
-    /// 2. **Commit** — only after the initiator's queue accepted the frame,
-    ///    end the delegation ([`Router::commit_completion`]): remove the
-    ///    entry and release the serving instance's capacity, but only if the
-    ///    live entry is still the very admission that was peeked (key +
-    ///    serving handle + [`InFlight::generation`]).
+    ///    one in-flight lock acquisition ([`Router::peek_for_completion`]).
+    /// 2. **Cap** — bound the payload in place.
+    /// 3. **Commit** — end the delegation ([`Router::commit_completion`]):
+    ///    remove the entry and release the serving instance's capacity, but
+    ///    only if the live entry is still the very admission that was peeked
+    ///    (key + serving handle + [`InFlight::generation`]). A commit that
+    ///    finds the entry gone or superseded means a concurrent cancel,
+    ///    sweep, or disconnect ended the delegation first — that path owns
+    ///    BOTH terminals (the initiator-bound frame and the observer event),
+    ///    so this result is dropped, undelivered.
+    /// 4. **Emit + deliver** — only the claiming frame announces the terminal
+    ///    to observers and queues the result to the initiator.
     ///
-    /// The token check in phase 1 is what extends admission exactness past the
-    /// CP boundary. Without it a late result for a cancelled admission A,
-    /// arriving after the same `delegation_id` was re-admitted as B to the same
-    /// worker, would peek B, be delivered to the initiator as B's terminal
-    /// frame, and then commit B (peek and commit both saw B, so B's own
-    /// generation matched) — releasing capacity B still occupies and leaving
-    /// B's genuine result to be dropped later as unknown.
+    /// Why commit before delivery: delivery is irreversible (once queued, the
+    /// initiator will act on the result), so whichever of the two happens
+    /// first is the one that can end up contradicted. The previous order —
+    /// deliver, then commit — let a concurrent cancel or sweep remove the
+    /// entry in between: the initiator had consumed a success terminal while
+    /// the observer stream's only terminal for that admission said
+    /// `cancelled`/`timeout`, and no party could detect the split. With the
+    /// commit first, exactly one path ever delivers an initiator-bound
+    /// terminal for an admission — the path that removed the entry — so the
+    /// wire and the event stream cannot diverge. The cost is deliberate: a
+    /// result whose commit loses the race is discarded, exactly as a result
+    /// arriving a moment after the cancel would have been dropped at the
+    /// peek. The "first terminal frame wins" client contract (see the ADR)
+    /// remains as defence in depth, but the CP itself no longer produces
+    /// competing terminal frames for one admission.
     ///
-    /// If the initiator's bounded queue refuses the frame, the entry stays
-    /// in flight and [`CompleteOutcome::InitiatorStalled`] tells the caller
-    /// to treat the initiator as disconnected (per the bounded-queue
-    /// contract): its teardown runs `fail_instance`, which releases capacity
-    /// exactly once and sends `cp/cancel` to the serving runtime.
+    /// A delivery failure after the commit does not reopen the delegation:
+    /// an initiator whose bounded queue refuses the frame is disconnected by
+    /// contract ([`CompleteOutcome::Completed::stalled_initiator`]), and a
+    /// disconnected initiator loses results — the same fate as one that died
+    /// a moment earlier. Its teardown finds no entry and synthesizes nothing.
     ///
-    /// Nothing outside the commit's exact-match window is touched, so the
-    /// peek-send window cannot corrupt CP state: a concurrent cancel, sweep,
-    /// or disconnect that already ended the delegation leaves this frame with
-    /// `Delivered { committed: false }`, and an id re-admitted in the window
-    /// keeps its own live entry and capacity.
-    ///
-    /// What the window *can* still produce is more than one terminal frame on
-    /// the wire for one `delegation_id` — a `completed` result racing the
-    /// sweep's synthesized `timeout`, or two duplicate results both passing
-    /// the peek. That is resolved by contract, not by CP-side suppression:
-    /// initiators MUST treat the FIRST terminal frame for a given **admission
-    /// token** as authoritative and ignore later ones for that token (see
-    /// "first terminal frame wins" in the ADR's v1 contract amendments). Every
-    /// initiator-bound terminal frame carries the token of the admission it
-    /// ends — CP-synthesized `timeout` and `target_disconnected` included — so
-    /// a late frame for a superseded admission can never mask the live one.
+    /// The token check in phase 1 extends admission exactness past the CP
+    /// boundary: a late result for a cancelled admission A, arriving after
+    /// the same `delegation_id` was re-admitted as B to the same worker, is
+    /// dropped instead of being delivered as B's terminal.
     ///
     /// Only the instance the delegation was routed to may complete it; a
     /// non-owner frame can never make the delegation momentarily invisible
     /// to a genuine result or to the deadline sweep.
+    ///
+    /// Observers are notified of the terminal status only when THIS path
+    /// authoritatively ends the delegation (`Commit::Claimed`). Every other
+    /// ending — cancel, sweep, initiator or target disconnect, forward
+    /// rollback — emits its own terminal from its own removal, so the event
+    /// stream carries exactly one authoritative terminal per admission and it
+    /// always matches what the initiator was sent. Dropped and stale results
+    /// emit nothing and deliver nothing.
     pub fn complete(
         &self,
         registry: &Registry,
+        events: &EventHub,
         serving_handle: u64,
         mut params: DelegateResultParams,
         max_result_bytes: usize,
         next_rpc_id: u64,
     ) -> CompleteOutcome {
-        // Phase 1 — peek: validate without removing. Removing before the
-        // send would make a refused send unrecoverable (silent loss of a
-        // computed result while the serving side is acked as delivered).
+        // Phase 1 — peek: validate ownership and the echoed admission token
+        // without removing anything, so refused/foreign/stale frames leave
+        // the table untouched.
         let namespace = match registry.get(serving_handle) {
             Some(i) => i.namespace,
             None => {
@@ -873,77 +1053,29 @@ impl Router {
             }
         };
 
-        // Truncate oversized results (keep the head; delegation already
-        // ran). The marker counts against the cap: the final value never
-        // exceeds max_result_bytes.
-        if let Some(r) = &params.result {
-            if r.len() > max_result_bytes {
-                let marker = format!("\n…[truncated by control plane: {} bytes total]", r.len());
-                let budget = max_result_bytes.saturating_sub(marker.len());
-                let cut = floor_char_boundary(r, budget);
-                let mut out = format!("{}{}", &r[..cut], marker);
-                if out.len() > max_result_bytes {
-                    // Degenerate tiny cap: keep whatever fits.
-                    out.truncate(floor_char_boundary(&out, max_result_bytes));
-                }
-                params.result = Some(out);
-            }
-        }
+        // Phase 2 — cap the payload (in place: the capped value is what the
+        // initiator and the lobby both see).
+        cap_payload(&mut params, max_result_bytes);
 
-        let Some(initiator) = registry.get(entry.from_handle) else {
-            // The initiator deregistered concurrently: its `fail_instance`
-            // pass removes this entry, releases capacity, and cancels the
-            // serving side — nothing to do here.
-            warn!(
-                delegation = %params.delegation_id,
-                "result for a delegation whose initiator is gone — dropped"
-            );
-            return CompleteOutcome::Dropped;
-        };
-        let frame = JsonRpcRequest::new(
-            next_rpc_id,
-            methods::DELEGATE_RESULT,
-            Some(serde_json::to_value(&params).expect("serializable")),
-        );
-        let text = serde_json::to_string(&frame).expect("serializable");
-
-        if initiator.tx.try_send(text).is_err() {
-            // Bounded-queue contract: a peer that cannot drain its queue is
-            // treated as disconnected, never silently skipped. The entry
-            // stays in flight; the caller closes the initiator, whose
-            // teardown fails the delegation over the `fail_instance` path.
-            warn!(
-                delegation = %params.delegation_id,
-                initiator = %entry.from_logical,
-                "initiator queue full — terminal result refused, treating initiator as disconnected"
-            );
-            return CompleteOutcome::InitiatorStalled {
-                initiator_handle: entry.from_handle,
-            };
-        }
-
-        // Phase 2 — commit. Claims ONLY the admission that was peeked; see
+        // Phase 3 — commit. Claims ONLY the admission that was peeked; see
         // `commit_completion` for why key + serving handle is not enough.
-        let committed = match self.commit_completion(registry, &entry) {
-            Commit::Claimed => {
-                info!(
-                    delegation = %params.delegation_id,
-                    status = ?params.status,
-                    from = %entry.to_logical,
-                    to = %entry.from_logical,
-                    "delegation completed"
-                );
-                true
-            }
+        // The commit precedes emission and delivery so that at most one path
+        // ever announces or delivers a terminal for this admission — see the
+        // method doc for why this order is load-bearing.
+        match self.commit_completion(registry, &entry) {
+            Commit::Claimed => {}
             Commit::Vanished => {
-                // Concurrent removal (duplicate result, cancel, sweep, or
-                // fail_instance): whoever removed it released the capacity.
+                // A concurrent cancel, sweep, disconnect, or duplicate result
+                // ended the delegation first. That path owns both terminals;
+                // this result is discarded UNDELIVERED so the initiator and
+                // the observer stream keep telling the same story.
                 info!(
                     delegation = %params.delegation_id,
                     namespace = %entry.namespace,
-                    "entry removed concurrently after delivery — capacity already released"
+                    "delegation ended concurrently before this result committed \
+                     — result dropped, terminal owned by the concurrent path"
                 );
-                false
+                return CompleteOutcome::Dropped;
             }
             Commit::Superseded { generation } => {
                 // The id was cancelled/expired and re-admitted between peek
@@ -955,12 +1087,58 @@ impl Router {
                     namespace = %entry.namespace,
                     peeked_generation = entry.generation,
                     live_generation = generation,
-                    "delegation id re-admitted between delivery and commit — live entry left untouched"
+                    "delegation id re-admitted between peek and commit — \
+                     result dropped, live entry left untouched"
                 );
-                false
+                return CompleteOutcome::Dropped;
             }
-        };
-        CompleteOutcome::Delivered { committed }
+        }
+
+        info!(
+            delegation = %params.delegation_id,
+            status = ?params.status,
+            from = %entry.to_logical,
+            to = %entry.from_logical,
+            "delegation completed"
+        );
+
+        // Phase 4a — emit. Lobby fan-out AFTER the authoritative removal:
+        // this path owns the entry's end, so it owns the terminal event.
+        // Every removal path (commit here, cancel, sweep, fail_instance,
+        // forward rollback) emits exactly one terminal from its own removal,
+        // so observers never see divergent or duplicate terminals for one
+        // admission, and a dropped or stale result emits nothing at all.
+        events.emit(
+            registry,
+            &entry.namespace,
+            CpEvent::DelegationCompleted {
+                delegation_id: params.delegation_id.clone(),
+                admission: entry.generation,
+                from: entry.from_logical.clone(),
+                to: entry.to_logical.clone(),
+                status: params.status.clone(),
+                result_excerpt: events.excerpt_opt(&entry.namespace, params.result.as_deref()),
+                error: events.excerpt_opt(&entry.namespace, params.error.as_deref()),
+            },
+        );
+
+        // Phase 4b — deliver. The delegation is already over; delivery
+        // failure is a fact about the initiator's connection, not about the
+        // delegation's outcome.
+        match deliver_result(registry, &entry, &params, next_rpc_id) {
+            Deliver::Queued => CompleteOutcome::Completed {
+                delivered: true,
+                stalled_initiator: None,
+            },
+            Deliver::InitiatorGone => CompleteOutcome::Completed {
+                delivered: false,
+                stalled_initiator: None,
+            },
+            Deliver::Refused => CompleteOutcome::Completed {
+                delivered: false,
+                stalled_initiator: Some(entry.from_handle),
+            },
+        }
     }
 
     /// Handle `cp/cancel` from the initiator. Returns the frame to forward
@@ -977,6 +1155,7 @@ impl Router {
     pub fn cancel(
         &self,
         registry: &Registry,
+        events: &EventHub,
         from_handle: u64,
         params: &CancelParams,
         next_rpc_id: u64,
@@ -1043,6 +1222,23 @@ impl Router {
             admission = entry.generation,
             "delegation cancelled by initiator"
         );
+        events.emit(
+            registry,
+            &entry.namespace,
+            CpEvent::DelegationCancelled {
+                delegation_id: params.delegation_id.clone(),
+                admission: entry.generation,
+                from: entry.from_logical.clone(),
+                to: entry.to_logical.clone(),
+                by: entry.from_logical.clone(),
+                // Initiator-supplied free text is agent content, not a CP
+                // diagnostic: it goes through the metadata_only-aware path,
+                // so a `metadata_only` namespace never mirrors it to
+                // observers (the counterparty still receives it verbatim in
+                // the forwarded cp/cancel below).
+                reason: events.excerpt(&entry.namespace, &params.reason),
+            },
+        );
         let target = registry.get(entry.to_handle);
         Ok(target.map(|t| {
             // Forwarded verbatim: the token was just matched against the live
@@ -1065,9 +1261,26 @@ impl Router {
     pub fn fail_instance(
         &self,
         registry: &Registry,
+        events: &EventHub,
         handle: u64,
         rpc_id: &mut impl FnMut() -> u64,
     ) -> Vec<(Instance, String)> {
+        // Scale note (shared with `sweep_deadlines`): this is an O(live) scan of
+        // the whole table plus an intermediate key `Vec`, and `complete` clones
+        // the full `InFlight` (chain included) per terminal. That is deliberate
+        // at this size: `max_inflight_delegations` caps the table at 4096 by
+        // default, so a scan is a few thousand comparisons under a lock held for
+        // microseconds, and the clone keeps the emit and frame construction off
+        // the lock entirely.
+        //
+        // Upgrade path when the cap is raised materially: keep two secondary
+        // indexes beside the primary map — `handle -> {DelegationKey}` for this
+        // function and a deadline-ordered structure (BTreeMap<deadline, keys> or
+        // a binary heap) for the sweep — so both become O(affected) instead of
+        // O(live). Both indexes must be maintained by the same five removal
+        // paths that own the primary map, which is the reason not to add them
+        // before the size justifies it: a drifted index is a silent
+        // wrong-delegation bug, where a slow scan is only slow.
         let mut affected = Vec::new();
         let entries: Vec<InFlight> = {
             let mut g = self.inflight.lock();
@@ -1079,48 +1292,86 @@ impl Router {
             keys.iter().filter_map(|k| g.remove(k)).collect()
         };
         for e in entries {
+            // An entry removed before `delegate`'s announce/forward section
+            // ran was never announced to observers and never forwarded to the
+            // worker: emit no terminal (it would dangle without a
+            // `requested`) and synthesize no frames (a result would reach an
+            // initiator whose `cp/delegate` call is itself returning an
+            // error, and a cancel would name an admission the worker never
+            // saw). Capacity release below still applies — the reservation
+            // was made at insert, before the announce.
             if e.to_handle == handle {
                 // Serving side died → tell the initiator.
-                if let Some(init) = registry.get(e.from_handle) {
-                    let params = DelegateResultParams {
-                        delegation_id: e.delegation_id.clone(),
-                        // The admission this frame ends — the initiator
-                        // correlates terminal frames on the token, not on the
-                        // reusable id.
-                        admission: e.generation,
-                        status: DelegationStatus::TargetDisconnected,
-                        result: None,
-                        error: Some(format!("{} disconnected", e.to_logical)),
-                    };
-                    let frame = JsonRpcRequest::new(
-                        rpc_id(),
-                        methods::DELEGATE_RESULT,
-                        Some(serde_json::to_value(&params).expect("serializable")),
+                let error = format!("{} disconnected", e.to_logical);
+                if e.announced {
+                    if let Some(init) = registry.get(e.from_handle) {
+                        let params = DelegateResultParams {
+                            delegation_id: e.delegation_id.clone(),
+                            // The admission this frame ends — the initiator
+                            // correlates terminal frames on the token, not on
+                            // the reusable id.
+                            admission: e.generation,
+                            status: DelegationStatus::TargetDisconnected,
+                            result: None,
+                            error: Some(error.clone()),
+                        };
+                        if let Some(text) =
+                            synthesized_frame(rpc_id(), methods::DELEGATE_RESULT, &params)
+                        {
+                            affected.push((init, text));
+                        }
+                    }
+                    // Emitted even when the initiator is already gone: the
+                    // lobby must see the delegation reach a terminal state.
+                    events.emit(
+                        registry,
+                        &e.namespace,
+                        CpEvent::DelegationCompleted {
+                            delegation_id: e.delegation_id.clone(),
+                            admission: e.generation,
+                            from: e.from_logical.clone(),
+                            to: e.to_logical.clone(),
+                            status: DelegationStatus::TargetDisconnected,
+                            result_excerpt: None,
+                            error: Some(events.cp_diagnostic(&error)),
+                        },
                     );
-                    affected.push((init, serde_json::to_string(&frame).expect("serializable")));
                 }
             } else {
                 // Initiator died → cancel downstream, free worker capacity.
                 registry.adjust_sessions(e.to_handle, -1);
-                if let Some(target) = registry.get(e.to_handle) {
-                    let params = CancelParams {
-                        delegation_id: e.delegation_id.clone(),
-                        // The admission this cancel ends. Built from the entry
-                        // this loop removed, so if the id is re-admitted before
-                        // this best-effort frame reaches the worker, the frame
-                        // still names the admission that is over.
-                        admission: e.generation,
-                        reason: format!("initiator {} disconnected", e.from_logical),
-                    };
-                    let frame = JsonRpcRequest::new(
-                        rpc_id(),
-                        methods::CANCEL,
-                        Some(serde_json::to_value(&params).expect("serializable")),
+                let reason = format!("initiator {} disconnected", e.from_logical);
+                if e.announced {
+                    if let Some(target) = registry.get(e.to_handle) {
+                        let params = CancelParams {
+                            delegation_id: e.delegation_id.clone(),
+                            // The admission this cancel ends. Built from the
+                            // entry this loop removed, so if the id is
+                            // re-admitted before this best-effort frame
+                            // reaches the worker, the frame still names the
+                            // admission that is over.
+                            admission: e.generation,
+                            reason: reason.clone(),
+                        };
+                        if let Some(text) = synthesized_frame(rpc_id(), methods::CANCEL, &params) {
+                            affected.push((target, text));
+                        }
+                    }
+                    events.emit(
+                        registry,
+                        &e.namespace,
+                        CpEvent::DelegationCancelled {
+                            delegation_id: e.delegation_id.clone(),
+                            admission: e.generation,
+                            from: e.from_logical.clone(),
+                            to: e.to_logical.clone(),
+                            by: "control-plane".to_string(),
+                            reason: Some(events.cp_diagnostic(&reason)),
+                        },
                     );
-                    affected.push((target, serde_json::to_string(&frame).expect("serializable")));
                 }
             }
-            warn!(delegation = %e.delegation_id, handle, "in-flight delegation failed by disconnect");
+            warn!(delegation = %e.delegation_id, handle, announced = e.announced, "in-flight delegation failed by disconnect");
         }
         affected
     }
@@ -1130,6 +1381,7 @@ impl Router {
     pub fn sweep_deadlines(
         &self,
         registry: &Registry,
+        events: &EventHub,
         now: DateTime<Utc>,
         rpc_id: &mut impl FnMut() -> u64,
     ) -> Vec<(Instance, String)> {
@@ -1145,7 +1397,28 @@ impl Router {
         let mut frames = Vec::new();
         for e in overdue {
             registry.adjust_sessions(e.to_handle, -1);
-            warn!(delegation = %e.delegation_id, deadline = %e.deadline, "delegation deadline exceeded");
+            warn!(delegation = %e.delegation_id, deadline = %e.deadline, announced = e.announced, "delegation deadline exceeded");
+            if !e.announced {
+                // Removed before `delegate`'s announce/forward section ran
+                // (possible only with a deadline at or before admission
+                // time): never announced, never forwarded — no terminal to
+                // emit, no frames to synthesize. Capacity was still reserved
+                // at insert, hence the release above.
+                continue;
+            }
+            events.emit(
+                registry,
+                &e.namespace,
+                CpEvent::DelegationCompleted {
+                    delegation_id: e.delegation_id.clone(),
+                    admission: e.generation,
+                    from: e.from_logical.clone(),
+                    to: e.to_logical.clone(),
+                    status: DelegationStatus::Timeout,
+                    result_excerpt: None,
+                    error: Some(events.cp_diagnostic("deadline exceeded")),
+                },
+            );
             if let Some(init) = registry.get(e.from_handle) {
                 let params = DelegateResultParams {
                     delegation_id: e.delegation_id.clone(),
@@ -1157,12 +1430,9 @@ impl Router {
                     result: None,
                     error: Some("deadline exceeded".to_string()),
                 };
-                let frame = JsonRpcRequest::new(
-                    rpc_id(),
-                    methods::DELEGATE_RESULT,
-                    Some(serde_json::to_value(&params).expect("serializable")),
-                );
-                frames.push((init, serde_json::to_string(&frame).expect("serializable")));
+                if let Some(text) = synthesized_frame(rpc_id(), methods::DELEGATE_RESULT, &params) {
+                    frames.push((init, text));
+                }
             }
             if let Some(target) = registry.get(e.to_handle) {
                 let params = CancelParams {
@@ -1176,12 +1446,9 @@ impl Router {
                     admission: e.generation,
                     reason: "deadline exceeded".to_string(),
                 };
-                let frame = JsonRpcRequest::new(
-                    rpc_id(),
-                    methods::CANCEL,
-                    Some(serde_json::to_value(&params).expect("serializable")),
-                );
-                frames.push((target, serde_json::to_string(&frame).expect("serializable")));
+                if let Some(text) = synthesized_frame(rpc_id(), methods::CANCEL, &params) {
+                    frames.push((target, text));
+                }
             }
         }
         frames
@@ -1199,6 +1466,131 @@ impl Router {
     pub fn inflight_count(&self) -> usize {
         self.inflight.lock().len()
     }
+}
+
+/// Outcome of the delivery phase of a completion. Under commit-first
+/// ordering, delivery runs AFTER the commit that ended the delegation and
+/// after the observer terminal was emitted: a failure here is a fact about
+/// the initiator's connection, never about the delegation's outcome, and
+/// must not emit a second terminal.
+enum Deliver {
+    /// The frame is on the initiator's outbound queue.
+    Queued,
+    /// The initiator deregistered before delivery. The delegation still
+    /// completed (the worker did the work); the dead initiator loses the
+    /// result exactly as it loses everything else in flight at its death.
+    /// Its teardown finds no in-flight entry and synthesizes nothing.
+    InitiatorGone,
+    /// The initiator's bounded queue refused the frame. Per the queue
+    /// contract it is treated as disconnected: the caller closes that
+    /// connection, and because the entry was already committed, the teardown
+    /// finds nothing to fail — no conflicting terminal can be produced.
+    Refused,
+}
+
+/// Cap an oversized result or error in place (keep the head — the delegation
+/// already ran). The marker counts against the cap, so the final value never
+/// exceeds `max_result_bytes`, and the capped value is what the initiator and
+/// the lobby both see. `error` is agent free text from the same frame and the
+/// same sender as `result`, so it gets the same bound — an uncapped error
+/// would ride up to the transport frame limit while the result beside it is
+/// capped.
+fn cap_payload(params: &mut DelegateResultParams, max_result_bytes: usize) {
+    if let Some(r) = &params.result {
+        if r.len() > max_result_bytes {
+            params.result = Some(truncate_with_marker(r, max_result_bytes));
+        }
+    }
+    if let Some(e) = &params.error {
+        if e.len() > max_result_bytes {
+            params.error = Some(truncate_with_marker(e, max_result_bytes));
+        }
+    }
+}
+
+/// Queue the terminal result on the initiator's connection.
+///
+/// The `expect("serializable")` here is INTENTIONAL, unlike the fail-soft
+/// [`synthesized_frame`] used by teardown paths: this runs on the
+/// `cp/delegate_result` request path (never from a Drop or the sweeper), its
+/// params were just deserialized from a client frame (provably
+/// serializable), and a panic here is absorbed by `RegistrationGuard`'s
+/// fail-soft teardown. Do not convert it to fail-soft without understanding
+/// that distinction — silently losing a genuine terminal on the request path
+/// is worse than the loud failure.
+fn deliver_result(
+    registry: &Registry,
+    entry: &InFlight,
+    params: &DelegateResultParams,
+    next_rpc_id: u64,
+) -> Deliver {
+    let Some(initiator) = registry.get(entry.from_handle) else {
+        warn!(
+            delegation = %params.delegation_id,
+            "result for a delegation whose initiator is gone — dropped"
+        );
+        return Deliver::InitiatorGone;
+    };
+    let frame = JsonRpcRequest::new(
+        next_rpc_id,
+        methods::DELEGATE_RESULT,
+        Some(serde_json::to_value(params).expect("serializable")),
+    );
+    let text = serde_json::to_string(&frame).expect("serializable");
+    if initiator.tx.try_send(text).is_err() {
+        // Bounded-queue contract: a peer that cannot drain its queue is
+        // treated as disconnected, never silently skipped.
+        warn!(
+            delegation = %params.delegation_id,
+            initiator = %entry.from_logical,
+            "initiator queue full — terminal result refused, treating initiator as disconnected"
+        );
+        return Deliver::Refused;
+    }
+    Deliver::Queued
+}
+
+/// Serialize a CP-synthesized wire frame, failing SOFT. Callers include
+/// `fail_instance` and `sweep_deadlines`, which are reachable from connection
+/// teardown — `RegistrationGuard`'s Drop, possibly already unwinding, where a
+/// second panic aborts the whole process — and from the lease sweeper. A
+/// frame that cannot serialize (practically unreachable for these types) is
+/// dropped with an error log instead of panicking: the peer reconciles via
+/// its own deadline, and the CP stays up.
+fn synthesized_frame(rpc_id: u64, method: &str, params: &impl serde::Serialize) -> Option<String> {
+    match serde_json::to_value(params)
+        .and_then(|v| serde_json::to_string(&JsonRpcRequest::new(rpc_id, method, Some(v))))
+    {
+        Ok(t) => Some(t),
+        Err(e) => {
+            tracing::error!(
+                method,
+                error = %e,
+                "CP-synthesized frame serialization failed — frame dropped"
+            );
+            None
+        }
+    }
+}
+
+/// Truncate `s` to at most `cap` bytes, keeping the head and appending a
+/// marker. The marker counts against the cap: the returned value never
+/// exceeds `cap`, and cuts always land on UTF-8 char boundaries. Shared by
+/// result/error capping, the server's inbound cancel-reason cap, and the
+/// observer excerpt paths so all use one implementation.
+pub(crate) fn truncate_with_marker(s: &str, cap: usize) -> String {
+    if s.len() <= cap {
+        return s.to_string();
+    }
+    let marker = format!("\n…[truncated by control plane: {} bytes total]", s.len());
+    let budget = cap.saturating_sub(marker.len());
+    let cut = floor_char_boundary(s, budget);
+    let mut out = format!("{}{}", &s[..cut], marker);
+    if out.len() > cap {
+        // Degenerate tiny cap: keep whatever fits.
+        out.truncate(floor_char_boundary(&out, cap));
+    }
+    out
 }
 
 /// Largest index `<= max` that lands on a char boundary of `s`.
@@ -1308,6 +1700,7 @@ type = "worker"
 
     struct World {
         cfg: CpConfig,
+        events: EventHub,
         registry: Registry,
         router: Router,
         h_primary: u64,
@@ -1317,13 +1710,18 @@ type = "worker"
     }
 
     fn world() -> World {
+        world_with_cfg(cfg())
+    }
+
+    fn world_with_cfg(cfg: CpConfig) -> World {
         let registry = Registry::new();
         let (p, primary_rx) = instance("prod", "koudu", AgentType::Primary, 4);
         let (w, worker_rx) = instance("prod", "worker-1", AgentType::Worker, 1);
         let h_primary = registry.register(p);
         let h_worker = registry.register(w);
         World {
-            cfg: cfg(),
+            events: EventHub::new(&cfg),
+            cfg,
             registry,
             router: Router::new(),
             h_primary,
@@ -1333,10 +1731,29 @@ type = "worker"
         }
     }
 
+    /// Register a lobby observer in `ns` and return its outbound queue.
+    fn observe(w: &World, ns: &str) -> crate::registry::FrameRx {
+        let (ob, rx) = instance(ns, "lobby", AgentType::Observer, 0);
+        w.registry.register(ob);
+        rx
+    }
+
+    /// Every `cp/event` params object queued for an observer.
+    fn events_of(rx: &mut crate::registry::FrameRx) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        while let Ok(text) = rx.try_recv() {
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(v["method"], "cp/event");
+            out.push(v["params"].clone());
+        }
+        out
+    }
+
     fn do_delegate(w: &World, params: DelegateParams) -> DelegateOutcome {
         w.router.delegate(
             &w.cfg,
             &w.registry,
+            &w.events,
             "prod",
             "koudu",
             &AgentType::Primary,
@@ -1389,7 +1806,7 @@ type = "worker"
             reason: "changed my mind".into(),
         };
         w.router
-            .cancel(&w.registry, w.h_primary, &cancel, 2)
+            .cancel(&w.registry, &w.events, w.h_primary, &cancel, 2)
             .expect("the initiator may cancel");
         drain(&mut w);
 
@@ -1408,6 +1825,7 @@ type = "worker"
         assert_eq!(
             w.router.complete(
                 &w.registry,
+                &w.events,
                 w.h_worker,
                 result_of("d-1", a.admission, "A's stale payload"),
                 1024,
@@ -1436,12 +1854,16 @@ type = "worker"
         assert_eq!(
             w.router.complete(
                 &w.registry,
+                &w.events,
                 w.h_worker,
                 result_of("d-1", b.admission, "B's genuine result"),
                 1024,
                 4
             ),
-            CompleteOutcome::Delivered { committed: true }
+            CompleteOutcome::Completed {
+                delivered: true,
+                stalled_initiator: None
+            }
         );
         let frame = w.primary_rx.try_recv().expect("initiator got B's result");
         assert!(frame.contains("B's genuine result"));
@@ -1480,9 +1902,12 @@ type = "worker"
             id += 1;
             id
         };
-        let swept =
-            w.router
-                .sweep_deadlines(&w.registry, Utc::now() + Duration::seconds(120), &mut next);
+        let swept = w.router.sweep_deadlines(
+            &w.registry,
+            &w.events,
+            Utc::now() + Duration::seconds(120),
+            &mut next,
+        );
         assert_eq!(w.router.inflight_count(), 0, "A expired");
         assert_eq!(w.registry.get(w.h_worker).unwrap().active_sessions, 0);
 
@@ -1547,7 +1972,7 @@ type = "worker"
             reason: "changed my mind".into(),
         };
         w.router
-            .cancel(&w.registry, w.h_primary, &first, 2)
+            .cancel(&w.registry, &w.events, w.h_primary, &first, 2)
             .expect("the initiator may cancel its live admission");
         drain(&mut w);
 
@@ -1561,7 +1986,7 @@ type = "worker"
         // The retry: same initiator, same id, A's token.
         let err = w
             .router
-            .cancel(&w.registry, w.h_primary, &first, 3)
+            .cancel(&w.registry, &w.events, w.h_primary, &first, 3)
             .expect_err("a cancel naming a superseded admission must be refused");
         assert_eq!(err.code, codes::POLICY_DENIED);
         // Byte-identical to the unknown-id refusal: the retry learns nothing
@@ -1575,7 +2000,7 @@ type = "worker"
             serde_json::to_string(&err).unwrap(),
             serde_json::to_string(
                 &w.router
-                    .cancel(&w.registry, w.h_primary, &unknown, 4)
+                    .cancel(&w.registry, &w.events, w.h_primary, &unknown, 4)
                     .unwrap_err()
             )
             .unwrap(),
@@ -1598,12 +2023,16 @@ type = "worker"
         assert_eq!(
             w.router.complete(
                 &w.registry,
+                &w.events,
                 w.h_worker,
                 result_of("d-1", b.admission, "B's genuine result"),
                 1024,
                 5
             ),
-            CompleteOutcome::Delivered { committed: true }
+            CompleteOutcome::Completed {
+                delivered: true,
+                stalled_initiator: None
+            }
         );
         let frame = w.primary_rx.try_recv().expect("initiator got B's result");
         assert!(frame.contains("B's genuine result"));
@@ -1630,9 +2059,12 @@ type = "worker"
             seq += 1;
             seq
         };
-        let swept =
-            w.router
-                .sweep_deadlines(&w.registry, Utc::now() + Duration::seconds(3600), &mut next);
+        let swept = w.router.sweep_deadlines(
+            &w.registry,
+            &w.events,
+            Utc::now() + Duration::seconds(3600),
+            &mut next,
+        );
         let timeout = swept
             .iter()
             .map(|(_, f)| f.clone())
@@ -1653,12 +2085,16 @@ type = "worker"
         assert_eq!(
             w.router.complete(
                 &w.registry,
+                &w.events,
                 w.h_worker,
                 result_of("d-1", b.admission, "B done"),
                 1024,
                 5
             ),
-            CompleteOutcome::Delivered { committed: true }
+            CompleteOutcome::Completed {
+                delivered: true,
+                stalled_initiator: None
+            }
         );
         let terminal_b = w.primary_rx.try_recv().unwrap();
         assert_eq!(frame_admission(&terminal_b), b.admission);
@@ -1672,7 +2108,9 @@ type = "worker"
         let c = accept(do_delegate(&w, delegate_params("d-2", "worker-1", 60)));
         drain(&mut w);
         w.registry.deregister(w.h_worker);
-        let frames = w.router.fail_instance(&w.registry, w.h_worker, &mut next);
+        let frames = w
+            .router
+            .fail_instance(&w.registry, &w.events, w.h_worker, &mut next);
         assert_eq!(frames.len(), 1);
         assert!(frames[0].1.contains("target_disconnected"));
         assert_eq!(
@@ -1706,6 +2144,7 @@ type = "primary"
         cfg.validate().unwrap();
         let registry = Registry::new();
         let router = Router::new();
+        let events = EventHub::new(&cfg);
         // Capacity 8 on the target, so the GLOBAL bound is the binding limit.
         let (p, mut primary_rx) = instance("prod", "koudu", AgentType::Primary, 8);
         let (wk, mut worker_rx) = instance("prod", "worker-1", AgentType::Worker, 8);
@@ -1715,6 +2154,7 @@ type = "primary"
             router.delegate(
                 &cfg,
                 &registry,
+                &events,
                 "prod",
                 "koudu",
                 &AgentType::Primary,
@@ -1748,12 +2188,16 @@ type = "primary"
         assert_eq!(
             router.complete(
                 &registry,
+                &events,
                 hw,
                 result_of("d-1", first.admission, "done"),
                 1024,
                 2
             ),
-            CompleteOutcome::Delivered { committed: true }
+            CompleteOutcome::Completed {
+                delivered: true,
+                stalled_initiator: None
+            }
         );
         assert_eq!(router.inflight_count(), 0);
         let second = accept(go("d-2"));
@@ -1765,7 +2209,9 @@ type = "primary"
             admission: second.admission,
             reason: "no longer needed".into(),
         };
-        router.cancel(&registry, hp, &cancel, 3).expect("owned");
+        router
+            .cancel(&registry, &events, hp, &cancel, 3)
+            .expect("owned");
         assert_eq!(router.inflight_count(), 0);
         assert_ne!(second.admission, accept(go("d-3")).admission);
         drain_all();
@@ -1777,14 +2223,19 @@ type = "primary"
             seq
         };
         assert!(!router
-            .sweep_deadlines(&registry, Utc::now() + Duration::seconds(3600), &mut next)
+            .sweep_deadlines(
+                &registry,
+                &events,
+                Utc::now() + Duration::seconds(3600),
+                &mut next
+            )
             .is_empty());
         assert_eq!(router.inflight_count(), 0);
         accept(go("d-4"));
         drain_all();
 
         // 4. fail_instance (the initiator's own disconnect).
-        router.fail_instance(&registry, hp, &mut next);
+        router.fail_instance(&registry, &events, hp, &mut next);
         assert_eq!(router.inflight_count(), 0);
         accept(go("d-5"));
         drain_all();
@@ -1794,7 +2245,7 @@ type = "primary"
         // must come back with it, which a second target proves.
         let (wk2, mut worker2_rx) = instance("prod", "worker-2", AgentType::Worker, 8);
         registry.register(wk2);
-        router.fail_instance(&registry, hp, &mut next);
+        router.fail_instance(&registry, &events, hp, &mut next);
         assert_eq!(router.inflight_count(), 0);
         worker_rx.close();
         match go("d-6") {
@@ -1805,6 +2256,7 @@ type = "primary"
         match router.delegate(
             &cfg,
             &registry,
+            &events,
             "prod",
             "koudu",
             &AgentType::Primary,
@@ -1849,9 +2301,15 @@ type = "primary"
             error: None,
         };
         assert_eq!(
-            w.router.complete(&w.registry, w.h_worker, result, 1024, 2),
-            CompleteOutcome::Delivered { committed: true }
+            w.router
+                .complete(&w.registry, &w.events, w.h_worker, result, 1024, 2),
+            CompleteOutcome::Completed {
+                delivered: true,
+                stalled_initiator: None
+            }
         );
+        // Delivery lands on the initiator's own queue — the frame arriving on
+        // `primary_rx` IS the `init.handle == h_primary` assertion.
         let frame = w.primary_rx.try_recv().unwrap();
         assert!(frame.contains("\"completed\""));
         // The initiator-bound terminal frame names the admission it ends.
@@ -1879,8 +2337,12 @@ type = "primary"
             error: None,
         };
         assert_eq!(
-            w.router.complete(&w.registry, w.h_worker, result, 1024, 2),
-            CompleteOutcome::Delivered { committed: true }
+            w.router
+                .complete(&w.registry, &w.events, w.h_worker, result, 1024, 2),
+            CompleteOutcome::Completed {
+                delivered: true,
+                stalled_initiator: None
+            }
         );
         w.worker_rx.try_recv().unwrap();
     }
@@ -1915,6 +2377,7 @@ type = "primary"
             let registry = Registry::new();
             let router = Router::new();
             let cfg = cfg();
+            let events = EventHub::new(&cfg);
             let (p1, _p1_rx) = instance("prod", "koudu", AgentType::Primary, 4);
             let (p2, _p2_rx) = instance("prod", "koudu-2", AgentType::Primary, 4);
             let (wk, mut worker_rx) = instance("prod", "worker-1", AgentType::Worker, 4);
@@ -1926,6 +2389,7 @@ type = "primary"
             match router.delegate(
                 &cfg,
                 &registry,
+                &events,
                 "prod",
                 "koudu",
                 &AgentType::Primary,
@@ -1947,12 +2411,13 @@ type = "primary"
                     gate.wait();
                     // p2 dies while its delegate call is in flight.
                     let mut next = || 99;
-                    router.fail_instance(&registry, hp2, &mut next);
+                    router.fail_instance(&registry, &events, hp2, &mut next);
                 });
                 gate.wait();
                 let _ = router.delegate(
                     &cfg,
                     &registry,
+                    &events,
                     "prod",
                     "koudu-2",
                     &AgentType::Primary,
@@ -1972,13 +2437,14 @@ type = "primary"
     }
 
     #[test]
-    fn stalled_initiator_result_is_never_silently_lost() {
-        // Terminal results honor the bounded-queue contract: if the
-        // initiator cannot drain its queue, the entry stays in flight and
-        // the caller is told to treat the initiator as disconnected. The
-        // delegation then resolves through fail_instance (cp/cancel to the
-        // serving side, capacity released once) — never by silently
-        // dropping a computed result while acking the serving side.
+    fn stalled_initiator_result_commits_and_reports_the_stall() {
+        // Commit-first: the delegation ends when the result commits, before
+        // delivery is attempted. An initiator whose bounded queue refuses the
+        // terminal frame is disconnected by contract and loses the result —
+        // the same fate as one that died a moment earlier — and the caller is
+        // told to close its connection. The entry is already gone, so the
+        // subsequent teardown finds nothing to fail and synthesizes nothing:
+        // no second, conflicting terminal can exist.
         let mut w = world();
         assert!(matches!(
             do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
@@ -1994,30 +2460,517 @@ type = "primary"
         assert_eq!(
             w.router.complete(
                 &w.registry,
+                &w.events,
                 w.h_worker,
                 result_of("d-1", tok, "late"),
                 1024,
                 2
             ),
-            CompleteOutcome::InitiatorStalled {
-                initiator_handle: w.h_primary
+            CompleteOutcome::Completed {
+                delivered: false,
+                stalled_initiator: Some(w.h_primary)
             }
         );
-        assert_eq!(w.router.inflight_count(), 1, "entry must stay in flight");
+        assert_eq!(w.router.inflight_count(), 0, "the commit ended the entry");
         assert_eq!(
             w.registry.get(w.h_worker).unwrap().active_sessions,
-            1,
-            "capacity must not be released while the delegation is unresolved"
+            0,
+            "capacity released by the commit, exactly once"
         );
 
-        // The stalled initiator is then failed (disconnect path): capacity
-        // is released exactly once and the serving side is told to cancel.
+        // The stalled initiator's teardown finds nothing: no duplicate
+        // capacity release, no synthesized cancel to the worker, no second
+        // terminal.
         let mut next = || 3;
-        let frames = w.router.fail_instance(&w.registry, w.h_primary, &mut next);
-        assert_eq!(frames.len(), 1);
-        assert!(frames[0].1.contains("cp/cancel"));
+        let frames = w
+            .router
+            .fail_instance(&w.registry, &w.events, w.h_primary, &mut next);
+        assert!(frames.is_empty(), "nothing left for the teardown to fail");
+        assert_eq!(w.registry.get(w.h_worker).unwrap().active_sessions, 0);
+    }
+
+    #[test]
+    fn result_racing_a_concurrent_cancel_is_dropped_undelivered() {
+        // Review round-8 F40: the old deliver-then-commit order let a result
+        // reach the initiator while a concurrent cancel owned the observer
+        // terminal — the two audiences recorded opposite outcomes for one
+        // admission and no party could detect the split. Commit-first drops
+        // the losing result UNDELIVERED: whoever removes the entry owns both
+        // the initiator-bound frame and the observer terminal. This test
+        // drives the exact peek → concurrent cancel → commit interleaving
+        // through the same private phases `complete` runs.
+        let mut w = world();
+        let mut lobby = observe(&w, "prod");
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        w.worker_rx.try_recv().unwrap();
+        let admission = token(&w.router, "prod", "d-1");
+
+        // Phase 1 as `complete` performs it: peek the live admission.
+        let peeked = match w
+            .router
+            .peek_for_completion("prod", "d-1", w.h_worker, admission)
+        {
+            Peek::Serving(e) => e,
+            _ => panic!("expected the live admission"),
+        };
+
+        // The initiator's cancel wins the window between peek and commit.
+        let cancel = CancelParams {
+            delegation_id: "d-1".into(),
+            admission,
+            reason: "changed my mind".into(),
+        };
+        assert!(w
+            .router
+            .cancel(&w.registry, &w.events, w.h_primary, &cancel, 3)
+            .is_ok());
+
+        // The commit finds the entry gone; under commit-first this happens
+        // BEFORE any delivery, so the result never reaches the initiator.
+        assert_eq!(
+            w.router.commit_completion(&w.registry, &peeked),
+            Commit::Vanished
+        );
+
+        // The full wire path agrees: a result arriving after the cancel is
+        // dropped end to end.
+        assert_eq!(
+            w.router.complete(
+                &w.registry,
+                &w.events,
+                w.h_worker,
+                result_of("d-1", admission, "done"),
+                1024,
+                4
+            ),
+            CompleteOutcome::Dropped
+        );
+
+        // No initiator-bound result frame; the observer stream carries the
+        // cancel path's terminal and never a completed.
+        assert!(
+            w.primary_rx.try_recv().is_err(),
+            "the losing result must not be delivered"
+        );
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 2, "requested + the cancel's terminal only");
+        assert_eq!(ev[0]["event"], "delegation_requested");
+        assert_eq!(ev[1]["event"], "delegation_cancelled");
+        assert_eq!(ev[1]["admission"], admission);
+        assert_eq!(
+            w.registry.get(w.h_worker).unwrap().active_sessions,
+            0,
+            "capacity released exactly once, by the cancel"
+        );
+    }
+
+    #[test]
+    fn teardown_of_an_unannounced_entry_emits_nothing_and_sends_nothing() {
+        // Review round-8 F39: a teardown can remove an entry in the window
+        // between the admission insert and `delegate`'s announce/forward
+        // critical section. Such an admission was never announced to
+        // observers and never forwarded to the worker, so the teardown must
+        // emit no observer terminal (it would dangle without a `requested`)
+        // and synthesize no wire frames (a cancel would name an admission
+        // the worker never saw) — only release the capacity reserved at
+        // insert. The announce/forward section then finds the entry gone and
+        // forwards nothing, so the worker can never run cancelled work.
+        let w = world();
+        let mut lobby = observe(&w, "prod");
+
+        // Construct the in-between state directly: entry inserted, capacity
+        // reserved, `announced` still false — exactly what a concurrent
+        // teardown can observe.
+        w.registry.adjust_sessions(w.h_worker, 1);
+        let entry = InFlight {
+            namespace: "prod".into(),
+            delegation_id: "d-race".into(),
+            from_logical: "prod/koudu".into(),
+            from_handle: w.h_primary,
+            to_logical: "prod/worker-1".into(),
+            to_handle: w.h_worker,
+            deadline: Utc::now() + Duration::seconds(60),
+            chain: vec!["prod/koudu".into()],
+            generation: 1,
+            announced: false,
+        };
+        w.router
+            .inflight
+            .lock()
+            .insert(DelegationKey::new("prod", "d-race"), entry);
+
+        // Initiator teardown wins the race.
+        let mut next = || 11;
+        let frames = w
+            .router
+            .fail_instance(&w.registry, &w.events, w.h_primary, &mut next);
+
+        assert!(
+            frames.is_empty(),
+            "no cp/cancel for a never-forwarded admission"
+        );
+        assert!(
+            events_of(&mut lobby).is_empty(),
+            "no observer event for a never-announced admission"
+        );
+        assert_eq!(w.router.inflight_count(), 0, "entry removed");
+        assert_eq!(
+            w.registry.get(w.h_worker).unwrap().active_sessions,
+            0,
+            "insert-time capacity reservation released exactly once"
+        );
+    }
+
+    #[test]
+    fn sweep_of_an_unannounced_entry_releases_capacity_and_stays_silent() {
+        // Same F39 gating on the deadline-sweep removal path: an entry the
+        // sweep reaps before it was announced (a deadline at or before
+        // admission time) releases its capacity but emits no terminal and
+        // synthesizes no frames.
+        let w = world();
+        let mut lobby = observe(&w, "prod");
+        w.registry.adjust_sessions(w.h_worker, 1);
+        let entry = InFlight {
+            namespace: "prod".into(),
+            delegation_id: "d-expired".into(),
+            from_logical: "prod/koudu".into(),
+            from_handle: w.h_primary,
+            to_logical: "prod/worker-1".into(),
+            to_handle: w.h_worker,
+            deadline: Utc::now() - Duration::seconds(1),
+            chain: vec!["prod/koudu".into()],
+            generation: 1,
+            announced: false,
+        };
+        w.router
+            .inflight
+            .lock()
+            .insert(DelegationKey::new("prod", "d-expired"), entry);
+
+        let mut next = || 13;
+        let frames = w
+            .router
+            .sweep_deadlines(&w.registry, &w.events, Utc::now(), &mut next);
+
+        assert!(frames.is_empty(), "no synthesized frames");
+        assert!(events_of(&mut lobby).is_empty(), "no observer events");
         assert_eq!(w.router.inflight_count(), 0);
         assert_eq!(w.registry.get(w.h_worker).unwrap().active_sessions, 0);
+    }
+
+    #[test]
+    fn oversized_error_truncated_like_result() {
+        // Carried review finding (R6-F14): `error` is agent free text from
+        // the same frame and the same sender as `result`; leaving it uncapped
+        // let it ride to the initiator bounded only by the transport frame
+        // limit while the result beside it was capped. Both now share
+        // `max_result_bytes`.
+        let mut w = world();
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        w.worker_rx.try_recv().unwrap();
+        let result = DelegateResultParams {
+            delegation_id: "d-1".into(),
+            admission: token(&w.router, "prod", "d-1"),
+            status: DelegationStatus::Failed,
+            result: None,
+            error: Some("e".repeat(200)),
+        };
+        let cap = 96usize;
+        assert_eq!(
+            w.router
+                .complete(&w.registry, &w.events, w.h_worker, result, cap, 2),
+            CompleteOutcome::Completed {
+                delivered: true,
+                stalled_initiator: None
+            }
+        );
+        let frame = w.primary_rx.try_recv().unwrap();
+        let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        let out = v["params"]["error"].as_str().unwrap();
+        assert!(out.contains("truncated by control plane"));
+        assert!(
+            out.len() <= cap,
+            "marker must count against the cap: {} > {}",
+            out.len(),
+            cap
+        );
+    }
+
+    #[test]
+    fn concurrent_completes_yield_exactly_one_claim() {
+        // Review round-10 F52 (completing R4-F34): two results for the same
+        // admission racing each other must resolve to exactly one authority.
+        // The commit is the serialization point, so driving both frames
+        // through the same peek->commit seams `complete` uses proves the
+        // exactly-once property at the racy boundary, and the full wire path
+        // confirms the loser is dropped end to end.
+        let mut w = world();
+        let mut lobby = observe(&w, "prod");
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        w.worker_rx.try_recv().unwrap();
+        let admission = token(&w.router, "prod", "d-1");
+
+        // Both duplicate results pass the peek before either commits — the
+        // widest possible race window.
+        let peek_a = match w
+            .router
+            .peek_for_completion("prod", "d-1", w.h_worker, admission)
+        {
+            Peek::Serving(e) => e,
+            _ => panic!("expected the live admission"),
+        };
+        let peek_b = match w
+            .router
+            .peek_for_completion("prod", "d-1", w.h_worker, admission)
+        {
+            Peek::Serving(e) => e,
+            _ => panic!("expected the live admission"),
+        };
+
+        // Exactly one commit claims; the other finds the entry gone.
+        assert_eq!(
+            w.router.commit_completion(&w.registry, &peek_a),
+            Commit::Claimed
+        );
+        assert_eq!(
+            w.router.commit_completion(&w.registry, &peek_b),
+            Commit::Vanished
+        );
+        assert_eq!(
+            w.registry.get(w.h_worker).unwrap().active_sessions,
+            0,
+            "capacity released exactly once"
+        );
+
+        // A duplicate arriving through the full wire path after the first
+        // committed is dropped at the peek — no second delivery, no second
+        // terminal.
+        assert_eq!(
+            w.router.complete(
+                &w.registry,
+                &w.events,
+                w.h_worker,
+                result_of("d-1", admission, "dup"),
+                1024,
+                5
+            ),
+            CompleteOutcome::Dropped
+        );
+        assert!(
+            w.primary_rx.try_recv().is_err(),
+            "the seam-driven commit did not deliver, and the duplicate must not either"
+        );
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 1, "requested only — seam commits do not emit");
+        assert_eq!(ev[0]["event"], "delegation_requested");
+    }
+
+    #[test]
+    fn teardown_of_unannounced_entry_target_side_is_silent_too() {
+        // Review round-10 F53: the initiator-teardown case is covered above;
+        // this is the symmetric case — the TARGET disconnects while the entry
+        // is inserted but not yet announced. Same contract: no synthesized
+        // result frame to the initiator (whose `cp/delegate` call is itself
+        // returning an error), no observer terminal, entry gone.
+        let w = world();
+        let mut lobby = observe(&w, "prod");
+        w.registry.adjust_sessions(w.h_worker, 1);
+        let entry = InFlight {
+            namespace: "prod".into(),
+            delegation_id: "d-race".into(),
+            from_logical: "prod/koudu".into(),
+            from_handle: w.h_primary,
+            to_logical: "prod/worker-1".into(),
+            to_handle: w.h_worker,
+            deadline: Utc::now() + Duration::seconds(60),
+            chain: vec!["prod/koudu".into()],
+            generation: 1,
+            announced: false,
+        };
+        w.router
+            .inflight
+            .lock()
+            .insert(DelegationKey::new("prod", "d-race"), entry);
+
+        let mut next = || 17;
+        let frames = w
+            .router
+            .fail_instance(&w.registry, &w.events, w.h_worker, &mut next);
+
+        assert!(
+            frames.is_empty(),
+            "no synthesized result for a never-announced admission"
+        );
+        assert!(events_of(&mut lobby).is_empty(), "no observer event");
+        assert_eq!(w.router.inflight_count(), 0, "entry removed");
+    }
+
+    #[test]
+    fn dropped_and_stale_results_emit_no_observer_events() {
+        // Review round-10 F54 (completing R6-F17): the "dropped results emit
+        // nothing" invariant asserted with an observer attached, for both the
+        // stale-admission drop and the unknown-id drop.
+        let mut w = world();
+        let mut lobby = observe(&w, "prod");
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        w.worker_rx.try_recv().unwrap();
+        let admission = token(&w.router, "prod", "d-1");
+        // Drain the requested event.
+        assert_eq!(events_of(&mut lobby).len(), 1);
+
+        // Stale admission token → dropped, no event, no delivery.
+        assert_eq!(
+            w.router.complete(
+                &w.registry,
+                &w.events,
+                w.h_worker,
+                result_of("d-1", admission + 999, "stale"),
+                1024,
+                6
+            ),
+            CompleteOutcome::Dropped
+        );
+        // Unknown id → dropped, no event, no delivery.
+        assert_eq!(
+            w.router.complete(
+                &w.registry,
+                &w.events,
+                w.h_worker,
+                result_of("d-unknown", 1, "ghost"),
+                1024,
+                7
+            ),
+            CompleteOutcome::Dropped
+        );
+        assert!(events_of(&mut lobby).is_empty(), "drops emit nothing");
+        assert!(
+            w.primary_rx.try_recv().is_err(),
+            "drops deliver nothing to the initiator"
+        );
+        assert_eq!(w.router.inflight_count(), 1, "live entry untouched");
+    }
+
+    #[test]
+    fn precomputed_prompt_excerpt_is_truncated_and_metadata_only_aware() {
+        // Review round-12 F65: the prompt excerpt is computed BEFORE the
+        // announce/forward critical section and passed in as a value. This
+        // pins the precomputed path directly: the requested event carries a
+        // properly truncated excerpt in a normal namespace, and no excerpt
+        // key at all in a metadata_only namespace — proving the hoisting
+        // changed neither the truncation nor the redaction behavior.
+        let w = world();
+        let mut lobby = observe(&w, "prod");
+        let mut p = delegate_params("d-big", "worker-1", 60);
+        p.prompt = "p".repeat(64 * 1024);
+        assert!(matches!(do_delegate(&w, p), DelegateOutcome::Accepted(_)));
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0]["event"], "delegation_requested");
+        let excerpt = ev[0]["prompt_excerpt"].as_str().unwrap();
+        assert!(excerpt.contains("truncated by control plane"));
+        assert!(
+            excerpt.len() <= 4096,
+            "excerpt bounded by max_event_excerpt_bytes: {}",
+            excerpt.len()
+        );
+
+        // metadata_only namespace: the key is absent entirely.
+        let cfg: CpConfig = toml::from_str(
+            r#"
+[namespaces.prod]
+metadata_only = true
+"#,
+        )
+        .unwrap();
+        let w = world_with_cfg(cfg);
+        let mut lobby = observe(&w, "prod");
+        let mut p = delegate_params("d-quiet", "worker-1", 60);
+        p.prompt = "secret payload".into();
+        assert!(matches!(do_delegate(&w, p), DelegateOutcome::Accepted(_)));
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0]["event"], "delegation_requested");
+        assert!(
+            ev[0].get("prompt_excerpt").is_none(),
+            "metadata_only suppresses the excerpt key entirely"
+        );
+        assert!(!ev[0].to_string().contains("secret payload"));
+    }
+
+    #[test]
+    fn saturated_observer_crowd_does_not_block_delegation() {
+        // Review round-10 F51 (functional contention floor): a full cap's
+        // worth of observers, every one of them saturated, must not block or
+        // fail admission, forwarding, or completion — sends are non-blocking
+        // and the per-observer work is bounded. (Latency budgeting is the
+        // config cap's job; this pins the functional non-interference.)
+        let mut w = world();
+        let mut lobbies = Vec::new();
+        for i in 0..16 {
+            let (tx, rx) = crate::registry::outbound_channel(8);
+            w.registry.register(Instance {
+                handle: 0,
+                namespace: "prod".into(),
+                name: format!("lobby-{i}"),
+                agent_type: AgentType::Observer,
+                instance_id: format!("o-{i}"),
+                labels: Default::default(),
+                max_delegated_sessions: 0,
+                active_sessions: 0,
+                registered_at: Instant::now(),
+                last_heartbeat: Instant::now(),
+                tx,
+            });
+            lobbies.push(rx);
+        }
+        // Saturate every observer queue (8-byte budgets refuse any frame
+        // after one filler).
+        for i in 0..16 {
+            let inst = w
+                .registry
+                .observers("prod")
+                .into_iter()
+                .find(|o| o.instance_id == format!("o-{i}"))
+                .unwrap();
+            while inst.tx.try_send("12345678".into()).is_ok() {}
+        }
+
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        w.worker_rx.try_recv().expect("forward reached the worker");
+        let admission = token(&w.router, "prod", "d-1");
+        assert_eq!(
+            w.router.complete(
+                &w.registry,
+                &w.events,
+                w.h_worker,
+                result_of("d-1", admission, "done"),
+                1024,
+                8
+            ),
+            CompleteOutcome::Completed {
+                delivered: true,
+                stalled_initiator: None
+            }
+        );
+        assert!(
+            w.primary_rx.try_recv().unwrap().contains("delegate_result"),
+            "the initiator got its terminal despite the saturated lobby crowd"
+        );
     }
 
     #[test]
@@ -2069,6 +3022,7 @@ type = "primary"
         let out = w.router.delegate(
             &w.cfg,
             &w.registry,
+            &w.events,
             "prod",
             "worker-1",
             &AgentType::Worker,
@@ -2107,7 +3061,8 @@ type = "primary"
         };
         // h_primary is a valid handle but NOT the serving instance.
         assert_eq!(
-            w.router.complete(&w.registry, w.h_primary, result, 1024, 2),
+            w.router
+                .complete(&w.registry, &w.events, w.h_primary, result, 1024, 2),
             CompleteOutcome::Dropped
         );
         assert_eq!(w.router.inflight_count(), 1);
@@ -2126,7 +3081,8 @@ type = "primary"
             error: None,
         };
         assert_eq!(
-            w.router.complete(&w.registry, w.h_worker, result, 1024, 2),
+            w.router
+                .complete(&w.registry, &w.events, w.h_worker, result, 1024, 2),
             CompleteOutcome::Dropped
         );
     }
@@ -2148,8 +3104,12 @@ type = "primary"
         };
         let cap = 96usize;
         assert_eq!(
-            w.router.complete(&w.registry, w.h_worker, result, cap, 2),
-            CompleteOutcome::Delivered { committed: true }
+            w.router
+                .complete(&w.registry, &w.events, w.h_worker, result, cap, 2),
+            CompleteOutcome::Completed {
+                delivered: true,
+                stalled_initiator: None
+            }
         );
         let frame = w.primary_rx.try_recv().unwrap();
         let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
@@ -2176,8 +3136,12 @@ type = "primary"
             error: None,
         };
         assert_eq!(
-            w.router.complete(&w.registry, w.h_worker, result2, 8, 3),
-            CompleteOutcome::Delivered { committed: true }
+            w.router
+                .complete(&w.registry, &w.events, w.h_worker, result2, 8, 3),
+            CompleteOutcome::Completed {
+                delivered: true,
+                stalled_initiator: None
+            }
         );
         let frame2 = w.primary_rx.try_recv().unwrap();
         let v2: serde_json::Value = serde_json::from_str(&frame2).unwrap();
@@ -2200,11 +3164,14 @@ type = "primary"
         };
         assert!(w
             .router
-            .sweep_deadlines(&w.registry, Utc::now(), &mut next)
+            .sweep_deadlines(&w.registry, &w.events, Utc::now(), &mut next)
             .is_empty());
-        let frames =
-            w.router
-                .sweep_deadlines(&w.registry, Utc::now() + Duration::seconds(120), &mut next);
+        let frames = w.router.sweep_deadlines(
+            &w.registry,
+            &w.events,
+            Utc::now() + Duration::seconds(120),
+            &mut next,
+        );
         assert_eq!(frames.len(), 2);
         assert_eq!(w.router.inflight_count(), 0);
         assert_eq!(w.registry.get(w.h_worker).unwrap().active_sessions, 0);
@@ -2237,7 +3204,9 @@ type = "primary"
             id += 1;
             id
         };
-        let frames = w.router.fail_instance(&w.registry, w.h_worker, &mut next);
+        let frames = w
+            .router
+            .fail_instance(&w.registry, &w.events, w.h_worker, &mut next);
         assert_eq!(frames.len(), 1);
         let (inst, frame) = &frames[0];
         assert_eq!(inst.handle, w.h_primary);
@@ -2262,7 +3231,9 @@ type = "primary"
             id += 1;
             id
         };
-        let frames = w.router.fail_instance(&w.registry, w.h_primary, &mut next);
+        let frames = w
+            .router
+            .fail_instance(&w.registry, &w.events, w.h_primary, &mut next);
         assert_eq!(frames.len(), 1);
         let (inst, frame) = &frames[0];
         assert_eq!(inst.handle, w.h_worker);
@@ -2286,13 +3257,13 @@ type = "primary"
         };
         let err = w
             .router
-            .cancel(&w.registry, w.h_worker, &params, 5)
+            .cancel(&w.registry, &w.events, w.h_worker, &params, 5)
             .unwrap_err();
         assert_eq!(err.code, codes::POLICY_DENIED);
         assert_eq!(w.router.inflight_count(), 1);
         let fwd = w
             .router
-            .cancel(&w.registry, w.h_primary, &params, 6)
+            .cancel(&w.registry, &w.events, w.h_primary, &params, 6)
             .unwrap();
         let (inst, frame) = fwd.unwrap();
         assert_eq!(inst.handle, w.h_worker);
@@ -2327,6 +3298,7 @@ allow_worker_initiation = true
         let root = accept(w.router.delegate(
             &cfg,
             &w.registry,
+            &w.events,
             "prod",
             "koudu",
             &AgentType::Primary,
@@ -2348,6 +3320,7 @@ allow_worker_initiation = true
         match w.router.delegate(
             &cfg,
             &w.registry,
+            &w.events,
             "prod",
             "worker-2",
             &AgentType::Worker,
@@ -2367,6 +3340,7 @@ allow_worker_initiation = true
         let child_ack = accept(w.router.delegate(
             &cfg,
             &w.registry,
+            &w.events,
             "prod",
             "worker-1",
             &AgentType::Worker,
@@ -2386,6 +3360,7 @@ allow_worker_initiation = true
         match w.router.delegate(
             &cfg,
             &w.registry,
+            &w.events,
             "prod",
             "worker-2",
             &AgentType::Worker,
@@ -2462,14 +3437,24 @@ allow_worker_initiation = true
         params: DelegateParams,
         rpc: u64,
     ) -> DelegateOutcome {
-        w.router
-            .delegate(cfg, &w.registry, "prod", name, ty, handle, params, rpc)
+        w.router.delegate(
+            cfg,
+            &w.registry,
+            &w.events,
+            "prod",
+            name,
+            ty,
+            handle,
+            params,
+            rpc,
+        )
     }
 
     fn cancel_admission(w: &World, delegation_id: &str, admission: u64, rpc: u64) {
         w.router
             .cancel(
                 &w.registry,
+                &w.events,
                 w.h_primary,
                 &CancelParams {
                     delegation_id: delegation_id.into(),
@@ -2610,9 +3595,12 @@ allow_worker_initiation = true
             id += 1;
             id
         };
-        let swept =
-            w.router
-                .sweep_deadlines(&w.registry, Utc::now() + Duration::seconds(60), &mut next);
+        let swept = w.router.sweep_deadlines(
+            &w.registry,
+            &w.events,
+            Utc::now() + Duration::seconds(60),
+            &mut next,
+        );
         assert!(!swept.is_empty(), "A expired and was swept");
         assert_eq!(w.router.inflight_count(), 0);
         assert_eq!(w.registry.get(w.h_worker).unwrap().active_sessions, 0);
@@ -2861,6 +3849,7 @@ allow_worker_initiation = true
                 assert_eq!(
                     w.router.complete(
                         &w.registry,
+                        &w.events,
                         w.h_primary,
                         result_of("d-1", tok, "spoofed"),
                         1024,
@@ -2878,12 +3867,16 @@ allow_worker_initiation = true
             assert_eq!(
                 w.router.complete(
                     &w.registry,
+                    &w.events,
                     w.h_worker,
                     result_of("d-1", tok, "genuine"),
                     1024,
                     3,
                 ),
-                CompleteOutcome::Delivered { committed: true },
+                CompleteOutcome::Completed {
+                    delivered: true,
+                    stalled_initiator: None
+                },
                 "genuine result must be delivered, never dropped"
             );
             let frame = w.primary_rx.try_recv().unwrap();
@@ -2896,6 +3889,7 @@ allow_worker_initiation = true
                 assert_eq!(
                     w.router.complete(
                         &w.registry,
+                        &w.events,
                         w.h_primary,
                         result_of("d-1", tok, "spoofed"),
                         1024,
@@ -2929,20 +3923,28 @@ allow_worker_initiation = true
                     // Registered, but not the serving instance.
                     w.router.complete(
                         &w.registry,
+                        &w.events,
                         w.h_primary,
                         result_of("d-1", tok, "spoofed"),
                         1024,
                         2,
-                    ) == CompleteOutcome::Delivered { committed: true }
+                    ) == CompleteOutcome::Completed {
+                        delivered: true,
+                        stalled_initiator: None,
+                    }
                 });
                 gate.wait();
                 let genuine = w.router.complete(
                     &w.registry,
+                    &w.events,
                     w.h_worker,
                     result_of("d-1", tok, "genuine"),
                     1024,
                     3,
-                ) == CompleteOutcome::Delivered { committed: true };
+                ) == CompleteOutcome::Completed {
+                    delivered: true,
+                    stalled_initiator: None,
+                };
                 (spoof.join().unwrap(), genuine)
             });
             assert!(!spoofed, "a non-owner must never complete a delegation");
@@ -2974,12 +3976,14 @@ allow_worker_initiation = true
                 let spoof = s.spawn(|| {
                     gate.wait();
                     // Registered, but not the initiator.
-                    w.router.cancel(&w.registry, w.h_worker, &params, 1).is_ok()
+                    w.router
+                        .cancel(&w.registry, &w.events, w.h_worker, &params, 1)
+                        .is_ok()
                 });
                 gate.wait();
                 let genuine = w
                     .router
-                    .cancel(&w.registry, w.h_primary, &params, 2)
+                    .cancel(&w.registry, &w.events, w.h_primary, &params, 2)
                     .is_ok();
                 (spoof.join().unwrap(), genuine)
             });
@@ -3010,7 +4014,7 @@ allow_worker_initiation = true
         };
         assert!(w
             .router
-            .cancel(&w.registry, w.h_worker, &params, 1)
+            .cancel(&w.registry, &w.events, w.h_worker, &params, 1)
             .is_err());
         assert_eq!(w.router.inflight_count(), 1);
         assert_eq!(
@@ -3021,7 +4025,7 @@ allow_worker_initiation = true
         // The genuine initiator can still cancel.
         let fwd = w
             .router
-            .cancel(&w.registry, w.h_primary, &params, 2)
+            .cancel(&w.registry, &w.events, w.h_primary, &params, 2)
             .unwrap()
             .unwrap();
         assert_eq!(fwd.0.handle, w.h_worker);
@@ -3052,11 +4056,11 @@ allow_worker_initiation = true
         // Both probes come from the worker: it initiated neither.
         let e_unknown = w
             .router
-            .cancel(&w.registry, w.h_worker, &unknown, 1)
+            .cancel(&w.registry, &w.events, w.h_worker, &unknown, 1)
             .unwrap_err();
         let e_foreign = w
             .router
-            .cancel(&w.registry, w.h_worker, &foreign, 2)
+            .cancel(&w.registry, &w.events, w.h_worker, &foreign, 2)
             .unwrap_err();
         // This one comes from the genuine initiator, naming a token that is
         // not the live admission's.
@@ -3067,7 +4071,7 @@ allow_worker_initiation = true
         };
         let e_stale = w
             .router
-            .cancel(&w.registry, w.h_primary, &stale, 3)
+            .cancel(&w.registry, &w.events, w.h_primary, &stale, 3)
             .unwrap_err();
         let as_json = |e: &ErrorObject| serde_json::to_string(e).unwrap();
         assert_eq!(
@@ -3096,6 +4100,7 @@ allow_worker_initiation = true
         let registry = Registry::new();
         let router = Router::new();
         let cfg = cfg();
+        let events = EventHub::new(&cfg);
         let (p_prod, mut prod_init_rx) = instance("prod", "koudu", AgentType::Primary, 4);
         let (w_prod, mut prod_rx) = instance("prod", "worker-1", AgentType::Worker, 2);
         let (p_dev, mut dev_init_rx) = instance("dev", "koudu", AgentType::Primary, 4);
@@ -3109,6 +4114,7 @@ allow_worker_initiation = true
             match router.delegate(
                 &cfg,
                 &registry,
+                &events,
                 ns,
                 "koudu",
                 &AgentType::Primary,
@@ -3145,11 +4151,11 @@ allow_worker_initiation = true
             reason: "probe".into(),
         };
         let e_cross = router
-            .cancel(&registry, hw_dev, &probe, 10)
+            .cancel(&registry, &events, hw_dev, &probe, 10)
             .unwrap_err()
             .message;
         let e_nowhere = router
-            .cancel(&registry, hw_dev, &nowhere, 11)
+            .cancel(&registry, &events, hw_dev, &nowhere, 11)
             .unwrap_err()
             .message;
         assert_eq!(e_cross, e_nowhere);
@@ -3159,13 +4165,19 @@ allow_worker_initiation = true
         assert_eq!(
             router.complete(
                 &registry,
+                &events,
                 hw_dev,
                 result_of("d-1", token(&router, "dev", "d-1"), "dev-done"),
                 1024,
                 12
             ),
-            CompleteOutcome::Delivered { committed: true }
+            CompleteOutcome::Completed {
+                delivered: true,
+                stalled_initiator: None
+            }
         );
+        // Landing on `dev_init_rx` is what "routed to hp_dev" means now that
+        // delivery happens inside `complete`.
         let frame = dev_init_rx.try_recv().unwrap();
         assert!(frame.contains("dev-done"));
         assert!(
@@ -3180,12 +4192,16 @@ allow_worker_initiation = true
         assert_eq!(
             router.complete(
                 &registry,
+                &events,
                 hw_prod,
                 result_of("d-1", token(&router, "prod", "d-1"), "prod-done"),
                 1024,
                 13
             ),
-            CompleteOutcome::Delivered { committed: true }
+            CompleteOutcome::Completed {
+                delivered: true,
+                stalled_initiator: None
+            }
         );
         let frame = prod_init_rx.try_recv().unwrap();
         assert!(frame.contains("prod-done"));
@@ -3208,6 +4224,7 @@ allow_worker_initiation = true
 "#,
         )
         .unwrap();
+        let events = EventHub::new(&cfg);
         let registry = Registry::new();
         let router = Router::new();
         let (p_prod, _rx1) = instance("prod", "koudu", AgentType::Primary, 4);
@@ -3226,6 +4243,7 @@ allow_worker_initiation = true
         let root = accept(router.delegate(
             &cfg,
             &registry,
+            &events,
             "prod",
             "koudu",
             &AgentType::Primary,
@@ -3242,6 +4260,7 @@ allow_worker_initiation = true
         match router.delegate(
             &cfg,
             &registry,
+            &events,
             "dev",
             "worker-1",
             &AgentType::Worker,
@@ -3261,6 +4280,7 @@ allow_worker_initiation = true
             router.delegate(
                 &cfg,
                 &registry,
+                &events,
                 "prod",
                 "worker-1",
                 &AgentType::Worker,
@@ -3308,7 +4328,7 @@ allow_worker_initiation = true
                     reason: "changed my mind".into(),
                 };
                 w.router
-                    .cancel(&w.registry, w.h_primary, &params, 90)
+                    .cancel(&w.registry, &w.events, w.h_primary, &params, 90)
                     .expect("the initiator may cancel")
                     .map(|(_, frame)| frame)
                     .into_iter()
@@ -3322,6 +4342,7 @@ allow_worker_initiation = true
                 };
                 let frames = w.router.sweep_deadlines(
                     &w.registry,
+                    &w.events,
                     Utc::now() + Duration::seconds(3600),
                     &mut next,
                 );
@@ -3413,12 +4434,16 @@ allow_worker_initiation = true
             assert_eq!(
                 w.router.complete(
                     &w.registry,
+                    &w.events,
                     w.h_worker,
                     result_of("d-1", b.generation, "genuine"),
                     1024,
                     7
                 ),
-                CompleteOutcome::Delivered { committed: true },
+                CompleteOutcome::Completed {
+                    delivered: true,
+                    stalled_initiator: None
+                },
                 "{how:?}"
             );
             let frame = w.primary_rx.try_recv().expect("initiator got the result");
@@ -3554,6 +4579,7 @@ allow_worker_initiation = true
         assert_eq!(
             w.router.complete(
                 &w.registry,
+                &w.events,
                 w.h_worker,
                 result_of("d-1", a.generation, "late"),
                 1024,
@@ -3603,6 +4629,7 @@ allow_worker_initiation = true
         match w.router.delegate(
             &w.cfg,
             &w.registry,
+            &w.events,
             "dev",
             "koudu",
             &AgentType::Primary,
@@ -3619,5 +4646,555 @@ allow_worker_initiation = true
             }
         }
         dev_rx.try_recv().unwrap();
+    }
+
+    // --- observer / lobby event emission (Phase 1) ---
+
+    #[test]
+    fn delegate_emits_requested_event_with_bounded_prompt_excerpt() {
+        let mut w = world_with_cfg(
+            toml::from_str(
+                r#"
+max_event_excerpt_bytes = 64
+
+[[agents]]
+key = "kp"
+namespace = "prod"
+name = "koudu"
+type = "primary"
+"#,
+            )
+            .unwrap(),
+        );
+        let mut lobby = observe(&w, "prod");
+        let mut p = delegate_params("d-1", "worker-1", 60);
+        p.prompt = "私はとても長いプロンプトです".repeat(20);
+        let prompt_len = p.prompt.len();
+        assert!(matches!(do_delegate(&w, p), DelegateOutcome::Accepted(_)));
+
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0]["event"], "delegation_requested");
+        assert_eq!(ev[0]["seq"], 1);
+        assert_eq!(ev[0]["namespace"], "prod");
+        assert_eq!(ev[0]["delegation_id"], "d-1");
+        assert_eq!(ev[0]["from"], "prod/koudu");
+        assert_eq!(ev[0]["to"], "prod/worker-1");
+        assert_eq!(ev[0]["chain"], serde_json::json!(["prod/koudu"]));
+        let excerpt = ev[0]["prompt_excerpt"].as_str().unwrap();
+        assert!(excerpt.len() <= 64, "excerpt must respect the cap");
+        assert!(excerpt.contains("truncated by control plane"));
+        assert!(prompt_len > 64);
+
+        // The worker still received the FULL prompt: the lobby is a mirror,
+        // not a filter on the delegation path.
+        let fwd: serde_json::Value =
+            serde_json::from_str(&w.worker_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(fwd["params"]["prompt"].as_str().unwrap().len(), prompt_len);
+    }
+
+    #[test]
+    fn result_emits_completed_event() {
+        let w = world();
+        let mut lobby = observe(&w, "prod");
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        let result = DelegateResultParams {
+            delegation_id: "d-1".into(),
+            admission: token(&w.router, "prod", "d-1"),
+            status: DelegationStatus::Completed,
+            result: Some("all done".into()),
+            error: None,
+        };
+        assert_eq!(
+            w.router
+                .complete(&w.registry, &w.events, w.h_worker, result, 1024, 2),
+            CompleteOutcome::Completed {
+                delivered: true,
+                stalled_initiator: None
+            }
+        );
+
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 2, "requested + completed");
+        assert_eq!(ev[1]["event"], "delegation_completed");
+        assert_eq!(ev[1]["seq"], 2, "per-namespace seq stays dense");
+        assert_eq!(ev[1]["status"], "completed");
+        assert_eq!(ev[1]["from"], "prod/koudu");
+        assert_eq!(ev[1]["to"], "prod/worker-1");
+        assert_eq!(ev[1]["result_excerpt"], "all done");
+        assert!(ev[1].get("error").is_none());
+    }
+
+    #[test]
+    fn completed_event_emitted_even_when_initiator_is_gone() {
+        // Commit-first contract (review round-8 F40): the worker finished and
+        // its result committed, so the delegation truthfully completed — the
+        // observer sees the worker's terminal even though the initiator died
+        // before delivery and loses the result. The commit removed the entry,
+        // so the initiator's teardown finds nothing and can never publish a
+        // second, conflicting terminal.
+        let w = world();
+        let mut lobby = observe(&w, "prod");
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        let admission = token(&w.router, "prod", "d-1");
+        w.registry.deregister(w.h_primary);
+        let result = DelegateResultParams {
+            delegation_id: "d-1".into(),
+            admission,
+            status: DelegationStatus::Failed,
+            result: None,
+            error: Some("boom".into()),
+        };
+        assert_eq!(
+            w.router
+                .complete(&w.registry, &w.events, w.h_worker, result, 1024, 2),
+            CompleteOutcome::Completed {
+                delivered: false,
+                stalled_initiator: None
+            },
+            "committed; undeliverable because the initiator is gone"
+        );
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 2, "requested + the commit's terminal");
+        assert_eq!(ev[0]["event"], "delegation_requested");
+        assert_eq!(ev[0]["admission"], admission);
+        assert_eq!(ev[1]["event"], "delegation_completed");
+        assert_eq!(ev[1]["admission"], admission);
+        assert_eq!(ev[1]["status"], "failed");
+
+        // The initiator's teardown finds nothing: no second terminal.
+        let mut next = || 7;
+        let frames = w
+            .router
+            .fail_instance(&w.registry, &w.events, w.h_primary, &mut next);
+        assert!(frames.is_empty(), "the commit already ended the delegation");
+        let ev = events_of(&mut lobby);
+        assert!(ev.is_empty(), "exactly one authoritative terminal");
+    }
+
+    #[test]
+    fn stalled_initiator_produces_single_completed_terminal_for_observers() {
+        // Review round-8 F40 follow-through: under commit-first the result
+        // commits BEFORE delivery, so a stalled initiator no longer flips the
+        // outcome. The observer records the truth — the worker completed the
+        // delegation — as the single terminal; the initiator, which received
+        // nothing (its queue refused the frame), is disconnected and its
+        // teardown finds no entry, so no cancelled terminal can follow. The
+        // two audiences can no longer record opposite outcomes: one saw
+        // `completed`, the other saw nothing at all.
+        let mut w = world();
+        let mut lobby = observe(&w, "prod");
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        w.worker_rx.try_recv().unwrap();
+        let admission = token(&w.router, "prod", "d-1");
+
+        let initiator_tx = w.registry.get(w.h_primary).unwrap().tx;
+        while initiator_tx.try_send("filler".into()).is_ok() {}
+
+        assert_eq!(
+            w.router.complete(
+                &w.registry,
+                &w.events,
+                w.h_worker,
+                result_of("d-1", admission, "late"),
+                1024,
+                2
+            ),
+            CompleteOutcome::Completed {
+                delivered: false,
+                stalled_initiator: Some(w.h_primary)
+            }
+        );
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 2, "requested + the commit's single terminal");
+        assert_eq!(ev[0]["event"], "delegation_requested");
+        assert_eq!(ev[1]["event"], "delegation_completed");
+        assert_eq!(ev[1]["admission"], admission);
+
+        // The refused frame must not have reached the initiator: its queue
+        // holds only the filler frames this test packed it with.
+        while let Ok(f) = w.primary_rx.try_recv() {
+            assert!(
+                !f.contains("delegate_result"),
+                "a refused terminal frame must not be delivered"
+            );
+        }
+
+        let mut next = || 9;
+        w.router
+            .fail_instance(&w.registry, &w.events, w.h_primary, &mut next);
+        let ev = events_of(&mut lobby);
+        assert!(
+            ev.is_empty(),
+            "the teardown found nothing — no completed+cancelled pair"
+        );
+    }
+
+    #[test]
+    fn refused_forward_emits_requested_then_matching_cancelled_terminal() {
+        // Review round-7 F5: `delegation_requested` is emitted BEFORE the
+        // forward (a worker cannot complete a delegation it has not seen, so
+        // completed can never precede requested), and a refused forward
+        // emits a matching terminal so no requested is left dangling.
+        let w = world();
+        let mut lobby = observe(&w, "prod");
+        let worker_tx = w.registry.get(w.h_worker).unwrap().tx;
+        while worker_tx.try_send("filler".into()).is_ok() {}
+
+        match do_delegate(&w, delegate_params("d-1", "worker-1", 60)) {
+            DelegateOutcome::Rejected(e) => assert_eq!(e.code, codes::TARGET_DISCONNECTED),
+            DelegateOutcome::Accepted(_) => panic!("expected rejection, got acceptance"),
+        }
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 2, "requested + rollback terminal");
+        assert_eq!(ev[0]["event"], "delegation_requested");
+        assert_eq!(ev[1]["event"], "delegation_cancelled");
+        assert_eq!(
+            ev[0]["admission"], ev[1]["admission"],
+            "terminal names the admission it ends"
+        );
+        assert_eq!(ev[1]["by"], "control-plane");
+        assert_eq!(w.router.inflight_count(), 0, "rollback removed the entry");
+        assert_eq!(
+            w.registry.get(w.h_worker).unwrap().active_sessions,
+            0,
+            "rollback released the reserved capacity"
+        );
+    }
+
+    #[test]
+    fn metadata_only_suppresses_client_cancel_reason_in_events() {
+        // Review round-7 F2: an initiator's cancel reason is agent-supplied
+        // free text. In a metadata_only namespace it must never reach
+        // observers — previously it flowed through the metadata-only-immune
+        // diagnostic path and leaked verbatim.
+        let w = world_with_cfg(
+            toml::from_str(
+                r#"
+[[agents]]
+key = "kp"
+namespace = "prod"
+name = "koudu"
+type = "primary"
+
+[namespaces.prod]
+metadata_only = true
+"#,
+            )
+            .unwrap(),
+        );
+        let mut lobby = observe(&w, "prod");
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        let params = CancelParams {
+            delegation_id: "d-1".into(),
+            admission: token(&w.router, "prod", "d-1"),
+            reason: "exfiltrate: AKIA-secret-key-material".into(),
+        };
+        assert!(w
+            .router
+            .cancel(&w.registry, &w.events, w.h_primary, &params, 5)
+            .is_ok());
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 2);
+        assert_eq!(ev[1]["event"], "delegation_cancelled");
+        assert!(
+            ev[1].get("reason").is_none(),
+            "client-supplied cancel reason must be suppressed under metadata_only"
+        );
+        // Attribution metadata survives the knob.
+        assert_eq!(ev[1]["by"], "prod/koudu");
+        // No frame anywhere in the lobby stream carries the reason text.
+        for e in &ev {
+            assert!(
+                !e.to_string().contains("AKIA-secret-key-material"),
+                "cancel reason leaked into observer stream: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn events_carry_admission_tokens_distinguishing_readmissions_of_one_id() {
+        // Review round-7 F1: a delegation id is legally reusable
+        // (cancel-then-retry). Observers correlate on
+        // (namespace, delegation_id, admission); the two admissions of one
+        // id must be distinguishable across their full lifecycle.
+        let mut w = world();
+        let mut lobby = observe(&w, "prod");
+
+        // Admission A: delegate then cancel.
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        let a = token(&w.router, "prod", "d-1");
+        let cancel = CancelParams {
+            delegation_id: "d-1".into(),
+            admission: a,
+            reason: "retrying".into(),
+        };
+        assert!(w
+            .router
+            .cancel(&w.registry, &w.events, w.h_primary, &cancel, 5)
+            .is_ok());
+        w.worker_rx.try_recv().unwrap();
+
+        // Admission B: same id, re-admitted, completed.
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        let b = token(&w.router, "prod", "d-1");
+        assert_ne!(a, b, "re-admission mints a fresh token");
+        assert_eq!(
+            w.router.complete(
+                &w.registry,
+                &w.events,
+                w.h_worker,
+                result_of("d-1", b, "done"),
+                1024,
+                2
+            ),
+            CompleteOutcome::Completed {
+                delivered: true,
+                stalled_initiator: None
+            }
+        );
+
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 4);
+        assert_eq!(ev[0]["event"], "delegation_requested");
+        assert_eq!(ev[0]["admission"], a);
+        assert_eq!(ev[1]["event"], "delegation_cancelled");
+        assert_eq!(ev[1]["admission"], a);
+        assert_eq!(ev[2]["event"], "delegation_requested");
+        assert_eq!(ev[2]["admission"], b);
+        assert_eq!(ev[3]["event"], "delegation_completed");
+        assert_eq!(ev[3]["admission"], b);
+        // Same reusable id throughout — only the token separates A from B.
+        for e in &ev {
+            assert_eq!(e["delegation_id"], "d-1");
+        }
+    }
+
+    #[test]
+    fn cancel_emits_cancelled_event_with_from_and_to() {
+        let w = world();
+        let mut lobby = observe(&w, "prod");
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        let params = CancelParams {
+            delegation_id: "d-1".into(),
+            admission: token(&w.router, "prod", "d-1"),
+            reason: "changed my mind".into(),
+        };
+        // A denied cancel emits nothing.
+        assert!(w
+            .router
+            .cancel(&w.registry, &w.events, w.h_worker, &params, 5)
+            .is_err());
+        assert_eq!(events_of(&mut lobby).len(), 1, "only delegation_requested");
+
+        assert!(w
+            .router
+            .cancel(&w.registry, &w.events, w.h_primary, &params, 6)
+            .is_ok());
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 1);
+        assert_eq!(ev[0]["event"], "delegation_cancelled");
+        assert_eq!(ev[0]["seq"], 2);
+        assert_eq!(ev[0]["from"], "prod/koudu");
+        assert_eq!(ev[0]["to"], "prod/worker-1");
+        assert_eq!(ev[0]["by"], "prod/koudu");
+        assert_eq!(ev[0]["reason"], "changed my mind");
+    }
+
+    #[test]
+    fn deadline_sweep_emits_timeout_completion() {
+        let mut w = world();
+        let mut lobby = observe(&w, "prod");
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        w.worker_rx.try_recv().unwrap();
+        let mut id = 100u64;
+        let mut next = || {
+            id += 1;
+            id
+        };
+        w.router.sweep_deadlines(
+            &w.registry,
+            &w.events,
+            Utc::now() + Duration::seconds(120),
+            &mut next,
+        );
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 2);
+        assert_eq!(ev[1]["event"], "delegation_completed");
+        assert_eq!(ev[1]["status"], "timeout");
+        assert_eq!(ev[1]["error"], "deadline exceeded");
+    }
+
+    #[test]
+    fn target_disconnect_emits_target_disconnected_completion() {
+        let w = world();
+        let mut lobby = observe(&w, "prod");
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        w.registry.deregister(w.h_worker);
+        let mut id = 0u64;
+        let mut next = || {
+            id += 1;
+            id
+        };
+        w.router
+            .fail_instance(&w.registry, &w.events, w.h_worker, &mut next);
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 2);
+        assert_eq!(ev[1]["event"], "delegation_completed");
+        assert_eq!(ev[1]["status"], "target_disconnected");
+        assert_eq!(ev[1]["error"], "prod/worker-1 disconnected");
+    }
+
+    #[test]
+    fn initiator_disconnect_emits_control_plane_cancellation() {
+        let w = world();
+        let mut lobby = observe(&w, "prod");
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        w.registry.deregister(w.h_primary);
+        let mut id = 0u64;
+        let mut next = || {
+            id += 1;
+            id
+        };
+        w.router
+            .fail_instance(&w.registry, &w.events, w.h_primary, &mut next);
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 2);
+        assert_eq!(ev[1]["event"], "delegation_cancelled");
+        assert_eq!(ev[1]["by"], "control-plane");
+        assert_eq!(ev[1]["from"], "prod/koudu");
+        assert_eq!(ev[1]["to"], "prod/worker-1");
+        assert!(ev[1]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("initiator prod/koudu disconnected"));
+    }
+
+    #[test]
+    fn metadata_only_namespace_omits_prompt_and_result_excerpts() {
+        let w = world_with_cfg(
+            toml::from_str(
+                r#"
+[[agents]]
+key = "kp"
+namespace = "prod"
+name = "koudu"
+type = "primary"
+
+[namespaces.prod]
+metadata_only = true
+"#,
+            )
+            .unwrap(),
+        );
+        let mut lobby = observe(&w, "prod");
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        let result = DelegateResultParams {
+            delegation_id: "d-1".into(),
+            admission: token(&w.router, "prod", "d-1"),
+            status: DelegationStatus::Completed,
+            result: Some("secret output".into()),
+            error: Some("secret error".into()),
+        };
+        assert_eq!(
+            w.router
+                .complete(&w.registry, &w.events, w.h_worker, result, 1024, 2),
+            CompleteOutcome::Completed {
+                delivered: true,
+                stalled_initiator: None
+            }
+        );
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 2);
+        assert!(ev[0].get("prompt_excerpt").is_none());
+        assert_eq!(ev[0]["to"], "prod/worker-1", "metadata still present");
+        assert!(ev[1].get("result_excerpt").is_none());
+        assert!(
+            ev[1].get("error").is_none(),
+            "runtime-reported error bodies are payload too"
+        );
+        assert_eq!(ev[1]["status"], "completed");
+    }
+
+    #[test]
+    fn observer_in_another_namespace_sees_nothing() {
+        let w = world();
+        let mut other = observe(&w, "dev");
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        assert!(events_of(&mut other).is_empty());
+    }
+
+    #[test]
+    fn saturated_observer_queue_never_affects_the_delegation() {
+        let mut w = world();
+        let lobby_rx = observe(&w, "prod");
+        let lobby = w
+            .registry
+            .observers("prod")
+            .into_iter()
+            .next()
+            .expect("observer registered");
+        for _ in 0..crate::registry::OUTBOUND_QUEUE {
+            lobby.tx.try_send("filler".into()).unwrap();
+        }
+        // Delegation must still be accepted, forwarded, and completed.
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-1", "worker-1", 60)),
+            DelegateOutcome::Accepted(_)
+        ));
+        assert!(w.worker_rx.try_recv().unwrap().contains("cp/delegate"));
+        let result = DelegateResultParams {
+            delegation_id: "d-1".into(),
+            admission: token(&w.router, "prod", "d-1"),
+            status: DelegationStatus::Completed,
+            result: Some("done".into()),
+            error: None,
+        };
+        assert_eq!(
+            w.router
+                .complete(&w.registry, &w.events, w.h_worker, result, 1024, 2),
+            CompleteOutcome::Completed {
+                delivered: true,
+                stalled_initiator: None
+            }
+        );
+        assert_eq!(w.router.inflight_count(), 0);
+        drop(lobby_rx);
     }
 }

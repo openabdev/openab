@@ -74,6 +74,19 @@ max_inflight_delegations = 4096
 # enormous budget would otherwise disable saturation entirely.
 default_max_delegated_sessions_cap = 16
 
+# Prompt/result excerpts mirrored to observers in cp/event frames are
+# truncated to this size (the lobby is an audit surface, not a payload path).
+# Validated to 1..=65536: excerpt serialization runs on the delegation path,
+# so the cap is a latency budget as well as a content bound.
+max_event_excerpt_bytes = 4096
+
+# Ceiling on simultaneously registered observer connections per namespace.
+# Observer fan-out does bounded per-observer work inside the delegation
+# path's critical section, so the observer population is a configured
+# latency budget: a registration beyond the cap is refused with SATURATED.
+# Agents (primary/worker) are unaffected.
+max_observers_per_namespace = 16
+
 [[agents]]
 key = "${CP_KEY_KOUDU}"          # per-agent secret, never shared
 namespace = "prod"
@@ -87,8 +100,25 @@ name = "worker-1"
 type = "worker"
 max_delegated_sessions_cap = 4   # overrides default_max_delegated_sessions_cap
 
+# Read-only lobby client (e.g. the macOS/iOS lobby app). Observers receive
+# cp/event notifications and may call cp/list_agents; they can never
+# initiate, serve, or cancel delegations — no config can relax this.
+[[agents]]
+key = "${CP_KEY_LOBBY}"
+namespace = "prod"
+name = "lobby-app"
+type = "observer"
+
 # Per-namespace policy. Absent namespaces use the conservative defaults:
-# max_depth = 1, allow_worker_initiation = false.
+# max_depth = 1, allow_worker_initiation = false, metadata_only = false.
 [namespaces.prod]
 max_depth = 1
 allow_worker_initiation = false
+# Withhold agent-supplied content from cp/event: prompt/result excerpts,
+# worker-reported error text, and initiator cancel reasons are all
+# suppressed. Observers still see every event with full attribution
+# (from/to/chain), timing, and status, and CP-synthesized diagnostics
+# (timeout / disconnect reasons) remain visible by design — the stream is
+# metadata-complete but content-free. Default false (excerpts included,
+# bounded by max_event_excerpt_bytes).
+# metadata_only = true

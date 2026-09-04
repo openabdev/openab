@@ -5,11 +5,14 @@ WebSocket JSON-RPC, so agents delegate work to each other without
 round-tripping through a chat platform. Design and wire contract:
 [ADR: Agent Control Plane](adr/agent-control-plane.md).
 
-> **Status: PR 1/4 of the control-plane stack.** This slice ships the CP
-> server binary (registry, policy, router, wire protocol). The OAB-runtime
+> **Status: PR 2/4 of the control-plane stack.** PR 1/4 shipped the CP
+> server binary (registry, policy, router, wire protocol); this slice adds
+> the observer/lobby surface — the read-only `observer` agent type, the
+> `cp/event` notification stream, and `cp/list_agents` (see
+> [Observer surface](#observer-surface-lobby) below). The OAB-runtime
 > client (`[control_plane]` config + registration), the MCP facade/CLI, and
-> streaming land in the follow-up slices — until then nothing connects to
-> this server in a stock deployment, and there is no packaged container
+> client relay land in the follow-up slices — until then nothing connects
+> to this server in a stock deployment, and there is no packaged container
 > image yet.
 
 ## Run
@@ -98,19 +101,110 @@ issue #1474).
   after upgrading the CP; there is no compatible optional spelling, because an
   absent token would be the wildcard the field exists to remove. Root
   delegations are unaffected.
-- **The first terminal frame for an `admission` token wins.** A `completed`
-  result can race the CP's synthesized `timeout`, so an initiator may receive
-  more than one terminal frame for the same admission. Treat the first as
-  authoritative and ignore later ones; the CP does not suppress them.
+- **The first terminal frame for an `admission` token wins.** The CP delivers
+  a terminal frame only from the one path that authoritatively ended the
+  admission (completion commit, cancel, deadline sweep, or disconnect
+  teardown), so under one CP process an initiator should see exactly one
+  terminal per admission. Keep the rule anyway, as defence in depth (frames
+  straddling a CP restart, future multi-instance deployments): treat the
+  first terminal frame as authoritative and ignore later ones for that token.
   Correlate on `admission`, not on `delegation_id`: the id is yours to reuse
   (cancel-then-retry is legal), and a late frame for the cancelled admission
   would otherwise mask the retry's genuine result. Every terminal frame carries
   the token, including CP-synthesized `timeout` and `target_disconnected`.
 - A delegation may be refused with `SATURATED` because the target is at
-  capacity *or* because the CP is at `max_inflight_delegations`; the error
-  message says which. The CP never queues — retry later.
+  capacity *or* because the CP is at `max_inflight_delegations`; an observer
+  registration may be refused with the same code when its namespace is at
+  `max_observers_per_namespace`. The error message always says which bound
+  was hit. The CP never queues — retry later (or raise the named knob).
 - The capacity a runtime advertises in `max_delegated_sessions` is clamped by
   the CP (`default_max_delegated_sessions_cap`, or a per-identity override).
   The ack's `effective_max_delegated_sessions` is the value that counts.
 - After a lease expires or the CP restarts, in-flight delegations are gone:
   initiators reconcile against their own deadlines and re-delegate.
+
+## Observer surface (lobby)
+
+A third identity type joins `primary`/`worker`: **`observer`** — a read-only
+lobby client, authenticated by the same per-key identity binding
+(`type = "observer"` on the `[[agents]]` entry). Observers register via the
+same `cp/register` first-frame rule and hold a lease like any agent, but they
+are read-only by construction: never selectable as a delegation target, and
+unconditionally refused as an initiator — at the policy layer, at target
+selection, and by an up-front method guard. There is no configuration that
+relaxes this.
+
+### `cp/event` notifications
+
+The CP pushes JSON-RPC **notifications** (method `cp/event`, no `id`) to
+every observer in the event's namespace. Envelope:
+
+```json
+{"jsonrpc":"2.0","method":"cp/event","params":{
+  "seq": 7, "ts": "2026-08-14T20:00:00Z", "namespace": "prod",
+  "event": "delegation_requested", "...": "event-specific fields"
+}}
+```
+
+Event kinds and their fields:
+
+| `event` | Fields |
+|---------|--------|
+| `agent_registered` | `agent`, `type`, `instance_id`, `labels` |
+| `agent_deregistered` | `agent`, `instance_id`, `reason` (`disconnect` / `lease_expired`) |
+| `delegation_requested` | `delegation_id`, `admission`, `from`, `to`, `prompt_excerpt`?, `deadline`, `chain` |
+| `delegation_completed` | `delegation_id`, `admission`, `from`, `to`, `status`, `result_excerpt`?, `error`? |
+| `delegation_cancelled` | `delegation_id`, `admission`, `from`, `to`, `by`, `reason`? |
+
+Client contract:
+
+- **Sequence numbers.** `seq` is per-namespace, monotonic, and dense: your
+  first received frame sets your baseline, and a gap means frames were
+  dropped for you (saturated queue) — resync your roster via
+  `cp/list_agents`. A `seq` regression means the CP restarted: treat it as a
+  full resync. `seq` is not durable across restarts.
+- **Correlate on `(namespace, delegation_id, admission)`.** A delegation id
+  is legally reusable (cancel-then-retry); the `admission` token is what ties
+  a terminal event to the exact admission it ends, mirroring the wire frames.
+- **Lifecycle ordering.** `delegation_requested` is published before the
+  forward reaches the worker, and a terminal event is published only by the
+  path that authoritatively ended the admission — so you never see a terminal
+  before its `requested`, never more than one terminal per admission, and the
+  terminal you see is the outcome the CP committed. One edge to know: if the
+  initiator's connection cannot accept its terminal frame (queue refused, or
+  it died first), the CP disconnects it and the frame is not delivered — the
+  observer still sees the committed outcome, which that initiator never
+  received. An `agent_deregistered` without a matching `agent_registered` is
+  possible (registration ack failure); treat removal of an unknown agent as
+  a no-op.
+- **Terminal asymmetry.** Completion-shaped endings (`completed`, `failed`,
+  `timeout`, `target_disconnected`) arrive as `delegation_completed` with a
+  `status`; cancellations (initiator cancel, initiator disconnect) arrive as
+  `delegation_cancelled` with `by` — the initiator's logical id, or the
+  literal `"control-plane"` for CP-synthesized cancellations.
+- **Best-effort delivery.** Fan-out uses the same bounded per-connection
+  queue as everything else: a lobby that cannot keep up loses frames and
+  detects it via the `seq` gap. Sends are non-blocking, so a single slow
+  observer cannot block a delegation — but fan-out serialization runs inside
+  the delegation path's in-flight critical section, so the observer
+  population adds bounded latency to delegation bookkeeping. The bound is
+  configuration, not hope: `max_observers_per_namespace` (default 16) caps
+  the population and `max_event_excerpt_bytes` (validated to at most 64 KiB)
+  caps the per-frame work.
+- **Content redaction.** Prompt/result excerpts are bounded by
+  `max_event_excerpt_bytes` (default 4 KiB). In a `metadata_only = true`
+  namespace, agent-supplied content (prompt/result excerpts, worker-reported
+  error text, initiator cancel reasons) is omitted entirely, while
+  CP-synthesized diagnostics (timeout/disconnect reasons) remain — the stream
+  stays metadata-complete but content-free.
+
+### `cp/list_agents`
+
+Any registered client (observers included) may call `cp/list_agents` (empty
+params). It returns the roster of the **caller's own namespace** — name,
+type, `instance_id`, labels, and load (`active_sessions` /
+`max_delegated_sessions`) per instance; the scope comes from the
+authenticated registration, never from the frame. This is the lobby's roster
+view and the resync path after a `seq` gap. Note the recovery scope: the
+snapshot restores the roster, not missed delegation lifecycle events — a
+lobby that needs delegation history must retain its own.
