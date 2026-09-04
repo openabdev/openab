@@ -56,7 +56,6 @@ jobs:
           - { name: devin, agent: "devin" }
           - { name: gemini, agent: "gemini" }
           - { name: grok, agent: "grok" }
-          - { name: hermes, agent: "hermes-acp" }
           - { name: kimi, agent: "kimi" }
           - { name: mimocode, agent: "mimo" }
           - { name: opencode, agent: "opencode" }

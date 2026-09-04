@@ -50,7 +50,7 @@ env:
   # OPENAB_AGENT_COMMAND=openab-agent but does not ship that binary (a
   # pre-existing bug across all lanes — see follow-up issue), so a nightly-pi
   # tag would publish a runtime-broken image. Re-add once the pi target is fixed.
-  ALL_VARIANTS: 'kiro,claude,codex,copilot,cursor,devin,gemini,grok,hermes,kimi,mimocode,opencode,antigravity'
+  ALL_VARIANTS: 'kiro,claude,codex,copilot,cursor,devin,gemini,grok,kimi,mimocode,opencode,antigravity'
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -182,7 +182,7 @@ jobs:
     steps:
       - name: Resolve the vendor's latest CLI version
         env:
-          # Used for the cross-repo GitHub API requests (hermes, antigravity).
+          # Used for the cross-repo GitHub API requests (antigravity).
           # An authenticated fetch avoids the shared-runner 429s seen on
           # api/raw.githubusercontent.com, while the resolved commit/tag keeps
           # the installer immutable.
@@ -319,34 +319,6 @@ jobs:
           AGY_SHA256_AMD64=
           AGY_SHA256_ARM64=
           ALLOW_UNVERIFIED_NIGHTLY_DOWNLOADS=true" ;;
-            hermes)
-              # Resolve the release, dereference an annotated tag to its immutable
-              # commit, then pin both the install commit and the installer SHA so
-              # the Dockerfile's SHA check stays enabled.
-              RELEASE=$(github_api https://api.github.com/repos/NousResearch/hermes-agent/releases/latest)
-              TAG=$(echo "$RELEASE" | jq -r .tag_name)
-              REF=$(github_api "https://api.github.com/repos/NousResearch/hermes-agent/git/ref/tags/${TAG}")
-              REF_TYPE=$(echo "$REF" | jq -r .object.type)
-              COMMIT=$(echo "$REF" | jq -r .object.sha)
-              for _ in 1 2 3; do
-                [ "$REF_TYPE" = "tag" ] || break
-                REF=$(github_api "https://api.github.com/repos/NousResearch/hermes-agent/git/tags/${COMMIT}")
-                REF_TYPE=$(echo "$REF" | jq -r .object.type)
-                COMMIT=$(echo "$REF" | jq -r .object.sha)
-              done
-              [ "$REF_TYPE" = "commit" ] || { echo "::error::hermes $TAG did not resolve to a commit"; exit 1; }
-              echo "$COMMIT" | grep -qE '^[0-9a-f]{40}$' || { echo "::error::invalid hermes commit: $COMMIT"; exit 1; }
-              # Hash the installer via the authenticated Contents API (raw+json)
-              # for the resolved commit — same reason as the release fetch above:
-              # dodges the shared-runner 429s on raw.githubusercontent.com. The
-              # Dockerfile still fetches+verifies against this SHA at build time.
-              INSTALL_SHA=$(github_api -H 'Accept: application/vnd.github.raw+json' \
-                "https://api.github.com/repos/NousResearch/hermes-agent/contents/scripts/install.sh?ref=${COMMIT}" \
-                | sha256sum | cut -d' ' -f1)
-              echo "$INSTALL_SHA" | grep -qE '^[0-9a-f]{64}$' || { echo "::error::could not hash hermes installer"; exit 1; }
-              REPORT="hermes $TAG @ $COMMIT"
-              BUILD_ARGS="HERMES_INSTALL_COMMIT=$COMMIT
-          HERMES_INSTALL_SHA256=$INSTALL_SHA" ;;
             *)
               echo "::error::no resolver for variant $VARIANT"; exit 1 ;;
           esac
