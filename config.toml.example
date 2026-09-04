@@ -249,13 +249,6 @@ working_dir = "/home/agent"
 # env = {}  # Auth via: kubectl exec -it <pod> -- cursor-agent login
 
 # [agent]
-# command = "hermes-acp"
-# working_dir = "/home/agent"
-# # Auth via: kubectl exec -it <pod> -- hermes auth add xai-oauth
-# # Supports 30+ providers (xAI Grok OAuth, Anthropic, OpenAI Codex, Gemini, etc.)
-# # Provider switching: kubectl exec -it <pod> -- hermes model
-
-# [agent]
 # command = "grok"
 # args = ["agent", "stdio"]
 # working_dir = "/home/agent"
