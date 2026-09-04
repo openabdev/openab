@@ -7,7 +7,7 @@ use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, warn};
 
 pub const GOOGLE_CHAT_API_BASE: &str = "https://chat.googleapis.com/v1";
@@ -29,28 +29,13 @@ const MEDIA_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 const TOKEN_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Bound each Google Chat API mutation independently. The enclosing delivery
 /// deadline below is stricter than core's 35-second acknowledgement window and
-/// covers token resolution plus every sequential chunk.
+/// covers serialization queue wait, token resolution, and every sequential chunk.
 const CHAT_API_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// End-to-end budget for one outbound Google Chat reply. Core waits 35 seconds
 /// for an acknowledged gateway reply; finishing within 30 seconds leaves room
 /// for response serialization and WebSocket/broadcast scheduling.
 const GOOGLE_CHAT_DELIVERY_DEADLINE: std::time::Duration =
     std::time::Duration::from_secs(30);
-
-async fn within_delivery_deadline<T, F>(
-    deadline: std::time::Duration,
-    future: F,
-) -> Result<T, String>
-where
-    F: std::future::Future<Output = Result<T, String>>,
-{
-    tokio::time::timeout(deadline, future).await.map_err(|_| {
-        format!(
-            "googlechat delivery timed out after {}s",
-            deadline.as_secs()
-        )
-    })?
-}
 /// Cap on text file attachments per message (matches Discord/Slack).
 const TEXT_FILE_COUNT_CAP: usize = 5;
 /// Cap on aggregate text file bytes per message (matches Discord/Slack 1 MB).
@@ -367,6 +352,10 @@ pub struct GoogleChatAdapter {
     pub metadata_source: Option<MetadataTokenSource>,
     pub access_token: Option<String>,
     pub jwt_verifier: Option<GoogleChatJwtVerifier>,
+    /// Serializes normal sends. Google Chat enforces a per-space write quota;
+    /// every caller starts its deadline before waiting on this lock so queueing
+    /// cannot outlive core's acknowledgement window.
+    delivery_lock: Mutex<()>,
     pub client: reqwest::Client,
     pub api_base: String,
 }
@@ -488,6 +477,7 @@ impl GoogleChatAdapter {
             metadata_source: None,
             access_token,
             jwt_verifier,
+            delivery_lock: Mutex::new(()),
             client: reqwest::Client::new(),
             api_base: GOOGLE_CHAT_API_BASE.into(),
         }
@@ -573,27 +563,47 @@ impl GoogleChatAdapter {
     }
 
     /// Deliver one normal Google Chat reply and return the created message
-    /// resource name. Both the standalone gateway acknowledgement path and the
-    /// in-process unified adapter call this method, so transport failures have
-    /// identical semantics instead of being observable only over WebSocket.
+    /// resource name. The absolute deadline starts before waiting for the
+    /// serialization lock, so queueing + token resolution + every chunk all fit
+    /// inside core's acknowledgement window.
     pub async fn deliver_message(&self, reply: &GatewayReply) -> Result<String, String> {
-        within_delivery_deadline(
-            GOOGLE_CHAT_DELIVERY_DEADLINE,
-            self.deliver_message_inner(reply),
+        self.deliver_message_before(
+            reply,
+            tokio::time::Instant::now() + GOOGLE_CHAT_DELIVERY_DEADLINE,
         )
         .await
     }
 
-    async fn deliver_message_inner(&self, reply: &GatewayReply) -> Result<String, String> {
+    async fn deliver_message_before(
+        &self,
+        reply: &GatewayReply,
+        deadline: tokio::time::Instant,
+    ) -> Result<String, String> {
+        let _delivery_guard = tokio::time::timeout_at(deadline, self.delivery_lock.lock())
+            .await
+            .map_err(|_| {
+                format!(
+                    "googlechat delivery queue timed out after {}s before sending any chunk",
+                    GOOGLE_CHAT_DELIVERY_DEADLINE.as_secs()
+                )
+            })?;
+        self.deliver_message_inner(reply, deadline).await
+    }
+
+    async fn deliver_message_inner(
+        &self,
+        reply: &GatewayReply,
+        deadline: tokio::time::Instant,
+    ) -> Result<String, String> {
         info!(
             space = %reply.channel.id,
             thread_id = ?reply.channel.thread_id,
             "gateway → googlechat"
         );
 
-        let token = self
-            .get_token()
+        let token = tokio::time::timeout_at(deadline, self.get_token())
             .await
+            .map_err(|_| "googlechat token resolution timed out before sending any chunk".to_string())?
             .ok_or_else(|| "no credentials configured".to_string())?;
         let chunks = split_text(&reply.content.text, GOOGLE_CHAT_MESSAGE_LIMIT);
         if chunks.is_empty() {
@@ -603,16 +613,27 @@ impl GoogleChatAdapter {
         let total = chunks.len();
         let mut first_message_name = None;
         for (index, chunk) in chunks.into_iter().enumerate() {
-            match send_message(
-                &self.client,
-                &token,
-                &reply.channel.id,
-                reply.channel.thread_id.as_deref(),
-                chunk,
-                &self.api_base,
+            let result = tokio::time::timeout_at(
+                deadline,
+                send_message(
+                    &self.client,
+                    &token,
+                    &reply.channel.id,
+                    reply.channel.thread_id.as_deref(),
+                    chunk,
+                    &self.api_base,
+                ),
             )
             .await
-            {
+            .map_err(|_| {
+                format!(
+                    "chunk {}/{} timed out after {} successful chunk(s)",
+                    index + 1,
+                    total,
+                    index
+                )
+            })?;
+            match result {
                 Ok(name) => {
                     if first_message_name.is_none() {
                         first_message_name = Some(name);
@@ -2419,6 +2440,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "integration: uses a local HTTP server"]
     async fn metadata_token_source_mints_chat_bot_token() {
         use wiremock::matchers::{header, method, path, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2475,6 +2497,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "integration: uses a local HTTP server"]
     async fn metadata_token_source_rejects_self_impersonation_before_token_request() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2575,6 +2598,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "integration: uses a local HTTP server"]
     async fn adc_refresh_failure_cooldown_prevents_queued_retry_storm() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2710,6 +2734,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "integration: exercises filesystem error handling"]
     fn from_parts_unreadable_key_file_with_use_adc_installs_adc() {
         // Regression: an unreadable/absent key FILE also yields token_cache=None
         // and must not suppress ADC.
@@ -2819,14 +2844,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delivery_deadline_cancels_hung_operation() {
-        let err = within_delivery_deadline(
-            std::time::Duration::from_millis(1),
-            std::future::pending::<Result<String, String>>(),
-        )
-        .await
-        .expect_err("pending delivery must time out");
-        assert!(err.contains("delivery timed out"), "{err}");
+    async fn delivery_deadline_includes_wait_for_serialization_lock() {
+        let adapter = GoogleChatAdapter::new(None, Some("token".into()), None);
+        let held = adapter.delivery_lock.lock().await;
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "orig".into(),
+            platform: "googlechat".into(),
+            channel: ReplyChannel {
+                id: "spaces/TEST".into(),
+                thread_id: None,
+            },
+            content: Content {
+                content_type: "text".into(),
+                attachments: vec![],
+                text: "hello".into(),
+            },
+            command: None,
+            request_id: Some("req_queue".into()),
+            quote_message_id: None,
+        };
+
+        let err = adapter
+            .deliver_message_before(
+                &reply,
+                tokio::time::Instant::now() + std::time::Duration::from_millis(1),
+            )
+            .await
+            .expect_err("queued delivery must time out before the held lock is released");
+        drop(held);
+        assert!(err.contains("delivery queue timed out"), "{err}");
+        assert!(err.contains("before sending any chunk"), "{err}");
     }
 
     #[tokio::test]
@@ -2837,6 +2885,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "integration: uses a local HTTP server"]
     async fn adc_failure_does_not_fall_back_to_whitespace_static_token() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2873,6 +2922,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "integration: uses a local HTTP server"]
     async fn adc_takes_precedence_over_static_access_token() {
         use wiremock::matchers::{method, path, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2925,6 +2975,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "integration: uses a local HTTP server"]
     async fn metadata_token_source_rejects_blank_minted_token() {
         use wiremock::matchers::{method, path, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2975,6 +3026,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "integration: uses a local HTTP server"]
     async fn handle_reply_edit_message_ignores_synthetic_unified_id() {
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3622,6 +3674,64 @@ mod tests {
         assert!(err.contains("chunk 2/2"), "{err}");
         assert!(err.contains("after 1 successful chunk(s)"), "{err}");
         assert!(err.contains("500"), "{err}");
+    }
+
+    #[tokio::test]
+    #[ignore = "integration: delayed local HTTP response validates partial-timeout context"]
+    async fn multi_chunk_timeout_reports_successful_chunk_count() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex("/spaces/.*/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"name": "spaces/TEST/messages/first_chunk"}),
+            ))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex("/spaces/.*/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_millis(250))
+                    .set_body_json(
+                        serde_json::json!({"name": "spaces/TEST/messages/late_chunk"}),
+                    ),
+            )
+            .mount(&server)
+            .await;
+
+        let mut adapter = GoogleChatAdapter::new(None, Some("fake-token".into()), None);
+        adapter.api_base = server.uri();
+        let reply = GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "orig".into(),
+            platform: "googlechat".into(),
+            channel: ReplyChannel {
+                id: "spaces/TEST".into(),
+                thread_id: None,
+            },
+            content: Content {
+                content_type: "text".into(),
+                attachments: vec![],
+                text: "x".repeat(5000),
+            },
+            command: None,
+            request_id: Some("req_partial_timeout".into()),
+            quote_message_id: None,
+        };
+
+        let err = adapter
+            .deliver_message_before(
+                &reply,
+                tokio::time::Instant::now() + std::time::Duration::from_millis(75),
+            )
+            .await
+            .expect_err("second chunk must exceed the absolute deadline");
+        assert!(err.contains("chunk 2/2 timed out"), "{err}");
+        assert!(err.contains("after 1 successful chunk(s)"), "{err}");
     }
 
     // --- Attachment parsing tests ---

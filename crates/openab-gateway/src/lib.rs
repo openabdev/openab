@@ -1077,11 +1077,19 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                             }
                             #[cfg(feature = "googlechat")]
                             "googlechat" => {
-                                if let Some(ref gc) = state_for_recv.google_chat {
-                                    gc.handle_reply(&reply, &state_for_recv.event_tx).await;
-                                } else {
-                                    warn!("reply for googlechat but adapter not configured");
-                                }
+                                // Do not await delivery inline: core's ack timer is already
+                                // running, and the receive loop must keep draining replies.
+                                // GoogleChatAdapter serializes sends internally; each spawned
+                                // task's deadline includes its wait for that delivery lock.
+                                let state = state_for_recv.clone();
+                                let reply = reply.clone();
+                                tokio::spawn(async move {
+                                    if let Some(ref gc) = state.google_chat {
+                                        gc.handle_reply(&reply, &state.event_tx).await;
+                                    } else {
+                                        warn!("reply for googlechat but adapter not configured");
+                                    }
+                                });
                             }
                             #[cfg(feature = "wecom")]
                             "wecom" => {
