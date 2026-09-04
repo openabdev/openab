@@ -1074,10 +1074,10 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                                 // running, and the receive loop must keep draining replies.
                                 // Dropping the JoinHandle detaches the delivery task; its deadline
                                 // includes any wait for the adapter's delivery lock.
-                                let _ = spawn_googlechat_reply(
+                                std::mem::drop(spawn_googlechat_reply(
                                     state_for_recv.clone(),
                                     reply.clone(),
-                                );
+                                ));
                             }
                             #[cfg(feature = "wecom")]
                             "wecom" => {
