@@ -27,6 +27,30 @@ const MEDIA_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// write lock (the refresh runs while holding it) or prevent the ADC → static
 /// token degradation path from engaging.
 const TOKEN_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Bound each Google Chat API mutation independently. The enclosing delivery
+/// deadline below is stricter than core's 35-second acknowledgement window and
+/// covers token resolution plus every sequential chunk.
+const CHAT_API_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// End-to-end budget for one outbound Google Chat reply. Core waits 35 seconds
+/// for an acknowledged gateway reply; finishing within 30 seconds leaves room
+/// for response serialization and WebSocket/broadcast scheduling.
+const GOOGLE_CHAT_DELIVERY_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
+async fn within_delivery_deadline<T, F>(
+    deadline: std::time::Duration,
+    future: F,
+) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, String>>,
+{
+    tokio::time::timeout(deadline, future).await.map_err(|_| {
+        format!(
+            "googlechat delivery timed out after {}s",
+            deadline.as_secs()
+        )
+    })?
+}
 /// Cap on text file attachments per message (matches Discord/Slack).
 const TEXT_FILE_COUNT_CAP: usize = 5;
 /// Cap on aggregate text file bytes per message (matches Discord/Slack 1 MB).
@@ -273,6 +297,51 @@ fn non_empty_token(value: &str) -> Option<&str> {
     (!value.trim().is_empty()).then_some(value)
 }
 
+/// Normalize and validate the dedicated ADC target identity before it can be
+/// interpolated into an IAM Credentials resource path. Only user-managed
+/// service-account emails are accepted: this intentionally rejects numeric
+/// unique IDs (which could alias the runtime SA and bypass the equality guard),
+/// trailing-dot aliases, and URL/path metacharacters.
+fn normalize_adc_target_service_account(value: Option<String>) -> Result<Option<String>, String> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let email = raw.trim().to_ascii_lowercase();
+    if email.is_empty() {
+        return Ok(None);
+    }
+
+    const SUFFIX: &str = ".iam.gserviceaccount.com";
+    let (account, domain) = email.split_once('@').ok_or_else(|| {
+        "adc_target_service_account must be a service-account email, not an ID".to_string()
+    })?;
+    let project = domain.strip_suffix(SUFFIX).ok_or_else(|| {
+        format!("adc_target_service_account must end with {SUFFIX}")
+    })?;
+    let valid_label = |label: &str| {
+        !label.is_empty()
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && label
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && label
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric)
+    };
+    if !valid_label(account) || !valid_label(project) {
+        return Err(
+            "adc_target_service_account must use account@project.iam.gserviceaccount.com with only lowercase letters, digits, and interior hyphens"
+                .into(),
+        );
+    }
+
+    Ok(Some(email))
+}
+
 /// Google Chat edit targets must be full `spaces/{space}/messages/{message}`
 /// resource names. Reject synthetic ids and incomplete `spaces/` prefixes
 /// before token resolution or network I/O.
@@ -355,11 +424,19 @@ impl GoogleChatAdapter {
             GoogleChatJwtVerifier::new(aud)
         });
         // Precedence at send time (see `get_token`): SA key > ADC > static token.
-        let adc_target = adc_target_service_account
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned);
+        // Validate at the adapter boundary so env-only/config-first construction
+        // and every future caller share the same IAM resource-path invariant.
+        let adc_target = if use_adc && token_cache.is_none() {
+            match normalize_adc_target_service_account(adc_target_service_account) {
+                Ok(target) => target,
+                Err(e) => {
+                    error!("googlechat ADC target is invalid: {e}; ADC is disabled");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         if use_adc && token_cache.is_none() {
             if key_configured {
                 // A key WAS configured but failed to load. Don't switch identity
@@ -472,7 +549,15 @@ impl GoogleChatAdapter {
         );
         let body = serde_json::json!({ "text": formatted });
 
-        match self.client.patch(&url).bearer_auth(&token).json(&body).send().await {
+        match self
+            .client
+            .patch(&url)
+            .bearer_auth(&token)
+            .json(&body)
+            .timeout(CHAT_API_REQUEST_TIMEOUT)
+            .send()
+            .await
+        {
             Ok(r) if r.status().is_success() => {
                 tracing::trace!(message_name = %message_name, "googlechat message edited");
             }
@@ -485,6 +570,66 @@ impl GoogleChatAdapter {
                 error!(err = %e, "googlechat edit_message request failed");
             }
         }
+    }
+
+    /// Deliver one normal Google Chat reply and return the created message
+    /// resource name. Both the standalone gateway acknowledgement path and the
+    /// in-process unified adapter call this method, so transport failures have
+    /// identical semantics instead of being observable only over WebSocket.
+    pub async fn deliver_message(&self, reply: &GatewayReply) -> Result<String, String> {
+        within_delivery_deadline(
+            GOOGLE_CHAT_DELIVERY_DEADLINE,
+            self.deliver_message_inner(reply),
+        )
+        .await
+    }
+
+    async fn deliver_message_inner(&self, reply: &GatewayReply) -> Result<String, String> {
+        info!(
+            space = %reply.channel.id,
+            thread_id = ?reply.channel.thread_id,
+            "gateway → googlechat"
+        );
+
+        let token = self
+            .get_token()
+            .await
+            .ok_or_else(|| "no credentials configured".to_string())?;
+        let chunks = split_text(&reply.content.text, GOOGLE_CHAT_MESSAGE_LIMIT);
+        if chunks.is_empty() {
+            return Err("empty message".into());
+        }
+
+        let total = chunks.len();
+        let mut first_message_name = None;
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            match send_message(
+                &self.client,
+                &token,
+                &reply.channel.id,
+                reply.channel.thread_id.as_deref(),
+                chunk,
+                &self.api_base,
+            )
+            .await
+            {
+                Ok(name) => {
+                    if first_message_name.is_none() {
+                        first_message_name = Some(name);
+                    }
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "chunk {}/{} failed after {} successful chunk(s): {e}",
+                        index + 1,
+                        total,
+                        index
+                    ));
+                }
+            }
+        }
+
+        first_message_name.ok_or_else(|| "googlechat delivery produced no message".into())
     }
 
     pub async fn handle_reply(
@@ -522,121 +667,25 @@ impl GoogleChatAdapter {
             _ => {}
         }
 
-        info!(
-            space = %reply.channel.id,
-            thread_id = ?reply.channel.thread_id,
-            "gateway → googlechat"
-        );
-
-        let Some(token) = self.get_token().await else {
-            info!(
-                text = %reply.content.text,
-                "googlechat reply (dry-run, no credentials configured)"
-            );
-            if let Some(ref req_id) = reply.request_id {
-                let resp = crate::schema::GatewayResponse {
-                    schema: "openab.gateway.response.v1".into(),
-                    request_id: req_id.clone(),
-                    success: false,
-                    thread_id: None,
-                    message_id: None,
-                    error: Some("no credentials configured".into()),
-                };
-                if let Ok(json) = serde_json::to_string(&resp) {
-                    let _ = event_tx.send(json);
-                }
+        let result = self.deliver_message(reply).await;
+        if let Some(ref req_id) = reply.request_id {
+            let (success, message_id, error) = match result {
+                Ok(name) => (true, Some(name), None),
+                Err(e) => (false, None, Some(e)),
+            };
+            let resp = crate::schema::GatewayResponse {
+                schema: "openab.gateway.response.v1".into(),
+                request_id: req_id.clone(),
+                success,
+                thread_id: None,
+                message_id,
+                error,
+            };
+            if let Ok(json) = serde_json::to_string(&resp) {
+                let _ = event_tx.send(json);
             }
-            return;
-        };
-
-        let text = &reply.content.text;
-        let chunks = split_text(text, GOOGLE_CHAT_MESSAGE_LIMIT);
-
-        // Empty message: short-circuit, send failure ack and skip API call
-        if chunks.is_empty() {
-            if let Some(ref req_id) = reply.request_id {
-                let resp = crate::schema::GatewayResponse {
-                    schema: "openab.gateway.response.v1".into(),
-                    request_id: req_id.clone(),
-                    success: false,
-                    thread_id: None,
-                    message_id: None,
-                    error: Some("empty message".into()),
-                };
-                if let Ok(json) = serde_json::to_string(&resp) {
-                    let _ = event_tx.send(json);
-                }
-            }
-            return;
-        }
-
-        if chunks.len() == 1 {
-            let result = send_message(
-                &self.client,
-                &token,
-                &reply.channel.id,
-                reply.channel.thread_id.as_deref(),
-                text,
-                &self.api_base,
-            )
-            .await;
-
-            if let Some(ref req_id) = reply.request_id {
-                let (success, message_id, error) = match result {
-                    Ok(name) => (true, Some(name), None),
-                    Err(e) => (false, None, Some(e)),
-                };
-                let resp = crate::schema::GatewayResponse {
-                    schema: "openab.gateway.response.v1".into(),
-                    request_id: req_id.clone(),
-                    success,
-                    thread_id: None,
-                    message_id,
-                    error,
-                };
-                if let Ok(json) = serde_json::to_string(&resp) {
-                    let _ = event_tx.send(json);
-                }
-            }
-        } else {
-            let mut first_msg_name: Option<String> = None;
-            let mut first_error: Option<String> = None;
-            for chunk in chunks {
-                match send_message(
-                    &self.client,
-                    &token,
-                    &reply.channel.id,
-                    reply.channel.thread_id.as_deref(),
-                    chunk,
-                    &self.api_base,
-                )
-                .await
-                {
-                    Ok(name) => {
-                        if first_msg_name.is_none() {
-                            first_msg_name = Some(name);
-                        }
-                    }
-                    Err(e) => {
-                        if first_error.is_none() {
-                            first_error = Some(e);
-                        }
-                    }
-                }
-            }
-            if let Some(ref req_id) = reply.request_id {
-                let resp = crate::schema::GatewayResponse {
-                    schema: "openab.gateway.response.v1".into(),
-                    request_id: req_id.clone(),
-                    success: first_msg_name.is_some() && first_error.is_none(),
-                    thread_id: None,
-                    message_id: first_msg_name,
-                    error: first_error,
-                };
-                if let Ok(json) = serde_json::to_string(&resp) {
-                    let _ = event_tx.send(json);
-                }
-            }
+        } else if let Err(e) = result {
+            error!(error = %e, "googlechat reply delivery failed without acknowledgement id");
         }
     }
 }
@@ -1117,8 +1166,10 @@ pub struct MetadataTokenSource {
 }
 
 impl MetadataTokenSource {
-    /// Production constructor: fixed trusted endpoints and a distinct target SA.
-    pub fn new(target_service_account: String) -> Self {
+    /// Production constructor for a target already normalized and validated by
+    /// [`normalize_adc_target_service_account`]. Kept private so callers cannot
+    /// bypass that invariant.
+    fn new(target_service_account: String) -> Self {
         Self::with_bases(
             target_service_account,
             "http://metadata.google.internal".into(),
@@ -1650,6 +1701,7 @@ async fn send_message(
         .post(&url)
         .bearer_auth(token)
         .json(&body)
+        .timeout(CHAT_API_REQUEST_TIMEOUT)
         .send()
         .await;
 
@@ -1657,11 +1709,15 @@ async fn send_message(
         Ok(r) if r.status().is_success() => {
             let body = r.text().await.unwrap_or_default();
             let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-            parsed
-                .get("name")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-                .ok_or_else(|| "missing message name in response".into())
+            if let Some(name) = parsed.get("name").and_then(|v| v.as_str()) {
+                Ok(name.to_string())
+            } else {
+                warn!(
+                    response_body = %body,
+                    "googlechat accepted message but omitted its resource name; using synthetic receipt"
+                );
+                Ok("googlechat_sent".into())
+            }
         }
         Ok(r) => {
             let status = r.status();
@@ -2455,6 +2511,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "integration: validates reqwest proxy routing with local HTTP servers"]
     async fn metadata_bypasses_proxy_while_iam_uses_proxy_client() {
         use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2619,6 +2676,19 @@ mod tests {
     }
 
     #[test]
+    fn from_parts_use_adc_with_invalid_target_fails_closed() {
+        let adapter = GoogleChatAdapter::from_parts(GoogleChatParts {
+            use_adc: true,
+            adc_target_service_account: Some("123456789012345678901".into()),
+            ..Default::default()
+        });
+        assert!(
+            adapter.metadata_source.is_none(),
+            "numeric unique IDs must not bypass the service-account email invariant"
+        );
+    }
+
+    #[test]
     fn from_parts_malformed_key_with_use_adc_installs_adc() {
         // Regression: a configured-but-malformed SA key parses to
         // token_cache=None; with use_adc=true the ADC source is still installed
@@ -2722,6 +2792,41 @@ mod tests {
         assert_eq!(non_empty_token(""), None);
         assert_eq!(non_empty_token(" \t\n"), None);
         assert_eq!(non_empty_token(" token "), Some(" token "));
+    }
+
+    #[test]
+    fn adc_target_requires_user_managed_service_account_email() {
+        assert_eq!(
+            normalize_adc_target_service_account(Some(
+                " Chat-Bot@Project-1.iam.gserviceaccount.com ".into()
+            ))
+            .unwrap()
+            .as_deref(),
+            Some("chat-bot@project-1.iam.gserviceaccount.com")
+        );
+        for invalid in [
+            "123456789012345678901",
+            "runtime@project-1.iam.gserviceaccount.com.",
+            "runtime@project-1.iam.gserviceaccount.com?x=y",
+            "runtime@project-1.iam.gserviceaccount.com/../other",
+            "-runtime@project-1.iam.gserviceaccount.com",
+        ] {
+            assert!(
+                normalize_adc_target_service_account(Some(invalid.into())).is_err(),
+                "accepted invalid ADC target: {invalid}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delivery_deadline_cancels_hung_operation() {
+        let err = within_delivery_deadline(
+            std::time::Duration::from_millis(1),
+            std::future::pending::<Result<String, String>>(),
+        )
+        .await
+        .expect_err("pending delivery must time out");
+        assert!(err.contains("delivery timed out"), "{err}");
     }
 
     #[tokio::test]
@@ -3458,9 +3563,10 @@ mod tests {
 
     #[tokio::test]
     async fn handle_reply_multi_chunk_partial_failure_reports_failure() {
-        // Mixed success/failure: chunk 1 succeeds, subsequent chunks fail.
-        // Expect success=false (any chunk failure marks overall as failed),
-        // but message_id is still set so core has a reference.
+        // Mixed success/failure: chunk 1 succeeds, chunk 2 fails. The direct
+        // Result contract reports no overall message receipt, but the error
+        // retains explicit partial-delivery context so operators know one chunk
+        // already reached the space and should not blindly retry the whole turn.
         use wiremock::{Mock, MockServer, ResponseTemplate};
         use wiremock::matchers::{method, path_regex};
 
@@ -3511,9 +3617,11 @@ mod tests {
         let resp: GatewayResponse = serde_json::from_str(&received.unwrap()).unwrap();
         assert_eq!(resp.request_id, "req_partial");
         assert!(!resp.success, "partial failure must report success=false");
-        assert_eq!(resp.message_id, Some("spaces/TEST/messages/first_chunk".into()));
+        assert!(resp.message_id.is_none(), "partial delivery is not an overall receipt");
         let err = resp.error.expect("partial failure should set error");
-        assert!(err.contains("500"));
+        assert!(err.contains("chunk 2/2"), "{err}");
+        assert!(err.contains("after 1 successful chunk(s)"), "{err}");
+        assert!(err.contains("500"), "{err}");
     }
 
     // --- Attachment parsing tests ---

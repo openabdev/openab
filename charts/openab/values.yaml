@@ -395,6 +395,10 @@ agents:
     gateway:
       enabled: false    # set to true + provide url to enable the [gateway] config block
       deploy: true      # set to false to skip Gateway Deployment/Service (config-only mode)
+      # Existing Kubernetes ServiceAccount for the gateway pod. Empty falls back
+      # to agents.<name>.serviceAccountName, then chart-global serviceAccountName.
+      # Required on GKE when googleChat.useAdc uses Workload Identity.
+      serviceAccountName: ""
       url: ""           # e.g. ws://openab-gateway:8080/ws
       platform: "telegram"  # default platform when gateway is enabled
       token: ""         # optional shared secret (injected via GATEWAY_WS_TOKEN env var)

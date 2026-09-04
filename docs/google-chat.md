@@ -134,6 +134,27 @@ export GOOGLE_CHAT_USE_ADC=true
 export GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT="openab-chat@PROJECT.iam.gserviceaccount.com"
 ```
 
+For GKE + Helm, bind a Kubernetes ServiceAccount (KSA) to the **runtime** GSA
+out of band, then attach that KSA to the gateway pod. The chart references an
+existing KSA; it does not create or annotate one:
+
+```yaml
+agents:
+  kiro:
+    gateway:
+      enabled: true
+      serviceAccountName: openab-googlechat-runtime
+      googleChat:
+        useAdc: true
+        adcTargetServiceAccount: openab-chat@PROJECT.iam.gserviceaccount.com
+```
+
+The `openab-googlechat-runtime` KSA must carry the usual
+`iam.gke.io/gcp-service-account: openab-runtime@PROJECT.iam.gserviceaccount.com`
+annotation and Workload Identity IAM binding. If `gateway.serviceAccountName`
+is empty, the chart falls back to `agents.<name>.serviceAccountName`, then the
+chart-global `serviceAccountName`.
+
 Precedence: if a configured SA key loads successfully, it wins and ADC is ignored. If a key is configured but fails to load, the adapter uses the configured ADC target and logs the identity switch. `GOOGLE_CHAT_USE_ADC=true` without `GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT` fails closed (ADC is not installed). If ADC fails and a static token is explicitly configured, the adapter degrades to it with a warning that it may represent a different identity.
 
 > **Migrating an existing release from a SA key to ADC:** the chart renders the Google Chat Secret only when `saKeyJson` / `accessToken` is set, and that Secret carries `helm.sh/resource-policy: keep`. Switching to ADC-only stops Helm from managing it but **leaves the old key material in the cluster indefinitely**. Delete the orphaned Secret after the switch: it is the gateway Secret named by the chart's `openab.agentFullname` helper — `<release>-<agent>-gateway` by default (or the agent's `nameOverride`) — and it contains the `google-chat-sa-key-json` key. Find it with `kubectl get secrets -o name | grep gateway`, confirm with `kubectl get secret <name> -o jsonpath='{.data}' | grep -o google-chat-sa-key-json`, then `kubectl delete secret <name>`. Otherwise the "no key to mount or leak" benefit is undercut.

@@ -232,6 +232,12 @@ Full first-class Google Chat section (config-first parity, #1379) — credential
 | `allow_all_users` | bool \| omit | `false` (deny-all) | Env: `GOOGLE_CHAT_ALLOW_ALL_USERS`. |
 | `allowed_users` | string[] | `[]` | User resource names (`users/<id>`). Env: `GOOGLE_CHAT_ALLOWED_USERS`. |
 
+For GKE Workload Identity, set Helm value
+`agents.<name>.gateway.serviceAccountName` to an existing annotated Kubernetes
+ServiceAccount for the runtime GSA. An empty value falls back to
+`agents.<name>.serviceAccountName`, then chart-global `serviceAccountName`; the
+chart does not create or annotate the ServiceAccount.
+
 ---
 
 ## `[teams]`

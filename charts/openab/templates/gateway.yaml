@@ -4,6 +4,8 @@
 {{- $gwCfg := omit $cfg "nameOverride" }}
 {{- $d := dict "ctx" $ "agent" (printf "%s-gateway" $name) "cfg" $gwCfg }}
 {{- $agentD := dict "ctx" $ "agent" $name "cfg" $cfg }}
+{{- $agentSvcAcct := default $.Values.serviceAccountName $cfg.serviceAccountName }}
+{{- $gatewaySvcAcct := default $agentSvcAcct (($cfg.gateway).serviceAccountName) }}
 {{- $hasTeams := and (($cfg.gateway).teams).appId (($cfg.gateway).teams).appSecret }}
 {{- $hasTelegram := (($cfg.gateway).telegram).botToken }}
 {{- $hasLine := (($cfg.gateway).line).channelSecret }}
@@ -31,6 +33,9 @@ spec:
       {{- with $.Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $gatewaySvcAcct }}
+      serviceAccountName: {{ $gatewaySvcAcct | quote }}
       {{- end }}
       containers:
         - name: gateway

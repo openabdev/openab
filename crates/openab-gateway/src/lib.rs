@@ -201,7 +201,7 @@ impl AppState {
                         access_token: std::env::var("GOOGLE_CHAT_ACCESS_TOKEN").ok(),
                         audience: std::env::var("GOOGLE_CHAT_AUDIENCE").ok(),
                         use_adc: std::env::var("GOOGLE_CHAT_USE_ADC")
-                            .map(|v| v == "true" || v == "1")
+                            .map(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
                             .unwrap_or(false),
                         adc_target_service_account: std::env::var(
                             "GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT",
@@ -770,7 +770,7 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
                     access_token: std::env::var("GOOGLE_CHAT_ACCESS_TOKEN").ok(),
                     audience: std::env::var("GOOGLE_CHAT_AUDIENCE").ok(),
                     use_adc: std::env::var("GOOGLE_CHAT_USE_ADC")
-                        .map(|v| v == "true" || v == "1")
+                        .map(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
                         .unwrap_or(false),
                     adc_target_service_account: std::env::var(
                         "GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT",

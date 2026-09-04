@@ -1,7 +1,7 @@
 //! UnifiedGatewayAdapter — routes ChatAdapter calls through in-process gateway
 //! platform adapters based on the ChannelRef.platform field.
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use openab_core::adapter::{ChannelRef, ChatAdapter, MessageRef};
 use openab_gateway::schema::{Content, GatewayReply, ReplyChannel};
@@ -24,8 +24,10 @@ impl UnifiedGatewayAdapter {
         }
     }
 
-    /// Dispatch a GatewayReply to the correct platform adapter.
-    async fn dispatch_reply(&self, reply: &GatewayReply) {
+    /// Dispatch a GatewayReply to the correct platform adapter. Platforms with
+    /// direct delivery receipts return the real message resource name; legacy
+    /// fire-and-forget adapters return `None`.
+    async fn dispatch_reply(&self, reply: &GatewayReply) -> Result<Option<String>> {
         let client = &self.gw_state.client;
         match reply.platform.as_str() {
             #[cfg(feature = "telegram")]
@@ -69,7 +71,16 @@ impl UnifiedGatewayAdapter {
             #[cfg(feature = "googlechat")]
             "googlechat" => {
                 if let Some(ref gc) = self.gw_state.google_chat {
+                    if reply.command.is_none() {
+                        return gc
+                            .deliver_message(reply)
+                            .await
+                            .map(Some)
+                            .map_err(anyhow::Error::msg);
+                    }
                     gc.handle_reply(reply, &self.gw_state.event_tx).await;
+                } else if reply.command.is_none() {
+                    return Err(anyhow!("googlechat adapter is not configured"));
                 }
             }
             #[cfg(feature = "wecom")]
@@ -112,9 +123,13 @@ impl UnifiedGatewayAdapter {
                 }
             }
             other => {
-                tracing::warn!(platform = other, "unified adapter: unknown platform, cannot route reply");
+                tracing::warn!(
+                    platform = other,
+                    "unified adapter: unknown platform, cannot route reply"
+                );
             }
         }
+        Ok(None)
     }
 
     /// Build a GatewayReply from ChatAdapter parameters.
@@ -157,11 +172,18 @@ impl ChatAdapter for UnifiedGatewayAdapter {
 
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
         let reply = self.build_reply(channel, content, None, None);
-        self.dispatch_reply(&reply).await;
+        let message_id = self.dispatch_reply(&reply).await?.unwrap_or_else(|| {
+            format!(
+                "unified_{:x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            )
+        });
         Ok(MessageRef {
             channel: channel.clone(),
-            message_id: format!("unified_{:x}", std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()),
+            message_id,
         })
     }
 
@@ -172,7 +194,7 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         title: &str,
     ) -> Result<ChannelRef> {
         let reply = self.build_reply(channel, title, Some("create_topic"), None);
-        self.dispatch_reply(&reply).await;
+        let _ = self.dispatch_reply(&reply).await?;
         // Return a thread channel ref with the trigger message as thread_id
         Ok(ChannelRef {
             platform: channel.platform.clone(),
@@ -187,7 +209,7 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         let mut reply = self.build_reply(&msg.channel, emoji, Some("add_reaction"), None);
         // Use the actual platform message_id (not origin_event_id which is a UUID)
         reply.reply_to = msg.message_id.clone();
-        self.dispatch_reply(&reply).await;
+        let _ = self.dispatch_reply(&reply).await?;
         Ok(())
     }
 
@@ -195,7 +217,7 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         let mut reply = self.build_reply(&msg.channel, emoji, Some("remove_reaction"), None);
         // Use the actual platform message_id (not origin_event_id which is a UUID)
         reply.reply_to = msg.message_id.clone();
-        self.dispatch_reply(&reply).await;
+        let _ = self.dispatch_reply(&reply).await?;
         Ok(())
     }
 
@@ -203,7 +225,7 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         let mut reply = self.build_reply(&msg.channel, content, Some("edit_message"), None);
         // Use the actual platform message_id (e.g. "draft" for streaming, or numeric for edits)
         reply.reply_to = msg.message_id.clone();
-        self.dispatch_reply(&reply).await;
+        let _ = self.dispatch_reply(&reply).await?;
         Ok(())
     }
 
@@ -214,11 +236,18 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         reply_to_message_id: &str,
     ) -> Result<MessageRef> {
         let reply = self.build_reply(channel, content, None, Some(reply_to_message_id));
-        self.dispatch_reply(&reply).await;
+        let message_id = self.dispatch_reply(&reply).await?.unwrap_or_else(|| {
+            format!(
+                "unified_{:x}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            )
+        });
         Ok(MessageRef {
             channel: channel.clone(),
-            message_id: format!("unified_{:x}", std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()),
+            message_id,
         })
     }
 
@@ -245,5 +274,37 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         // table→code-block pre-pass so tables display with proper formatting.
         // Only applies to Telegram; other platforms in unified mode keep wrapping.
         platform == "telegram" && self.gw_state.telegram_rich_messages
+    }
+}
+
+#[cfg(all(test, feature = "googlechat"))]
+mod tests {
+    use super::*;
+    use openab_gateway::adapters::googlechat::GoogleChatAdapter;
+    use tokio::sync::broadcast;
+
+    #[tokio::test]
+    async fn googlechat_send_failure_propagates_in_unified_mode() {
+        let (event_tx, _event_rx) = broadcast::channel(4);
+        let mut state = AppState::test_default(event_tx);
+        // No credential source: delivery fails before any network access.
+        state.google_chat = Some(GoogleChatAdapter::new(None, None, None));
+        let adapter = UnifiedGatewayAdapter::new(Arc::new(state));
+        let channel = ChannelRef {
+            platform: "googlechat".into(),
+            channel_id: "spaces/TEST".into(),
+            thread_id: None,
+            parent_id: None,
+            origin_event_id: Some("evt_test".into()),
+        };
+
+        let err = adapter
+            .send_message(&channel, "hello")
+            .await
+            .expect_err("unified mode must not synthesize success after delivery failure");
+        assert!(
+            err.to_string().contains("no credentials configured"),
+            "{err}"
+        );
     }
 }

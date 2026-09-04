@@ -1273,7 +1273,7 @@ impl GoogleChatConfig {
             access_token: opt_str(&self.access_token, "GOOGLE_CHAT_ACCESS_TOKEN"),
             use_adc: self.use_adc.unwrap_or_else(|| {
                 std::env::var("GOOGLE_CHAT_USE_ADC")
-                    .map(|v| v == "true" || v == "1")
+                    .map(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
                     .unwrap_or(false)
             }),
             adc_target_service_account: opt_str(
@@ -3009,6 +3009,11 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         assert!(r.adc_target_service_account.is_none());
         std::env::remove_var("GOOGLE_CHAT_ACCESS_TOKEN");
         std::env::remove_var("GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT");
+
+        // --- identity-selecting bool env accepts common case/whitespace forms ---
+        std::env::set_var("GOOGLE_CHAT_USE_ADC", " True ");
+        assert!(GoogleChatConfig::default().resolve().use_adc);
+        std::env::remove_var("GOOGLE_CHAT_USE_ADC");
 
         // --- use_adc: config value resolves without touching env ---
         let r = GoogleChatConfig {
