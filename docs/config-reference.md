@@ -225,10 +225,23 @@ Full first-class Google Chat section (config-first parity, #1379) — credential
 | `sa_key_json` | string | — | Inline service-account key JSON (wins over `sa_key_file`). Env: `GOOGLE_CHAT_SA_KEY_JSON`. |
 | `sa_key_file` | string | — | Path to a service-account key file. Env: `GOOGLE_CHAT_SA_KEY_FILE`. |
 | `access_token` | string | — | Static access token alternative. Env: `GOOGLE_CHAT_ACCESS_TOKEN`. |
+| `use_adc` | bool | `false` | Enable keyless ADC: the attached runtime SA impersonates a distinct Chat-app target via IAM Credentials. Requires `roles/iam.serviceAccountTokenCreator` on the target + `iamcredentials.googleapis.com`. Self-impersonation is prohibited. Env: `GOOGLE_CHAT_USE_ADC`. |
+| `adc_target_service_account` | string | — | Dedicated Chat-app SA email to impersonate. Required with `use_adc=true`; MUST differ from the runtime SA. Env: `GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT`. |
 | `audience` | string | — | JWT audience — enables webhook JWT verification (L1). Env: `GOOGLE_CHAT_AUDIENCE`. |
 | `webhook_path` | string | `/webhook/googlechat` | Env: `GOOGLE_CHAT_WEBHOOK_PATH`. |
 | `allow_all_users` | bool \| omit | `false` (deny-all) | Env: `GOOGLE_CHAT_ALLOW_ALL_USERS`. |
 | `allowed_users` | string[] | `[]` | User resource names (`users/<id>`). Env: `GOOGLE_CHAT_ALLOWED_USERS`. |
+
+Outbound auth precedence is: a successfully loaded service-account key, then
+ADC, then the configured static `access_token`. ADC mint failures may fall back
+to that static token and log a possible identity switch.
+
+For GKE Workload Identity, set Helm value
+`agents.<name>.gateway.serviceAccountName` to an existing annotated Kubernetes
+ServiceAccount for the runtime GSA. An empty value omits `serviceAccountName`
+and preserves the Kubernetes default identity; it does not inherit per-agent or
+chart-global ServiceAccount values. The chart does not create or annotate the
+ServiceAccount.
 
 ---
 

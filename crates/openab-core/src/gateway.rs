@@ -10,8 +10,12 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
-/// Timeout for waiting on gateway reply acknowledgement.
+/// Legacy timeout for streaming platforms that may not acknowledge normal sends.
 const GATEWAY_REPLY_TIMEOUT_SECS: u64 = 5;
+/// Acknowledged send-once replies can include bounded auth refresh (up to three
+/// 10-second requests), so allow that work to finish; unlike the legacy path,
+/// timeout is an error because the adapter promised a delivery response.
+const ACKED_GATEWAY_REPLY_TIMEOUT_SECS: u64 = 35;
 
 /// Platforms whose gateway adapter emits a `GatewayResponse` for `edit_message`
 /// so core can observe edit success or failure (used to gate the per-edit
@@ -40,29 +44,50 @@ fn platform_acks_writes(platform: &str) -> bool {
     EDIT_RESPONSE_PLATFORMS.contains(&platform)
 }
 
-/// Gateway platforms whose messaging API cannot edit a message after it is sent.
+/// Platforms whose gateway adapters acknowledge normal send replies with a
+/// `GatewayResponse`. This capability is independent of cosmetic streaming:
+/// Google Chat is send-once, but its adapter reports API/auth failures and core
+/// must retain the request id to observe them.
+const REPLY_RESPONSE_PLATFORMS: &[&str] = &["googlechat"];
+
+fn platform_acks_replies(platform: &str) -> bool {
+    REPLY_RESPONSE_PLATFORMS.contains(&platform)
+}
+
+/// Preserve legacy request/response waits for streaming adapters while also
+/// supporting send-once adapters that explicitly acknowledge delivery.
+fn reply_requires_ack(platform: &str, streaming: bool) -> bool {
+    streaming || platform_acks_replies(platform)
+}
+
+/// Platforms where cosmetic (typewriter) streaming is not viable, so replies
+/// are forced send-once regardless of the configured `streaming` flag.
 ///
-/// Cosmetic (typewriter) streaming works by posting a placeholder and then
-/// repeatedly editing it in place with the growing text. On a platform with no
-/// edit endpoint, each of those "edits" is delivered as a brand-new message
-/// instead — so the user sees the same reply posted several times, each copy
-/// longer than the last. Streaming is therefore force-disabled (send-once) for
-/// these platforms regardless of the configured `streaming` flag.
+/// Cosmetic streaming posts a placeholder and repeatedly edits it with growing
+/// text. Without a usable edit path, those updates become duplicate messages:
 ///
-/// LINE's Messaging API only exposes reply/push (no edit), so it lives here.
-/// (The in-process unified adapter additionally hard-drops stray edit_message
-/// commands in the LINE adapter itself — see `dispatch_line_reply`.)
+/// - `line` / `lineworks`: no message-edit API.
+/// - `googlechat`: editing requires a real message resource name, but unified
+///   fallback IDs are synthetic; its per-space quota also makes rapid edits
+///   unsuitable. See <https://developers.google.com/workspace/chat/limits>.
 ///
-/// NOTE: like `EDIT_RESPONSE_PLATFORMS`, this is platform-identity standing in
-/// for a *capability*. The right long-term model is a capability handshake at
-/// gateway-connect time ("can this adapter edit messages?"); until that exists,
-/// any new gateway platform that lacks a message-edit API MUST be added here.
-const NON_EDITABLE_PLATFORMS: &[&str] = &["line", "lineworks"];
+/// NOTE: like `EDIT_RESPONSE_PLATFORMS`, this is platform identity standing in
+/// for a capability. Replace it with a negotiated capability when available;
+/// until then, add every platform that cannot support cosmetic edits here.
+const NON_STREAMING_PLATFORMS: &[&str] = &["line", "lineworks", "googlechat"];
 
 /// Whether cosmetic streaming (placeholder + in-place edits) is possible on
-/// `platform`. See `NON_EDITABLE_PLATFORMS`.
-fn platform_supports_streaming(platform: &str) -> bool {
-    !NON_EDITABLE_PLATFORMS.contains(&platform)
+/// `platform`. See `NON_STREAMING_PLATFORMS`. `pub(crate)` so the shared
+/// dispatch path (`AdapterRouter::stream_prompt_blocks`) can force send-once on
+/// these platforms too, not just the WebSocket `run_gateway_adapter` path.
+///
+/// Sibling gate: the embedded/unified dispatch path wraps this in
+/// `adapter::resolve_streaming`, which additionally forces send-once for
+/// `acp` (embedded-only, streams append-only deltas). An embedded-only
+/// non-streaming platform must be handled there — adding it to the shared
+/// list above covers both paths, but a platform-specific carve-out does not.
+pub(crate) fn platform_supports_streaming(platform: &str) -> bool {
+    !NON_STREAMING_PLATFORMS.contains(&platform)
 }
 
 /// Shared filter parameters for gateway event gating.
@@ -213,6 +238,17 @@ struct GatewayResponse {
     error: Option<String>,
 }
 
+fn gateway_delivery_result(resp: GatewayResponse) -> Result<String> {
+    if resp.success {
+        Ok(resp.message_id.unwrap_or_else(|| "gw_sent".into()))
+    } else {
+        Err(anyhow::anyhow!(
+            "gateway reported failure: {}",
+            resp.error.unwrap_or_else(|| "unspecified error".to_string())
+        ))
+    }
+}
+
 // --- GatewayAdapter: ChatAdapter over WebSocket ---
 
 type PendingRequests = Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<GatewayResponse>>>>;
@@ -262,7 +298,7 @@ impl GatewayAdapter {
         content: &str,
         quote_message_id: Option<&str>,
     ) -> Result<MessageRef> {
-        let req_id = if self.streaming {
+        let req_id = if reply_requires_ack(self.platform_name, self.streaming) {
             Some(format!("req_{}", uuid::Uuid::new_v4()))
         } else {
             None
@@ -298,33 +334,42 @@ impl GatewayAdapter {
             return Err(e.into());
         }
         let msg_id = if let (Some(rx), Some(ref id)) = (pending_rx, &req_id) {
-            match tokio::time::timeout(std::time::Duration::from_secs(GATEWAY_REPLY_TIMEOUT_SECS), rx).await {
-                Ok(Ok(resp)) if resp.success => resp.message_id.unwrap_or_else(|| "gw_sent".into()),
-                Ok(Ok(resp)) => {
-                    // Gateway explicitly reported failure (success=false). Surface
-                    // as Err so dispatch sets ❌ instead of 🆗 over an incomplete
-                    // delivery. Examples: Feishu edit cap reached after append-new
-                    // fallback also failed; chunked send delivered N/M chunks.
-                    let err_msg = resp.error.clone()
-                        .unwrap_or_else(|| "gateway reported failure".to_string());
-                    tracing::warn!(request_id = %id, error = %err_msg, "gateway replied with failure");
-                    return Err(anyhow::anyhow!("gateway reported failure: {err_msg}"));
-                }
+            let ack_required = platform_acks_replies(self.platform_name);
+            let timeout_secs = if ack_required {
+                ACKED_GATEWAY_REPLY_TIMEOUT_SECS
+            } else {
+                GATEWAY_REPLY_TIMEOUT_SECS
+            };
+            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
+                Ok(Ok(resp)) => match gateway_delivery_result(resp) {
+                    Ok(message_id) => message_id,
+                    Err(e) => {
+                        tracing::warn!(request_id = %id, error = %e, "gateway replied with failure");
+                        return Err(e);
+                    }
+                },
                 Ok(Err(_)) => {
-                    // Channel closed (gateway shutting down or pending dropped).
-                    // Maintain legacy behavior — adapters that don't implement
-                    // GatewayResponse for all reply types (LINE, Teams) rely on
-                    // this for non-failure outcomes.
+                    if ack_required {
+                        return Err(anyhow::anyhow!(
+                            "gateway acknowledgement channel closed for {}",
+                            self.platform_name
+                        ));
+                    }
+                    // Legacy streaming adapters may not acknowledge normal sends.
                     tracing::warn!(request_id = %id, "gateway response channel closed");
                     "gw_sent".into()
                 }
                 Err(_) => {
-                    // Timeout. Many adapters (LINE, Teams) intentionally do not
-                    // emit GatewayResponse for replies, so timeout is the expected
-                    // path for them. Maintain legacy behavior to avoid breaking
-                    // platforms that have not yet wired request/response feedback.
-                    tracing::warn!(request_id = %id, "gateway reply timed out");
                     self.pending.lock().await.remove(id);
+                    if ack_required {
+                        return Err(anyhow::anyhow!(
+                            "gateway delivery acknowledgement timed out after {timeout_secs}s for {}",
+                            self.platform_name
+                        ));
+                    }
+                    // Preserve legacy behavior for adapters that do not promise
+                    // a GatewayResponse for normal sends.
+                    tracing::warn!(request_id = %id, "gateway reply timed out");
                     "gw_sent".into()
                 }
             }
@@ -1670,16 +1715,40 @@ mod tests {
     }
 
     #[test]
+    fn googlechat_rate_limit_forces_send_once() {
+        // Google Chat has an edit API, but the unified adapter's synthetic
+        // message id is not a valid resource name, so patch returns 400
+        // INVALID_ARGUMENT; the documented 1 write/sec-per-space quota further
+        // constrains high-frequency editing. Force send-once.
+        assert!(!platform_supports_streaming("googlechat"));
+    }
+
+    #[test]
+    fn googlechat_send_once_still_requires_delivery_ack() {
+        assert!(platform_acks_replies("googlechat"));
+        assert!(reply_requires_ack("googlechat", false));
+        assert!(!reply_requires_ack("line", false));
+        // Preserve legacy behavior: streaming adapters still carry request IDs.
+        assert!(reply_requires_ack("discord", true));
+    }
+
+    #[test]
+    fn acknowledged_reply_failure_is_propagated() {
+        let err = gateway_delivery_result(GatewayResponse {
+            schema: "openab.gateway.response.v1".into(),
+            request_id: "req_test".into(),
+            success: false,
+            thread_id: None,
+            message_id: None,
+            error: Some("googlechat API returned 403".into()),
+        })
+        .expect_err("success=false must reach core as Err");
+        assert!(err.to_string().contains("googlechat API returned 403"));
+    }
+
+    #[test]
     fn editable_platforms_still_allow_streaming() {
-        for platform in [
-            "telegram",
-            "slack",
-            "discord",
-            "feishu",
-            "teams",
-            "googlechat",
-            "wecom",
-        ] {
+        for platform in ["telegram", "slack", "discord", "feishu", "teams", "wecom"] {
             assert!(
                 platform_supports_streaming(platform),
                 "{platform} should still support streaming",

@@ -132,8 +132,8 @@ pr      = ""
 [[openab_features]]
 feature = "streaming"
 status  = "n_a"
-note    = "No edit API to drive post+edit streaming. The platform is listed in NON_EDITABLE_PLATFORMS so the core forces streaming off and the cosmetic edit/delete commands are dropped by the dispatcher."
-source  = ["crates/openab-core/src/gateway.rs#NON_EDITABLE_PLATFORMS", "crates/openab-gateway/src/adapters/lineworks.rs#dispatch_lineworks_reply"]
+note    = "No edit API to drive post+edit streaming. The platform is listed in NON_STREAMING_PLATFORMS so the core forces streaming off and the cosmetic edit/delete commands are dropped by the dispatcher."
+source  = ["crates/openab-core/src/gateway.rs#NON_STREAMING_PLATFORMS", "crates/openab-gateway/src/adapters/lineworks.rs#dispatch_lineworks_reply"]
 pr      = ""
 
 [[openab_features]]
