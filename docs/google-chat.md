@@ -268,7 +268,7 @@ Each field falls back to its `GOOGLE_CHAT_ALLOW_ALL_USERS` / `GOOGLE_CHAT_ALLOWE
 | `GOOGLE_CHAT_SA_KEY_JSON` | No | — | Service account key JSON string (enables auto-refresh) |
 | `GOOGLE_CHAT_SA_KEY_FILE` | No | — | Path to service account key JSON file (alternative to `SA_KEY_JSON`) |
 | `GOOGLE_CHAT_ACCESS_TOKEN` | No | — | Static OAuth2 access token (fallback, expires in 1 hour) |
-| `GOOGLE_CHAT_USE_ADC` | No | `false` | Enable keyless ADC: attached runtime SA impersonates a distinct Chat-app target via IAM Credentials — see Option C |
+| `GOOGLE_CHAT_USE_ADC` | No | `false` | Set to `true` or `1` to enable keyless ADC: attached runtime SA impersonates a distinct Chat-app target via IAM Credentials — see Option C |
 | `GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT` | With ADC | — | Email of the dedicated Chat-app SA to impersonate. Required when `USE_ADC=true`; MUST differ from the runtime SA |
 | `GOOGLE_CHAT_WEBHOOK_PATH` | No | `/webhook/googlechat` | Webhook endpoint path |
 

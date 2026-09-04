@@ -10,6 +10,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+fn synthetic_unified_id() -> String {
+    format!(
+        "unified_{:x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    )
+}
+
 pub struct UnifiedGatewayAdapter {
     pub gw_state: Arc<AppState>,
     /// Telegram reaction state (message_id -> emoji list) for add/remove_reaction
@@ -81,6 +91,11 @@ impl UnifiedGatewayAdapter {
                     gc.handle_reply(reply, &self.gw_state.event_tx).await;
                 } else if reply.command.is_none() {
                     return Err(anyhow!("googlechat adapter is not configured"));
+                } else {
+                    tracing::warn!(
+                        command = ?reply.command.as_deref(),
+                        "googlechat command dropped: adapter is not configured"
+                    );
                 }
             }
             #[cfg(feature = "wecom")]
@@ -172,15 +187,10 @@ impl ChatAdapter for UnifiedGatewayAdapter {
 
     async fn send_message(&self, channel: &ChannelRef, content: &str) -> Result<MessageRef> {
         let reply = self.build_reply(channel, content, None, None);
-        let message_id = self.dispatch_reply(&reply).await?.unwrap_or_else(|| {
-            format!(
-                "unified_{:x}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            )
-        });
+        let message_id = self
+            .dispatch_reply(&reply)
+            .await?
+            .unwrap_or_else(synthetic_unified_id);
         Ok(MessageRef {
             channel: channel.clone(),
             message_id,
@@ -236,15 +246,10 @@ impl ChatAdapter for UnifiedGatewayAdapter {
         reply_to_message_id: &str,
     ) -> Result<MessageRef> {
         let reply = self.build_reply(channel, content, None, Some(reply_to_message_id));
-        let message_id = self.dispatch_reply(&reply).await?.unwrap_or_else(|| {
-            format!(
-                "unified_{:x}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            )
-        });
+        let message_id = self
+            .dispatch_reply(&reply)
+            .await?
+            .unwrap_or_else(synthetic_unified_id);
         Ok(MessageRef {
             channel: channel.clone(),
             message_id,

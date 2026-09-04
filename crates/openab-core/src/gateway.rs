@@ -44,7 +44,6 @@ fn platform_acks_writes(platform: &str) -> bool {
     EDIT_RESPONSE_PLATFORMS.contains(&platform)
 }
 
-
 /// Platforms whose gateway adapters acknowledge normal send replies with a
 /// `GatewayResponse`. This capability is independent of cosmetic streaming:
 /// Google Chat is send-once, but its adapter reports API/auth failures and core
@@ -60,32 +59,21 @@ fn platform_acks_replies(platform: &str) -> bool {
 fn reply_requires_ack(platform: &str, streaming: bool) -> bool {
     streaming || platform_acks_replies(platform)
 }
-/// Gateway platforms whose messaging API cannot edit a message after it is sent.
+
+/// Platforms where cosmetic (typewriter) streaming is not viable, so replies
+/// are forced send-once regardless of the configured `streaming` flag.
 ///
-/// Cosmetic (typewriter) streaming works by posting a placeholder and then
-/// repeatedly editing it in place with the growing text. On a platform with no
-/// edit endpoint, each of those "edits" is delivered as a brand-new message
-/// instead — so the user sees the same reply posted several times, each copy
-/// longer than the last. Streaming is therefore force-disabled (send-once) for
-/// these platforms regardless of the configured `streaming` flag.
+/// Cosmetic streaming posts a placeholder and repeatedly edits it with growing
+/// text. Without a usable edit path, those updates become duplicate messages:
 ///
-/// LINE's Messaging API only exposes reply/push (no edit), so it lives here.
-/// (The in-process unified adapter additionally hard-drops stray edit_message
-/// commands in the LINE adapter itself — see `dispatch_line_reply`.)
+/// - `line` / `lineworks`: no message-edit API.
+/// - `googlechat`: editing requires a real message resource name, but unified
+///   fallback IDs are synthetic; its per-space quota also makes rapid edits
+///   unsuitable. See <https://developers.google.com/workspace/chat/limits>.
 ///
-/// NOTE: like `EDIT_RESPONSE_PLATFORMS`, this is platform-identity standing in
-/// for a *capability*. The right long-term model is a capability handshake at
-/// gateway-connect time ("can this adapter edit messages?"); until that exists,
-/// any new gateway platform that lacks a message-edit API MUST be added here.
-/// Platforms where cosmetic (typewriter) streaming — a placeholder message
-/// then rapid in-place edits — is not viable, so replies are forced send-once:
-///   - `line` / `lineworks`: no message-edit API at all.
-///   - `googlechat`: has an edit API, but the unified adapter's synthetic
-///     `unified_<hex>` message id is not a valid resource name, so `patch`
-///     rejects it with 400 INVALID_ARGUMENT before any edit applies; the
-///     documented 1 write/sec-per-space quota (create + patch + delete
-///     combined) further constrains high-frequency editing.
-///     See <https://developers.google.com/workspace/chat/limits>.
+/// NOTE: like `EDIT_RESPONSE_PLATFORMS`, this is platform identity standing in
+/// for a capability. Replace it with a negotiated capability when available;
+/// until then, add every platform that cannot support cosmetic edits here.
 const NON_STREAMING_PLATFORMS: &[&str] = &["line", "lineworks", "googlechat"];
 
 /// Whether cosmetic streaming (placeholder + in-place edits) is possible on
@@ -256,8 +244,7 @@ fn gateway_delivery_result(resp: GatewayResponse) -> Result<String> {
     } else {
         Err(anyhow::anyhow!(
             "gateway reported failure: {}",
-            resp.error
-                .unwrap_or_else(|| "gateway reported failure".to_string())
+            resp.error.unwrap_or_else(|| "unspecified error".to_string())
         ))
     }
 }

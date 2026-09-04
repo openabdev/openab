@@ -195,20 +195,7 @@ impl AppState {
                 .unwrap_or(false);
             if enabled {
                 Some(adapters::googlechat::GoogleChatAdapter::from_parts(
-                    adapters::googlechat::GoogleChatParts {
-                        sa_key_json: std::env::var("GOOGLE_CHAT_SA_KEY_JSON").ok(),
-                        sa_key_file: std::env::var("GOOGLE_CHAT_SA_KEY_FILE").ok(),
-                        access_token: std::env::var("GOOGLE_CHAT_ACCESS_TOKEN").ok(),
-                        audience: std::env::var("GOOGLE_CHAT_AUDIENCE").ok(),
-                        use_adc: std::env::var("GOOGLE_CHAT_USE_ADC")
-                            .map(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
-                            .unwrap_or(false),
-                        adc_target_service_account: std::env::var(
-                            "GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT",
-                        )
-                        .ok()
-                        .filter(|s| !s.trim().is_empty()),
-                    },
+                    adapters::googlechat::GoogleChatParts::from_env(),
                 ))
             } else {
                 None
@@ -764,20 +751,7 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
             info!(path = %googlechat_webhook_path, "googlechat adapter enabled");
             app = app.route(&googlechat_webhook_path, post(adapters::googlechat::webhook));
             Some(adapters::googlechat::GoogleChatAdapter::from_parts(
-                adapters::googlechat::GoogleChatParts {
-                    sa_key_json: std::env::var("GOOGLE_CHAT_SA_KEY_JSON").ok(),
-                    sa_key_file: std::env::var("GOOGLE_CHAT_SA_KEY_FILE").ok(),
-                    access_token: std::env::var("GOOGLE_CHAT_ACCESS_TOKEN").ok(),
-                    audience: std::env::var("GOOGLE_CHAT_AUDIENCE").ok(),
-                    use_adc: std::env::var("GOOGLE_CHAT_USE_ADC")
-                        .map(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
-                        .unwrap_or(false),
-                    adc_target_service_account: std::env::var(
-                        "GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT",
-                    )
-                    .ok()
-                    .filter(|s| !s.trim().is_empty()),
-                },
+                adapters::googlechat::GoogleChatParts::from_env(),
             ))
         } else {
             None

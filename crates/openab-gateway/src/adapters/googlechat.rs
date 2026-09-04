@@ -331,6 +331,12 @@ fn normalize_adc_target_service_account(value: Option<String>) -> Result<Option<
 /// resource names. Reject synthetic ids and incomplete `spaces/` prefixes
 /// before token resolution or network I/O.
 fn is_google_chat_message_name(name: &str) -> bool {
+    let safe_segment = |segment: &str| {
+        !segment.is_empty()
+            && !segment
+                .bytes()
+                .any(|b| matches!(b, b'?' | b'#' | b'&' | b'=' | b'%'))
+    };
     let mut parts = name.split('/');
     matches!(
         (
@@ -341,7 +347,7 @@ fn is_google_chat_message_name(name: &str) -> bool {
             parts.next(),
         ),
         (Some("spaces"), Some(space), Some("messages"), Some(message), None)
-            if !space.is_empty() && !message.is_empty()
+            if safe_segment(space) && safe_segment(message)
     )
 }
 
@@ -349,12 +355,12 @@ fn is_google_chat_message_name(name: &str) -> bool {
 
 pub struct GoogleChatAdapter {
     pub token_cache: Option<GoogleChatTokenCache>,
-    pub metadata_source: Option<MetadataTokenSource>,
-    pub access_token: Option<String>,
+    pub(crate) metadata_source: Option<MetadataTokenSource>,
+    pub(crate) access_token: Option<String>,
     pub jwt_verifier: Option<GoogleChatJwtVerifier>,
-    /// Serializes normal sends. Google Chat enforces a per-space write quota;
-    /// every caller starts its deadline before waiting on this lock so queueing
-    /// cannot outlive core's acknowledgement window.
+    /// Conservatively serializes normal sends across the adapter. Google Chat's
+    /// quota is per-space; every caller starts its deadline before waiting on
+    /// this lock so the current coarse queue cannot outlive core's ack window.
     delivery_lock: Mutex<()>,
     pub client: reqwest::Client,
     pub api_base: String,
@@ -373,6 +379,27 @@ pub(crate) struct GoogleChatParts {
     /// workload identity. It MUST differ from the metadata server's default SA;
     /// Google prohibits access-token self-impersonation.
     pub adc_target_service_account: Option<String>,
+}
+
+impl GoogleChatParts {
+    /// Read the env-only credential contract once so standalone constructors
+    /// cannot drift on ADC parsing or target trimming.
+    pub(crate) fn from_env() -> Self {
+        Self {
+            sa_key_json: std::env::var("GOOGLE_CHAT_SA_KEY_JSON").ok(),
+            sa_key_file: std::env::var("GOOGLE_CHAT_SA_KEY_FILE").ok(),
+            access_token: std::env::var("GOOGLE_CHAT_ACCESS_TOKEN").ok(),
+            audience: std::env::var("GOOGLE_CHAT_AUDIENCE").ok(),
+            use_adc: std::env::var("GOOGLE_CHAT_USE_ADC")
+                .map(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            adc_target_service_account: std::env::var(
+                "GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT",
+            )
+            .ok()
+            .filter(|s| !s.trim().is_empty()),
+        }
+    }
 }
 
 impl GoogleChatAdapter {
@@ -2919,6 +2946,9 @@ mod tests {
         assert!(!is_google_chat_message_name("spaces/SP"));
         assert!(!is_google_chat_message_name("spaces/SP/messages/"));
         assert!(!is_google_chat_message_name("spaces/SP/messages/msg1/extra"));
+        assert!(!is_google_chat_message_name("spaces/SP/messages/msg1?x=1"));
+        assert!(!is_google_chat_message_name("spaces/SP/messages/msg1#fragment"));
+        assert!(!is_google_chat_message_name("spaces/SP/messages/msg%2F1"));
     }
 
     #[tokio::test]

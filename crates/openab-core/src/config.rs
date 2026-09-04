@@ -823,11 +823,11 @@ impl TelegramConfig {
     }
 }
 
-/// `true` when env var == "1" or "true" (case-insensitive); default `false`.
-/// Matches the legacy `TELEGRAM_TRUSTED_SOURCE_ONLY` semantics.
+/// `true` when the trimmed env var is "1" or "true" (case-insensitive);
+/// default `false`. Matches the legacy `TELEGRAM_TRUSTED_SOURCE_ONLY` semantics.
 fn env_flag_true_one(key: &str) -> bool {
     std::env::var(key)
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .map(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
 
@@ -1271,11 +1271,9 @@ impl GoogleChatConfig {
             sa_key_json: opt_str(&self.sa_key_json, "GOOGLE_CHAT_SA_KEY_JSON"),
             sa_key_file: opt_str(&self.sa_key_file, "GOOGLE_CHAT_SA_KEY_FILE"),
             access_token: opt_str(&self.access_token, "GOOGLE_CHAT_ACCESS_TOKEN"),
-            use_adc: self.use_adc.unwrap_or_else(|| {
-                std::env::var("GOOGLE_CHAT_USE_ADC")
-                    .map(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
-                    .unwrap_or(false)
-            }),
+            use_adc: self
+                .use_adc
+                .unwrap_or_else(|| env_flag_true_one("GOOGLE_CHAT_USE_ADC")),
             adc_target_service_account: opt_str(
                 &self.adc_target_service_account,
                 "GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT",

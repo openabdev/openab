@@ -232,6 +232,10 @@ Full first-class Google Chat section (config-first parity, #1379) — credential
 | `allow_all_users` | bool \| omit | `false` (deny-all) | Env: `GOOGLE_CHAT_ALLOW_ALL_USERS`. |
 | `allowed_users` | string[] | `[]` | User resource names (`users/<id>`). Env: `GOOGLE_CHAT_ALLOWED_USERS`. |
 
+Outbound auth precedence is: a successfully loaded service-account key, then
+ADC, then the configured static `access_token`. ADC mint failures may fall back
+to that static token and log a possible identity switch.
+
 For GKE Workload Identity, set Helm value
 `agents.<name>.gateway.serviceAccountName` to an existing annotated Kubernetes
 ServiceAccount for the runtime GSA. An empty value falls back to
