@@ -381,6 +381,10 @@ impl GoogleChatAdapter {
                     target_service_account = %target,
                     "googlechat keyless ADC enabled (distinct target, chat.bot via IAM Credentials)"
                 );
+            } else {
+                error!(
+                    "googlechat use_adc=true has no adc_target_service_account; ADC is disabled"
+                );
             }
         }
         let mut adapter = Self::new(token_cache, access_token, jwt_verifier);
@@ -398,6 +402,10 @@ impl GoogleChatAdapter {
         access_token: Option<String>,
         jwt_verifier: Option<GoogleChatJwtVerifier>,
     ) -> Self {
+        // Static credentials enter through config and env construction paths.
+        // Reject whitespace-only values here so every caller shares the same
+        // outbound bearer boundary without altering valid token bytes.
+        let access_token = access_token.filter(|token| non_empty_token(token).is_some());
         Self {
             token_cache,
             metadata_source: None,
@@ -445,7 +453,10 @@ impl GoogleChatAdapter {
                 }
             }
         }
-        self.access_token.clone()
+        self.access_token
+            .as_deref()
+            .and_then(non_empty_token)
+            .map(str::to_owned)
     }
 
     async fn edit_message(&self, message_name: &str, text: &str) {
@@ -1098,9 +1109,11 @@ pub struct MetadataTokenSource {
     // caller can retarget the metadata bearer to an arbitrary host.
     metadata_base: String,
     iam_credentials_base: String,
-    // No-redirect client: a redirect from either endpoint must never carry
-    // the metadata bearer (`Authorization`) on to a third host.
-    client: reqwest::Client,
+    // Metadata is plaintext/link-local: never redirect it or allow a proxy hop.
+    metadata_client: reqwest::Client,
+    // IAM is a public HTTPS API and must retain the deployment's configured
+    // egress proxy while still refusing bearer-carrying redirects.
+    iam_client: reqwest::Client,
 }
 
 impl MetadataTokenSource {
@@ -1120,23 +1133,53 @@ impl MetadataTokenSource {
         metadata_base: String,
         iam_credentials_base: String,
     ) -> Self {
+        let metadata_client = Self::build_metadata_client(reqwest::Client::builder());
+        let iam_client = Self::build_iam_client(reqwest::Client::builder());
+        Self::with_bases_and_clients(
+            target_service_account,
+            metadata_base,
+            iam_credentials_base,
+            metadata_client,
+            iam_client,
+        )
+    }
+
+    fn build_metadata_client(builder: reqwest::ClientBuilder) -> reqwest::Client {
+        builder
+            // The metadata bearer must never follow a redirect onto a third
+            // host, nor traverse a proxy (the plaintext metadata token would
+            // then transit an operator/attacker-controlled hop). Fail loud
+            // rather than silently falling back to an unsafe default client.
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .build()
+            .expect("no-redirect, no-proxy metadata client must build")
+    }
+
+    fn build_iam_client(builder: reqwest::ClientBuilder) -> reqwest::Client {
+        builder
+            // IAM is HTTPS egress, so preserve HTTP(S)_PROXY/system proxy
+            // routing while preventing a bearer-carrying redirect.
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("no-redirect IAM client must build")
+    }
+
+    fn with_bases_and_clients(
+        target_service_account: String,
+        metadata_base: String,
+        iam_credentials_base: String,
+        metadata_client: reqwest::Client,
+        iam_client: reqwest::Client,
+    ) -> Self {
         Self {
             token: RwLock::new(None),
             refresh_retry_after: RwLock::new(None),
             target_service_account,
             metadata_base,
             iam_credentials_base,
-            client: reqwest::Client::builder()
-                // The metadata bearer must never follow a redirect onto a third
-                // host, nor traverse a proxy (the plaintext metadata token would
-                // then transit an operator/attacker-controlled hop). Fail loud
-                // at construction rather than silently falling back to a default
-                // client that does both — a default client here would defeat the
-                // guarantee this source exists to uphold.
-                .redirect(reqwest::redirect::Policy::none())
-                .no_proxy()
-                .build()
-                .expect("no-redirect, no-proxy metadata client must build"),
+            metadata_client,
+            iam_client,
         }
     }
 
@@ -1227,10 +1270,11 @@ impl MetadataTokenSource {
     }
 
     async fn refresh(&self) -> Result<MintedToken, String> {
-        // Use the source's own no-redirect client for every bearer-carrying call.
-        let client = &self.client;
+        // Metadata and IAM have different proxy requirements. Both clients
+        // reject redirects, but only the plaintext metadata path disables proxying.
+        let metadata_client = &self.metadata_client;
         // 1. Default SA email from the GCE metadata server.
-        let email = client
+        let email = metadata_client
             .get(format!(
                 "{}/computeMetadata/v1/instance/service-accounts/default/email",
                 self.metadata_base
@@ -1257,7 +1301,7 @@ impl MetadataTokenSource {
         }
 
         // 2. Base access token for the default SA from the metadata server.
-        let base: serde_json::Value = client
+        let base: serde_json::Value = metadata_client
             .get(format!(
                 "{}/computeMetadata/v1/instance/service-accounts/default/token",
                 self.metadata_base
@@ -1284,7 +1328,8 @@ impl MetadataTokenSource {
             "{}/v1/projects/-/serviceAccounts/{}:generateAccessToken",
             self.iam_credentials_base, self.target_service_account
         );
-        let resp = client
+        let resp = self
+            .iam_client
             .post(&url)
             .bearer_auth(base_token)
             .json(&serde_json::json!({
@@ -2410,6 +2455,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metadata_bypasses_proxy_while_iam_uses_proxy_client() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let metadata_server = MockServer::start().await;
+        let iam_proxy = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/computeMetadata/v1/instance/service-accounts/default/email",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("runtime@project.iam.gserviceaccount.com"),
+            )
+            .expect(1)
+            .mount(&metadata_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/computeMetadata/v1/instance/service-accounts/default/token",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "base-tok", "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&metadata_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(header("authorization", "Bearer base-tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "accessToken": "chat-bot-tok"
+            })))
+            .expect(1)
+            .mount(&iam_proxy)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&iam_proxy)
+            .await;
+
+        // Start both production policy helpers from a builder carrying the
+        // same explicit proxy. Metadata must clear it; IAM must retain it.
+        let metadata_client = MetadataTokenSource::build_metadata_client(
+            reqwest::Client::builder()
+                .proxy(reqwest::Proxy::all(iam_proxy.uri()).unwrap()),
+        );
+        let iam_client = MetadataTokenSource::build_iam_client(
+            reqwest::Client::builder()
+                .proxy(reqwest::Proxy::all(iam_proxy.uri()).unwrap()),
+        );
+        let src = MetadataTokenSource::with_bases_and_clients(
+            "chat-bot@project.iam.gserviceaccount.com".into(),
+            metadata_server.uri(),
+            "http://iam.invalid".into(),
+            metadata_client,
+            iam_client,
+        );
+
+        assert_eq!(src.get_token().await.unwrap(), "chat-bot-tok");
+    }
+
+    #[tokio::test]
     async fn adc_refresh_failure_cooldown_prevents_queued_retry_storm() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2469,13 +2577,44 @@ mod tests {
 
     #[test]
     fn from_parts_use_adc_without_target_fails_closed() {
-        let adapter = GoogleChatAdapter::from_parts(GoogleChatParts {
-            use_adc: true,
-            ..Default::default()
+        use std::io::Write;
+        use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+        #[derive(Clone)]
+        struct Capture(StdArc<StdMutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buffer = StdArc::new(StdMutex::new(Vec::new()));
+        let capture = Capture(buffer.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || capture.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let adapter = tracing::subscriber::with_default(subscriber, || {
+            GoogleChatAdapter::from_parts(GoogleChatParts {
+                use_adc: true,
+                ..Default::default()
+            })
         });
         assert!(
             adapter.metadata_source.is_none(),
             "use_adc without adc_target_service_account must not install ADC"
+        );
+        let output = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+        assert!(
+            output.contains(
+                "googlechat use_adc=true has no adc_target_service_account; ADC is disabled"
+            ),
+            "missing ADC target must emit a startup diagnostic: {output}"
         );
     }
 
@@ -2583,6 +2722,39 @@ mod tests {
         assert_eq!(non_empty_token(""), None);
         assert_eq!(non_empty_token(" \t\n"), None);
         assert_eq!(non_empty_token(" token "), Some(" token "));
+    }
+
+    #[tokio::test]
+    async fn static_access_token_rejects_whitespace_at_adapter_boundary() {
+        let adapter = GoogleChatAdapter::new(None, Some(" \t\n".into()), None);
+        assert!(adapter.access_token.is_none());
+        assert_eq!(adapter.get_token().await, None);
+    }
+
+    #[tokio::test]
+    async fn adc_failure_does_not_fall_back_to_whitespace_static_token() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/computeMetadata/v1/instance/service-accounts/default/email",
+            ))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut adapter = GoogleChatAdapter::new(None, Some(" \t\n".into()), None);
+        adapter.metadata_source = Some(MetadataTokenSource::with_bases(
+            "chat-bot@project.iam.gserviceaccount.com".into(),
+            server.uri(),
+            server.uri(),
+        ));
+
+        assert_eq!(adapter.get_token().await, None);
+        assert!(adapter.access_token.is_none());
     }
 
     #[test]

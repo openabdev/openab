@@ -1254,13 +1254,13 @@ pub struct ResolvedGoogleChat {
 
 impl GoogleChatConfig {
     /// Resolve every field: config value (if set) → `GOOGLE_CHAT_*` env →
-    /// default. String fields filter empty strings from `${}` expansion.
+    /// default. String fields filter empty or whitespace-only `${}` expansion.
     pub fn resolve(&self) -> ResolvedGoogleChat {
         let opt_str = |cfg: &Option<String>, env: &str| -> Option<String> {
             cfg.as_ref()
-                .filter(|s| !s.is_empty())
+                .filter(|s| !s.trim().is_empty())
                 .cloned()
-                .or_else(|| std::env::var(env).ok())
+                .or_else(|| std::env::var(env).ok().filter(|s| !s.trim().is_empty()))
         };
         ResolvedGoogleChat {
             enabled: self.enabled.unwrap_or_else(|| {
@@ -3001,6 +3001,15 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         assert!(r.audience.is_none());
         assert_eq!(r.webhook_path, "/webhook/googlechat");
 
+        // --- whitespace-only secrets/targets are absent at the config boundary ---
+        std::env::set_var("GOOGLE_CHAT_ACCESS_TOKEN", " \t ");
+        std::env::set_var("GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT", " \t ");
+        let r = GoogleChatConfig::default().resolve();
+        assert!(r.access_token.is_none());
+        assert!(r.adc_target_service_account.is_none());
+        std::env::remove_var("GOOGLE_CHAT_ACCESS_TOKEN");
+        std::env::remove_var("GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT");
+
         // --- use_adc: config value resolves without touching env ---
         let r = GoogleChatConfig {
             use_adc: Some(true),
@@ -3028,9 +3037,9 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         assert!(!r.enabled); // config false wins over env true
         assert_eq!(r.audience.as_deref(), Some("cfg-aud"));
 
-        // --- empty-string ${} expansion falls through to env ---
+        // --- whitespace-only ${} expansion falls through to env ---
         let cfg = GoogleChatConfig {
-            audience: Some("".into()),
+            audience: Some(" \t ".into()),
             ..Default::default()
         };
         let r = cfg.resolve();
