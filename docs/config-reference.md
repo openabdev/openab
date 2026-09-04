@@ -404,11 +404,6 @@ working_dir = "/home/node"
 command = "cursor-agent"
 args = ["acp", "--model", "auto", "--workspace", "/home/agent"]
 working_dir = "/home/agent"
-
-# Hermes Agent
-[agent]
-command = "hermes-acp"
-working_dir = "/home/agent"
 ```
 
 ---

@@ -285,41 +285,6 @@ ENTRYPOINT ["tini", "--"]
 CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
 
 # =============================================================================
-# Target: hermes
-# =============================================================================
-FROM python:3.12-slim-trixie AS hermes
-RUN useradd -m -u 1000 agent
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl procps ripgrep tini git ffmpeg unzip xz-utils \
-    && rm -rf /var/lib/apt/lists/*
-ARG HERMES_INSTALL_COMMIT=2bd1977d8fad185c9b4be47884f7e87f1add0ce3
-ARG HERMES_INSTALL_SHA256=dbd9d555ed4ac67bd1fc71ba6a39b410cf2af0ebcfd8f4889e086af78c9ddcaa
-RUN curl -fsSL "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_INSTALL_COMMIT}/scripts/install.sh" \
-      -o /tmp/install-hermes.sh && \
-    echo "${HERMES_INSTALL_SHA256}  /tmp/install-hermes.sh" | sha256sum -c - && \
-    HERMES_HOME=/home/agent/.hermes bash /tmp/install-hermes.sh && \
-    rm /tmp/install-hermes.sh && \
-    (test -d /root/.local/share/uv && chmod -R a+rX /root/.local/share/uv && chmod a+rx /root /root/.local /root/.local/share || true) && \
-    ln -sf /usr/local/lib/hermes-agent/venv/bin/hermes-acp /usr/local/bin/hermes-acp
-RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-      -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-      > /etc/apt/sources.list.d/github-cli.list && \
-    apt-get update && apt-get install -y --no-install-recommends gh && \
-    rm -rf /var/lib/apt/lists/*
-ENV HOME=/home/agent
-WORKDIR /home/agent
-COPY --from=builder --chown=agent:agent /build/target/release/openab /usr/local/bin/openab
-RUN chown -R agent:agent /home/agent
-USER agent
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-  CMD pgrep -x openab || exit 1
-ENV OPENAB_AGENT_COMMAND="hermes-acp"
-ENV OPENAB_AGENT_AUTH_COMMAND="hermes auth add"
-ENTRYPOINT ["tini", "--"]
-CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
-
-# =============================================================================
 # Target: mimocode
 # =============================================================================
 FROM base-node AS mimocode

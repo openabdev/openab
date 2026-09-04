@@ -30,7 +30,6 @@ jobs:
           - { dockerfile: Dockerfile.cursor, suffix: "-cursor", agent: "cursor-agent", agent_args: "acp", build_args: "" }
           - { dockerfile: Dockerfile.kimi, suffix: "-kimi", agent: "kimi", agent_args: "acp", build_args: "" }
           - { dockerfile: Dockerfile.mimocode, suffix: "-mimocode", agent: "mimo", agent_args: "acp", build_args: "" }
-          - { dockerfile: Dockerfile.hermes, suffix: "-hermes", agent: "hermes-acp", agent_args: "", build_args: "" }
           - { dockerfile: Dockerfile.grok, suffix: "-grok", agent: "grok", agent_args: "agent stdio", build_args: "" }
           - { dockerfile: Dockerfile.devin, suffix: "-devin", agent: "devin", agent_args: "acp", build_args: "" }
           - { dockerfile: Dockerfile.antigravity, suffix: "-antigravity", agent: "agy-acp", agent_args: "", build_args: "" }
@@ -158,6 +157,17 @@ jobs:
               grep -Fx "$expected" "$file"
             done
           }
+          assert_occurrences() {
+            local expected_count="$1"
+            local needle="$2"
+            local file="$3"
+            local actual_count
+            actual_count=$(grep -Fc -- "$needle" "$file" || true)
+            [ "$actual_count" -eq "$expected_count" ] || {
+              echo "Expected $expected_count occurrences of '$needle' in $file, found $actual_count" >&2
+              exit 1
+            }
+          }
 
           assert_line 'ARG KIRO_CLI_VERSION=2.13.0' Dockerfile Dockerfile.package Dockerfile.unified
           assert_line 'ARG KIRO_SHA256_AMD64=d8c5277358b4a82b2d9a9ed2d52e110862536dc82b9e32c3719fc5f5a9834c94' Dockerfile Dockerfile.package Dockerfile.unified
@@ -168,6 +178,35 @@ jobs:
           assert_line 'ARG DEVIN_VERSION=3000.2.17' Dockerfile.devin Dockerfile.package Dockerfile.unified
           assert_line 'ARG DEVIN_SHA256_AMD64=f0e1e9363afc6ee68c4ef87bab4aeb7ff5cc08a5fa838350ef3ceefdbb2a2be2' Dockerfile.devin Dockerfile.package Dockerfile.unified
           assert_line 'ARG DEVIN_SHA256_ARM64=116dc71ef085a922bc3ff0ea0377d4b26c529a431d58246e36572913e2d25624' Dockerfile.devin Dockerfile.package Dockerfile.unified
-          assert_line 'ENV AGY_VERSION=1.1.13' Dockerfile.antigravity Dockerfile.package Dockerfile.unified Dockerfile.final Dockerfile.ci
+          assert_line 'ENV AGY_VERSION=1.1.13' Dockerfile.antigravity Dockerfile.unified Dockerfile.final Dockerfile.ci
+          assert_line 'ARG AGY_VERSION=1.1.13' Dockerfile.package
+          assert_line 'ENV AGY_VERSION="${AGY_VERSION}"' Dockerfile.package
+          assert_line 'LABEL dev.openab.agy.version="${AGY_VERSION}"' Dockerfile.package
           assert_line 'ARG AGY_SHA256_AMD64=edc7c32b5ab4fc2e4da03381fee83ed566dea6b56b56f9329cd13cd77947a1d9' Dockerfile.antigravity Dockerfile.package Dockerfile.unified Dockerfile.final Dockerfile.ci
           assert_line 'ARG AGY_SHA256_ARM64=a9fdd2a386770c27dbf784436bd4de70d4d4901c832d5ec6abf27758d5c370f8' Dockerfile.antigravity Dockerfile.package Dockerfile.unified Dockerfile.final Dockerfile.ci
+
+          # Nightly checksum relaxation must be explicit and limited to the two
+          # TLS-only vendor paths. These substring checks intentionally ignore
+          # indentation, line continuations, and BUILD_ARGS ordering.
+          assert_occurrences 2 'ARG ALLOW_UNVERIFIED_NIGHTLY_DOWNLOADS=false' Dockerfile.package
+          assert_occurrences 2 'elif [ "$ALLOW_UNVERIFIED_NIGHTLY_DOWNLOADS" != "true" ]; then' Dockerfile.package
+          assert_occurrences 1 'elif [ -z "$ETAG" ]; then' Dockerfile.package
+          assert_occurrences 1 'echo "${sha}  /tmp/devin.tar.gz" | sha256sum -c -' Dockerfile.package
+
+          # Parse the resolver case arms so a third variant cannot silently opt
+          # in even if the workflow is reformatted or BUILD_ARGS are reordered.
+          OPT_IN_VARIANTS=$(awk '
+            /^[[:space:]]*[[:alnum:]_-]+\)$/ {
+              variant=$1
+              sub(/\)$/, "", variant)
+            }
+            index($0, "ALLOW_UNVERIFIED_NIGHTLY_DOWNLOADS=true") {
+              print variant
+            }
+          ' .github/workflows/nightly-build.yml | sort)
+          EXPECTED_OPT_IN_VARIANTS=$(printf 'antigravity\ngrok')
+          [ "$OPT_IN_VARIANTS" = "$EXPECTED_OPT_IN_VARIANTS" ] || {
+            echo "Expected only antigravity and grok nightly opt-ins; found:" >&2
+            printf '%s\n' "$OPT_IN_VARIANTS" >&2
+            exit 1
+          }

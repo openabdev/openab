@@ -46,18 +46,34 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 # =============================================================================
 FROM base-debian AS kiro
 ARG KIRO_CLI_VERSION=2.13.0
+# Optional immutable content identifiers for the nightly `latest` path. Release
+# and pre-beta builds leave these empty and retain their pinned SHA256 checks.
+ARG KIRO_ETAG_AMD64=
+ARG KIRO_ETAG_ARM64=
 ARG KIRO_SHA256_AMD64=d8c5277358b4a82b2d9a9ed2d52e110862536dc82b9e32c3719fc5f5a9834c94
 ARG KIRO_SHA256_ARM64=95972602568c2065b7d8cc28924730304d40e612c0984ee0144d8ba452000be3
 RUN ARCH=$(dpkg --print-architecture) && \
     if [ "$ARCH" = "arm64" ]; then \
       URL="https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/kirocli-aarch64-linux.zip"; \
+      ETAG="$KIRO_ETAG_ARM64"; \
       SHA256="$KIRO_SHA256_ARM64"; \
     else \
       URL="https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/kirocli-x86_64-linux.zip"; \
+      ETAG="$KIRO_ETAG_AMD64"; \
       SHA256="$KIRO_SHA256_AMD64"; \
     fi && \
-    curl --proto '=https' --tlsv1.2 -sSf --retry 3 --retry-delay 5 "$URL" -o /tmp/kirocli.zip && \
-    echo "$SHA256  /tmp/kirocli.zip" | sha256sum -c - && \
+    if [ -n "$ETAG" ]; then \
+      curl --proto '=https' --tlsv1.2 -sSf --retry 3 --retry-delay 5 \
+        -H "If-Match: \"$ETAG\"" "$URL" -o /tmp/kirocli.zip; \
+    else \
+      curl --proto '=https' --tlsv1.2 -sSf --retry 3 --retry-delay 5 \
+        "$URL" -o /tmp/kirocli.zip; \
+    fi && \
+    if [ -n "$SHA256" ]; then \
+      echo "$SHA256  /tmp/kirocli.zip" | sha256sum -c -; \
+    elif [ -z "$ETAG" ]; then \
+      echo "Kiro download requires SHA256 or a strong ETag" >&2; exit 1; \
+    fi && \
     unzip /tmp/kirocli.zip -d /tmp && \
     cp /tmp/kirocli/bin/* /usr/local/bin/ && \
     chmod +x /usr/local/bin/kiro-cli* && \
@@ -209,6 +225,9 @@ FROM base-debian AS grok
 ARG GROK_VERSION=0.1.220
 ARG GROK_SHA256_AMD64=98d331d64dfc4fb1dae862475218cccdd195f76839b8361a0678af2fd388364b
 ARG GROK_SHA256_ARM64=3b15efc258f4219d01736acee70c575a8167f970cb4d497a3b0c218440db58ff
+# Explicit opt-in for the nightly TLS-only path. Empty SHA values fail closed
+# for every other caller, including release and pre-beta builds.
+ARG ALLOW_UNVERIFIED_NIGHTLY_DOWNLOADS=false
 ARG TARGETPLATFORM
 RUN set -eux; \
     case "${TARGETPLATFORM:-linux/amd64}" in \
@@ -218,7 +237,11 @@ RUN set -eux; \
     esac; \
     curl -fsSL "https://storage.googleapis.com/grok-build-public-artifacts/cli/grok-${GROK_VERSION}-linux-${arch}" \
       -o /tmp/grok && \
-    echo "${sha}  /tmp/grok" | sha256sum -c - && \
+    if [ -n "$sha" ]; then \
+      echo "${sha}  /tmp/grok" | sha256sum -c -; \
+    elif [ "$ALLOW_UNVERIFIED_NIGHTLY_DOWNLOADS" != "true" ]; then \
+      echo "Grok download requires SHA256 unless the nightly-only opt-in is true" >&2; exit 1; \
+    fi && \
     install -m 0755 /tmp/grok /usr/local/bin/grok && \
     rm /tmp/grok
 ENV HOME=/home/agent
@@ -230,41 +253,6 @@ HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD pgrep -x openab || exit 1
 ENV OPENAB_AGENT_COMMAND="grok agent stdio"
 ENV OPENAB_AGENT_AUTH_COMMAND="grok login --device-auth"
-ENTRYPOINT ["tini", "--"]
-CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
-
-# =============================================================================
-# Target: hermes
-# =============================================================================
-FROM python:3.12-slim-trixie AS hermes
-RUN useradd -m -u 1000 agent
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl procps ripgrep tini git ffmpeg unzip xz-utils \
-    && rm -rf /var/lib/apt/lists/*
-ARG HERMES_INSTALL_COMMIT=2bd1977d8fad185c9b4be47884f7e87f1add0ce3
-ARG HERMES_INSTALL_SHA256=dbd9d555ed4ac67bd1fc71ba6a39b410cf2af0ebcfd8f4889e086af78c9ddcaa
-RUN curl -fsSL "https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_INSTALL_COMMIT}/scripts/install.sh" \
-      -o /tmp/install-hermes.sh && \
-    echo "${HERMES_INSTALL_SHA256}  /tmp/install-hermes.sh" | sha256sum -c - && \
-    HERMES_HOME=/home/agent/.hermes bash /tmp/install-hermes.sh && \
-    rm /tmp/install-hermes.sh && \
-    (test -d /root/.local/share/uv && chmod -R a+rX /root/.local/share/uv && chmod a+rx /root /root/.local /root/.local/share || true) && \
-    ln -sf /usr/local/lib/hermes-agent/venv/bin/hermes-acp /usr/local/bin/hermes-acp
-RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-      -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-      > /etc/apt/sources.list.d/github-cli.list && \
-    apt-get update && apt-get install -y --no-install-recommends gh && \
-    rm -rf /var/lib/apt/lists/*
-ENV HOME=/home/agent
-WORKDIR /home/agent
-COPY --from=bins --chown=agent:agent /openab /usr/local/bin/openab
-RUN chown -R agent:agent /home/agent
-USER agent
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-  CMD pgrep -x openab || exit 1
-ENV OPENAB_AGENT_COMMAND="hermes-acp"
-ENV OPENAB_AGENT_AUTH_COMMAND="hermes auth add"
 ENTRYPOINT ["tini", "--"]
 CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
 
@@ -340,9 +328,15 @@ CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
 # Target: antigravity
 # =============================================================================
 FROM base-debian AS antigravity
-ENV AGY_VERSION=1.1.13
+# One overridable pin drives the download and all persisted image metadata.
+ARG AGY_VERSION=1.1.13
+ENV AGY_VERSION="${AGY_VERSION}"
+LABEL dev.openab.agy.version="${AGY_VERSION}"
 ARG AGY_SHA256_AMD64=edc7c32b5ab4fc2e4da03381fee83ed566dea6b56b56f9329cd13cd77947a1d9
 ARG AGY_SHA256_ARM64=a9fdd2a386770c27dbf784436bd4de70d4d4901c832d5ec6abf27758d5c370f8
+# Explicit opt-in for the nightly TLS-only path. Empty SHA values fail closed
+# for every other caller, including release and pre-beta builds.
+ARG ALLOW_UNVERIFIED_NIGHTLY_DOWNLOADS=false
 RUN ARCH=$(dpkg --print-architecture) && \
     case "$ARCH" in \
       amd64) ASSET="agy_cli_linux_x64.tar.gz"; sha="${AGY_SHA256_AMD64}" ;; \
@@ -351,7 +345,11 @@ RUN ARCH=$(dpkg --print-architecture) && \
     esac && \
     curl -fsSL "https://github.com/google-antigravity/antigravity-cli/releases/download/${AGY_VERSION}/${ASSET}" \
       -o /tmp/agy.tar.gz && \
-    echo "${sha}  /tmp/agy.tar.gz" | sha256sum -c - && \
+    if [ -n "$sha" ]; then \
+      echo "${sha}  /tmp/agy.tar.gz" | sha256sum -c -; \
+    elif [ "$ALLOW_UNVERIFIED_NIGHTLY_DOWNLOADS" != "true" ]; then \
+      echo "Antigravity download requires SHA256 unless the nightly-only opt-in is true" >&2; exit 1; \
+    fi && \
     tar -xzf /tmp/agy.tar.gz -C /usr/local/bin && \
     rm /tmp/agy.tar.gz && \
     mv /usr/local/bin/antigravity /usr/local/bin/agy && \
