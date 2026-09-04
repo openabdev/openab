@@ -48,7 +48,7 @@ Each agent lives under `agents.<name>`.
 | `stt.baseUrl` | STT API base URL. | `"https://api.groq.com/openai/v1"` |
 | `gateway.enabled` | Enable the gateway config block for webhook-based platforms. | `false` |
 | `gateway.deploy` | Deploy the gateway Deployment and Service. | `true` |
-| `gateway.serviceAccountName` | Existing ServiceAccount attached to the gateway pod. Empty falls back to the per-agent `serviceAccountName`, then the chart-global value. Required for GKE Workload Identity when `gateway.googleChat.useAdc=true`; the chart does not create or annotate the ServiceAccount. | `""` |
+| `gateway.serviceAccountName` | Existing ServiceAccount attached to the gateway pod. Empty preserves the Kubernetes default identity and does not inherit per-agent or chart-global values. Required for GKE Workload Identity when `gateway.googleChat.useAdc=true`; the chart does not create or annotate the ServiceAccount. | `""` |
 | `cron.usercronEnabled` | Enable user-provided cron configuration. | `false` |
 | `cronjobs` | Config-driven scheduled messages for an agent. | `[]` |
 | `persistence.enabled` | Enable persistent storage for auth and settings. | `true` |

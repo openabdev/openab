@@ -151,9 +151,10 @@ agents:
 
 The `openab-googlechat-runtime` KSA must carry the usual
 `iam.gke.io/gcp-service-account: openab-runtime@PROJECT.iam.gserviceaccount.com`
-annotation and Workload Identity IAM binding. If `gateway.serviceAccountName`
-is empty, the chart falls back to `agents.<name>.serviceAccountName`, then the
-chart-global `serviceAccountName`.
+annotation and Workload Identity IAM binding. Set
+`gateway.serviceAccountName` explicitly to attach that KSA. An empty value
+preserves the Kubernetes default identity and does not inherit per-agent or
+chart-global ServiceAccount values.
 
 Precedence: if a configured SA key loads successfully, it wins and ADC is ignored. If a key is configured but fails to load, the adapter uses the configured ADC target and logs the identity switch. `GOOGLE_CHAT_USE_ADC=true` without `GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT` fails closed (ADC is not installed). If ADC fails and a static token is explicitly configured, the adapter degrades to it with a warning that it may represent a different identity.
 

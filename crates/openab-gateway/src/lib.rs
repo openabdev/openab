@@ -954,6 +954,25 @@ async fn ws_handler(
     ws.on_upgrade(move |socket| handle_oab_connection(state, socket))
 }
 
+#[cfg(feature = "googlechat")]
+fn spawn_googlechat_reply(
+    state: Arc<AppState>,
+    reply: schema::GatewayReply,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Some(ref google_chat) = state.google_chat {
+            google_chat.handle_reply(&reply, &state.event_tx).await;
+        } else {
+            tracing::warn!("reply for googlechat but adapter not configured");
+            adapters::googlechat::emit_delivery_response(
+                &state.event_tx,
+                &reply.request_id,
+                Err("googlechat adapter is not configured".into()),
+            );
+        }
+    })
+}
+
 async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::WebSocket) {
     use axum::extract::ws::Message;
     use futures_util::{SinkExt, StreamExt};
@@ -1053,17 +1072,12 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
                             "googlechat" => {
                                 // Do not await delivery inline: core's ack timer is already
                                 // running, and the receive loop must keep draining replies.
-                                // GoogleChatAdapter serializes sends internally; each spawned
-                                // task's deadline includes its wait for that delivery lock.
-                                let state = state_for_recv.clone();
-                                let reply = reply.clone();
-                                tokio::spawn(async move {
-                                    if let Some(ref gc) = state.google_chat {
-                                        gc.handle_reply(&reply, &state.event_tx).await;
-                                    } else {
-                                        warn!("reply for googlechat but adapter not configured");
-                                    }
-                                });
+                                // Dropping the JoinHandle detaches the delivery task; its deadline
+                                // includes any wait for the adapter's delivery lock.
+                                let _ = spawn_googlechat_reply(
+                                    state_for_recv.clone(),
+                                    reply.clone(),
+                                );
                             }
                             #[cfg(feature = "wecom")]
                             "wecom" => {
@@ -1113,6 +1127,51 @@ async fn handle_oab_connection(state: Arc<AppState>, socket: axum::extract::ws::
         _ = recv_task => {},
     }
     info!("OAB client disconnected");
+}
+
+#[cfg(all(test, feature = "googlechat"))]
+mod googlechat_dispatch_tests {
+    use super::{schema, spawn_googlechat_reply, AppState};
+    use std::sync::Arc;
+    use tokio::sync::broadcast;
+
+    #[tokio::test]
+    async fn missing_adapter_dispatch_emits_correlated_failure() {
+        let (event_tx, mut event_rx) = broadcast::channel::<String>(4);
+        let state = Arc::new(AppState::test_default(event_tx));
+        let reply = schema::GatewayReply {
+            schema: "openab.gateway.reply.v1".into(),
+            reply_to: "original".into(),
+            platform: "googlechat".into(),
+            channel: schema::ReplyChannel {
+                id: "spaces/TEST".into(),
+                thread_id: None,
+            },
+            content: schema::Content {
+                content_type: "text".into(),
+                text: "hello".into(),
+                attachments: vec![],
+            },
+            command: None,
+            request_id: Some("req_route_missing".into()),
+            quote_message_id: None,
+        };
+
+        spawn_googlechat_reply(state, reply).await.unwrap();
+
+        let response: schema::GatewayResponse = serde_json::from_str(
+            &event_rx
+                .try_recv()
+                .expect("missing adapter must emit a failure response"),
+        )
+        .unwrap();
+        assert_eq!(response.request_id, "req_route_missing");
+        assert!(!response.success);
+        assert_eq!(
+            response.error.as_deref(),
+            Some("googlechat adapter is not configured")
+        );
+    }
 }
 
 async fn health() -> &'static str {

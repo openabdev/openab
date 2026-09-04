@@ -402,6 +402,34 @@ impl GoogleChatParts {
     }
 }
 
+/// Emit one correlated normal-reply result when core supplied a request id.
+/// Missing-adapter paths use the same contract as configured delivery failures,
+/// so core never waits for an acknowledgement that cannot arrive.
+pub(crate) fn emit_delivery_response(
+    event_tx: &tokio::sync::broadcast::Sender<String>,
+    request_id: &Option<String>,
+    result: Result<String, String>,
+) {
+    let Some(request_id) = request_id else {
+        return;
+    };
+    let (success, message_id, error) = match result {
+        Ok(name) => (true, Some(name), None),
+        Err(error) => (false, None, Some(error)),
+    };
+    let response = crate::schema::GatewayResponse {
+        schema: "openab.gateway.response.v1".into(),
+        request_id: request_id.clone(),
+        success,
+        thread_id: None,
+        message_id,
+        error,
+    };
+    if let Ok(json) = serde_json::to_string(&response) {
+        let _ = event_tx.send(json);
+    }
+}
+
 impl GoogleChatAdapter {
     /// Build an adapter from resolved parts (#1379): SA key JSON (inline wins
     /// over file path), optional static access token, optional JWT audience,
@@ -716,22 +744,8 @@ impl GoogleChatAdapter {
         }
 
         let result = self.deliver_message(reply).await;
-        if let Some(ref req_id) = reply.request_id {
-            let (success, message_id, error) = match result {
-                Ok(name) => (true, Some(name), None),
-                Err(e) => (false, None, Some(e)),
-            };
-            let resp = crate::schema::GatewayResponse {
-                schema: "openab.gateway.response.v1".into(),
-                request_id: req_id.clone(),
-                success,
-                thread_id: None,
-                message_id,
-                error,
-            };
-            if let Ok(json) = serde_json::to_string(&resp) {
-                let _ = event_tx.send(json);
-            }
+        if reply.request_id.is_some() {
+            emit_delivery_response(event_tx, &reply.request_id, result);
         } else if let Err(e) = result {
             error!(error = %e, "googlechat reply delivery failed without acknowledgement id");
         }
@@ -1042,6 +1056,8 @@ impl GoogleChatTokenCache {
             .and_then(|v| v.as_str())
             .ok_or("missing private_key in SA key")?
             .to_string();
+        jsonwebtoken::EncodingKey::from_rsa_pem(pkey.as_bytes())
+            .map_err(|e| format!("invalid private_key in SA key: {e}"))?;
         Ok(Self {
             token: RwLock::new(None),
             sa_email: email,
@@ -2425,6 +2441,12 @@ mod tests {
 
     // --- Token cache tests ---
 
+    const VALID_SA_KEY_JSON: &str = r#"{
+        "type": "service_account",
+        "client_email": "test@test.iam.gserviceaccount.com",
+        "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDdcQN1uyXnPVop\n76hhCUfZswb7/2AAqHPiikNp8Kkxx5R9Up/vGCEJDxbZ0iZy/oPVs27Fa3LtM+9D\n3p9qpbQLZLw3AhK3R/VoS4Ex0p6EkvcxqfQ4OolaJlDG+/myFEuZLqEs164DFUIJ\ntr4dygVdU+jFy6A+h7Q5T1QXArG4pR6Ap7DuBJhgEtvPqAn6U7JxAMEELcAZbhHU\nARjfiks2uFMaew1DKrH1qLzIj159ZmhgrXM/4Vc1lSgKMYyqUN3Kued05/DXd2rd\ngfpX7af9tyYsD6Lh1bwREJ4wDOYSewUZxj35mhZhdxHDlZa8wzXQdN8Z04eUghEL\nA+9whYa9AgMBAAECggEAEB0mNE3/Dxmu0vhml1EWkmftrS7DLKkVbbnD+BSUK1Qr\noQb/LmXiGYeokQcy1xFgRI+/Esyj21D5K0Yq8ZbHSED3VUVoWT/6QrGj4B1Efb84\nD7wfUmwoDJBXNnOlkujZK3dyMRIsznqgiJZstTw7MbRmbuZHbeVwHu9/3gDLL/Vp\nXET6KvhGbe5ssmBAefQhOsB+L0aKh4h0HuJdeD+Q7Xhc9gTKRZBwWs6xJgCUqLCr\n5XI7MqjMGDmDN8CImos8zOHCXCYJvIj5BHT1iVkdYn+VmeSDCh+hFcTxmVnSoYf9\nf7G14C160QeEnl0gGxE3yMqMvhI9tb9nXR9vRZjqnQKBgQD18YdRsZLhi9ZnZzXI\nMs1/BCslDnka6yt6q0jYlkzRn/mCyg9QzyFeQpD1fyoWVclRKnYbJygvA90ZkHCN\nXxn7M+0yYWxO9hF+ghK/bhGsVQE/nElLLumt5P8JH0rKB/NvTHpjvM4Q26A23mMp\n9/46gWEHpeIhJL852k2H+a9fZwKBgQDmfwEbVW9wLNDmYaG3z4su7B/n4DHWZrt/\nF5+XziZiEza2NIVFsa03ZaFPHRIK1m6ExDFnnbBd34CU0o3SMsxrTj92VEDb4LdF\nw9foEZnq0wMWT6y9qCZysYQCIJ/4Uy3Un98sbXc1HBJZ9lWq3baaeDttxvyhifNq\nPsmZtPzmOwKBgC3VDceelOWtPo5UgIRHW15BM50bPlxS2O5qPxAFqlkiO8gwyXvg\nrbI4K3Vkdj5lTDfw9sOGn4lraeeasC7YOypB+gD6gMmSN55gtQexhl+cE7h78nit\nTGTYmOJlT3Wo16e1E9XEWI5xr0CqXsZybZEPjTp0olhU1cH9OZeOYy0fAoGAUjp0\n1p+ABfC3BblGzCBKcw7hwwMERIyZzxlKYgm1P7/DAPVzpg1g0iZ7iZHBYgRloQ+s\n4F4tERAu+uiyl45vxsg/c6NTEB32w/i+CZhd5JwqucbqxS47qScTBP9Gknx6GSR/\npYXXxSailV1/6lj2T90ctmkKr0ZbhEep/B/JKQkCgYBx6jih7r21GZMrGLI4mN2H\nirN6VYrNklGBhgIBToJ9cp3iTApyr1pwYQSGAhjkA7ERS4UelhYOY6k466mBX+eR\nIUWbl2pgsjuySiq2WPEnjaI1pXoPGl5xDHVCEXH1+wUq4+iLCUuIeZ9mLRKY9xVT\nEE0jaWDa0qXlgQH+iAsJNw==\n-----END PRIVATE KEY-----\n"
+    }"#;
+
     #[test]
     fn token_cache_rejects_invalid_json() {
         let result = GoogleChatTokenCache::new("not json");
@@ -2440,14 +2462,22 @@ mod tests {
     }
 
     #[test]
-    fn token_cache_accepts_valid_sa_key() {
-        let key = r#"{
-            "type": "service_account",
+    fn token_cache_rejects_invalid_pem() {
+        let key = serde_json::json!({
             "client_email": "test@test.iam.gserviceaccount.com",
-            "private_key": "-----BEGIN RSA PRIVATE KEY-----\nMIIBogIBAAJBALvRE+oCMiEhtfO5ufaVc9wGPUMgPGxmVFiMPC/NMxmCSiMGNO9h\nCOyByeF78QHp4gOW/lgVU8MJkv33hVMbOr0CAwEAAQJAD2k/cFR5MIkw1PFcm98K\n9MqYKGpJCmGBjFY0ek0FHoC14d/hpAGaoWMjNaAyjU/IbGv1fj8C5MfFRal0fV/L\nAQIhAP0T6FPJMm3O4bM18kMHnOP2+Y5kxMpVxCCjkVNH7D09AiEAvXEQJYwR+PFs\njDDhEm4VPmk+lKJoQlopj8TN5gQV8DECIBcXbU+LPWx4H+qRElhCB1B5a9mYmpY\nV6LFPnvSfHqNAiEAiNj5+A6E7WJ50il+5NG5yn7gXh8vNxdCYIw5qx6C2bECIBmW\nVGVRhSmNsmDMJFsGIdKJsnEXpizIVHtfpXsS4j9X\n-----END RSA PRIVATE KEY-----\n"
-        }"#;
-        let result = GoogleChatTokenCache::new(key);
-        assert!(result.is_ok());
+            "private_key": "-----BEGIN PRIVATE KEY-----\nnot-a-real-key\n-----END PRIVATE KEY-----\n",
+        })
+        .to_string();
+        let error = match GoogleChatTokenCache::new(&key) {
+            Err(error) => error,
+            Ok(_) => panic!("expected invalid PEM to be rejected during construction"),
+        };
+        assert!(error.contains("invalid private_key in SA key"), "{error}");
+    }
+
+    #[test]
+    fn token_cache_accepts_valid_sa_key() {
+        assert!(GoogleChatTokenCache::new(VALID_SA_KEY_JSON).is_ok());
     }
 
     // --- Keyless ADC (MetadataTokenSource) tests ---
@@ -2761,6 +2791,26 @@ mod tests {
     }
 
     #[test]
+    fn from_parts_invalid_pem_with_use_adc_installs_adc() {
+        let key = serde_json::json!({
+            "client_email": "sa@example.iam.gserviceaccount.com",
+            "private_key": "-----BEGIN PRIVATE KEY-----\nnot-a-real-key\n-----END PRIVATE KEY-----\n",
+        })
+        .to_string();
+        let adapter = GoogleChatAdapter::from_parts(GoogleChatParts {
+            sa_key_json: Some(key),
+            use_adc: true,
+            adc_target_service_account: Some("chat-bot@project.iam.gserviceaccount.com".into()),
+            ..Default::default()
+        });
+        assert!(adapter.token_cache.is_none(), "invalid PEM must not load");
+        assert!(
+            adapter.metadata_source.is_some(),
+            "invalid PEM must leave the configured ADC fallback selectable"
+        );
+    }
+
+    #[test]
     #[ignore = "integration: exercises filesystem error handling"]
     fn from_parts_unreadable_key_file_with_use_adc_installs_adc() {
         // Regression: an unreadable/absent key FILE also yields token_cache=None
@@ -2780,23 +2830,18 @@ mod tests {
 
     #[test]
     fn from_parts_loaded_key_suppresses_metadata_source() {
-        // A successfully loaded SA key wins outright at send time, so no ADC
-        // source is installed behind it (dead-at-runtime otherwise).
-        let key = serde_json::json!({
-            "client_email": "sa@example.iam.gserviceaccount.com",
-            "private_key": "-----BEGIN PRIVATE KEY-----\nnot-a-real-key\n-----END PRIVATE KEY-----\n",
-        })
-        .to_string();
+        // A successfully loaded and PEM-validated SA key wins outright at send
+        // time, so no dead ADC source is installed behind it.
         let adapter = GoogleChatAdapter::from_parts(GoogleChatParts {
-            sa_key_json: Some(key),
+            sa_key_json: Some(VALID_SA_KEY_JSON.into()),
             use_adc: true,
             adc_target_service_account: Some("chat-bot@project.iam.gserviceaccount.com".into()),
             ..Default::default()
         });
-        assert!(adapter.token_cache.is_some(), "valid key JSON → SA-key cache");
+        assert!(adapter.token_cache.is_some(), "valid SA key loads cache");
         assert!(
             adapter.metadata_source.is_none(),
-            "loaded SA key → ADC source not installed"
+            "loaded SA key suppresses ADC source"
         );
     }
 
@@ -3333,6 +3378,26 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(resp_json).unwrap();
         let name = parsed.get("name").and_then(|v| v.as_str());
         assert_eq!(name, Some("spaces/SP1/messages/msg123"));
+    }
+
+    #[test]
+    fn emit_delivery_response_reports_missing_adapter_failure() {
+        let (event_tx, mut event_rx) = tokio::sync::broadcast::channel::<String>(4);
+        emit_delivery_response(
+            &event_tx,
+            &Some("req_missing_adapter".into()),
+            Err("googlechat adapter is not configured".into()),
+        );
+
+        let response: GatewayResponse =
+            serde_json::from_str(&event_rx.try_recv().expect("expected failure response")).unwrap();
+        assert_eq!(response.request_id, "req_missing_adapter");
+        assert!(!response.success);
+        assert!(response.message_id.is_none());
+        assert_eq!(
+            response.error.as_deref(),
+            Some("googlechat adapter is not configured")
+        );
     }
 
     #[tokio::test]

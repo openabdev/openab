@@ -238,9 +238,10 @@ to that static token and log a possible identity switch.
 
 For GKE Workload Identity, set Helm value
 `agents.<name>.gateway.serviceAccountName` to an existing annotated Kubernetes
-ServiceAccount for the runtime GSA. An empty value falls back to
-`agents.<name>.serviceAccountName`, then chart-global `serviceAccountName`; the
-chart does not create or annotate the ServiceAccount.
+ServiceAccount for the runtime GSA. An empty value omits `serviceAccountName`
+and preserves the Kubernetes default identity; it does not inherit per-agent or
+chart-global ServiceAccount values. The chart does not create or annotate the
+ServiceAccount.
 
 ---
 
