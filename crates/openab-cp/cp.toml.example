@@ -76,7 +76,16 @@ default_max_delegated_sessions_cap = 16
 
 # Prompt/result excerpts mirrored to observers in cp/event frames are
 # truncated to this size (the lobby is an audit surface, not a payload path).
+# Validated to 1..=65536: excerpt serialization runs on the delegation path,
+# so the cap is a latency budget as well as a content bound.
 max_event_excerpt_bytes = 4096
+
+# Ceiling on simultaneously registered observer connections per namespace.
+# Observer fan-out does bounded per-observer work inside the delegation
+# path's critical section, so the observer population is a configured
+# latency budget: a registration beyond the cap is refused with SATURATED.
+# Agents (primary/worker) are unaffected.
+max_observers_per_namespace = 16
 
 [[agents]]
 key = "${CP_KEY_KOUDU}"          # per-agent secret, never shared
@@ -105,8 +114,11 @@ type = "observer"
 [namespaces.prod]
 max_depth = 1
 allow_worker_initiation = false
-# Withhold prompt/result bodies from cp/event: observers still see every
-# event with full attribution (from/to/chain), timing, and status, but no
-# payload excerpts. Default false (excerpts included, bounded by
-# max_event_excerpt_bytes).
+# Withhold agent-supplied content from cp/event: prompt/result excerpts,
+# worker-reported error text, and initiator cancel reasons are all
+# suppressed. Observers still see every event with full attribution
+# (from/to/chain), timing, and status, and CP-synthesized diagnostics
+# (timeout / disconnect reasons) remain visible by design — the stream is
+# metadata-complete but content-free. Default false (excerpts included,
+# bounded by max_event_excerpt_bytes).
 # metadata_only = true

@@ -326,7 +326,11 @@ async fn handle_connection(
         .effective_max_sessions(&identity, reg.max_delegated_sessions);
     // The registry assigns the CP-generated handle: ownership
     // and teardown never key on the client-supplied instance_id.
-    let handle = state.registry.register_conn(
+    // Observers are additionally bounded per namespace: fan-out does
+    // bounded per-observer work inside the delegation path's in-flight
+    // critical section, so the observer count is a configured latency
+    // budget, not an open-ended population.
+    let handle = match state.registry.register_conn_capped(
         Instance {
             handle: 0,
             namespace: identity.namespace.clone(),
@@ -341,7 +345,38 @@ async fn handle_connection(
             tx: tx.clone(),
         },
         Arc::clone(&shutdown),
-    );
+        state.cfg.max_observers_per_namespace,
+    ) {
+        Ok(h) => h,
+        Err(current) => {
+            warn!(
+                agent = %format!("{}/{}", identity.namespace, identity.name),
+                observers = current,
+                max = state.cfg.max_observers_per_namespace,
+                "registration refused: namespace is at its observer cap"
+            );
+            let resp = JsonRpcErrorResponse::new(
+                reg_rpc_id,
+                ErrorObject::new(
+                    codes::SATURATED,
+                    format!(
+                        "namespace is at its observer cap \
+                         (max_observers_per_namespace = {}); retry later or \
+                         raise the cap",
+                        state.cfg.max_observers_per_namespace
+                    ),
+                ),
+            );
+            let _ = send_bounded(
+                &mut sink,
+                Message::Text(serde_json::to_string(&resp).expect("serializable").into()),
+                write_timeout,
+                &mut shutdown_rx,
+            )
+            .await;
+            return;
+        }
+    };
     // From here on, teardown is owned by an RAII guard rather than the return
     // path: a panic anywhere below (the `expect("serializable")` sites are on
     // production paths) would otherwise skip deregistration and leave this
@@ -520,10 +555,16 @@ struct RegistrationGuard {
 impl Drop for RegistrationGuard {
     fn drop(&mut self) {
         // Must not panic: a panic here during an unwind aborts the process.
-        // Everything it touches is lock-guarded map mutation and non-blocking
-        // sends — no `expect`, no allocation-dependent invariants. parking_lot
-        // locks are not poisoned and are released by the unwind itself, so a
-        // panic taken while holding one cannot deadlock this call.
+        // Teardown is lock-guarded map mutation, non-blocking sends, and
+        // FAIL-SOFT frame/event serialization. This Drop chain reaches
+        // `fail_instance` and `EventHub::emit`; the teardown-adjacent
+        // `sweep_deadlines` (called from the lease sweeper task, not from
+        // here) shares the same fail-soft discipline. All three drop a frame
+        // with an error log instead of panicking on a serialization error
+        // (see `synthesized_frame` and `emit`), so no `expect`/`unwrap` lies
+        // on this path. parking_lot locks are not poisoned and are released
+        // by the unwind itself, so a panic taken while holding one cannot
+        // deadlock this call.
         teardown(&self.state, self.handle, &self.identity);
     }
 }
@@ -809,45 +850,41 @@ fn handle_frame(state: &Arc<AppState>, handle: u64, text: &str) -> Option<String
                 state.cfg.max_result_bytes,
                 state.next_rpc_id(),
             ) {
-                CompleteOutcome::InitiatorStalled { initiator_handle } => {
-                    // The initiator cannot drain its bounded queue: per the
-                    // queue contract it is treated as disconnected, never
-                    // silently skipped. Its teardown fails the delegation
-                    // over the fail_instance path (capacity released once,
-                    // cp/cancel to this serving runtime). Do NOT ack the
-                    // result as delivered — the serving side must know its
-                    // result did not reach the initiator.
-                    state
-                        .registry
-                        .signal_shutdown(initiator_handle, REASON_BACKPRESSURE);
-                    let resp = JsonRpcErrorResponse::new(
-                        rpc_id,
-                        ErrorObject::new(
-                            codes::TARGET_DISCONNECTED,
-                            "initiator cannot receive the result; the delegation will be cancelled",
-                        ),
-                    );
-                    Some(serde_json::to_string(&resp).expect("serializable"))
-                }
-                // The result reached the initiator, which is what the serving
-                // side is being acked for. Whether THIS frame also committed
-                // the state transition is a CP-internal matter: a concurrent
-                // cancel/sweep/disconnect may have ended the delegation
-                // first, and the initiator resolves competing terminal frames
-                // by "first one wins" (see the ADR wire contract).
-                CompleteOutcome::Delivered { committed } => {
-                    if !committed {
+                CompleteOutcome::Completed {
+                    delivered,
+                    stalled_initiator,
+                } => {
+                    if let Some(initiator_handle) = stalled_initiator {
+                        // The initiator cannot drain its bounded queue: per
+                        // the queue contract it is treated as disconnected,
+                        // never silently skipped. The delegation itself
+                        // already committed (entry removed, capacity
+                        // released, terminal emitted), so the teardown finds
+                        // nothing to fail and synthesizes nothing.
+                        state
+                            .registry
+                            .signal_shutdown(initiator_handle, REASON_BACKPRESSURE);
+                    }
+                    if !delivered {
                         info!(
                             handle,
-                            "terminal result delivered, but the delegation had already been \
-                             ended (or its id re-admitted) — no state change"
+                            "delegation completed and committed, but the terminal \
+                             frame did not reach the initiator (gone or stalled)"
                         );
                     }
+                    // The commit is what the serving side is acked for: its
+                    // work is done and the delegation is over. Whether the
+                    // initiator's connection survived long enough to receive
+                    // the frame is a CP-internal matter, and the ack stays
+                    // byte-identical to the dropped case so the reply is
+                    // never an oracle for initiator liveness.
                     let resp = JsonRpcResponse::new(rpc_id, serde_json::json!({"ok": true}));
                     Some(serde_json::to_string(&resp).expect("serializable"))
                 }
-                // Dropped as unknown/foreign; each case is logged in the
-                // router (late results after a CP restart are expected).
+                // Dropped as unknown/foreign/stale, or a concurrent path
+                // (cancel, sweep, disconnect) ended the delegation first and
+                // owns its terminals; each case is logged in the router (late
+                // results after a CP restart are expected).
                 CompleteOutcome::Dropped => {
                     let resp = JsonRpcResponse::new(rpc_id, serde_json::json!({"ok": true}));
                     Some(serde_json::to_string(&resp).expect("serializable"))
@@ -855,7 +892,19 @@ fn handle_frame(state: &Arc<AppState>, handle: u64, text: &str) -> Option<String
             }
         }
         methods::CANCEL => {
-            let p = params_or_err!(CancelParams);
+            let mut p = params_or_err!(CancelParams);
+            // Defence in depth on initiator free text. The event path already
+            // redacts this string in `metadata_only` namespaces and truncates
+            // it elsewhere, but capping at the entry keeps an oversized reason
+            // from being carried through the router and the forwarded frame at
+            // all — the same posture `max_prompt_bytes` takes on the delegate
+            // path, one layer earlier than the excerpt cap.
+            if p.reason.len() > state.cfg.max_event_excerpt_bytes {
+                p.reason = crate::router::truncate_with_marker(
+                    &p.reason,
+                    state.cfg.max_event_excerpt_bytes,
+                );
+            }
             match state.router.cancel(
                 &state.registry,
                 &state.events,
@@ -1207,8 +1256,17 @@ mod tests {
         let state = state_with("");
         let (h_i, _rx_i) = register_test_instance(&state, "koudu", AgentType::Primary, 4);
         let (h_w, mut rx_w) = register_test_instance(&state, "worker-1", AgentType::Worker, 1);
+        // An observer is attached so the unwind exercises the FULL teardown
+        // emit surface — the deregister announcement and the per-admission
+        // terminal — which must be fail-soft: this Drop may already be
+        // unwinding, where a second panic aborts the process (review
+        // round-10 F62).
+        let (h_o, mut rx_o) = register_test_instance(&state, "lobby", AgentType::Observer, 0);
+        let _ = h_o;
         delegate_through_handler(&state, h_i, "d-1", "worker-1");
         rx_w.try_recv().expect("worker received the forward");
+        // Drain the events the delegation produced so far.
+        while rx_o.try_recv().is_ok() {}
         assert_eq!(state.registry.get(h_w).unwrap().active_sessions, 1);
         assert_eq!(state.router.inflight_count(), 1);
 
@@ -1245,6 +1303,17 @@ mod tests {
         // ...and the serving runtime is told to stop working.
         let cancel = rx_w.try_recv().expect("downstream cancel was queued");
         assert!(cancel.contains("cp/cancel") && cancel.contains("d-1"));
+        // The observer received the teardown's whole emit surface — produced
+        // during the unwind without a second panic: the deregister
+        // announcement and the delegation's terminal.
+        let mut saw_deregistered = false;
+        let mut saw_cancelled = false;
+        while let Ok(f) = rx_o.try_recv() {
+            saw_deregistered |= f.contains("agent_deregistered");
+            saw_cancelled |= f.contains("delegation_cancelled");
+        }
+        assert!(saw_deregistered, "deregister announcement emitted in Drop");
+        assert!(saw_cancelled, "delegation terminal emitted in Drop");
     }
 
     #[test]
@@ -1409,11 +1478,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stalled_initiator_is_disconnected_and_serving_side_not_falsely_acked() {
-        // The bounded-queue contract for the one frame that matters most:
-        // when the initiator's queue refuses the terminal result, the
-        // serving side must NOT receive `ok: true`, and the initiator must
-        // be closed (treated as disconnected) rather than silently skipped.
+    async fn stalled_initiator_is_disconnected_and_result_still_commits() {
+        // The bounded-queue contract for the terminal result under
+        // commit-first: the commit ends the delegation before delivery, so
+        // the serving side is acked for the commit (`ok: true`, its work is
+        // done), the stalled initiator is closed (treated as disconnected)
+        // rather than silently skipped, and its teardown finds nothing —
+        // capacity was already released exactly once by the commit.
         let state = state_with("");
 
         // Initiator whose outbound byte budget one filler frame exhausts —
@@ -1491,29 +1562,28 @@ mod tests {
         .to_string();
         let reply: serde_json::Value =
             serde_json::from_str(&handle_frame(&state, h_w, &res).expect("answered")).unwrap();
-        assert_eq!(
-            reply["error"]["code"],
-            codes::TARGET_DISCONNECTED,
-            "the serving side must not be acked as delivered"
+        assert!(
+            reply.get("error").is_none(),
+            "the commit ended the delegation; the serving side is acked for it"
         );
-        assert_eq!(reply["id"], 2, "the error must correlate with the request");
+        assert_eq!(reply["result"]["ok"], true);
+        assert_eq!(reply["id"], 2, "the ack must correlate with the request");
 
         // The initiator is told to close, with the backpressure reason.
         observer.changed().await.unwrap();
         assert_eq!(*observer.borrow(), Some(REASON_BACKPRESSURE));
 
-        // The delegation is still in flight: teardown of the stalled
-        // initiator resolves it through fail_instance (capacity released
-        // once, cp/cancel to the serving runtime).
-        assert_eq!(state.router.inflight_count(), 1);
+        // The commit already ended the delegation and released capacity:
+        // teardown of the stalled initiator finds nothing to fail, so no
+        // second terminal and no double release can occur.
+        assert_eq!(state.router.inflight_count(), 0);
+        assert_eq!(state.registry.get(h_w).unwrap().active_sessions, 0);
         let mut next = || 9;
         let frames = state
             .router
             .fail_instance(&state.registry, &state.events, h_i, &mut next);
-        assert_eq!(frames.len(), 1);
-        assert!(frames[0].1.contains("cp/cancel"));
+        assert!(frames.is_empty());
         assert_eq!(state.registry.get(h_w).unwrap().active_sessions, 0);
-        assert_eq!(state.router.inflight_count(), 0);
     }
 
     // --- observer / lobby wiring (Phase 1) ---
@@ -1774,5 +1844,60 @@ mod tests {
         assert_eq!(seen[1]["result_excerpt"], "ok");
         assert_eq!(seen[0]["seq"], 1);
         assert_eq!(seen[1]["seq"], 2);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_cancel_reason_is_capped_at_the_entry() {
+        // Initiator free text is capped before the router or the forwarded
+        // frame ever sees it. The event path redacts/truncates too, but this
+        // keeps a multi-megabyte reason from riding through the CP at all.
+        let state = state_with("max_event_excerpt_bytes = 256");
+        let (h_primary, _p_rx) = join(&state, "prod", "koudu", AgentType::Primary);
+        let (_h_worker, mut w_rx) = join(&state, "prod", "worker-1", AgentType::Worker);
+
+        let ack = call(
+            &state,
+            h_primary,
+            methods::DELEGATE,
+            serde_json::json!({
+                "delegation_id": "d-cap",
+                "target": {"name": "worker-1"},
+                "prompt": "work",
+                "deadline": (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339()
+            }),
+        );
+        let v: serde_json::Value = serde_json::from_str(&ack).unwrap();
+        let admission = v["result"]["admission"]
+            .as_u64()
+            .expect("ack carries the token");
+        w_rx.try_recv().expect("forwarded");
+
+        let huge = "A".repeat(64 * 1024);
+        let reply = call(
+            &state,
+            h_primary,
+            methods::CANCEL,
+            serde_json::json!({
+                "delegation_id": "d-cap",
+                "admission": admission,
+                "reason": huge
+            }),
+        );
+        assert!(
+            reply.contains("\"ok\":true"),
+            "the cancel itself succeeds: {reply}"
+        );
+
+        // The forwarded cp/cancel carries the capped reason, not 64 KiB.
+        let forwarded = w_rx.try_recv().expect("cancel forwarded to the worker");
+        assert!(
+            forwarded.len() < 2048,
+            "the forwarded cancel must not carry the untruncated reason ({} bytes)",
+            forwarded.len()
+        );
+        assert!(
+            forwarded.contains("truncated by control plane"),
+            "the cap leaves its marker: {forwarded}"
+        );
     }
 }

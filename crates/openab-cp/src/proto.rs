@@ -157,8 +157,19 @@ pub mod codes {
     pub const POLICY_DENIED: i64 = -32003;
     /// No registered, healthy runtime matches the target selector.
     pub const NO_TARGET: i64 = -32004;
-    /// Matching targets exist but all are at their advertised capacity.
-    /// Explicit fast-fail: the CP never queues (v1 has no durable state).
+    /// A capacity ceiling is exhausted. Explicit fast-fail: the CP never
+    /// queues (v1 has no durable state).
+    ///
+    /// Deliberately ONE code for three capacity domains — all matching
+    /// targets at their advertised capacity, the CP at its global
+    /// `max_inflight_delegations` ceiling, or a namespace at its
+    /// `max_observers_per_namespace` ceiling (registration refusal). Every
+    /// message names the exhausted bound and, where applicable, the config
+    /// knob, so a human can attribute the refusal; a client's reaction is
+    /// the same in all three cases (back off / retry / raise the bound), so
+    /// splitting the code would grow the wire surface without changing any
+    /// client decision. Revisit if machine-readable attribution is ever
+    /// needed for alerting.
     pub const SATURATED: i64 = -32005;
     // -32006 is deliberately unassigned. It held a `DEADLINE_EXCEEDED` code
     // that nothing could ever emit: a deadline already in the past is
@@ -534,6 +545,13 @@ pub enum CpEvent {
     },
     DelegationRequested {
         delegation_id: String,
+        /// Admission token of this admission of `delegation_id`. A delegation
+        /// id is legally reusable (cancel-then-retry re-admits the same id),
+        /// so observers MUST correlate lifecycle events on the composite key
+        /// `(namespace, delegation_id, admission)` — the token is what ties a
+        /// terminal event to the exact admission it ends, mirroring the wire
+        /// frames (ack/result/cancel), which all carry it.
+        admission: AdmissionToken,
         from: String,
         to: String,
         /// Absent when the namespace is `metadata_only`.
@@ -544,16 +562,33 @@ pub enum CpEvent {
     },
     DelegationCompleted {
         delegation_id: String,
+        /// Admission token this terminal event ends — correlate on
+        /// `(namespace, delegation_id, admission)`, never on the reusable id
+        /// alone. First terminal event for a given admission wins; later ones
+        /// for that admission are duplicates.
+        admission: AdmissionToken,
         from: String,
         to: String,
         status: DelegationStatus,
         #[serde(skip_serializing_if = "Option::is_none")]
         result_excerpt: Option<String>,
+        /// Bounded excerpt of the terminal error text, when there is one.
+        /// Its `metadata_only` behavior depends on who wrote it: a
+        /// worker-reported error (`failed` results) is agent content and is
+        /// suppressed (key absent) exactly like `result_excerpt`, while a
+        /// CP-synthesized diagnostic (`timeout`, `target_disconnected`) is
+        /// metadata the CP composed and survives the knob — mirroring
+        /// `DelegationCancelled::reason`.
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
     DelegationCancelled {
         delegation_id: String,
+        /// Admission token this terminal event ends — correlate on
+        /// `(namespace, delegation_id, admission)`, never on the reusable id
+        /// alone. First terminal event for a given admission wins; later ones
+        /// for that admission are duplicates.
+        admission: AdmissionToken,
         /// Initiator of the cancelled delegation (`namespace/name`) — an
         /// observer that missed `delegation_requested` still gets full
         /// attribution.
@@ -563,7 +598,13 @@ pub enum CpEvent {
         /// Who cancelled: the initiator's logical id, or `"control-plane"`
         /// for deadline/disconnect synthesis.
         by: String,
-        reason: String,
+        /// Bounded excerpt of the cancel reason. An initiator-supplied reason
+        /// is agent content: it is suppressed entirely (key absent) when the
+        /// namespace is `metadata_only`, exactly like prompt/result excerpts.
+        /// CP-synthesized reasons (disconnect/deadline diagnostics) are
+        /// metadata and survive the knob.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
 }
 
@@ -916,6 +957,7 @@ mod tests {
             namespace: "prod".into(),
             event: CpEvent::DelegationRequested {
                 delegation_id: "d-1".into(),
+                admission: 1,
                 from: "prod/koudu".into(),
                 to: "prod/worker-1".into(),
                 prompt_excerpt: Some("do it".into()),
@@ -965,10 +1007,11 @@ mod tests {
     fn delegation_cancelled_carries_from_and_to() {
         let ev = CpEvent::DelegationCancelled {
             delegation_id: "d-1".into(),
+            admission: 3,
             from: "prod/koudu".into(),
             to: "prod/worker-1".into(),
             by: "control-plane".into(),
-            reason: "deadline exceeded".into(),
+            reason: Some("deadline exceeded".into()),
         };
         let v = serde_json::to_value(&ev).unwrap();
         assert_eq!(v["event"], "delegation_cancelled");
@@ -983,6 +1026,7 @@ mod tests {
     fn absent_prompt_excerpt_is_omitted_from_the_wire() {
         let ev = CpEvent::DelegationRequested {
             delegation_id: "d-1".into(),
+            admission: 1,
             from: "prod/koudu".into(),
             to: "prod/worker-1".into(),
             prompt_excerpt: None,
