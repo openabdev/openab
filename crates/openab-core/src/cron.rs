@@ -217,7 +217,7 @@ fn compact_ordinal_set(sorted: &[u32]) -> String {
 
 fn render_run(start: u32, end: u32) -> String {
     if start == end {
-        format!("{}", start)
+        start.to_string()
     } else {
         format!("{}-{}", start, end)
     }

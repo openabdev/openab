@@ -856,6 +856,35 @@ impl SessionPool {
         }
     }
 
+    /// Drop a session and all its bookkeeping WITHOUT sending
+    /// `session/cancel` first. Returns `true` when there was an active
+    /// connection to drop.
+    ///
+    /// [`Self::reset_session`] is the same teardown *plus* a cancel and an
+    /// error when the session is unknown, which suits the interactive
+    /// `/reset` it serves. Non-interactive owners of single-use sessions —
+    /// the control-plane executor, which runs one fresh session per
+    /// delegation — need neither: after a completed turn there is nothing to
+    /// cancel, and after a cancelled one the cancel has already been sent.
+    /// Calling `reset_session` there would emit a spurious `session/cancel`
+    /// at the agent and log an error for the benign already-gone case.
+    ///
+    /// The ACP process exits once the last `Arc` to its connection drops, so
+    /// removing the map entry is what reclaims the pool slot.
+    pub async fn discard_session(&self, thread_id: &str) -> bool {
+        let mut state = self.state.write().await;
+        let had_active = state.active.remove(thread_id).is_some();
+        purge_session_entries(&mut state, thread_id);
+        #[cfg(feature = "acp-mcp")]
+        revoke_facade_token_for_key(&mut state, thread_id, self.session_registrar.as_ref());
+        self.save_mapping(&state.persisted);
+        self.save_meta(&state.session_workdirs);
+        if had_active {
+            info!(thread_id = %crate::redact::redact_session_ids(thread_id), "session discarded");
+        }
+        had_active
+    }
+
     pub async fn cleanup_idle(&self, ttl_secs: u64) {
         let cutoff = Instant::now() - std::time::Duration::from_secs(ttl_secs);
         let hung_threshold = std::time::Duration::from_secs(self.hung_threshold_secs);

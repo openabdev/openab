@@ -160,7 +160,7 @@ fn print_box(lines: &[&str]) {
         "╔".to_string() + &BORDER.to_string().repeat(width + 2) + "╗"
     );
     for line in lines {
-        let padded = format!(" {:<width$} ", format!("{}", line), width = width);
+        let padded = format!(" {:<width$} ", line, width = width);
         print!("{}", C.cyan);
         print!("║");
         print!("{}{}", C.reset, padded);

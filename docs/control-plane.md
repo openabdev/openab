@@ -5,15 +5,11 @@ WebSocket JSON-RPC, so agents delegate work to each other without
 round-tripping through a chat platform. Design and wire contract:
 [ADR: Agent Control Plane](adr/agent-control-plane.md).
 
-> **Status: PR 2/4 of the control-plane stack.** PR 1/4 shipped the CP
-> server binary (registry, policy, router, wire protocol); this slice adds
-> the observer/lobby surface — the read-only `observer` agent type, the
-> `cp/event` notification stream, and `cp/list_agents` (see
-> [Observer surface](#observer-surface-lobby) below). The OAB-runtime
-> client (`[control_plane]` config + registration), the MCP facade/CLI, and
-> client relay land in the follow-up slices — until then nothing connects
-> to this server in a stock deployment, and there is no packaged container
-> image yet.
+> **Status: PR 3/4 of the control-plane stack.** PR 1/4 shipped the CP
+> server; PR 2/4 added the observer/lobby surface. This slice adds the
+> OAB-runtime client, `[control_plane]` configuration, worker-side delegation
+> serving, and headless worker mode. The MCP facade/CLI and primary-side
+> initiation tools land in PR 4/4.
 
 ## Run
 
@@ -122,6 +118,37 @@ issue #1474).
   The ack's `effective_max_delegated_sessions` is the value that counts.
 - After a lease expires or the CP restarts, in-flight delegations are gone:
   initiators reconcile against their own deadlines and re-delegate.
+
+## Delegated prompt context (`openab.delegation.v1`)
+
+When an OAB runtime serves a `cp/delegate`, it prepends one standalone
+`<sender_context>` text block before the delegated prompt. The XML-shaped
+block is a structural envelope shared with normal chat arrivals, but the JSON
+inside is **multi-schema**: consumers MUST inspect `schema` before interpreting
+any other field. Chat arrivals use `openab.sender.v1`; delegated work uses
+`openab.delegation.v1`.
+
+```text
+<sender_context>
+{"schema":"openab.delegation.v1","delegation_id":"d-01J...","from":"prod/koudu","chain":["prod/koudu"],"deadline":"2026-09-08T20:30:00Z"}
+</sender_context>
+```
+
+| Field | Meaning |
+|-------|---------|
+| `schema` | Always `openab.delegation.v1` for this context shape |
+| `delegation_id` | Caller-supplied delegation id; useful for logs, but reusable and therefore not an admission identity |
+| `from` | CP-authenticated logical initiator (`namespace/name`) |
+| `chain` | CP-constructed delegation ancestry, root first |
+| `deadline` | Absolute RFC 3339 deadline enforced by both CP and serving runtime |
+
+`from`, `chain`, and `deadline` are stamped by the control plane rather than
+accepted from the agent prompt, so a serving agent may trust them as routing
+and policy provenance. The protocol-visible `admission` token is intentionally
+not placed in the prompt context: it is runtime bookkeeping echoed on result
+and cancel frames, not an agent instruction. Agents written for chat arrivals
+must not assume every `<sender_context>` body is `openab.sender.v1`; unknown
+schemas should be preserved or ignored safely.
 
 ## Observer surface (lobby)
 

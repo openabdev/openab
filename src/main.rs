@@ -195,6 +195,73 @@ fn has_unified_platform(cfg: &config::Config) -> bool {
         || (cfg!(feature = "lineworks") && lineworks_activated(cfg.lineworks.as_ref()))
 }
 
+/// What `openab run` does when NO chat adapter is configured.
+///
+/// Two headless deployments exist, and the order below is the whole rule:
+///
+/// - Any configuration that needs the control-plane client and the normal
+///   runtime takes `FullRuntime`: a worker can be adapter-less, while a primary
+///   needs either a chat adapter or `[mcp]` (the facade supplies its local
+///   initiating surface). The full path builds the pool/router and starts both
+///   configured services.
+/// - `[mcp]` alone stays exactly what it was: the facade in the foreground.
+///
+/// `type = "primary"` alone (without `[mcp]`) deliberately does NOT unlock a
+/// headless boot. A primary is the *initiating* side of a delegation; its
+/// prompts come from a chat platform, so an adapter-less primary has no way to
+/// be given work and is a misconfiguration worth failing on.
+#[derive(Debug, PartialEq, Eq)]
+enum HeadlessMode {
+    FullRuntime,
+    FacadeOnly,
+    None,
+}
+
+fn headless_run_mode(cfg: &config::Config) -> HeadlessMode {
+    let cp_worker = cfg
+        .control_plane
+        .as_ref()
+        .is_some_and(|cp| cp.agent_type == openab_core::config::CpAgentType::Worker);
+    if cp_worker {
+        HeadlessMode::FullRuntime
+    } else if cfg.mcp.is_some() {
+        if cfg.control_plane.is_some() {
+            HeadlessMode::FullRuntime
+        } else {
+            HeadlessMode::FacadeOnly
+        }
+    } else {
+        HeadlessMode::None
+    }
+}
+
+struct SupervisedControlPlaneTask {
+    abort: tokio::task::AbortHandle,
+    completion: tokio::sync::oneshot::Receiver<Result<(), tokio::task::JoinError>>,
+}
+
+fn supervise_control_plane(handle: tokio::task::JoinHandle<()>) -> SupervisedControlPlaneTask {
+    let abort = handle.abort_handle();
+    let (tx, completion) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _ = tx.send(handle.await);
+    });
+    SupervisedControlPlaneTask { abort, completion }
+}
+
+async fn wait_for_control_plane_exit(
+    task: &mut Option<SupervisedControlPlaneTask>,
+) -> anyhow::Error {
+    let Some(task) = task.as_mut() else {
+        return std::future::pending::<anyhow::Error>().await;
+    };
+    match (&mut task.completion).await {
+        Ok(Ok(())) => anyhow::anyhow!("control-plane client exited unexpectedly"),
+        Ok(Err(error)) => anyhow::anyhow!("control-plane client task failed: {error}"),
+        Err(_) => anyhow::anyhow!("control-plane client supervisor stopped unexpectedly"),
+    }
+}
+
 /// Single LINE WORKS activation validator: the resolved (config → env →
 /// default) credentials must be complete and non-empty — the same rule the
 /// adapter constructor applies. Used by startup preflight AND cron platform
@@ -421,26 +488,53 @@ async fn main() -> anyhow::Result<()> {
         && cfg.telegram.is_none()
         && !has_unified_platform(&cfg)
     {
-        // Facade-only run mode (#1451): an adapter-less config with `[mcp]`
-        // present is a valid deployment — the broker serves just the OAB MCP
-        // Facade listener. One entrypoint, config-driven: hosts that only
-        // need the capability surface (coding-CLI-only users, dev loops, CI
-        // runners, agent hosts with no chat platform) run the same
-        // `openab run` with a two-line config instead of a chat token.
-        if let Some(mcp_cfg) = cfg.mcp.clone() {
-            tracing::info!(
-                listen = %mcp_cfg.listen,
-                "no chat adapter configured — running in facade-only mode ([mcp] present)"
-            );
-            // Foreground, not spawned: the facade IS the workload. A bind
-            // failure or server exit terminates the process (fail fast).
-            return openab_mcp::mcp::facade::serve_http(&mcp_cfg.listen)
-                .await
-                .map_err(|e| anyhow::anyhow!("OAB MCP facade exited: {e:#}"));
+        match headless_run_mode(&cfg) {
+            // Control-plane worker (Agent Control Plane ADR): an adapter-less
+            // config whose `[control_plane]` says `type = "worker"` is a valid
+            // deployment — the runtime's work arrives as `cp/delegate` over the
+            // CP socket instead of as chat messages. Fall through to the normal
+            // boot path: it builds the pool and router the delegation executor
+            // needs, spawns the CP client, and (if `[mcp]` is also present)
+            // starts the facade alongside, exactly as an adapter run would.
+            HeadlessMode::FullRuntime => {
+                let cp = cfg
+                    .control_plane
+                    .as_ref()
+                    .expect("control-plane headless mode implies [control_plane]");
+                tracing::info!(
+                    agent = %format!("{}/{}", cp.namespace, cp.name),
+                    r#type = %match cp.agent_type {
+                        openab_core::config::CpAgentType::Worker => "worker",
+                        openab_core::config::CpAgentType::Primary => "primary",
+                    },
+                    mcp = cfg.mcp.is_some(),
+                    "no chat adapter configured — running headless with the control-plane client"
+                );
+            }
+            // Facade-only run mode (#1451): an adapter-less config with `[mcp]`
+            // present is a valid deployment — the broker serves just the OAB MCP
+            // Facade listener. One entrypoint, config-driven: hosts that only
+            // need the capability surface (coding-CLI-only users, dev loops, CI
+            // runners, agent hosts with no chat platform) run the same
+            // `openab run` with a two-line config instead of a chat token.
+            HeadlessMode::FacadeOnly => {
+                let mcp_cfg = cfg.mcp.clone().expect("facade-only mode implies [mcp]");
+                tracing::info!(
+                    listen = %mcp_cfg.listen,
+                    "no chat adapter configured — running in facade-only mode ([mcp] present)"
+                );
+                // Foreground, not spawned: the facade IS the workload. A bind
+                // failure or server exit terminates the process (fail fast).
+                return openab_mcp::mcp::facade::serve_http(&mcp_cfg.listen)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("OAB MCP facade exited: {e:#}"));
+            }
+            HeadlessMode::None => {
+                anyhow::bail!(
+                    "no adapter configured — add [discord], [slack], [telegram], [line], [lineworks], [feishu], [wecom], [googlechat], [teams], or [gateway] to config (or [mcp] for facade-only mode, or [control_plane] with type = \"worker\" for control-plane worker mode), or set the corresponding platform environment variables"
+                );
+            }
         }
-        anyhow::bail!(
-            "no adapter configured — add [discord], [slack], [telegram], [wecom], [googlechat], or [gateway] to config (or [mcp] for facade-only mode), or set platform env vars (TELEGRAM_BOT_TOKEN, etc.)"
-        );
     }
 
     // --- Lifecycle hooks: Unix-only. Fail fast on unsupported platforms. ---
@@ -558,6 +652,12 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+
+    // Taken before the sections below are moved into their runtime components:
+    // the control-plane client is constructed much later (it needs the router),
+    // and `cfg.agent` / `cfg.pool` are gone by then.
+    let control_plane_cfg = cfg.control_plane.clone();
+    let prompt_hard_timeout_secs = cfg.pool.prompt_hard_timeout_secs;
 
     let pool_inner = acp::SessionPool::new(
         cfg.agent,
@@ -876,6 +976,25 @@ async fn main() -> anyhow::Result<()> {
 
     // Shutdown signal for Slack adapter
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    // --- Agent Control Plane membership (`[control_plane]`) ---
+    // Spawned here because the client needs the router (its delegation executor
+    // drives ACP turns through the same seam every platform uses) and the
+    // shutdown watch. Absent section = no task, no socket, no behaviour change.
+    // The auth key is used only for the `Authorization` header on the outbound
+    // upgrade: it is never logged, and never reaches the agent subprocess —
+    // `[agent].env` plumbing is untouched by this.
+    let mut cp_task = control_plane_cfg.map(|cp_cfg| {
+        let runner: Arc<dyn openab_core::control_plane::PromptRunner> = Arc::new(
+            openab_core::control_plane::RouterPromptRunner::new(router.clone()),
+        );
+        let client = Arc::new(openab_core::control_plane::ControlPlaneClient::new(
+            cp_cfg,
+            runner,
+            std::time::Duration::from_secs(prompt_hard_timeout_secs),
+        ));
+        supervise_control_plane(tokio::spawn(client.run(shutdown_rx.clone())))
+    });
 
     let dispatchers: Arc<Mutex<Vec<Arc<dispatch::Dispatcher>>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -1617,6 +1736,11 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // A control-plane task failure is fatal, but it must not bypass the
+    // ordered cleanup below (notably pool.shutdown and pre_shutdown hooks).
+    // Record it while the runtime wait ends, clean everything up, then return.
+    let mut runtime_error: Option<anyhow::Error> = None;
+
     // Run Discord adapter (foreground, blocking) or wait for ctrl_c
     #[cfg(feature = "discord")]
     if let Some(discord_cfg) = cfg.discord {
@@ -1733,7 +1857,14 @@ async fn main() -> anyhow::Result<()> {
         });
 
         info!("discord bot running");
-        match client.start().await {
+        let discord_result = tokio::select! {
+            result = client.start() => result,
+            error = wait_for_control_plane_exit(&mut cp_task) => {
+                runtime_error = Some(error);
+                Ok(())
+            }
+        };
+        match discord_result {
             Err(serenity::Error::Gateway(GatewayError::DisallowedGatewayIntents)) => {
                 error!(
                     "Discord rejected privileged intents. \
@@ -1754,8 +1885,10 @@ async fn main() -> anyhow::Result<()> {
         }
     } else {
         info!("running without discord, press ctrl+c to stop");
-        shutdown_signal().await;
-        info!("shutdown signal received");
+        tokio::select! {
+            _ = shutdown_signal() => info!("shutdown signal received"),
+            error = wait_for_control_plane_exit(&mut cp_task) => runtime_error = Some(error),
+        }
     }
     // When discord feature is disabled at compile time, use this fallback block.
     // (When discord feature IS enabled but no [discord] config exists, the `else`
@@ -1763,8 +1896,10 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(not(feature = "discord"))]
     {
         info!("running without discord, press ctrl+c to stop");
-        shutdown_signal().await;
-        info!("shutdown signal received");
+        tokio::select! {
+            _ = shutdown_signal() => info!("shutdown signal received"),
+            error = wait_for_control_plane_exit(&mut cp_task) => runtime_error = Some(error),
+        }
     }
 
     // Cleanup
@@ -1795,6 +1930,26 @@ async fn main() -> anyhow::Result<()> {
     for d in dispatchers.lock().unwrap().iter() {
         d.shutdown();
     }
+    // Stop the control-plane client BEFORE the pool: it cancels its in-flight
+    // delegations (each stopping its agent and dropping its session) and closes
+    // the socket, so the CP sees a clean disconnect instead of a lease timeout.
+    // Tearing the pool down first would leave those turns writing to sessions
+    // that no longer exist.
+    if let Some(mut task) = cp_task {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), &mut task.completion).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => {
+                tracing::warn!(%error, "control-plane client failed during shutdown");
+            }
+            Ok(Err(_)) => {
+                tracing::warn!("control-plane client supervisor stopped during shutdown");
+            }
+            Err(_) => {
+                tracing::warn!("control-plane client missed the shutdown deadline — aborting");
+                task.abort.abort();
+            }
+        }
+    }
     let shutdown_pool = pool;
     shutdown_pool.shutdown().await;
     if let Some(ref hook) = shutdown_hook {
@@ -1803,7 +1958,11 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     info!("openab shut down");
-    Ok(())
+    if let Some(error) = runtime_error {
+        Err(error)
+    } else {
+        Ok(())
+    }
 }
 
 fn parse_id_set(raw: &[String], label: &str) -> anyhow::Result<HashSet<u64>> {
@@ -2083,5 +2242,87 @@ agent_id = "1000002"
         .unwrap();
 
         assert_eq!(has_unified_wecom_config(&cfg), cfg!(feature = "wecom"));
+    }
+
+    // --- headless run modes (no chat adapter configured) ---
+
+    fn cp_section(agent_type: &str) -> String {
+        format!(
+            "[control_plane]\nurl = \"wss://cp:9800/cp\"\nauth_key = \"k\"\n\
+             namespace = \"prod\"\nname = \"w\"\ntype = \"{agent_type}\"\n"
+        )
+    }
+
+    #[test]
+    fn nothing_configured_is_still_a_startup_error() {
+        let cfg = config::parse_config_str("", "test").unwrap();
+        assert_eq!(headless_run_mode(&cfg), HeadlessMode::None);
+    }
+
+    #[test]
+    fn mcp_only_is_still_facade_only() {
+        // Regression guard for #1451: adding control-plane modes must not
+        // change what an `[mcp]`-only config does.
+        let cfg = config::parse_config_str("[mcp]\n", "test").unwrap();
+        assert_eq!(headless_run_mode(&cfg), HeadlessMode::FacadeOnly);
+    }
+
+    #[tokio::test]
+    async fn an_early_control_plane_exit_is_supervised() {
+        let mut task = Some(supervise_control_plane(tokio::spawn(async {})));
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            wait_for_control_plane_exit(&mut task),
+        )
+        .await
+        .expect("the completed task is observed");
+        assert!(error.to_string().contains("exited unexpectedly"));
+    }
+
+    #[test]
+    fn a_control_plane_worker_boots_without_any_adapter() {
+        let cfg = config::parse_config_str(&cp_section("worker"), "test").unwrap();
+        assert_eq!(headless_run_mode(&cfg), HeadlessMode::FullRuntime);
+    }
+
+    #[test]
+    fn a_control_plane_primary_alone_does_not_unlock_a_headless_boot() {
+        // A primary initiates delegations; its prompts come from a chat
+        // platform, so an adapter-less primary has no way to be given work.
+        let cfg = config::parse_config_str(&cp_section("primary"), "test").unwrap();
+        assert_eq!(headless_run_mode(&cfg), HeadlessMode::None);
+    }
+
+    #[test]
+    fn a_primary_with_mcp_takes_the_full_boot_path_so_both_run() {
+        // Facade-only would foreclose the CP client; with both sections
+        // present the full boot serves the facade in the background AND
+        // registers with the control plane.
+        let cfg =
+            config::parse_config_str(&format!("[mcp]\n{}", cp_section("primary")), "test").unwrap();
+        assert_eq!(headless_run_mode(&cfg), HeadlessMode::FullRuntime);
+    }
+
+    #[test]
+    fn mcp_plus_worker_takes_the_worker_path_so_both_run() {
+        // The worker path falls through to the normal boot, which spawns the
+        // facade in the background — the facade-only path would return before
+        // ever reaching the CP client.
+        let cfg =
+            config::parse_config_str(&format!("[mcp]\n{}", cp_section("worker")), "test").unwrap();
+        assert_eq!(headless_run_mode(&cfg), HeadlessMode::FullRuntime);
+    }
+
+    /// A configured adapter never consults the headless matrix at all — the
+    /// `[control_plane]` section simply rides along with it.
+    #[test]
+    fn an_adapter_config_with_a_control_plane_section_parses() {
+        let cfg = config::parse_config_str(
+            &format!("[discord]\nbot_token = \"x\"\n{}", cp_section("primary")),
+            "test",
+        )
+        .unwrap();
+        assert!(cfg.discord.is_some());
+        assert!(cfg.control_plane.is_some());
     }
 }
