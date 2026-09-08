@@ -1224,7 +1224,7 @@ mod tests {
         let elapsed = start.elapsed();
         assert_eq!(
             elapsed, TEARDOWN_BOUND,
-            "teardown must complete at the shared 5s bound"
+            "teardown must complete at the shared {TEARDOWN_BOUND:?} bound"
         );
         assert!(
             runner.discarded().is_empty(),
