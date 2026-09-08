@@ -307,6 +307,13 @@ impl CpConfig {
         if self.write_timeout_secs == 0 {
             bail!("write_timeout_secs must be greater than 0");
         }
+        if self.max_frame_bytes < crate::proto::MIN_RUNTIME_FRAME_BYTES {
+            bail!(
+                "max_frame_bytes ({}) is below the bundled runtime minimum ({}) —                  raise it or use a protocol-compatible client with a smaller negotiated ceiling",
+                self.max_frame_bytes,
+                crate::proto::MIN_RUNTIME_FRAME_BYTES
+            );
+        }
         // A budget that cannot hold one maximum-size frame would refuse every
         // enqueue and disconnect every peer the moment a large frame is routed
         // to it.
@@ -612,6 +619,15 @@ lease_expiry_secs = 30
             let cfg: CpConfig = toml::from_str(bad).unwrap();
             assert!(cfg.validate().is_err(), "{bad} must be rejected");
         }
+    }
+
+    #[test]
+    fn frame_limit_cannot_undercut_the_bundled_runtime_contract() {
+        let cfg: CpConfig = toml::from_str("max_frame_bytes = 1048575").unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("bundled runtime minimum"), "{err}");
+        let cfg: CpConfig = toml::from_str("max_frame_bytes = 1048576").unwrap();
+        cfg.validate().unwrap();
     }
 
     #[test]

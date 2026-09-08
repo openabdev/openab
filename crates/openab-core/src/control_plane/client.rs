@@ -25,7 +25,7 @@ use futures_util::{SinkExt, StreamExt};
 use openab_cp::proto::{
     codes, methods, DelegateForward, DelegateResultParams, ErrorObject, HeartbeatParams,
     JsonRpcErrorResponse, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RegisterAck,
-    RegisterParams, PROTOCOL_VERSION,
+    RegisterParams, MIN_RUNTIME_FRAME_BYTES, PROTOCOL_VERSION,
 };
 use rand::Rng;
 use tokio::net::TcpStream;
@@ -38,7 +38,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::{debug, error, info, warn};
 
 use crate::config::{ControlPlaneConfig, CpAgentType};
-use crate::control_plane::executor::{DelegationExecutor, PromptRunner};
+use crate::control_plane::executor::{cap_text, DelegationExecutor, PromptRunner};
 
 /// Backoff ceiling, matching the gateway adapter.
 const MAX_BACKOFF_SECS: u64 = 30;
@@ -58,7 +58,7 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// hub is configured with a larger ceiling, frames exceeding 1 MiB are
 /// rejected at the transport layer; future protocol revisions may negotiate
 /// effective limits in `RegisterAck`.
-const MAX_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_FRAME_BYTES: usize = MIN_RUNTIME_FRAME_BYTES;
 
 /// Bound on DNS/TCP/TLS/WebSocket establishment. The outer shutdown select can
 /// cancel this sooner, but a blackholed endpoint must still enter backoff.
@@ -128,7 +128,6 @@ impl ControlPlaneClient {
                 info!("control-plane client shutting down");
                 return;
             }
-            let mut shutdown_signal = shutdown.clone();
             info!(
                 agent = %format!("{}/{}", self.cfg.namespace, self.cfg.name),
                 r#type = %self.cfg.agent_type,
@@ -136,15 +135,10 @@ impl ControlPlaneClient {
                 "connecting to control plane"
             );
             let session_started = tokio::time::Instant::now();
-            let served = tokio::select! {
-                r = self.connect_and_serve(&mut shutdown) => r,
-                // connect()/register() are not themselves shutdown-aware; this
-                // select is what keeps a hung dial from stalling shutdown.
-                _ = shutdown_signal.changed() => {
-                    info!("control-plane client shutting down");
-                    return;
-                }
-            };
+            // connect_and_serve owns shutdown for each phase: connect/register
+            // race it directly, then the serve loop alone performs
+            // cancel/drain/abort. No outer arm may drop serve mid-cleanup.
+            let served = self.connect_and_serve(&mut shutdown).await;
             match served {
                 Ok(Outcome::Shutdown) => {
                     info!("control-plane client shutting down");
@@ -187,16 +181,20 @@ impl ControlPlaneClient {
         &self,
         shutdown: &mut watch::Receiver<bool>,
     ) -> anyhow::Result<Outcome> {
-        let ws = self.connect_with_timeout().await?;
+        let ws = tokio::select! {
+            result = self.connect_with_timeout() => result?,
+            _ = shutdown.changed() => return Ok(Outcome::Shutdown),
+        };
         let (mut sink, mut stream) = ws.split();
-        let ack = tokio::time::timeout(REGISTER_TIMEOUT, self.register(&mut sink, &mut stream))
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
+        let ack = tokio::select! {
+            result = tokio::time::timeout(REGISTER_TIMEOUT, self.register(&mut sink, &mut stream)) => {
+                result.map_err(|_| anyhow::anyhow!(
                     "control plane did not ack registration within {}s",
                     REGISTER_TIMEOUT.as_secs()
-                )
-            })??;
+                ))??
+            }
+            _ = shutdown.changed() => return Ok(Outcome::Shutdown),
+        };
         self.executor
             .set_effective_max(ack.effective_max_delegated_sessions);
         info!(
@@ -353,11 +351,7 @@ impl ControlPlaneClient {
                 // when the turn ends, never by the model: this is the only
                 // frame that closes the initiator's wait.
                 Some(result) = result_rx.recv() => {
-                    let frame = JsonRpcRequest::new(
-                        self.next_id(),
-                        methods::DELEGATE_RESULT,
-                        Some(serde_json::to_value(&result)?),
-                    );
+                    let frame = delegate_result_request(self.next_id(), result)?;
                     if send(&mut sink, &frame).await.is_err() {
                         break Outcome::Disconnected;
                     }
@@ -551,6 +545,54 @@ enum FrameAction {
     Reply(String),
     /// Nothing to say.
     Ignore,
+}
+
+fn delegate_result_request(
+    id: u64,
+    mut result: DelegateResultParams,
+) -> anyhow::Result<JsonRpcRequest> {
+    let build = |result: &DelegateResultParams| -> anyhow::Result<JsonRpcRequest> {
+        Ok(JsonRpcRequest::new(
+            id,
+            methods::DELEGATE_RESULT,
+            Some(serde_json::to_value(result)?),
+        ))
+    };
+    let frame = build(&result)?;
+    if serde_json::to_string(&frame)?.len() <= MAX_FRAME_BYTES {
+        return Ok(frame);
+    }
+
+    let (payload, is_result) = if let Some(text) = result.result.take() {
+        (text, true)
+    } else if let Some(text) = result.error.take() {
+        (text, false)
+    } else {
+        anyhow::bail!("delegate_result envelope exceeds the transport limit without a payload");
+    };
+    if is_result {
+        result.result = Some(String::new());
+    } else {
+        result.error = Some(String::new());
+    }
+    let empty_frame = build(&result)?;
+    let envelope_bytes = serde_json::to_string(&empty_frame)?.len();
+    anyhow::ensure!(
+        envelope_bytes < MAX_FRAME_BYTES,
+        "delegate_result envelope ({envelope_bytes} bytes) exceeds transport limit ({MAX_FRAME_BYTES} bytes)"
+    );
+    let fitted = cap_text(payload, MAX_FRAME_BYTES - envelope_bytes);
+    if is_result {
+        result.result = Some(fitted);
+    } else {
+        result.error = Some(fitted);
+    }
+    let frame = build(&result)?;
+    anyhow::ensure!(
+        serde_json::to_string(&frame)?.len() <= MAX_FRAME_BYTES,
+        "delegate_result payload could not be fitted to the transport limit"
+    );
+    Ok(frame)
 }
 
 async fn send(sink: &mut WsSink, frame: &JsonRpcRequest) -> anyhow::Result<()> {
@@ -756,6 +798,21 @@ max_delegated_sessions = 3
             backoff_after_session(16, Duration::from_secs(STABLE_SESSION_SECS)),
             1
         );
+    }
+
+    #[test]
+    fn delegate_result_cap_accounts_for_the_complete_envelope() {
+        let result = DelegateResultParams {
+            delegation_id: "d".repeat(600 * 1024),
+            admission: 1,
+            status: openab_cp::proto::DelegationStatus::Completed,
+            result: Some("x".repeat(512 * 1024)),
+            error: None,
+        };
+        let frame = delegate_result_request(42, result).unwrap();
+        let serialized = serde_json::to_string(&frame).unwrap();
+        assert!(serialized.len() <= MAX_FRAME_BYTES);
+        assert!(serialized.contains("truncated by worker"));
     }
 
     #[test]

@@ -569,3 +569,39 @@ async fn shutdown_deregisters_the_instance() {
     })
     .await;
 }
+
+/// Shutdown during an active delegation must be owned by the serve loop: it
+/// cancels and discards the local session before returning, rather than an
+/// outer select dropping the serve future and detaching its task.
+#[tokio::test]
+async fn shutdown_drains_an_inflight_delegation_before_exit() {
+    let (state, url) = spawn_cp(cp_config("")).await;
+    let runner = ScriptedRunner::new(Script::Hang);
+    let (shutdown, handle, _client) =
+        spawn_worker(&url, Arc::clone(&runner), Duration::from_secs(60));
+    wait_for("the worker to register", || {
+        !worker_instances(&state).is_empty()
+    })
+    .await;
+
+    let mut initiator = connect_initiator(&url).await;
+    delegate(&mut initiator, 8, "d-shutdown", "hang until shutdown", 300).await;
+    assert_eq!(next_json(&mut initiator).await["id"], 8, "delegate ack");
+    wait_for("the delegated turn to start", || runner.started() == 1).await;
+
+    let _ = shutdown.send(true);
+    tokio::time::timeout(Duration::from_secs(7), handle)
+        .await
+        .expect("client drains within its bounded window")
+        .expect("client task does not panic");
+    assert_eq!(runner.cancelled().len(), 1, "agent turn was interrupted");
+    assert_eq!(
+        runner.discarded().len(),
+        1,
+        "single-use session was discarded"
+    );
+    wait_for("the CP to see the drained disconnect", || {
+        worker_instances(&state).is_empty()
+    })
+    .await;
+}

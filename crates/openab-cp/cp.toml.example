@@ -23,6 +23,8 @@ max_deadline_secs = 1800
 max_result_bytes = 262144
 
 # Transport-level cap on inbound WebSocket messages (enforced pre-parse).
+# Must remain at least 1048576 bytes for the bundled runtime client; larger
+# values are allowed, while smaller values are rejected during validation.
 max_frame_bytes = 1048576
 
 # Delegation prompts larger than this are rejected.

@@ -411,7 +411,7 @@ impl DelegationExecutor {
 
 /// Bound on each session-teardown step (cancel, discard). Matches the pool's
 /// own cleanup bound and stays under the client's disconnect drain window.
-const TEARDOWN_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+const TEARDOWN_BOUND: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// Client-side ceiling on a `cp/delegate_result` body.
 ///
@@ -448,7 +448,7 @@ pub(crate) fn json_escaped_len(s: &str) -> usize {
         .sum()
 }
 
-fn cap_text(text: String, budget: usize) -> String {
+pub(crate) fn cap_text(text: String, budget: usize) -> String {
     if json_escaped_len(&text) <= budget {
         return text;
     }
@@ -899,6 +899,9 @@ mod tests {
     #[tokio::test]
     async fn silent_failure_maps_to_failed_not_completed() {
         let runner = Arc::new(FakeRunner {
+            // A rendered tool summary must not turn a raw silent failure into
+            // success; classification is carried separately from display text.
+            text: "3 tools completed".into(),
             silent_failure: true,
             ..Default::default()
         });
@@ -1207,8 +1210,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stalled_cancel_and_stalled_discard_share_one_teardown_bound() {
         // Both cancel and discard can wedge (dead agent process, starved pool lock).
-        // cancel_and_discard must bound the SUM of both to TEARDOWN_BOUND (5s),
-        // not 5s each (~10s total), which would exceed the client's DRAIN_TIMEOUT (5s) (F52).
+        // cancel_and_discard must bound the SUM of both to TEARDOWN_BOUND (4s),
+        // strictly below the client's DRAIN_TIMEOUT (5s), so normal teardown
+        // finishes before the connection-level abort backstop (F52).
         let runner = Arc::new(FakeRunner {
             cancel_delay: Some(Duration::from_secs(10)),
             discard_delay: Some(Duration::from_secs(10)),

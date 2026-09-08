@@ -1135,6 +1135,11 @@ impl AdapterRouter {
                     // it was emitted alongside.
                     let (directives, text_buf) =
                         split_delivery(&text_buf, answer_start, keep_full_text);
+                    // Classify from the raw answer body BEFORE tool summaries,
+                    // reset notices, and presentation diagnostics are composed.
+                    // Otherwise a tool-only silent failure looks non-empty and
+                    // is incorrectly reported to a delegation initiator as success.
+                    let silent_failure = is_silent_execution(&text_buf, &turn_result);
                     // The session-reset notice lives at the head of the buffer; a
                     // tool advancing answer_start past it would drop it from the
                     // slice, so re-prepend it to the (directive-stripped) body in
@@ -1151,8 +1156,6 @@ impl AdapterRouter {
                     // executor) needs the *classification*, not the rendered
                     // "⚠️ …" prefix, to decide Completed vs Failed.
                     let terminal_error = response_error.clone();
-                    let silent_failure =
-                        final_content.is_empty() && turn_result.is_silent_failure();
                     let final_content = if final_content.is_empty() {
                         if turn_result.is_silent_failure() {
                             warn!(
@@ -1528,6 +1531,12 @@ fn render_group(title: &str, state: ToolState, count: usize) -> String {
 
 /// Message to show the consumer when a silent failure is detected.
 pub(crate) const SILENT_FAILURE_MSG: &str = "⚠️ The agent did not produce a response. This usually indicates a backend configuration issue — not an intentional empty reply. Please try again later.";
+
+/// Whether the raw final answer represents a silent provider/model failure.
+/// Tool summaries and other presentation text must never influence this signal.
+pub(crate) fn is_silent_execution(answer_text: &str, turn_result: &TurnResult) -> bool {
+    answer_text.trim().is_empty() && turn_result.is_silent_failure()
+}
 
 /// Classify what to display when the composed body is empty.
 /// Returns the final content string for the consumer.
@@ -2373,7 +2382,7 @@ mod tests {
 #[cfg(test)]
 mod directive_tests {
     use super::parse_output_directives;
-    use super::{classify_empty_turn, SILENT_FAILURE_MSG};
+    use super::{classify_empty_turn, is_silent_execution, SILENT_FAILURE_MSG};
     use crate::acp::TurnResult;
 
     #[test]
@@ -2528,6 +2537,22 @@ mod directive_tests {
     }
 
     // --- classify_empty_turn: adapter-level finalization tests ---
+
+    #[test]
+    fn silent_failure_uses_raw_answer_not_rendered_tool_text() {
+        let tr = TurnResult {
+            stop_reason: Some("end_turn".into()),
+            output_tokens: Some(0),
+            input_tokens: Some(12),
+            total_tokens: Some(12),
+        };
+        assert!(is_silent_execution("", &tr));
+        assert!(is_silent_execution("   ", &tr));
+        assert!(
+            !is_silent_execution("actual answer", &tr),
+            "real answer text defeats a contradictory zero-token report"
+        );
+    }
 
     #[test]
     fn empty_turn_silent_failure_produces_diagnostic() {

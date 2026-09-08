@@ -1736,6 +1736,11 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // A control-plane task failure is fatal, but it must not bypass the
+    // ordered cleanup below (notably pool.shutdown and pre_shutdown hooks).
+    // Record it while the runtime wait ends, clean everything up, then return.
+    let mut runtime_error: Option<anyhow::Error> = None;
+
     // Run Discord adapter (foreground, blocking) or wait for ctrl_c
     #[cfg(feature = "discord")]
     if let Some(discord_cfg) = cfg.discord {
@@ -1854,7 +1859,10 @@ async fn main() -> anyhow::Result<()> {
         info!("discord bot running");
         let discord_result = tokio::select! {
             result = client.start() => result,
-            error = wait_for_control_plane_exit(&mut cp_task) => return Err(error),
+            error = wait_for_control_plane_exit(&mut cp_task) => {
+                runtime_error = Some(error);
+                Ok(())
+            }
         };
         match discord_result {
             Err(serenity::Error::Gateway(GatewayError::DisallowedGatewayIntents)) => {
@@ -1879,7 +1887,7 @@ async fn main() -> anyhow::Result<()> {
         info!("running without discord, press ctrl+c to stop");
         tokio::select! {
             _ = shutdown_signal() => info!("shutdown signal received"),
-            error = wait_for_control_plane_exit(&mut cp_task) => return Err(error),
+            error = wait_for_control_plane_exit(&mut cp_task) => runtime_error = Some(error),
         }
     }
     // When discord feature is disabled at compile time, use this fallback block.
@@ -1890,7 +1898,7 @@ async fn main() -> anyhow::Result<()> {
         info!("running without discord, press ctrl+c to stop");
         tokio::select! {
             _ = shutdown_signal() => info!("shutdown signal received"),
-            error = wait_for_control_plane_exit(&mut cp_task) => return Err(error),
+            error = wait_for_control_plane_exit(&mut cp_task) => runtime_error = Some(error),
         }
     }
 
@@ -1950,7 +1958,11 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     info!("openab shut down");
-    Ok(())
+    if let Some(error) = runtime_error {
+        Err(error)
+    } else {
+        Ok(())
+    }
 }
 
 fn parse_id_set(raw: &[String], label: &str) -> anyhow::Result<HashSet<u64>> {
