@@ -5,6 +5,9 @@ pub mod acp_mcp;
 pub mod redact;
 pub mod bot_turns;
 pub mod config;
+/// Runtime membership in the Agent Control Plane (`[control_plane]`).
+/// Unconditional: the opt-in is the config section, not a cargo feature.
+pub mod control_plane;
 pub mod cron;
 pub mod directives;
 pub mod dispatch;

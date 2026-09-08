@@ -125,7 +125,7 @@ The config section and subsystem are named `control_plane`, not
 
 ```toml
 [control_plane]
-url = "wss://cp.example.internal/acp"
+url = "wss://cp.example.internal/cp"
 auth_key = "${OPENAB_CP_KEY}"          # per-agent credential, never shared
 namespace = "prod"
 name = "koudu"
@@ -687,7 +687,7 @@ Two distinct auth boundaries exist, and they must not be conflated:
    private network) in front — bearer keys must never cross untrusted
    cleartext TCP. See the "v1 contract amendments" in §4 for the enforced
    registration semantics.
-2. **Agent subprocess ↔ local facade (PR 3/4, not yet shipped):** the UDS
+2. **Agent subprocess ↔ local facade (PR 4/4, not yet shipped):** the UDS
    path is the only thing the child needs; filesystem permissions on the
    socket are the local auth boundary. The *local facade* is never exposed
    on TCP — this claim is about the UDS facade, not about the CP itself,
