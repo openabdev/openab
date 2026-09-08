@@ -45,7 +45,7 @@
 //! The router holds two locks and acquires them in ONE order only:
 //!
 //! ```text
-//! admission  →  inflight  →  registry (read)  →  event stream
+//! admission  →  inflight  →  event stream  →  registry (read)
 //! ```
 //!
 //! `admission` serializes the whole delegate admission sequence; `inflight`
@@ -60,17 +60,20 @@
 //!
 //! The two right-hand positions exist for exactly one code path:
 //! `delegate`'s announce/forward critical section holds `inflight` across one
-//! [`EventHub::emit`] (which takes a registry read snapshot and then the
-//! per-namespace event stream lock) and one non-blocking `try_send` to the
-//! target. That hold is what makes announcement and forwarding atomic with
-//! respect to entry removal — a teardown's terminal event can never precede
-//! the `requested` it terminates, and its best-effort `cp/cancel` can never
-//! be enqueued before the forward it cancels. The work under the hold is
-//! bounded (one serialization plus non-blocking sends). Every other path
-//! acquires and releases `registry` or the stream locks strictly OUTSIDE any
-//! `inflight` critical section, and neither the registry nor the event hub
-//! ever calls back into the router while holding its own lock, so the order
-//! above is total and acyclic.
+//! [`EventHub::emit`] (which takes the per-namespace event stream lock, then a
+//! short registry read snapshot) and one non-blocking `try_send` to the target.
+//! Snapshotting membership under the stream lock is what makes observer
+//! eligibility atomic with sequence allocation; the cloned registry snapshot
+//! releases its read lock before serialization or enqueue. The `inflight` hold
+//! makes announcement and forwarding atomic with respect to entry removal — a
+//! teardown's terminal event can never precede the `requested` it terminates,
+//! and its best-effort `cp/cancel` can never be enqueued before the forward it
+//! cancels. The work under the hold is bounded (one registry snapshot, one
+//! serialization, plus non-blocking sends). Every other path acquires and
+//! releases `registry` or the stream locks strictly OUTSIDE any `inflight`
+//! critical section, and neither the registry nor the event hub ever calls
+//! back into the router while holding its own lock, so the order above is
+//! total and acyclic.
 
 use std::collections::BTreeMap;
 

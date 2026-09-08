@@ -91,24 +91,52 @@ impl EventHub {
     /// No observers → nothing is serialized and no sequence number is
     /// consumed, which keeps the stream dense from an observer's first frame.
     ///
-    /// Ordering: the per-namespace stream lock is held from seq allocation
-    /// through the last `try_send`, so frames enter every observer queue in
-    /// seq order — concurrent emits in one namespace cannot interleave
-    /// (seq=2 enqueued before seq=1 would false-trigger gap detection).
-    /// The sends inside the lock are non-blocking `try_send`s to bounded
-    /// queues, so the hold time is bounded and the delegation path never
-    /// waits on a slow observer. The registry lock is not held here:
-    /// `observers()` returns a cloned snapshot.
+    /// Ordering and membership: the per-namespace stream lock is held from
+    /// the observer snapshot through seq allocation and the last `try_send`.
+    /// This gives membership and sequence assignment one linearization point:
+    /// an observer that joins while an older emit is waiting for the stream
+    /// lock cannot receive a newer seq and then miss the older emit under the
+    /// next seq. Concurrent emits therefore enter every eligible observer
+    /// queue in seq order without manufacturing a false gap.
+    ///
+    /// The registry read lock is nested briefly under the stream lock only to
+    /// clone the observer snapshot; it is released before serialization and
+    /// enqueue. Sends are non-blocking `try_send`s to bounded queues, so the
+    /// hold time remains bounded and the delegation path never waits on a
+    /// slow observer.
     pub fn emit(&self, registry: &Registry, namespace: &str, event: CpEvent) {
-        let observers = registry.observers(namespace);
-        if observers.is_empty() {
-            return;
-        }
+        self.emit_ordered(registry, namespace, event, || {});
+    }
+
+    /// Implementation hook used by the membership-ordering regression test to
+    /// pause an emit after it owns the stream lock but before it snapshots the
+    /// registry. Production callers always pass a no-op closure via [`Self::emit`].
+    fn emit_ordered<F>(
+        &self,
+        registry: &Registry,
+        namespace: &str,
+        event: CpEvent,
+        stream_locked: F,
+    ) where
+        F: FnOnce(),
+    {
         let stream = {
             let mut g = self.streams.lock();
             Arc::clone(g.entry(namespace.to_string()).or_default())
         };
         let mut seq = stream.lock();
+        stream_locked();
+
+        // Snapshot membership inside the same per-namespace critical section
+        // that allocates seq and enqueues the frame. Taking this snapshot
+        // before `stream.lock()` lets a newer emit overtake an older snapshot:
+        // a joining observer can receive N, miss N+1 without saturation, then
+        // receive N+2 and falsely diagnose a dropped frame.
+        let observers = registry.observers(namespace);
+        if observers.is_empty() {
+            return;
+        }
+
         *seq += 1;
         let params = EventParams {
             seq: *seq,
@@ -116,7 +144,8 @@ impl EventHub {
             namespace: namespace.to_string(),
             event,
         };
-        // Serialized once per emission; registry/hub map locks are not held.
+        // Serialized once per emission; the registry and outer hub-map locks
+        // are released, while the per-namespace stream lock remains held.
         // Fail SOFT on a serialization error: this function is reachable from
         // connection teardown (`RegistrationGuard`'s Drop, which may already
         // be unwinding — a second panic would abort the process) and from the
@@ -286,6 +315,45 @@ mod tests {
                 "received order must be strictly 1..N — enqueue happened out of seq order"
             );
         }
+    }
+
+    #[test]
+    fn observer_join_after_stream_lock_is_included_in_that_sequence() {
+        // Regression: membership must be snapshotted only after the stream
+        // lock is held. With the old snapshot-before-lock order, this emitter
+        // captures only `existing`, pauses on the stream lock, and the joining
+        // observer receives only the next frame. Keeping the snapshot under
+        // the lock makes the join visible to this seq and keeps its stream
+        // dense from the first frame.
+        let registry = Registry::new();
+        let h = hub("");
+        let _existing = observer(&registry, "prod", "existing");
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+
+        let mut joining = std::thread::scope(|s| {
+            let h_ref = &h;
+            let registry_ref = &registry;
+            s.spawn(move || {
+                h_ref.emit_ordered(registry_ref, "prod", registered("prod/first"), || {
+                    locked_tx.send(()).unwrap();
+                    resume_rx.recv().unwrap();
+                });
+            });
+
+            locked_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("emitter must reach the stream-locked hook");
+            let joining = observer(&registry, "prod", "joining");
+            resume_tx.send(()).unwrap();
+            joining
+        });
+
+        h.emit(&registry, "prod", registered("prod/second"));
+        let frames = drain(&mut joining);
+        assert_eq!(frames.len(), 2, "joining observer missed the locked emit");
+        assert_eq!(frames[0]["params"]["seq"], 1);
+        assert_eq!(frames[1]["params"]["seq"], 2);
     }
 
     #[test]
