@@ -823,11 +823,11 @@ impl TelegramConfig {
     }
 }
 
-/// `true` when env var == "1" or "true" (case-insensitive); default `false`.
-/// Matches the legacy `TELEGRAM_TRUSTED_SOURCE_ONLY` semantics.
+/// `true` when the trimmed env var is "1" or "true" (case-insensitive);
+/// default `false`. Matches the legacy `TELEGRAM_TRUSTED_SOURCE_ONLY` semantics.
 fn env_flag_true_one(key: &str) -> bool {
     std::env::var(key)
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .map(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
 
@@ -1225,6 +1225,16 @@ pub struct GoogleChatConfig {
     /// checked when `allow_all_users` resolves to `false`. Env fallback:
     /// `GOOGLE_CHAT_ALLOWED_USERS` (comma-separated).
     pub allowed_users: Option<Vec<String>>,
+    /// Use keyless ADC (GCE metadata server + IAM Credentials
+    /// `generateAccessToken`) to mint the `chat.bot` token for a distinct target
+    /// service account. Env fallback: `GOOGLE_CHAT_USE_ADC` (`true`/`1`; default
+    /// false). Ignored when a configured SA key loads successfully.
+    pub use_adc: Option<bool>,
+    /// Dedicated Google Chat service account impersonated by the attached
+    /// runtime service account. Required when `use_adc=true`; MUST differ from
+    /// the runtime identity because Google prohibits access-token
+    /// self-impersonation. Env: `GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT`.
+    pub adc_target_service_account: Option<String>,
 }
 
 /// Fully resolved Google Chat settings (config → env → default applied).
@@ -1234,6 +1244,8 @@ pub struct ResolvedGoogleChat {
     pub sa_key_json: Option<String>,
     pub sa_key_file: Option<String>,
     pub access_token: Option<String>,
+    pub use_adc: bool,
+    pub adc_target_service_account: Option<String>,
     pub audience: Option<String>,
     pub webhook_path: String,
     pub allow_all_users: bool,
@@ -1242,13 +1254,13 @@ pub struct ResolvedGoogleChat {
 
 impl GoogleChatConfig {
     /// Resolve every field: config value (if set) → `GOOGLE_CHAT_*` env →
-    /// default. String fields filter empty strings from `${}` expansion.
+    /// default. String fields filter empty or whitespace-only `${}` expansion.
     pub fn resolve(&self) -> ResolvedGoogleChat {
         let opt_str = |cfg: &Option<String>, env: &str| -> Option<String> {
             cfg.as_ref()
-                .filter(|s| !s.is_empty())
+                .filter(|s| !s.trim().is_empty())
                 .cloned()
-                .or_else(|| std::env::var(env).ok())
+                .or_else(|| std::env::var(env).ok().filter(|s| !s.trim().is_empty()))
         };
         ResolvedGoogleChat {
             enabled: self.enabled.unwrap_or_else(|| {
@@ -1259,6 +1271,13 @@ impl GoogleChatConfig {
             sa_key_json: opt_str(&self.sa_key_json, "GOOGLE_CHAT_SA_KEY_JSON"),
             sa_key_file: opt_str(&self.sa_key_file, "GOOGLE_CHAT_SA_KEY_FILE"),
             access_token: opt_str(&self.access_token, "GOOGLE_CHAT_ACCESS_TOKEN"),
+            use_adc: self
+                .use_adc
+                .unwrap_or_else(|| env_flag_true_one("GOOGLE_CHAT_USE_ADC")),
+            adc_target_service_account: opt_str(
+                &self.adc_target_service_account,
+                "GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT",
+            ),
             audience: opt_str(&self.audience, "GOOGLE_CHAT_AUDIENCE"),
             webhook_path: opt_str(&self.webhook_path, "GOOGLE_CHAT_WEBHOOK_PATH")
                 .unwrap_or_else(|| "/webhook/googlechat".into()),
@@ -2966,6 +2985,8 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
             "GOOGLE_CHAT_SA_KEY_JSON",
             "GOOGLE_CHAT_SA_KEY_FILE",
             "GOOGLE_CHAT_ACCESS_TOKEN",
+            "GOOGLE_CHAT_USE_ADC",
+            "GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT",
             "GOOGLE_CHAT_AUDIENCE",
             "GOOGLE_CHAT_WEBHOOK_PATH",
         ] {
@@ -2974,8 +2995,38 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         // --- defaults ---
         let r = GoogleChatConfig::default().resolve();
         assert!(!r.enabled);
+        assert!(!r.use_adc);
         assert!(r.audience.is_none());
         assert_eq!(r.webhook_path, "/webhook/googlechat");
+
+        // --- whitespace-only secrets/targets are absent at the config boundary ---
+        std::env::set_var("GOOGLE_CHAT_ACCESS_TOKEN", " \t ");
+        std::env::set_var("GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT", " \t ");
+        let r = GoogleChatConfig::default().resolve();
+        assert!(r.access_token.is_none());
+        assert!(r.adc_target_service_account.is_none());
+        std::env::remove_var("GOOGLE_CHAT_ACCESS_TOKEN");
+        std::env::remove_var("GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT");
+
+        // --- identity-selecting bool env accepts common case/whitespace forms ---
+        std::env::set_var("GOOGLE_CHAT_USE_ADC", " True ");
+        assert!(GoogleChatConfig::default().resolve().use_adc);
+        std::env::remove_var("GOOGLE_CHAT_USE_ADC");
+
+        // --- use_adc: config value resolves without touching env ---
+        let r = GoogleChatConfig {
+            use_adc: Some(true),
+            adc_target_service_account: Some(
+                "chat-bot@project.iam.gserviceaccount.com".into(),
+            ),
+            ..Default::default()
+        }
+        .resolve();
+        assert!(r.use_adc);
+        assert_eq!(
+            r.adc_target_service_account.as_deref(),
+            Some("chat-bot@project.iam.gserviceaccount.com")
+        );
 
         // --- config wins over env ---
         std::env::set_var("GOOGLE_CHAT_ENABLED", "true");
@@ -2989,9 +3040,9 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         assert!(!r.enabled); // config false wins over env true
         assert_eq!(r.audience.as_deref(), Some("cfg-aud"));
 
-        // --- empty-string ${} expansion falls through to env ---
+        // --- whitespace-only ${} expansion falls through to env ---
         let cfg = GoogleChatConfig {
-            audience: Some("".into()),
+            audience: Some(" \t ".into()),
             ..Default::default()
         };
         let r = cfg.resolve();

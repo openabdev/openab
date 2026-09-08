@@ -4,6 +4,7 @@
 {{- $gwCfg := omit $cfg "nameOverride" }}
 {{- $d := dict "ctx" $ "agent" (printf "%s-gateway" $name) "cfg" $gwCfg }}
 {{- $agentD := dict "ctx" $ "agent" $name "cfg" $cfg }}
+{{- $gatewaySvcAcct := (($cfg.gateway).serviceAccountName) }}
 {{- $hasTeams := and (($cfg.gateway).teams).appId (($cfg.gateway).teams).appSecret }}
 {{- $hasTelegram := (($cfg.gateway).telegram).botToken }}
 {{- $hasLine := (($cfg.gateway).line).channelSecret }}
@@ -31,6 +32,9 @@ spec:
       {{- with $.Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if $gatewaySvcAcct }}
+      serviceAccountName: {{ $gatewaySvcAcct | quote }}
       {{- end }}
       containers:
         - name: gateway
@@ -157,10 +161,16 @@ spec:
               value: "false"
             {{- end }}
             {{- end }}
-            {{- $hasGoogleChat := or (($cfg.gateway).googleChat).saKeyJson (($cfg.gateway).googleChat).accessToken (($cfg.gateway).googleChat).audience }}
+            {{- $hasGoogleChat := or (($cfg.gateway).googleChat).saKeyJson (($cfg.gateway).googleChat).accessToken (($cfg.gateway).googleChat).audience (($cfg.gateway).googleChat).useAdc }}
             {{- if $hasGoogleChat }}
             - name: GOOGLE_CHAT_ENABLED
               value: "true"
+            {{- if (($cfg.gateway).googleChat).useAdc }}
+            - name: GOOGLE_CHAT_USE_ADC
+              value: "true"
+            - name: GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT
+              value: {{ required "gateway.googleChat.adcTargetServiceAccount is required when useAdc=true" (($cfg.gateway).googleChat).adcTargetServiceAccount | quote }}
+            {{- end }}
             {{- if (($cfg.gateway).googleChat).audience }}
             - name: GOOGLE_CHAT_AUDIENCE
               value: {{ ($cfg.gateway).googleChat.audience | quote }}

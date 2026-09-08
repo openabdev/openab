@@ -1284,6 +1284,8 @@ async fn main() -> anyhow::Result<()> {
                     sa_key_json: r.sa_key_json,
                     sa_key_file: r.sa_key_file,
                     access_token: r.access_token,
+                    use_adc: r.use_adc,
+                    adc_target_service_account: r.adc_target_service_account,
                     audience: r.audience,
                     webhook_path: r.webhook_path,
                 });

@@ -131,9 +131,9 @@ pr      = ""
 
 [[openab_features]]
 feature = "streaming"
-status  = "partial"
-note    = "No native streaming API. Gateway adapter leaves uses_native_streaming=false, so core streams via the post-then-edit_message loop; each edit sends the full accumulated text as a patch call."
-source  = ["crates/openab-gateway/src/adapters/googlechat.rs#edit_message", "crates/openab-core/src/adapter.rs#uses_native_streaming"]
+status  = "not_implemented"
+note    = "Send-once by design (no cosmetic streaming). The decisive reason is structural: the unified adapter returns a synthetic `unified_<hex>` message id that is not a valid resource name, so `spaces.messages.patch` rejects it with 400 INVALID_ARGUMENT ('Missing or malformed message resource name') before any content is applied — per-token post-then-edit cannot work at all. Separately, Google Chat documents a 1 write/sec-per-space quota (create+patch+delete combined; https://developers.google.com/workspace/chat/limits); treat that as a documented constraint on high-frequency editing rather than an observed hard failure, since enforcement is burst-tolerant in practice. googlechat is therefore in NON_STREAMING_PLATFORMS, and `resolve_streaming` forces send-once on BOTH the embedded dispatch and the WebSocket gateway paths — matching Google Chat's documented send-once default. (Previously 'partial': core attempted post-then-edit, which failed on every edit.)"
+source  = ["crates/openab-core/src/gateway.rs#NON_STREAMING_PLATFORMS", "crates/openab-core/src/adapter.rs#resolve_streaming", "crates/openab-core/src/adapter.rs#uses_native_streaming"]
 pr      = ""
 
 [[openab_features]]
@@ -153,7 +153,7 @@ pr      = ""
 [[openab_features]]
 feature = "delete_message"
 status  = "not_implemented"
-note    = "GatewayAdapter overrides delete_message to emit a fire-and-forget command:\"delete_message\" instead of the trait default (edit-to-zero-width). The googlechat adapter does not match delete_message in handle_reply (only add_reaction/remove_reaction/create_topic/edit_message), so it falls through to the send path with empty text → hits the empty-message short-circuit and sends nothing. Net: delete is a no-op on Google Chat."
+note    = "GatewayAdapter emits a fire-and-forget command:\"delete_message\" instead of the trait default (edit-to-zero-width). The googlechat adapter explicitly matches delete_message with the other unsupported commands and returns before token resolution, logging, or network I/O. Net: delete is an intentional no-op on Google Chat."
 source  = ["crates/openab-gateway/src/adapters/googlechat.rs#handle_reply", "crates/openab-core/src/gateway.rs#delete_message", "crates/openab-core/src/adapter.rs#delete_message"]
 pr      = ""
 
@@ -246,6 +246,14 @@ source = "crates/openab-gateway/src/adapters/googlechat.rs#build_jwt"
 refs   = []
 
 [[quirks]]
+date   = "2026-08-25"
+title  = "Keyless ADC outbound path (no SA key)"
+note   = "Outbound creds have a third option beside the SA-key JWT-bearer exchange and the static token: keyless ADC (use_adc / GOOGLE_CHAT_USE_ADC). MetadataTokenSource reads the attached runtime SA email + base token from GCE metadata, then calls IAM Credentials generateAccessToken for the distinct adc_target_service_account / GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT and requests chat.bot. Google prohibits access-token self-impersonation, so runtime and target identities MUST differ; the code rejects equality before minting. The runtime SA needs roles/iam.serviceAccountTokenCreator on the target. Auth precedence: SA key > ADC target > explicitly configured static token (ADC-to-static degradation logs a possible identity switch)."
+kind   = "openab_decision"
+source = "crates/openab-gateway/src/adapters/googlechat.rs#MetadataTokenSource"
+refs   = []
+
+[[quirks]]
 date   = "2026-07-04"
 title  = "Reactions are structurally impossible for the bot"
 note   = "The single biggest divergence from other adapters: Google Chat's reaction API is user-auth only (the reactions.create REST reference explicitly lists only user-auth scopes). A chat.bot app cannot add/remove reactions at all, so OpenAB's status-reaction UX (👀 queued / 🤔 thinking / tool emojis / mood face) is silently dropped. The adapter deliberately early-returns on add_reaction/remove_reaction/create_topic rather than issuing doomed API calls. Consider a message-edit-based status line if a progress indicator is needed here."
@@ -287,8 +295,8 @@ refs   = []
 
 [[quirks]]
 date   = "2026-07-04"
-title  = "Delete is a silent no-op (not even the edit fallback)"
-note   = "Unlike platforms where delete_message falls back to the trait's edit-to-zero-width, on Google Chat the delete_message command isn't matched in handle_reply, falls through to the send path with empty text, and hits the empty-message short-circuit — so nothing is sent and no edit occurs. Streaming-placeholder cleanup that relies on delete is therefore a no-op here."
+title  = "Delete is an explicit no-op (not even the edit fallback)"
+note   = "Unlike platforms where delete_message falls back to the trait's edit-to-zero-width, Google Chat matches the delete_message command in handle_reply and returns before token resolution, logging, or network I/O. Streaming-placeholder cleanup that relies on delete is therefore an intentional no-op here."
 kind   = "openab_decision"
 source = "crates/openab-gateway/src/adapters/googlechat.rs#handle_reply"
 refs   = []

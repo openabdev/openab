@@ -395,6 +395,11 @@ agents:
     gateway:
       enabled: false    # set to true + provide url to enable the [gateway] config block
       deploy: true      # set to false to skip Gateway Deployment/Service (config-only mode)
+      # Existing Kubernetes ServiceAccount for the gateway pod. Empty omits
+      # serviceAccountName and preserves the Kubernetes default identity; it
+      # does not inherit per-agent or chart-global serviceAccountName values.
+      # Required on GKE when googleChat.useAdc uses Workload Identity.
+      serviceAccountName: ""
       url: ""           # e.g. ws://openab-gateway:8080/ws
       platform: "telegram"  # default platform when gateway is enabled
       token: ""         # optional shared secret (injected via GATEWAY_WS_TOKEN env var)
@@ -459,6 +464,8 @@ agents:
         audience: ""           # JWT audience → GOOGLE_CHAT_AUDIENCE (set to your webhook URL to enable JWT verification)
         saKeyJson: ""          # Service account key JSON string → GOOGLE_CHAT_SA_KEY_JSON (recommended, auto-refresh)
         accessToken: ""        # Static OAuth2 access token → GOOGLE_CHAT_ACCESS_TOKEN (fallback, 1-hour TTL)
+        useAdc: false          # Keyless ADC → GOOGLE_CHAT_USE_ADC. Runtime SA impersonates the distinct adcTargetServiceAccount; no SA key file. Needs roles/iam.serviceAccountTokenCreator on the target + iamcredentials.googleapis.com. Self-impersonation is prohibited.
+        adcTargetServiceAccount: "" # Dedicated Chat-app SA email → GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT. Required when useAdc=true; MUST differ from the pod/runtime SA.
         webhookPath: ""        # Gateway default: /webhook/googlechat → GOOGLE_CHAT_WEBHOOK_PATH
       # WeCom (企业微信) adapter config (gateway-side env vars)
       # See docs/wecom.md for full setup guide
