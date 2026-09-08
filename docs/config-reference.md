@@ -777,6 +777,7 @@ and no behaviour change. Unknown keys are a hard startup failure.
 ```toml
 [control_plane]
 url = "wss://cp.example.internal/cp"   # the CP mounts the socket at /cp
+# allow_insecure_transport = true       # only for explicit non-loopback ws:// exceptions
 auth_key = "${OPENAB_CP_KEY}"          # per-agent credential, never shared
 namespace = "prod"
 name = "koudu"
@@ -790,7 +791,8 @@ tier = "batch"
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `url` | ✅ | — | CP WebSocket endpoint (`ws://` or `wss://`), path `/cp` |
+| `url` | ✅ | — | CP WebSocket endpoint, path `/cp`. Remote endpoints should use `wss://`; `ws://` is accepted only on loopback unless explicitly overridden |
+| `allow_insecure_transport` | — | `false` | Permit non-loopback cleartext `ws://`. This sends the bearer key without connection-level encryption and logs a startup warning |
 | `auth_key` | ✅ | — | Bearer key sent on the upgrade request. Use `${ENV}` or `[secrets.refs]` — never a literal |
 | `namespace` | ✅ | — | Asserted namespace; the CP verifies it against the key's claims |
 | `name` | ✅ | — | Asserted logical agent name; likewise verified |
@@ -813,19 +815,25 @@ than chat messages.
 
 | Config | Result |
 |--------|--------|
-| `[control_plane] type = "worker"`, no adapter | Worker mode — pool + control-plane client, no chat platform |
-| `[control_plane] type = "primary"`, no adapter | Startup error — a primary's prompts come from a chat platform |
+| `[control_plane] type = "worker"`, no adapter | Full runtime — pool + control-plane client, no chat platform |
+| `[control_plane] type = "primary"`, no adapter and no `[mcp]` | Startup error — no local surface can initiate work |
 | `[mcp]` only, no adapter | Facade-only mode (unchanged) |
-| `[mcp]` + worker, no adapter | Both — the facade listener and the control-plane client |
+| `[mcp]` + worker, no adapter | Full runtime — facade listener + worker-side control-plane client |
+| `[mcp]` + primary, no adapter | Full runtime — facade listener + primary registration (initiation tools land in PR 4/4) |
 
 ### Operational notes
 
 - **The key never reaches the agent.** Agent subprocesses start from
   `env_clear()` with a fixed baseline plus explicit `[agent].env` keys;
   `auth_key` is in neither, and it is never logged.
-- **Reconnects are automatic** with 1/2/4/8/16/30s backoff. One instance id is
-  generated per process and reused across reconnects, so the CP can tell a
-  reconnecting replica from a new one.
+- **Reconnects are automatic** with equal jitter over 1/2/4/8/16/30s base
+  backoff and a 10-second connect deadline. One instance id is generated per
+  process and reused across reconnects, so the CP can tell a reconnecting
+  replica from a new one without a fleet-wide reconnect herd.
+- **Transport is fail-closed.** Remote bearer credentials require `wss://` by
+  default. Loopback `ws://` is allowed for local development; a non-loopback
+  cleartext exception requires `allow_insecure_transport = true` and emits a
+  warning because the bearer key is not encrypted by that connection.
 - **Per-turn ceiling.** A delegation is bounded by the nearer of its CP
   deadline and `[pool].prompt_hard_timeout_secs`; exceeding the local one is
   reported to the initiator as `timeout`.

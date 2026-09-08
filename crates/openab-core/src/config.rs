@@ -3,6 +3,7 @@ use regex::Regex;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 /// Controls how incoming messages are dispatched to ACP turns.
 ///
@@ -142,12 +143,17 @@ fn default_mcp_listen() -> String {
 /// **Strict.** An unknown key here is a hard startup failure rather than a
 /// silently-defaulted one: a mistyped `max_delegated_sessions` would otherwise
 /// look effective while the runtime advertised the default budget of 1.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ControlPlaneConfig {
     /// CP WebSocket endpoint, e.g. `wss://cp.internal:9800/cp`. The server
     /// mounts the socket at `/cp`.
     pub url: String,
+    /// Explicit opt-in for sending the bearer key over cleartext `ws://` to a
+    /// non-loopback host. Defaults to false; loopback `ws://` and all `wss://`
+    /// endpoints do not need this escape hatch.
+    #[serde(default)]
+    pub allow_insecure_transport: bool,
     /// Bearer key presented on the upgrade request. The CP maps it to the
     /// immutable identity claims below and rejects any mismatch, so this value
     /// is the whole credential: it is never logged, and never reaches the
@@ -201,8 +207,50 @@ fn default_max_delegated_sessions() -> u32 {
     1
 }
 
+impl std::fmt::Debug for ControlPlaneConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlPlaneConfig")
+            .field("url", &self.url)
+            .field("allow_insecure_transport", &self.allow_insecure_transport)
+            .field("auth_key", &"[REDACTED]")
+            .field("namespace", &self.namespace)
+            .field("name", &self.name)
+            .field("agent_type", &self.agent_type)
+            .field("labels", &self.labels)
+            .field("max_delegated_sessions", &self.max_delegated_sessions)
+            .finish()
+    }
+}
+
+fn control_plane_transport_is_insecure(cp: &ControlPlaneConfig) -> anyhow::Result<bool> {
+    let request = cp
+        .url
+        .as_str()
+        .into_client_request()
+        .map_err(|e| anyhow::anyhow!("control_plane.url is not a valid WebSocket URL: {e}"))?;
+    let uri = request.uri();
+    let scheme = uri
+        .scheme_str()
+        .ok_or_else(|| anyhow::anyhow!("control_plane.url must use ws:// or wss://"))?;
+    if scheme == "wss" {
+        return Ok(false);
+    }
+    anyhow::ensure!(scheme == "ws", "control_plane.url must use ws:// or wss://");
+    let host = uri
+        .host()
+        .ok_or_else(|| anyhow::anyhow!("control_plane.url must include a host"))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false);
+    Ok(!loopback)
+}
+
 #[derive(Debug, Clone, Deserialize)]
-pub struct AgentCoreConfig {    /// AgentCore Runtime ARN (required)
+pub struct AgentCoreConfig {
+    /// AgentCore Runtime ARN (required)
     pub runtime_arn: String,
     /// ACP agent command to run in the PTY shell (default: kiro-cli acp --trust-all-tools)
     #[serde(default = "default_agentcore_shell_command")]
@@ -2417,6 +2465,12 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
                 "control_plane.{field} must not be empty"
             );
         }
+        let insecure_non_loopback = control_plane_transport_is_insecure(cp)?;
+        anyhow::ensure!(
+            !insecure_non_loopback || cp.allow_insecure_transport,
+            "control_plane.url uses cleartext ws:// on a non-loopback host; use wss://, \
+             a loopback endpoint, or explicitly set allow_insecure_transport = true"
+        );
         anyhow::ensure!(
             cp.max_delegated_sessions > 0,
             "control_plane.max_delegated_sessions must be > 0 \
@@ -2690,7 +2744,7 @@ tier = "batch"
     #[test]
     fn control_plane_defaults_are_conservative() {
         let cfg = parse_config_str(
-            "[discord]\nbot_token = \"x\"\n[control_plane]\nurl = \"ws://cp:9800/cp\"\n\
+            "[discord]\nbot_token = \"x\"\n[control_plane]\nurl = \"wss://cp:9800/cp\"\n\
              auth_key = \"k\"\nnamespace = \"prod\"\nname = \"koudu\"\ntype = \"primary\"\n",
             "test",
         )
@@ -2709,7 +2763,7 @@ tier = "batch"
     #[test]
     fn control_plane_refuses_the_observer_role() {
         let err = parse_config_str(
-            "[control_plane]\nurl = \"ws://cp:9800/cp\"\nauth_key = \"k\"\n\
+            "[control_plane]\nurl = \"wss://cp:9800/cp\"\nauth_key = \"k\"\n\
              namespace = \"prod\"\nname = \"lobby\"\ntype = \"observer\"\n",
             "test",
         )
@@ -2724,7 +2778,7 @@ tier = "batch"
     #[test]
     fn control_plane_unknown_key_is_a_hard_failure() {
         let err = parse_config_str(
-            "[control_plane]\nurl = \"ws://cp:9800/cp\"\nauth_key = \"k\"\n\
+            "[control_plane]\nurl = \"wss://cp:9800/cp\"\nauth_key = \"k\"\n\
              namespace = \"prod\"\nname = \"w\"\ntype = \"worker\"\nmax_delegated_session = 4\n",
             "test",
         )
@@ -2769,7 +2823,7 @@ tier = "batch"
     #[test]
     fn control_plane_zero_capacity_is_rejected() {
         let err = parse_config_str(
-            "[control_plane]\nurl = \"ws://c/cp\"\nauth_key = \"k\"\nnamespace = \"p\"\n\
+            "[control_plane]\nurl = \"wss://c/cp\"\nauth_key = \"k\"\nnamespace = \"p\"\n\
              name = \"w\"\ntype = \"worker\"\nmax_delegated_sessions = 0\n",
             "test",
         )
@@ -2778,6 +2832,45 @@ tier = "batch"
             .to_string()
             .contains("control_plane.max_delegated_sessions must be > 0"));
     }
+    #[test]
+    fn control_plane_transport_requires_tls_or_an_explicit_exception() {
+        let common = "auth_key = \"k\"\nnamespace = \"prod\"\nname = \"w\"\ntype = \"worker\"\n";
+        parse_config_str(
+            &format!("[control_plane]\nurl = \"ws://127.0.0.1:9800/cp\"\n{common}"),
+            "test",
+        )
+        .expect("loopback cleartext");
+        parse_config_str(
+            &format!("[control_plane]\nurl = \"ws://[::1]:9800/cp\"\n{common}"),
+            "test",
+        )
+        .expect("IPv6 loopback cleartext");
+        parse_config_str(
+            &format!("[control_plane]\nurl = \"wss://cp.example/cp\"\n{common}"),
+            "test",
+        )
+        .expect("TLS remote");
+        let err = parse_config_str(
+            &format!("[control_plane]\nurl = \"ws://cp.example/cp\"\n{common}"),
+            "test",
+        )
+        .expect_err("remote cleartext");
+        assert!(err.to_string().contains("allow_insecure_transport"));
+        let cfg = parse_config_str(&format!("[control_plane]\nurl = \"ws://cp.internal/cp\"\nallow_insecure_transport = true\n{common}"), "test").unwrap();
+        assert!(cfg.control_plane.unwrap().allow_insecure_transport);
+    }
+
+    #[test]
+    fn control_plane_debug_always_redacts_the_auth_key() {
+        let cfg = parse_config_str("[control_plane]\nurl = \"wss://cp.example/cp\"\nauth_key = \"top-secret-key\"\nnamespace = \"prod\"\nname = \"w\"\ntype = \"worker\"\n", "test").unwrap().control_plane.unwrap();
+        let debug = format!("{cfg:?}");
+        assert!(
+            !debug.contains("top-secret-key"),
+            "credential leaked: {debug}"
+        );
+        assert!(debug.contains("[REDACTED]"));
+    }
+
     use std::io::Write;
 
     #[test]

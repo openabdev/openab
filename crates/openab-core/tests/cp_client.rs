@@ -161,6 +161,7 @@ async fn spawn_cp(cfg: CpConfig) -> (Arc<AppState>, String) {
 fn worker_cfg(url: &str) -> ControlPlaneConfig {
     ControlPlaneConfig {
         url: url.to_string(),
+        allow_insecure_transport: false,
         auth_key: WORKER_KEY.to_string(),
         namespace: "prod".into(),
         name: "worker-1".into(),

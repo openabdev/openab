@@ -27,6 +27,7 @@ use openab_cp::proto::{
     JsonRpcErrorResponse, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RegisterAck,
     RegisterParams, PROTOCOL_VERSION,
 };
+use rand::Rng;
 use tokio::net::TcpStream;
 use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -36,7 +37,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::{debug, error, info, warn};
 
-use crate::config::ControlPlaneConfig;
+use crate::config::{ControlPlaneConfig, CpAgentType};
 use crate::control_plane::executor::{DelegationExecutor, PromptRunner};
 
 /// Backoff ceiling, matching the gateway adapter.
@@ -49,15 +50,19 @@ const STABLE_SESSION_SECS: u64 = 60;
 /// agent, drop the session) before their tasks are aborted outright.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Inbound WS message/frame ceiling, mirroring the CP server's own
-/// `max_frame_bytes` default (1 MiB). Outbound frames are already capped at
-/// the executor; this closes the other direction.
+/// Bidirectional WS message/frame ceiling, mirroring the CP server's own
+/// `max_frame_bytes` default (1 MiB). The executor caps result/error fields;
+/// [`send`] additionally caps each complete serialized outbound frame.
 ///
 /// Note (F51): The server default is 1 MiB but configurable hub-side. If the
 /// hub is configured with a larger ceiling, frames exceeding 1 MiB are
 /// rejected at the transport layer; future protocol revisions may negotiate
 /// effective limits in `RegisterAck`.
-const MAX_INBOUND_FRAME_BYTES: usize = 1024 * 1024;
+const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+/// Bound on DNS/TCP/TLS/WebSocket establishment. The outer shutdown select can
+/// cancel this sooner, but a blackholed endpoint must still enter backoff.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Bound on the wait for the `cp/register` ack, mirroring the CP's own
 /// `register_timeout_secs` default. A CP that upgrades the socket but never
@@ -87,6 +92,9 @@ impl ControlPlaneClient {
         runner: Arc<dyn PromptRunner>,
         prompt_hard_timeout: Duration,
     ) -> Self {
+        if cfg.allow_insecure_transport && cfg.url.starts_with("ws://") {
+            warn!(url = %cfg.url, "control-plane cleartext transport explicitly enabled; the bearer key is not encrypted by this connection");
+        }
         let instance_id = uuid::Uuid::new_v4().to_string();
         // Advertised budget until the first ack tells us the effective one.
         let executor = Arc::new(DelegationExecutor::new(
@@ -148,9 +156,7 @@ impl ControlPlaneClient {
                     // then promptly closes (lease misconfig, crash loop,
                     // rolling deploys) would otherwise reconnect every second
                     // forever — a clean Close frame is not evidence of health.
-                    if session_started.elapsed() >= Duration::from_secs(STABLE_SESSION_SECS) {
-                        backoff = 1;
-                    }
+                    backoff = backoff_after_session(backoff, session_started.elapsed());
                     warn!(
                         backoff_secs = backoff,
                         "control-plane connection closed — reconnecting"
@@ -160,14 +166,20 @@ impl ControlPlaneClient {
                     error!(error = %format!("{e:#}"), backoff_secs = backoff, "control-plane connection failed");
                 }
             }
+            let retry_delay = jittered_backoff(backoff);
+            debug!(
+                base_backoff_secs = backoff,
+                retry_delay_ms = retry_delay.as_millis(),
+                "control-plane reconnect delay selected"
+            );
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(backoff)) => {}
+                _ = tokio::time::sleep(retry_delay) => {}
                 _ = shutdown.changed() => {
                     info!("control-plane client shutting down");
                     return;
                 }
             }
-            backoff = (backoff * 2).min(MAX_BACKOFF_SECS);
+            backoff = next_backoff(backoff);
         }
     }
 
@@ -175,7 +187,7 @@ impl ControlPlaneClient {
         &self,
         shutdown: &mut watch::Receiver<bool>,
     ) -> anyhow::Result<Outcome> {
-        let ws = self.connect().await?;
+        let ws = self.connect_with_timeout().await?;
         let (mut sink, mut stream) = ws.split();
         let ack = tokio::time::timeout(REGISTER_TIMEOUT, self.register(&mut sink, &mut stream))
             .await
@@ -197,6 +209,17 @@ impl ControlPlaneClient {
         self.serve(sink, stream, &ack, shutdown).await
     }
 
+    async fn connect_with_timeout(&self) -> anyhow::Result<Ws> {
+        tokio::time::timeout(CONNECT_TIMEOUT, self.connect())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "control-plane connection timed out after {}s",
+                    CONNECT_TIMEOUT.as_secs()
+                )
+            })?
+    }
+
     /// Dial the CP. The key travels in the `Authorization` header, never the
     /// URL — the CP's own contract, so it cannot leak into an access log.
     async fn connect(&self) -> anyhow::Result<Ws> {
@@ -212,8 +235,8 @@ impl ControlPlaneClient {
         // 64 MiB default from an anomalous or misconfigured hub before any
         // parsing runs.
         let ws_config = WebSocketConfig {
-            max_message_size: Some(MAX_INBOUND_FRAME_BYTES),
-            max_frame_size: Some(MAX_INBOUND_FRAME_BYTES),
+            max_message_size: Some(MAX_FRAME_BYTES),
+            max_frame_size: Some(MAX_FRAME_BYTES),
             ..Default::default()
         };
         let (ws, _resp) =
@@ -270,7 +293,7 @@ impl ControlPlaneClient {
                     let result = parsed
                         .result
                         .ok_or_else(|| anyhow::anyhow!("cp/register reply carried no result"))?;
-                    return Ok(serde_json::from_value(result)?);
+                    return validate_register_ack(result);
                 }
                 Message::Close(_) => {
                     anyhow::bail!("control plane closed the connection during registration")
@@ -456,6 +479,15 @@ impl ControlPlaneClient {
 
         match method.as_str() {
             methods::DELEGATE => {
+                if self.cfg.agent_type != CpAgentType::Worker {
+                    return error_reply(
+                        id,
+                        ErrorObject::new(
+                            codes::POLICY_DENIED,
+                            "this runtime is registered as primary and does not serve delegations",
+                        ),
+                    );
+                }
                 let forward: Option<DelegateForward> =
                     msg.params.and_then(|p| serde_json::from_value(p).ok());
                 match forward {
@@ -479,7 +511,7 @@ impl ControlPlaneClient {
                             .cancel(&params.delegation_id, params.admission);
                         info!(
                             delegation_id = %params.delegation_id,
-                            reason = %params.reason,
+                            reason_bytes = params.reason.len(),
                             known,
                             "cp/cancel received"
                         );
@@ -523,15 +555,43 @@ enum FrameAction {
 
 async fn send(sink: &mut WsSink, frame: &JsonRpcRequest) -> anyhow::Result<()> {
     let text = serde_json::to_string(frame)?;
-    if text.len() > MAX_INBOUND_FRAME_BYTES {
+    if text.len() > MAX_FRAME_BYTES {
         anyhow::bail!(
             "outbound frame ({} bytes) exceeds transport limit ({} bytes)",
             text.len(),
-            MAX_INBOUND_FRAME_BYTES
+            MAX_FRAME_BYTES
         );
     }
     sink.send(Message::Text(text)).await?;
     Ok(())
+}
+
+fn validate_register_ack(result: serde_json::Value) -> anyhow::Result<RegisterAck> {
+    let ack: RegisterAck = serde_json::from_value(result)?;
+    anyhow::ensure!(
+        ack.protocol_version == PROTOCOL_VERSION,
+        "control plane acknowledged protocol version {}, but this runtime requires {}",
+        ack.protocol_version,
+        PROTOCOL_VERSION
+    );
+    Ok(ack)
+}
+
+fn jittered_backoff(base_secs: u64) -> Duration {
+    let max_ms = base_secs.saturating_mul(1000).max(1);
+    Duration::from_millis(rand::thread_rng().gen_range(max_ms / 2..=max_ms))
+}
+
+fn next_backoff(current: u64) -> u64 {
+    current.saturating_mul(2).min(MAX_BACKOFF_SECS)
+}
+
+fn backoff_after_session(current: u64, elapsed: Duration) -> u64 {
+    if elapsed >= Duration::from_secs(STABLE_SESSION_SECS) {
+        1
+    } else {
+        current
+    }
 }
 
 fn ok_reply_text(id: u64) -> Option<String> {
@@ -646,6 +706,56 @@ max_delegated_sessions = 3
         c.agent_type = CpAgentType::Primary;
         let ty: openab_cp::proto::AgentType = c.agent_type.into();
         assert_eq!(ty, openab_cp::proto::AgentType::Primary);
+    }
+
+    #[test]
+    fn a_primary_refuses_worker_side_delegate_frames() {
+        let mut primary_cfg = cfg();
+        primary_cfg.agent_type = CpAgentType::Primary;
+        let primary =
+            ControlPlaneClient::new(primary_cfg, Arc::new(NoopRunner), Duration::from_secs(60));
+        let frame = serde_json::json!({"jsonrpc":"2.0","id":9,"method":"cp/delegate","params":{
+            "delegation_id":"d-1","admission":7,"prompt":"hi",
+            "deadline":(chrono::Utc::now()+chrono::Duration::seconds(60)).to_rfc3339(),
+            "from":"prod/koudu","chain":["prod/koudu"]}})
+        .to_string();
+        let FrameAction::Reply(reply) = primary.handle_frame(&frame) else {
+            panic!("primary served work");
+        };
+        let v: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(v["error"]["code"], codes::POLICY_DENIED);
+    }
+
+    #[test]
+    fn register_ack_requires_the_exact_protocol_version() {
+        let good = serde_json::json!({"protocol_version":PROTOCOL_VERSION,"heartbeat_interval_secs":15,"lease_expiry_secs":45,"effective_max_delegated_sessions":1});
+        assert!(validate_register_ack(good).is_ok());
+        let bad = serde_json::json!({"protocol_version":PROTOCOL_VERSION+1,"heartbeat_interval_secs":15,"lease_expiry_secs":45,"effective_max_delegated_sessions":1});
+        assert!(validate_register_ack(bad)
+            .unwrap_err()
+            .to_string()
+            .contains("requires"));
+    }
+
+    #[test]
+    fn reconnect_backoff_is_jittered_bounded_and_resets_only_after_stability() {
+        for base in [1, 2, 4, 8, 16, 30] {
+            for _ in 0..100 {
+                let delay = jittered_backoff(base);
+                assert!(delay >= Duration::from_millis(base * 500));
+                assert!(delay <= Duration::from_secs(base));
+            }
+        }
+        assert_eq!(next_backoff(16), 30);
+        assert_eq!(next_backoff(30), 30);
+        assert_eq!(
+            backoff_after_session(16, Duration::from_secs(STABLE_SESSION_SECS - 1)),
+            16
+        );
+        assert_eq!(
+            backoff_after_session(16, Duration::from_secs(STABLE_SESSION_SECS)),
+            1
+        );
     }
 
     #[test]
@@ -769,6 +879,32 @@ max_delegated_sessions = 3
     fn garbage_is_dropped_not_answered() {
         let c = client();
         assert!(matches!(c.handle_frame("{not json"), FrameAction::Ignore));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_websocket_handshake_hits_the_connect_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let mut stalled_cfg = cfg();
+        stalled_cfg.url = format!("ws://{addr}/cp");
+        let stalled = Arc::new(ControlPlaneClient::new(
+            stalled_cfg,
+            Arc::new(NoopRunner),
+            Duration::from_secs(60),
+        ));
+        let connecting = tokio::spawn(async move { stalled.connect_with_timeout().await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(CONNECT_TIMEOUT + Duration::from_secs(1)).await;
+        let error = match connecting.await.unwrap() {
+            Ok(_) => panic!("unexpected connection"),
+            Err(e) => e,
+        };
+        assert!(error.to_string().contains("timed out"));
+        server.abort();
     }
 
     #[tokio::test]

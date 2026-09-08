@@ -19,7 +19,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -144,9 +144,16 @@ impl DelegationExecutor {
         self.effective_max.load(Ordering::Relaxed)
     }
 
+    fn lock_inflight(&self) -> MutexGuard<'_, BTreeMap<String, (AdmissionToken, Arc<Notify>)>> {
+        self.inflight.lock().unwrap_or_else(|poisoned| {
+            warn!("recovering poisoned control-plane inflight mutex");
+            poisoned.into_inner()
+        })
+    }
+
     /// Number of admitted, not-yet-finished delegations.
     pub fn active(&self) -> u32 {
-        self.inflight.lock().expect("inflight mutex").len() as u32
+        self.lock_inflight().len() as u32
     }
 
     /// Reserve a slot for `delegation_id`, or explain why not.
@@ -156,7 +163,7 @@ impl DelegationExecutor {
         admission: AdmissionToken,
     ) -> std::result::Result<Arc<Notify>, Refusal> {
         let max = self.effective_max();
-        let mut g = self.inflight.lock().expect("inflight mutex");
+        let mut g = self.lock_inflight();
         if g.contains_key(delegation_id) {
             return Err(Refusal::Duplicate);
         }
@@ -170,10 +177,7 @@ impl DelegationExecutor {
     }
 
     fn release(&self, delegation_id: &str) {
-        self.inflight
-            .lock()
-            .expect("inflight mutex")
-            .remove(delegation_id);
+        self.lock_inflight().remove(delegation_id);
     }
 
     /// Signal cancellation for one delegation (`cp/cancel` from the CP).
@@ -185,7 +189,7 @@ impl DelegationExecutor {
     /// serving task is still observed instead of being lost.
     pub fn cancel(&self, delegation_id: &str, admission: AdmissionToken) -> bool {
         let signal = {
-            let g = self.inflight.lock().expect("inflight mutex");
+            let g = self.lock_inflight();
             match g.get(delegation_id) {
                 // The token names ONE admission of this reusable id. A stale
                 // cancel — the CP swept admission A, this worker was already
@@ -221,9 +225,7 @@ impl DelegationExecutor {
     /// possible nor needed.
     pub fn cancel_all(&self) {
         let signals: Vec<Arc<Notify>> = self
-            .inflight
-            .lock()
-            .expect("inflight mutex")
+            .lock_inflight()
             .values()
             .map(|(_, s)| Arc::clone(s))
             .collect();
@@ -369,7 +371,10 @@ impl DelegationExecutor {
             .await
             .is_err()
         {
-            warn!(session_key, "session discard exceeded its bound; leaving it to pool cleanup");
+            warn!(
+                session_key,
+                "session discard exceeded its bound; leaving it to pool cleanup"
+            );
         }
     }
 
@@ -380,7 +385,10 @@ impl DelegationExecutor {
             .await
             .is_err()
         {
-            warn!(session_key, "session discard exceeded its bound; leaving it to pool cleanup");
+            warn!(
+                session_key,
+                "session discard exceeded its bound; leaving it to pool cleanup"
+            );
         }
     }
 
@@ -852,6 +860,27 @@ mod tests {
             "the clamped ceiling, not the advertised one, is enforced"
         );
         assert_eq!(runner.starts(), 0);
+    }
+
+    #[test]
+    fn a_poisoned_inflight_mutex_is_recovered_even_on_the_drop_path() {
+        let ex = executor(FakeRunner::completing("ok"), 1);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let ex = Arc::clone(&ex);
+            move || {
+                let _guard = ex.inflight.lock().unwrap();
+                panic!("poison map");
+            }
+        }));
+        assert!(poisoned.is_err());
+        assert_eq!(ex.active(), 0);
+        {
+            let _slot = SlotGuard {
+                executor: ex.as_ref(),
+                id: "missing".into(),
+            };
+        }
+        let _admitted = ex.admit("after-poison", 1).expect("recovered admission");
     }
 
     #[tokio::test]
