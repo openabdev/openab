@@ -605,3 +605,175 @@ async fn shutdown_drains_an_inflight_delegation_before_exit() {
     })
     .await;
 }
+
+/// The PR4 local API against two real runtime clients and the real CP server:
+/// primary UDS -> primary client -> CP -> worker client -> scripted agent -> result.
+#[tokio::test]
+async fn primary_local_api_lists_spawns_and_awaits_over_the_real_cp() {
+    use openab_core::control_plane::{
+        serve_local, ClientCommand, LocalClient, LocalRequest, LocalResponse, LocalTarget,
+    };
+
+    let (state, url) = spawn_cp(cp_config("")).await;
+    let worker_runner = ScriptedRunner::new(Script::Answer);
+    let (worker_shutdown, worker_task, _worker) =
+        spawn_worker(&url, Arc::clone(&worker_runner), Duration::from_secs(60));
+
+    let primary_runner = ScriptedRunner::new(Script::Answer);
+    let mut cfg = worker_cfg(&url);
+    cfg.auth_key = PRIMARY_KEY.to_string();
+    cfg.name = "koudu".into();
+    cfg.agent_type = CpAgentType::Primary;
+    let (primary_shutdown, primary_rx) = tokio::sync::watch::channel(false);
+    let primary = Arc::new(ControlPlaneClient::new(
+        cfg,
+        primary_runner,
+        Duration::from_secs(60),
+    ));
+    let primary_handle = primary.handle();
+    let primary_task = tokio::spawn(primary.run(primary_rx));
+
+    wait_for("both runtimes to register", || {
+        state.registry.list("prod").len() >= 2
+    })
+    .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("agent.sock");
+    let (local_shutdown, local_rx) = tokio::sync::watch::channel(false);
+    let local_task = tokio::spawn(serve_local(socket.clone(), primary_handle, local_rx));
+    wait_for("local agent socket", || socket.exists()).await;
+    let local = LocalClient::new(socket);
+
+    let list = local.request(&LocalRequest::ListAgents).await.unwrap();
+    let LocalResponse::Agents { agents } = list else {
+        panic!("expected agent roster");
+    };
+    assert!(agents.iter().any(|a| a.name == "worker-1"));
+
+    let spawned = local
+        .request(&LocalRequest::Spawn {
+            delegation_id: "d-local-e2e".into(),
+            target: LocalTarget {
+                name: Some("worker-1".into()),
+                labels: None,
+            },
+            prompt: "ship it".into(),
+            deadline_secs: 60,
+            parent: None,
+        })
+        .await
+        .unwrap();
+    let LocalResponse::Spawned {
+        handle,
+        assigned_to,
+    } = spawned
+    else {
+        panic!("expected spawned handle");
+    };
+    assert_eq!(assigned_to, "prod/worker-1");
+    assert_eq!(handle.len(), 64, "opaque random handle token");
+
+    let terminal = local
+        .request(&LocalRequest::Await { handle })
+        .await
+        .unwrap();
+    let LocalResponse::Terminal {
+        status,
+        result,
+        error,
+    } = terminal
+    else {
+        panic!("expected terminal result");
+    };
+    assert_eq!(
+        status,
+        openab_core::control_plane::DelegationStatusWire::Completed
+    );
+    assert_eq!(result.as_deref(), Some("done: ship it"));
+    assert!(error.is_none());
+
+    let _ = local_shutdown.send(true);
+    let _ = primary_shutdown.send(true);
+    let _ = worker_shutdown.send(true);
+    let _ = local_task.await;
+    let _ = primary_task.await;
+    let _ = worker_task.await;
+
+    // Compile-time assertion that the direct command type remains exported for
+    // in-process callers as well as the UDS frontends.
+    let _unused: Option<ClientCommand> = None;
+}
+
+#[tokio::test]
+async fn primary_local_api_cancels_a_running_delegation_over_the_real_cp() {
+    use openab_core::control_plane::{
+        serve_local, LocalClient, LocalRequest, LocalResponse, LocalTarget,
+    };
+
+    let (state, url) = spawn_cp(cp_config("max_deadline_secs = 600")).await;
+    let worker_runner = ScriptedRunner::new(Script::Hang);
+    let (worker_shutdown, worker_task, _worker) =
+        spawn_worker(&url, Arc::clone(&worker_runner), Duration::from_secs(600));
+
+    let mut cfg = worker_cfg(&url);
+    cfg.auth_key = PRIMARY_KEY.to_string();
+    cfg.name = "koudu".into();
+    cfg.agent_type = CpAgentType::Primary;
+    let (primary_shutdown, primary_rx) = tokio::sync::watch::channel(false);
+    let primary = Arc::new(ControlPlaneClient::new(
+        cfg,
+        ScriptedRunner::new(Script::Answer),
+        Duration::from_secs(600),
+    ));
+    let handle = primary.handle();
+    let primary_task = tokio::spawn(primary.run(primary_rx));
+    wait_for("both runtimes to register", || {
+        state.registry.list("prod").len() >= 2
+    })
+    .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("agent.sock");
+    let (local_shutdown, local_rx) = tokio::sync::watch::channel(false);
+    let local_task = tokio::spawn(serve_local(socket.clone(), handle, local_rx));
+    wait_for("local agent socket", || socket.exists()).await;
+    let local = LocalClient::new(socket);
+
+    let spawned = local
+        .request(&LocalRequest::Spawn {
+            delegation_id: "d-local-cancel".into(),
+            target: LocalTarget {
+                name: Some("worker-1".into()),
+                labels: None,
+            },
+            prompt: "hang".into(),
+            deadline_secs: 300,
+            parent: None,
+        })
+        .await
+        .unwrap();
+    let LocalResponse::Spawned { handle, .. } = spawned else {
+        panic!("expected spawned handle");
+    };
+    wait_for("worker prompt to start", || worker_runner.started() == 1).await;
+    let cancelled = local
+        .request(&LocalRequest::Cancel {
+            handle,
+            reason: "operator cancelled".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(cancelled, LocalResponse::Cancelled);
+    wait_for("worker cleanup", || {
+        !worker_runner.cancelled().is_empty() && !worker_runner.discarded().is_empty()
+    })
+    .await;
+
+    let _ = local_shutdown.send(true);
+    let _ = primary_shutdown.send(true);
+    let _ = worker_shutdown.send(true);
+    let _ = local_task.await;
+    let _ = primary_task.await;
+    let _ = worker_task.await;
+}

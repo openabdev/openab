@@ -466,20 +466,6 @@ impl CapabilitySource for AcpTunnelSource {
     }
 }
 
-/// Root-side adapter: exposes the facade's `SessionTokens` registry through
-/// core's `SessionTokenRegistrar` hook (core cannot depend on openab-mcp).
-pub struct FacadeRegistrar(pub openab_mcp::mcp::sources::SessionTokens);
-
-impl openab_core::acp_mcp::SessionTokenRegistrar for FacadeRegistrar {
-    fn mint(&self, channel_id: &str) -> String {
-        self.0.mint(channel_id)
-    }
-    fn revoke(&self, token: &str) {
-        // Token-specific: a late teardown must not strip the successor's live token (R1).
-        self.0.revoke_token(token)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{AcpTunnelSource, CapabilitySource, SessionCtx, Tool};

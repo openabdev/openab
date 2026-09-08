@@ -1,6 +1,6 @@
 # ADR: Agent Control Plane — Direct Inter-Agent Communication
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-08-06
 - **Author:** chaodu-agent
 - **Related:** [ACP Server with WebSocket Transport](./acp-server-websocket.md), [OAB MCP Adapter](./oab-mcp-adapter.md), [Custom Gateway](./custom-gateway.md), [Multi-Platform Adapters](./multi-platform-adapters.md)
@@ -687,7 +687,7 @@ Two distinct auth boundaries exist, and they must not be conflated:
    private network) in front — bearer keys must never cross untrusted
    cleartext TCP. See the "v1 contract amendments" in §4 for the enforced
    registration semantics.
-2. **Agent subprocess ↔ local facade (PR 4/4, not yet shipped):** the UDS
+2. **Agent subprocess ↔ local facade (shipped in PR 4/4):** the UDS
    path is the only thing the child needs; filesystem permissions on the
    socket are the local auth boundary. The *local facade* is never exposed
    on TCP — this claim is about the UDS facade, not about the CP itself,

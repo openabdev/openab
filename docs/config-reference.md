@@ -817,20 +817,28 @@ one.
 
 ### Headless (no chat adapter)
 
-A config with `[agent]` and `[control_plane] type = "worker"` and **no** chat
-adapter is a valid deployment: the runtime's work arrives as delegations rather
-than chat messages.
+Any `[control_plane]` runtime may run without a chat adapter. Workers receive
+remote delegations; primaries initiate through the owner-only local socket,
+`openab agent`, and the automatically injected four-tool MCP facade.
 
 | Config | Result |
 |--------|--------|
 | `[control_plane] type = "worker"`, no adapter | Full runtime — pool + control-plane client, no chat platform |
-| `[control_plane] type = "primary"`, no adapter and no `[mcp]` | Startup error — no local surface can initiate work |
+| `[control_plane] type = "primary"`, no adapter and no `[mcp]` | Full runtime — auto-started CP MCP tools + local CLI socket |
 | `[mcp]` only, no adapter | Facade-only mode (unchanged) |
 | `[mcp]` + worker, no adapter | Full runtime — facade listener + worker-side control-plane client |
-| `[mcp]` + primary, no adapter | Full runtime — facade listener + primary registration (initiation tools land in PR 4/4) |
+| `[mcp]` + primary, no adapter | Full runtime — configured facade capabilities + four direct CP tools + primary registration |
 
 ### Operational notes
 
+- **Local agent API.** `$OPENAB_AGENT_SOCKET` overrides the default
+  `$HOME/.openab/agent.sock`. The runtime creates an owner-only directory
+  (`0700`) and socket (`0600`); filesystems without Unix sockets are not
+  supported by this v1 local transport.
+- **Primary MCP tools are automatic.** A primary starts the loopback facade on
+  `127.0.0.1:8848` when `[mcp]` is absent, or adds the four direct CP tools to
+  the configured facade listener when `[mcp]` is present. Tools are visible
+  only to broker-authenticated agent sessions.
 - **The key never reaches the agent.** Agent subprocesses start from
   `env_clear()` with a fixed baseline plus explicit `[agent].env` keys;
   `auth_key` is in neither, and it is never logged.
