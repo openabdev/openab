@@ -7,6 +7,7 @@
 //! `cp/delegate` / `cp/delegate_result` frames between them.
 
 pub mod config;
+pub mod events;
 pub mod policy;
 pub mod proto;
 pub mod registry;
