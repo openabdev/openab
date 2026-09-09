@@ -817,20 +817,30 @@ one.
 
 ### Headless (no chat adapter)
 
-A config with `[agent]` and `[control_plane] type = "worker"` and **no** chat
-adapter is a valid deployment: the runtime's work arrives as delegations rather
-than chat messages.
+Any `[control_plane]` runtime may run without a chat adapter. Workers receive
+remote delegations; primaries initiate through the owner-only local socket,
+`openab agent`, and the automatically injected four-tool MCP facade.
 
 | Config | Result |
 |--------|--------|
 | `[control_plane] type = "worker"`, no adapter | Full runtime — pool + control-plane client, no chat platform |
-| `[control_plane] type = "primary"`, no adapter and no `[mcp]` | Startup error — no local surface can initiate work |
+| `[control_plane] type = "primary"`, no adapter and no `[mcp]` | Full runtime — auto-started CP MCP tools + local CLI socket |
 | `[mcp]` only, no adapter | Facade-only mode (unchanged) |
 | `[mcp]` + worker, no adapter | Full runtime — facade listener + worker-side control-plane client |
-| `[mcp]` + primary, no adapter | Full runtime — facade listener + primary registration (initiation tools land in PR 4/4) |
+| `[mcp]` + primary, no adapter | Full runtime — configured facade capabilities + four direct CP tools + primary registration |
 
 ### Operational notes
 
+- **Local agent API.** `$OPENAB_AGENT_SOCKET` overrides the default
+  `$HOME/.openab/run/agent.sock`. The runtime creates an owner-only directory
+  (`0700`) and socket (`0600`). The transport is a **Unix-domain socket and is
+  Unix-only**: non-Unix builds compile (the server and client are stubbed) but
+  fail loudly at runtime, and **no Windows support is planned** — CP
+  deployments are Linux containers or macOS.
+- **Primary MCP tools are automatic.** A primary starts the loopback facade on
+  `127.0.0.1:8848` when `[mcp]` is absent, or adds the four direct CP tools to
+  the configured facade listener when `[mcp]` is present. Tools are visible
+  only to broker-authenticated agent sessions.
 - **The key never reaches the agent.** Agent subprocesses start from
   `env_clear()` with a fixed baseline plus explicit `[agent].env` keys;
   `auth_key` is in neither, and it is never logged.
@@ -845,6 +855,12 @@ than chat messages.
 - **Per-turn ceiling.** A delegation is bounded by the nearer of its CP
   deadline and `[pool].prompt_hard_timeout_secs`; exceeding the local one is
   reported to the initiator as `timeout`.
+- **Delegation deadlines are `1..=1800` seconds.** The MCP `spawn_agent` tool
+  (`deadline_secs`) and the `openab agent spawn --deadline-secs` CLI both
+  validate this 1-second..=30-minute window before any frame leaves the host,
+  and a blocking spawn bounds the whole operation — admission plus the await of
+  the result — under one `deadline_secs + 5` ceiling, so a hung admission
+  cannot block the caller past its deadline.
 - **One session per delegation.** Each delegation runs in a fresh ACP session
   that is discarded when it ends, so delegations never see each other's
   conversation and none of them counts against the pool afterwards.

@@ -1,3 +1,4 @@
+mod cp_tools;
 mod ctl;
 #[cfg(any(
     feature = "telegram",
@@ -130,6 +131,14 @@ enum Commands {
         #[command(subcommand)]
         addon: McpAddon,
     },
+    /// Agent Control Plane delegation operations over the local runtime socket.
+    Agent {
+        /// Override the local runtime socket (default: $OPENAB_AGENT_SOCKET or ~/.openab/run/agent.sock).
+        #[arg(long, global = true)]
+        socket: Option<PathBuf>,
+        #[command(subcommand)]
+        action: AgentAction,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -141,6 +150,39 @@ enum McpAddon {
     GmailNative {
         #[command(subcommand)]
         action: GmailNativeAction,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum AgentAction {
+    /// Delegate a prompt by agent name or label selector.
+    Spawn {
+        /// Exact target agent name (mutually exclusive with --label).
+        #[arg(long)]
+        target: Option<String>,
+        /// Label selector entry key=value; repeat for multiple labels.
+        #[arg(long = "label")]
+        labels: Vec<String>,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long, default_value_t = 300)]
+        deadline_secs: u64,
+        /// Return the opaque handle immediately instead of waiting for a result.
+        #[arg(long = "async")]
+        async_mode: bool,
+        /// Opaque parent handle when spawning a child delegation.
+        #[arg(long)]
+        parent: Option<String>,
+    },
+    /// List registered agents in this runtime's namespace.
+    List,
+    /// Return current state for an opaque delegation handle.
+    Status { handle: String },
+    /// Cancel an in-flight delegation.
+    Cancel {
+        handle: String,
+        #[arg(long, default_value = "cancelled by operator")]
+        reason: String,
     },
 }
 
@@ -162,6 +204,98 @@ enum GmailNativeAction {
         #[arg(long, default_value = openab_mcp::native::gmail::DEFAULT_REDIRECT_URI)]
         redirect_uri: String,
     },
+}
+
+async fn run_agent_command(socket: Option<PathBuf>, action: AgentAction) -> anyhow::Result<()> {
+    use openab_core::control_plane::{default_socket_path, LocalClient, LocalRequest, LocalResponse, LocalTarget};
+
+    let client = LocalClient::new(socket.unwrap_or(default_socket_path()?));
+    // A spawn is the one action bounded as a whole operation; the others are a
+    // single request/response.
+    if let AgentAction::Spawn {
+        target,
+        labels,
+        prompt,
+        deadline_secs,
+        async_mode,
+        parent,
+    } = action
+    {
+        let labels = parse_agent_labels(labels)?;
+        anyhow::ensure!(
+            target.is_some() ^ !labels.is_empty(),
+            "spawn requires exactly one of --target or one-or-more --label key=value"
+        );
+        // Client-side deadline validation BEFORE any frame leaves the host, so
+        // an out-of-range value is a fast local error rather than a spawn the
+        // server would reject or silently clamp. Mirrors the MCP tool schema's
+        // `1..=1800` and the server's own bound.
+        validate_deadline_secs(deadline_secs)?;
+        let spawn = LocalRequest::Spawn {
+            delegation_id: cp_tools::new_delegation_id(),
+            target: LocalTarget {
+                name: target,
+                labels: (!labels.is_empty()).then_some(labels),
+            },
+            prompt,
+            deadline_secs,
+            parent,
+        };
+        // Same full-operation wrapper the MCP facade uses: admission + optional
+        // await under one `deadline_secs + 5` bound.
+        let client_ref = &client;
+        let response =
+            cp_tools::spawn_within_bound(deadline_secs, async_mode, spawn, move |req| async move {
+                client_ref.request(&req).await
+            })
+            .await?;
+        if let LocalResponse::Error { message } = &response {
+            anyhow::bail!("{message}");
+        }
+        println!("{}", serde_json::to_string_pretty(&response)?);
+        return Ok(());
+    }
+
+    let request = match action {
+        AgentAction::Spawn { .. } => unreachable!("handled above"),
+        AgentAction::List => LocalRequest::ListAgents,
+        AgentAction::Status { handle } => LocalRequest::Check { handle },
+        AgentAction::Cancel { handle, reason } => LocalRequest::Cancel { handle, reason },
+    };
+    let response = client.request(&request).await?;
+    if let LocalResponse::Error { message } = &response {
+        anyhow::bail!("{message}");
+    }
+    println!("{}", serde_json::to_string_pretty(&response)?);
+    Ok(())
+}
+
+/// Accepted `deadline_secs` window for `openab agent spawn`, enforced
+/// client-side before any frame leaves the host. Matches the MCP tool schema
+/// (`minimum: 1, maximum: 1800`) and the local API server's own bound, so all
+/// three surfaces agree on the same 1-second..=30-minute window.
+const MIN_DEADLINE_SECS: u64 = 1;
+const MAX_DEADLINE_SECS: u64 = 1800;
+
+fn validate_deadline_secs(deadline_secs: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        (MIN_DEADLINE_SECS..=MAX_DEADLINE_SECS).contains(&deadline_secs),
+        "--deadline-secs must be between {MIN_DEADLINE_SECS} and {MAX_DEADLINE_SECS} (got {deadline_secs})"
+    );
+    Ok(())
+}
+
+fn parse_agent_labels(values: Vec<String>) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    values
+        .into_iter()
+        .map(|entry| {
+            let (key, value) = entry
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("invalid --label {entry:?}; expected key=value"))?;
+            anyhow::ensure!(!key.is_empty() && !value.is_empty(), "label key and value must be non-empty");
+            Ok((key.to_string(), value.to_string()))
+        })
+        .collect()
 }
 
 /// Returns true if any unified platform is enabled and its corresponding
@@ -199,17 +333,14 @@ fn has_unified_platform(cfg: &config::Config) -> bool {
 ///
 /// Two headless deployments exist, and the order below is the whole rule:
 ///
-/// - Any configuration that needs the control-plane client and the normal
-///   runtime takes `FullRuntime`: a worker can be adapter-less, while a primary
-///   needs either a chat adapter or `[mcp]` (the facade supplies its local
-///   initiating surface). The full path builds the pool/router and starts both
-///   configured services.
+/// - Any `[control_plane]` runtime takes `FullRuntime`: workers receive remote
+///   delegations, while primaries gain the local UDS/CLI and injected MCP tools
+///   that initiate them. The full path builds the pool/router and starts every
+///   configured local surface.
 /// - `[mcp]` alone stays exactly what it was: the facade in the foreground.
 ///
-/// `type = "primary"` alone (without `[mcp]`) deliberately does NOT unlock a
-/// headless boot. A primary is the *initiating* side of a delegation; its
-/// prompts come from a chat platform, so an adapter-less primary has no way to
-/// be given work and is a misconfiguration worth failing on.
+/// `type = "primary"` may run without a chat adapter: `openab agent` and the
+/// automatically injected four-tool MCP facade are its initiating surfaces.
 #[derive(Debug, PartialEq, Eq)]
 enum HeadlessMode {
     FullRuntime,
@@ -218,18 +349,10 @@ enum HeadlessMode {
 }
 
 fn headless_run_mode(cfg: &config::Config) -> HeadlessMode {
-    let cp_worker = cfg
-        .control_plane
-        .as_ref()
-        .is_some_and(|cp| cp.agent_type == openab_core::config::CpAgentType::Worker);
-    if cp_worker {
+    if cfg.control_plane.is_some() {
         HeadlessMode::FullRuntime
     } else if cfg.mcp.is_some() {
-        if cfg.control_plane.is_some() {
-            HeadlessMode::FullRuntime
-        } else {
-            HeadlessMode::FacadeOnly
-        }
+        HeadlessMode::FacadeOnly
     } else {
         HeadlessMode::None
     }
@@ -240,6 +363,13 @@ struct SupervisedControlPlaneTask {
     completion: tokio::sync::oneshot::Receiver<Result<(), tokio::task::JoinError>>,
 }
 
+struct SupervisedLocalApiTask {
+    abort: tokio::task::AbortHandle,
+    completion: tokio::sync::oneshot::Receiver<
+        Result<anyhow::Result<()>, tokio::task::JoinError>,
+    >,
+}
+
 fn supervise_control_plane(handle: tokio::task::JoinHandle<()>) -> SupervisedControlPlaneTask {
     let abort = handle.abort_handle();
     let (tx, completion) = tokio::sync::oneshot::channel();
@@ -247,6 +377,17 @@ fn supervise_control_plane(handle: tokio::task::JoinHandle<()>) -> SupervisedCon
         let _ = tx.send(handle.await);
     });
     SupervisedControlPlaneTask { abort, completion }
+}
+
+fn supervise_local_api(
+    handle: tokio::task::JoinHandle<anyhow::Result<()>>,
+) -> SupervisedLocalApiTask {
+    let abort = handle.abort_handle();
+    let (tx, completion) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _ = tx.send(handle.await);
+    });
+    SupervisedLocalApiTask { abort, completion }
 }
 
 async fn wait_for_control_plane_exit(
@@ -259,6 +400,28 @@ async fn wait_for_control_plane_exit(
         Ok(Ok(())) => anyhow::anyhow!("control-plane client exited unexpectedly"),
         Ok(Err(error)) => anyhow::anyhow!("control-plane client task failed: {error}"),
         Err(_) => anyhow::anyhow!("control-plane client supervisor stopped unexpectedly"),
+    }
+}
+
+async fn wait_for_local_api_exit(task: &mut Option<SupervisedLocalApiTask>) -> anyhow::Error {
+    let Some(task) = task.as_mut() else {
+        return std::future::pending::<anyhow::Error>().await;
+    };
+    match (&mut task.completion).await {
+        Ok(Ok(Ok(()))) => anyhow::anyhow!("control-plane local API exited unexpectedly"),
+        Ok(Ok(Err(error))) => anyhow::anyhow!("control-plane local API failed: {error:#}"),
+        Ok(Err(error)) => anyhow::anyhow!("control-plane local API task failed: {error}"),
+        Err(_) => anyhow::anyhow!("control-plane local API supervisor stopped unexpectedly"),
+    }
+}
+
+async fn wait_for_control_service_exit(
+    cp: &mut Option<SupervisedControlPlaneTask>,
+    local: &mut Option<SupervisedLocalApiTask>,
+) -> anyhow::Error {
+    tokio::select! {
+        error = wait_for_control_plane_exit(cp) => error,
+        error = wait_for_local_api_exit(local) => error,
     }
 }
 
@@ -463,6 +626,10 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
+        Commands::Agent { socket, action } => {
+            run_agent_command(socket, action).await?;
+            return Ok(());
+        }
         Commands::Run { config } => config,
     };
 
@@ -583,6 +750,21 @@ async fn main() -> anyhow::Result<()> {
     let unified_platform_enabled = has_unified_platform(&cfg);
 
     let shutdown_hook = cfg.hooks.pre_shutdown.clone();
+    // Capture after secret substitution. Primaries automatically receive the
+    // local four-tool MCP facade; every CP runtime receives the owner-only UDS.
+    let control_plane_cfg = cfg.control_plane.clone();
+    let cp_primary = control_plane_cfg.as_ref().is_some_and(|cp| {
+        cp.agent_type == openab_core::config::CpAgentType::Primary
+    });
+    let agent_socket_path = control_plane_cfg
+        .as_ref()
+        .map(|_| openab_core::control_plane::default_socket_path())
+        .transpose()?;
+    let facade_listen = cfg
+        .mcp
+        .as_ref()
+        .map(|m| m.listen.clone())
+        .or_else(|| cp_primary.then(|| "127.0.0.1:8848".to_string()));
 
     // Shared MCP-over-ACP tunnel registry (D6-a'): the gateway populates it per session; the
     // core's `acp_mcp` module reads it through the `RootAcpTunnel` implementation below.
@@ -619,9 +801,7 @@ async fn main() -> anyhow::Result<()> {
     // session-aware in-process source — one listener, per-session identity
     // via broker-minted tokens; no per-session proxy servers.
     let facade_sessions = openab_mcp::mcp::sources::SessionTokens::new();
-    // Only read under the acp feature (pool facade wiring below).
-    #[cfg(feature = "acp")]
-    let facade_serving = cfg.mcp.is_some();
+    let facade_serving = facade_listen.is_some();
     // Startup, not per-session: report whether the facade is serving, so an operator learns it
     // here rather than by inferring it from tools that never appear. This is NOT the
     // `OPENAB_BROWSER_MODE` migration notice — that was removed (see `acp_mcp`), and nothing
@@ -630,12 +810,8 @@ async fn main() -> anyhow::Result<()> {
     // that is a core feature and naming it here is an unknown-cfg error.
     #[cfg(feature = "acp")]
     openab_core::acp_mcp::report_facade_status(cfg.mcp.is_some(), &cfg.agent.working_dir);
-    if let Some(mcp_cfg) = cfg.mcp.clone() {
-        let listen = mcp_cfg.listen.clone();
+    if let Some(listen) = facade_listen.clone() {
         let tokens = facade_sessions.clone();
-        // The ACP tunnel source is registered unconditionally under the `acp` feature. It used to
-        // be skipped in bridge mode; with the bridge gone there is no mode in which the facade
-        // runs without it.
         #[cfg(feature = "acp")]
         let sources: Vec<Arc<dyn openab_mcp::mcp::sources::CapabilitySource>> =
             vec![Arc::new(acp_tunnel_source::AcpTunnelSource::new(
@@ -643,9 +819,24 @@ async fn main() -> anyhow::Result<()> {
             ))];
         #[cfg(not(feature = "acp"))]
         let sources: Vec<Arc<dyn openab_mcp::mcp::sources::CapabilitySource>> = Vec::new();
+        let providers: Vec<Arc<dyn openab_mcp::mcp::facade::DirectToolProvider>> =
+            if cp_primary {
+                vec![Arc::new(cp_tools::ControlPlaneTools::new(
+                    agent_socket_path
+                        .clone()
+                        .expect("primary control plane has a local socket path"),
+                ))]
+            } else {
+                Vec::new()
+            };
         tokio::spawn(async move {
-            if let Err(e) =
-                openab_mcp::mcp::facade::serve_http_with(&listen, sources, tokens).await
+            if let Err(e) = openab_mcp::mcp::facade::serve_http_with_tools(
+                &listen,
+                sources,
+                providers,
+                tokens,
+            )
+            .await
             {
                 tracing::error!(error = %format!("{e:#}"), listen, "OAB MCP facade exited");
                 std::process::exit(1);
@@ -653,10 +844,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // Taken before the sections below are moved into their runtime components:
-    // the control-plane client is constructed much later (it needs the router),
-    // and `cfg.agent` / `cfg.pool` are gone by then.
-    let control_plane_cfg = cfg.control_plane.clone();
+    // Taken before `cfg.agent` / `cfg.pool` are moved into runtime components.
     let prompt_hard_timeout_secs = cfg.pool.prompt_hard_timeout_secs;
 
     let pool_inner = acp::SessionPool::new(
@@ -670,18 +858,14 @@ async fn main() -> anyhow::Result<()> {
     // Facade session wiring: only when the facade is actually serving. With no `[mcp]` there is
     // no registrar and no facade url, and the pool simply starts sessions without browser
     // capabilities — there is no longer a proxy path for it to fall back to.
-    #[cfg(feature = "acp")]
     let pool_inner = pool_inner.with_facade_sessions(
         facade_serving.then(|| {
-            Arc::new(acp_tunnel_source::FacadeRegistrar(facade_sessions.clone()))
+            Arc::new(cp_tools::FacadeRegistrar(facade_sessions.clone()))
                 as Arc<dyn openab_core::acp_mcp::SessionTokenRegistrar>
         }),
-        facade_serving.then(|| {
-            format!(
-                "http://{}/mcp",
-                cfg.mcp.as_ref().map(|m| m.listen.as_str()).unwrap_or("127.0.0.1:8848")
-            )
-        }),
+        facade_listen
+            .as_ref()
+            .map(|listen| format!("http://{listen}/mcp")),
     );
     let pool = Arc::new(pool_inner);
     let ttl_secs = cfg.pool.session_ttl_hours * 3600;
@@ -984,7 +1168,8 @@ async fn main() -> anyhow::Result<()> {
     // The auth key is used only for the `Authorization` header on the outbound
     // upgrade: it is never logged, and never reaches the agent subprocess —
     // `[agent].env` plumbing is untouched by this.
-    let mut cp_task = control_plane_cfg.map(|cp_cfg| {
+    let mut local_api_task: Option<SupervisedLocalApiTask> = None;
+    let mut cp_task = if let Some(cp_cfg) = control_plane_cfg {
         let runner: Arc<dyn openab_core::control_plane::PromptRunner> = Arc::new(
             openab_core::control_plane::RouterPromptRunner::new(router.clone()),
         );
@@ -993,8 +1178,21 @@ async fn main() -> anyhow::Result<()> {
             runner,
             std::time::Duration::from_secs(prompt_hard_timeout_secs),
         ));
-        supervise_control_plane(tokio::spawn(client.run(shutdown_rx.clone())))
-    });
+        local_api_task = Some(supervise_local_api(tokio::spawn(
+            openab_core::control_plane::serve_local(
+                agent_socket_path
+                    .clone()
+                    .expect("control-plane runtime has a local socket path"),
+                client.handle(),
+                shutdown_rx.clone(),
+            ),
+        )));
+        Some(supervise_control_plane(tokio::spawn(
+            client.run(shutdown_rx.clone()),
+        )))
+    } else {
+        None
+    };
 
     let dispatchers: Arc<Mutex<Vec<Arc<dispatch::Dispatcher>>>> = Arc::new(Mutex::new(Vec::new()));
 
@@ -1861,7 +2059,7 @@ async fn main() -> anyhow::Result<()> {
         info!("discord bot running");
         let discord_result = tokio::select! {
             result = client.start() => result,
-            error = wait_for_control_plane_exit(&mut cp_task) => {
+            error = wait_for_control_service_exit(&mut cp_task, &mut local_api_task) => {
                 runtime_error = Some(error);
                 Ok(())
             }
@@ -1889,7 +2087,7 @@ async fn main() -> anyhow::Result<()> {
         info!("running without discord, press ctrl+c to stop");
         tokio::select! {
             _ = shutdown_signal() => info!("shutdown signal received"),
-            error = wait_for_control_plane_exit(&mut cp_task) => runtime_error = Some(error),
+            error = wait_for_control_service_exit(&mut cp_task, &mut local_api_task) => runtime_error = Some(error),
         }
     }
     // When discord feature is disabled at compile time, use this fallback block.
@@ -1900,7 +2098,7 @@ async fn main() -> anyhow::Result<()> {
         info!("running without discord, press ctrl+c to stop");
         tokio::select! {
             _ = shutdown_signal() => info!("shutdown signal received"),
-            error = wait_for_control_plane_exit(&mut cp_task) => runtime_error = Some(error),
+            error = wait_for_control_service_exit(&mut cp_task, &mut local_api_task) => runtime_error = Some(error),
         }
     }
 
@@ -1931,6 +2129,25 @@ async fn main() -> anyhow::Result<()> {
     }
     for d in dispatchers.lock().unwrap().iter() {
         d.shutdown();
+    }
+    // Stop accepting local CLI/MCP requests before the CP client and pool.
+    if let Some(mut task) = local_api_task {
+        match tokio::time::timeout(std::time::Duration::from_secs(5), &mut task.completion).await {
+            Ok(Ok(Ok(Ok(())))) => {}
+            Ok(Ok(Ok(Err(error)))) => {
+                tracing::warn!(error = %format!("{error:#}"), "control-plane local API failed during shutdown");
+            }
+            Ok(Ok(Err(error))) => {
+                tracing::warn!(%error, "control-plane local API task failed during shutdown");
+            }
+            Ok(Err(_)) => {
+                tracing::warn!("control-plane local API supervisor stopped during shutdown");
+            }
+            Err(_) => {
+                tracing::warn!("control-plane local API missed the shutdown deadline — aborting");
+                task.abort.abort();
+            }
+        }
     }
     // Stop the control-plane client BEFORE the pool: it cancels its in-flight
     // delegations (each stopping its agent and dropping its session) and closes
@@ -2069,9 +2286,127 @@ mod tests {
     }
 
     #[test]
+    fn cli_agent_status_and_spawn_parse() {
+        let cli = Cli::try_parse_from(["openab", "agent", "status", "opaque-handle"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Agent {
+                action: AgentAction::Status { .. },
+                ..
+            })
+        ));
+        let cli = Cli::try_parse_from([
+            "openab",
+            "agent",
+            "spawn",
+            "--target",
+            "worker-1",
+            "--prompt",
+            "review this",
+            "--async",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Agent {
+                action: AgentAction::Spawn { async_mode: true, .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn cli_setup_subcommand() {
         let cli = Cli::try_parse_from(["openab", "setup"]).unwrap();
         assert!(matches!(cli.command.unwrap(), Commands::Setup { .. }));
+    }
+
+    #[test]
+    fn cli_spawn_deadline_defaults_and_parses() {
+        // Default is 300 when the flag is absent.
+        let cli = Cli::try_parse_from([
+            "openab", "agent", "spawn", "--target", "w1", "--prompt", "p",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Agent {
+                action: AgentAction::Spawn { deadline_secs, .. },
+                ..
+            } => assert_eq!(deadline_secs, 300),
+            _ => panic!("expected spawn"),
+        }
+        // `--deadline-secs` (clap kebab-cases the `deadline_secs` field) parses.
+        let cli = Cli::try_parse_from([
+            "openab",
+            "agent",
+            "spawn",
+            "--target",
+            "w1",
+            "--prompt",
+            "p",
+            "--deadline-secs",
+            "42",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Agent {
+                action: AgentAction::Spawn { deadline_secs, .. },
+                ..
+            } => assert_eq!(deadline_secs, 42),
+            _ => panic!("expected spawn"),
+        }
+    }
+
+    #[test]
+    fn cli_deadline_window_is_one_to_eighteen_hundred_inclusive() {
+        // Boundaries accepted.
+        assert!(validate_deadline_secs(1).is_ok());
+        assert!(validate_deadline_secs(1800).is_ok());
+        assert!(validate_deadline_secs(300).is_ok());
+        // Out of range rejected on both ends, with an actionable message.
+        let zero = validate_deadline_secs(0).unwrap_err().to_string();
+        assert!(zero.contains("between 1 and 1800"), "got {zero}");
+        assert!(validate_deadline_secs(1801).is_err());
+        assert!(validate_deadline_secs(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn cli_spawn_requires_exactly_one_of_target_or_labels() {
+        // Exactly one of name / labels is the local API's XOR rule, enforced
+        // by run_agent_command before any frame leaves the host. Reproduce the
+        // exact predicate over the parsed pieces.
+        fn xor_ok(target: Option<&str>, labels: &[&str]) -> anyhow::Result<()> {
+            let target = target.map(str::to_string);
+            let labels = parse_agent_labels(labels.iter().map(|s| s.to_string()).collect())?;
+            anyhow::ensure!(
+                target.is_some() ^ !labels.is_empty(),
+                "spawn requires exactly one of --target or one-or-more --label key=value"
+            );
+            Ok(())
+        }
+        // name only → ok.
+        assert!(xor_ok(Some("w1"), &[]).is_ok());
+        // labels only → ok.
+        assert!(xor_ok(None, &["backend=kiro"]).is_ok());
+        assert!(xor_ok(None, &["backend=kiro", "tier=batch"]).is_ok());
+        // both → rejected.
+        assert!(xor_ok(Some("w1"), &["backend=kiro"]).is_err());
+        // neither → rejected.
+        assert!(xor_ok(None, &[]).is_err());
+    }
+
+    #[test]
+    fn cli_label_parsing_rejects_malformed_entries() {
+        assert!(parse_agent_labels(vec!["k=v".into()]).is_ok());
+        // Missing '='.
+        assert!(parse_agent_labels(vec!["novalue".into()]).is_err());
+        // Empty key or value.
+        assert!(parse_agent_labels(vec!["=v".into()]).is_err());
+        assert!(parse_agent_labels(vec!["k=".into()]).is_err());
+        // A parsed map keeps every entry.
+        let parsed = parse_agent_labels(vec!["a=1".into(), "b=2".into()]).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed["a"], "1");
     }
 
     #[test]
@@ -2281,6 +2616,18 @@ agent_id = "1000002"
         assert!(error.to_string().contains("exited unexpectedly"));
     }
 
+    #[tokio::test]
+    async fn an_early_local_api_exit_is_supervised() {
+        let mut task = Some(supervise_local_api(tokio::spawn(async { Ok(()) })));
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            wait_for_local_api_exit(&mut task),
+        )
+        .await
+        .expect("the completed local API task is observed");
+        assert!(error.to_string().contains("exited unexpectedly"));
+    }
+
     #[test]
     fn a_control_plane_worker_boots_without_any_adapter() {
         let cfg = config::parse_config_str(&cp_section("worker"), "test").unwrap();
@@ -2288,11 +2635,9 @@ agent_id = "1000002"
     }
 
     #[test]
-    fn a_control_plane_primary_alone_does_not_unlock_a_headless_boot() {
-        // A primary initiates delegations; its prompts come from a chat
-        // platform, so an adapter-less primary has no way to be given work.
+    fn a_control_plane_primary_boots_headless_for_cli_and_mcp_initiation() {
         let cfg = config::parse_config_str(&cp_section("primary"), "test").unwrap();
-        assert_eq!(headless_run_mode(&cfg), HeadlessMode::None);
+        assert_eq!(headless_run_mode(&cfg), HeadlessMode::FullRuntime);
     }
 
     #[test]

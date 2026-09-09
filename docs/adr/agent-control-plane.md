@@ -1,6 +1,6 @@
 # ADR: Agent Control Plane — Direct Inter-Agent Communication
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-08-06
 - **Author:** chaodu-agent
 - **Related:** [ACP Server with WebSocket Transport](./acp-server-websocket.md), [OAB MCP Adapter](./oab-mcp-adapter.md), [Custom Gateway](./custom-gateway.md), [Multi-Platform Adapters](./multi-platform-adapters.md)
@@ -153,6 +153,24 @@ CP connection, existing deployments unchanged.
 platform adapters at all** — just `[agent]` + `[control_plane]`. No bot
 token, no allowlists, smaller attack surface, cheaper task. Only reachable
 via the CP.
+
+A **primary** may run headless too: with no chat adapter it still starts its
+two local initiating surfaces — the owner-only Unix socket and the
+auto-injected four-tool MCP facade — so `openab agent …` and the model's
+`spawn_agent` tool can initiate delegations even though no human is on a chat
+platform. `type` remains the policy axis (only a primary initiates); "headless"
+describes the *absence of a chat adapter*, not the role. The two headless
+shapes are therefore orthogonal: worker-headless serves delegations, and
+primary-headless initiates them.
+
+> **Platform support: the local agent surface is Unix-only.** The local API is
+> a Unix-domain socket (owner-only `0600` inside an owner-only `0700`
+> directory); there is no non-Unix transport in v1. Non-Unix targets compile —
+> the socket server and `LocalClient` have stubs so `cargo check --target
+> x86_64-pc-windows-gnu` stays green — but every local operation fails loudly
+> at runtime. OpenAB's CP deployments are containerized (Linux) or macOS, so
+> this is a compile-time-only concern; **no Windows support is planned or
+> added.**
 
 ### Replica semantics (rolling deploys)
 
@@ -630,7 +648,7 @@ integration. v1 tool surface, intentionally minimal:
 
 | Tool | Behavior |
 |------|----------|
-| `spawn_agent` | Delegate a task. Blocking (waits up to deadline) or async (returns a `delegation` handle immediately). |
+| `spawn_agent` | Delegate a task. Blocking (waits up to deadline) or async (returns a `delegation` handle immediately). `target` is exactly one of an exact `name` or a **non-empty** `labels` selector (schema `minProperties: 1`); `deadline_secs` must be within `1..=1800` and is rejected otherwise. |
 | `check_delegation` | Status / result by `delegation` handle. |
 | `list_agents` | Registry view for the caller's namespace (names, types, labels, availability) — lets the model discover targets by label. |
 | `cancel_delegation` | Cancel an in-flight delegation by `delegation` handle. |
@@ -668,6 +686,18 @@ evolves underneath.
   `openab agent spawn …` without new plumbing
 - **Escape hatch** for backends where MCP injection proves awkward
 
+The CLI and the MCP facade are **one enforcement path, not two parallel
+ones**: both mint delegation ids from a single shared generator (so CLI- and
+MCP-initiated delegations are indistinguishable on the wire — no `d-cli-`
+fork), and both run a spawn under one shared full-operation wrapper. That
+wrapper bounds the *whole* operation — the admission round-trip **and**, for a
+blocking spawn, the await of the terminal result — under a single
+`deadline_secs + 5` ceiling, so a hung admission can no longer block the
+caller indefinitely. `--deadline-secs` is validated to the `1..=1800`
+(1 second .. 30 minutes) window **before any frame leaves the host**, matching
+the MCP tool schema's `minimum: 1, maximum: 1800` and the socket server's own
+bound.
+
 ### Explicitly deferred from v1
 
 Kiro-style session-management primitives — inbox messaging, `interrupt`,
@@ -687,7 +717,7 @@ Two distinct auth boundaries exist, and they must not be conflated:
    private network) in front — bearer keys must never cross untrusted
    cleartext TCP. See the "v1 contract amendments" in §4 for the enforced
    registration semantics.
-2. **Agent subprocess ↔ local facade (PR 4/4, not yet shipped):** the UDS
+2. **Agent subprocess ↔ local facade (shipped in PR 4/4):** the UDS
    path is the only thing the child needs; filesystem permissions on the
    socket are the local auth boundary. The *local facade* is never exposed
    on TCP — this claim is about the UDS facade, not about the CP itself,
