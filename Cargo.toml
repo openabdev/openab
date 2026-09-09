@@ -9,10 +9,17 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
+# OAB MCP Facade: in-process loopback Streamable HTTP MCP server, enabled by
+# `[mcp]` in config.toml (OAB MCP Adapter ADR §6.2). The `acp-mcp` core feature
+# is enabled UNCONDITIONALLY here — not via the `acp` feature — because the
+# agent control-plane facade (`src/cp_tools.rs`) links `openab_core::acp_mcp`
+# and `openab_core::control_plane` in every build, including a default
+# Discord/Slack build without any gateway. Enabling it on the dependency once,
+# rather than re-adding `openab-core/acp-mcp` from the `acp` feature, keeps a
+# single source of truth (the `acp` feature adding it again was redundant and
+# could drift).
 openab-core = { path = "crates/openab-core", default-features = false, features = ["acp-mcp"] }
 openab-gateway = { path = "crates/openab-gateway", default-features = false, optional = true }
-# OAB MCP Facade: in-process loopback Streamable HTTP MCP server, enabled by
-# `[mcp]` in config.toml (OAB MCP Adapter ADR §6.2).
 openab-mcp = { path = "crates/openab-mcp" }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
@@ -51,8 +58,22 @@ feishu = ["dep:openab-gateway", "dep:axum", "openab-gateway/feishu"]
 googlechat = ["dep:openab-gateway", "dep:axum", "openab-gateway/googlechat"]
 wecom = ["dep:openab-gateway", "dep:axum", "openab-gateway/wecom"]
 teams = ["dep:openab-gateway", "dep:axum", "openab-gateway/teams"]
-acp = ["dep:openab-gateway", "dep:axum", "openab-gateway/acp", "openab-core/acp-mcp"]
+# `openab-core/acp-mcp` is NOT re-listed here: it is enabled unconditionally on
+# the `openab-core` dependency above (the CP facade links it in every build), so
+# adding it to this feature would be redundant.
+acp = ["dep:openab-gateway", "dep:axum", "openab-gateway/acp"]
 lineworks = ["dep:openab-gateway", "dep:axum", "openab-gateway/lineworks"]
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# `test-util` unlocks paused-time control (`tokio::time::pause`/`advance` and
+# `#[tokio::test(start_paused = true)]`) used by the shared spawn-timeout test,
+# which must not wait real seconds for the `deadline_secs + 5` bound.
+tokio = { version = "1", features = ["full", "test-util"] }
+# rmcp 1.7's Streamable-HTTP client transport is generic over a client that
+# implements its `StreamableHttpClient` trait, whose blanket impl is for
+# reqwest 0.13's `Client` (the runtime crate holds the same pin). The
+# cp_tools real-HTTP facade test drives that client, so the test build — and
+# only the test build — needs reqwest 0.13 to construct one with a custom
+# `Authorization` header.
+reqwest013 = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls", "json"] }

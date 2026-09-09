@@ -133,7 +133,7 @@ enum Commands {
     },
     /// Agent Control Plane delegation operations over the local runtime socket.
     Agent {
-        /// Override the local runtime socket (default: $OPENAB_AGENT_SOCKET or ~/.openab/agent.sock).
+        /// Override the local runtime socket (default: $OPENAB_AGENT_SOCKET or ~/.openab/run/agent.sock).
         #[arg(long, global = true)]
         socket: Option<PathBuf>,
         #[command(subcommand)]
@@ -210,47 +210,78 @@ async fn run_agent_command(socket: Option<PathBuf>, action: AgentAction) -> anyh
     use openab_core::control_plane::{default_socket_path, LocalClient, LocalRequest, LocalResponse, LocalTarget};
 
     let client = LocalClient::new(socket.unwrap_or(default_socket_path()?));
-    let (request, wait_after_spawn) = match action {
-        AgentAction::Spawn { target, labels, prompt, deadline_secs, async_mode, parent } => {
-            let labels = parse_agent_labels(labels)?;
-            anyhow::ensure!(
-                target.is_some() ^ !labels.is_empty(),
-                "spawn requires exactly one of --target or one-or-more --label key=value"
-            );
-            (
-                LocalRequest::Spawn {
-                    delegation_id: cli_delegation_id(),
-                    target: LocalTarget {
-                        name: target,
-                        labels: (!labels.is_empty()).then_some(labels),
-                    },
-                    prompt,
-                    deadline_secs,
-                    parent,
-                },
-                !async_mode,
-            )
+    // A spawn is the one action bounded as a whole operation; the others are a
+    // single request/response.
+    if let AgentAction::Spawn {
+        target,
+        labels,
+        prompt,
+        deadline_secs,
+        async_mode,
+        parent,
+    } = action
+    {
+        let labels = parse_agent_labels(labels)?;
+        anyhow::ensure!(
+            target.is_some() ^ !labels.is_empty(),
+            "spawn requires exactly one of --target or one-or-more --label key=value"
+        );
+        // Client-side deadline validation BEFORE any frame leaves the host, so
+        // an out-of-range value is a fast local error rather than a spawn the
+        // server would reject or silently clamp. Mirrors the MCP tool schema's
+        // `1..=1800` and the server's own bound.
+        validate_deadline_secs(deadline_secs)?;
+        let spawn = LocalRequest::Spawn {
+            delegation_id: cp_tools::new_delegation_id(),
+            target: LocalTarget {
+                name: target,
+                labels: (!labels.is_empty()).then_some(labels),
+            },
+            prompt,
+            deadline_secs,
+            parent,
+        };
+        // Same full-operation wrapper the MCP facade uses: admission + optional
+        // await under one `deadline_secs + 5` bound.
+        let client_ref = &client;
+        let response =
+            cp_tools::spawn_within_bound(deadline_secs, async_mode, spawn, move |req| async move {
+                client_ref.request(&req).await
+            })
+            .await?;
+        if let LocalResponse::Error { message } = &response {
+            anyhow::bail!("{message}");
         }
-        AgentAction::List => (LocalRequest::ListAgents, false),
-        AgentAction::Status { handle } => (LocalRequest::Check { handle }, false),
-        AgentAction::Cancel { handle, reason } => {
-            (LocalRequest::Cancel { handle, reason }, false)
-        }
-    };
-    let mut response = client.request(&request).await?;
-    if wait_after_spawn {
-        if let LocalResponse::Spawned { handle, .. } = &response {
-            response = client
-                .request(&LocalRequest::Await {
-                    handle: handle.clone(),
-                })
-                .await?;
-        }
+        println!("{}", serde_json::to_string_pretty(&response)?);
+        return Ok(());
     }
+
+    let request = match action {
+        AgentAction::Spawn { .. } => unreachable!("handled above"),
+        AgentAction::List => LocalRequest::ListAgents,
+        AgentAction::Status { handle } => LocalRequest::Check { handle },
+        AgentAction::Cancel { handle, reason } => LocalRequest::Cancel { handle, reason },
+    };
+    let response = client.request(&request).await?;
     if let LocalResponse::Error { message } = &response {
         anyhow::bail!("{message}");
     }
     println!("{}", serde_json::to_string_pretty(&response)?);
+    Ok(())
+}
+
+/// Accepted `deadline_secs` window for `openab agent spawn`, enforced
+/// client-side before any frame leaves the host. Matches the MCP tool schema
+/// (`minimum: 1, maximum: 1800`) and the local API server's own bound, so all
+/// three surfaces agree on the same 1-second..=30-minute window.
+const MIN_DEADLINE_SECS: u64 = 1;
+const MAX_DEADLINE_SECS: u64 = 1800;
+
+fn validate_deadline_secs(deadline_secs: u64) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        (MIN_DEADLINE_SECS..=MAX_DEADLINE_SECS).contains(&deadline_secs),
+        "--deadline-secs must be between {MIN_DEADLINE_SECS} and {MAX_DEADLINE_SECS} (got {deadline_secs})"
+    );
     Ok(())
 }
 
@@ -265,16 +296,6 @@ fn parse_agent_labels(values: Vec<String>) -> anyhow::Result<std::collections::B
             Ok((key.to_string(), value.to_string()))
         })
         .collect()
-}
-
-fn cli_delegation_id() -> String {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("d-cli-{}-{nanos:032x}-{seq:016x}", std::process::id())
 }
 
 /// Returns true if any unified platform is enabled and its corresponding
@@ -2298,6 +2319,94 @@ mod tests {
     fn cli_setup_subcommand() {
         let cli = Cli::try_parse_from(["openab", "setup"]).unwrap();
         assert!(matches!(cli.command.unwrap(), Commands::Setup { .. }));
+    }
+
+    #[test]
+    fn cli_spawn_deadline_defaults_and_parses() {
+        // Default is 300 when the flag is absent.
+        let cli = Cli::try_parse_from([
+            "openab", "agent", "spawn", "--target", "w1", "--prompt", "p",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Agent {
+                action: AgentAction::Spawn { deadline_secs, .. },
+                ..
+            } => assert_eq!(deadline_secs, 300),
+            _ => panic!("expected spawn"),
+        }
+        // `--deadline-secs` (clap kebab-cases the `deadline_secs` field) parses.
+        let cli = Cli::try_parse_from([
+            "openab",
+            "agent",
+            "spawn",
+            "--target",
+            "w1",
+            "--prompt",
+            "p",
+            "--deadline-secs",
+            "42",
+        ])
+        .unwrap();
+        match cli.command.unwrap() {
+            Commands::Agent {
+                action: AgentAction::Spawn { deadline_secs, .. },
+                ..
+            } => assert_eq!(deadline_secs, 42),
+            _ => panic!("expected spawn"),
+        }
+    }
+
+    #[test]
+    fn cli_deadline_window_is_one_to_eighteen_hundred_inclusive() {
+        // Boundaries accepted.
+        assert!(validate_deadline_secs(1).is_ok());
+        assert!(validate_deadline_secs(1800).is_ok());
+        assert!(validate_deadline_secs(300).is_ok());
+        // Out of range rejected on both ends, with an actionable message.
+        let zero = validate_deadline_secs(0).unwrap_err().to_string();
+        assert!(zero.contains("between 1 and 1800"), "got {zero}");
+        assert!(validate_deadline_secs(1801).is_err());
+        assert!(validate_deadline_secs(u64::MAX).is_err());
+    }
+
+    #[test]
+    fn cli_spawn_requires_exactly_one_of_target_or_labels() {
+        // Exactly one of name / labels is the local API's XOR rule, enforced
+        // by run_agent_command before any frame leaves the host. Reproduce the
+        // exact predicate over the parsed pieces.
+        fn xor_ok(target: Option<&str>, labels: &[&str]) -> anyhow::Result<()> {
+            let target = target.map(str::to_string);
+            let labels = parse_agent_labels(labels.iter().map(|s| s.to_string()).collect())?;
+            anyhow::ensure!(
+                target.is_some() ^ !labels.is_empty(),
+                "spawn requires exactly one of --target or one-or-more --label key=value"
+            );
+            Ok(())
+        }
+        // name only → ok.
+        assert!(xor_ok(Some("w1"), &[]).is_ok());
+        // labels only → ok.
+        assert!(xor_ok(None, &["backend=kiro"]).is_ok());
+        assert!(xor_ok(None, &["backend=kiro", "tier=batch"]).is_ok());
+        // both → rejected.
+        assert!(xor_ok(Some("w1"), &["backend=kiro"]).is_err());
+        // neither → rejected.
+        assert!(xor_ok(None, &[]).is_err());
+    }
+
+    #[test]
+    fn cli_label_parsing_rejects_malformed_entries() {
+        assert!(parse_agent_labels(vec!["k=v".into()]).is_ok());
+        // Missing '='.
+        assert!(parse_agent_labels(vec!["novalue".into()]).is_err());
+        // Empty key or value.
+        assert!(parse_agent_labels(vec!["=v".into()]).is_err());
+        assert!(parse_agent_labels(vec!["k=".into()]).is_err());
+        // A parsed map keeps every entry.
+        let parsed = parse_agent_labels(vec!["a=1".into(), "b=2".into()]).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed["a"], "1");
     }
 
     #[test]

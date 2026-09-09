@@ -639,7 +639,7 @@ async fn primary_local_api_lists_spawns_and_awaits_over_the_real_cp() {
     .await;
 
     let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("agent.sock");
+    let socket = dir.path().join("run").join("agent.sock");
     let (local_shutdown, local_rx) = tokio::sync::watch::channel(false);
     let local_task = tokio::spawn(serve_local(socket.clone(), primary_handle, local_rx));
     wait_for("local agent socket", || socket.exists()).await;
@@ -734,7 +734,7 @@ async fn primary_local_api_cancels_a_running_delegation_over_the_real_cp() {
     .await;
 
     let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("agent.sock");
+    let socket = dir.path().join("run").join("agent.sock");
     let (local_shutdown, local_rx) = tokio::sync::watch::channel(false);
     let local_task = tokio::spawn(serve_local(socket.clone(), handle, local_rx));
     wait_for("local agent socket", || socket.exists()).await;
@@ -774,6 +774,82 @@ async fn primary_local_api_cancels_a_running_delegation_over_the_real_cp() {
     let _ = primary_shutdown.send(true);
     let _ = worker_shutdown.send(true);
     let _ = local_task.await;
+    let _ = primary_task.await;
+    let _ = worker_task.await;
+}
+
+#[tokio::test]
+async fn oversized_inprocess_spawn_is_rejected_without_disconnect() {
+    use openab_core::control_plane::{ClientCommand, CommandError, SpawnRequest, SpawnTarget};
+
+    let (state, url) = spawn_cp(cp_config("")).await;
+    let worker_runner = ScriptedRunner::new(Script::Answer);
+    let (worker_shutdown, worker_task, _worker) =
+        spawn_worker(&url, Arc::clone(&worker_runner), Duration::from_secs(60));
+
+    let mut cfg = worker_cfg(&url);
+    cfg.auth_key = PRIMARY_KEY.to_string();
+    cfg.name = "koudu".into();
+    cfg.agent_type = CpAgentType::Primary;
+    let (primary_shutdown, primary_rx) = tokio::sync::watch::channel(false);
+    let primary = Arc::new(ControlPlaneClient::new(
+        cfg,
+        ScriptedRunner::new(Script::Answer),
+        Duration::from_secs(60),
+    ));
+    let handle = primary.handle();
+    let primary_task = tokio::spawn(primary.run(primary_rx));
+    wait_for("both runtimes to register", || {
+        state.registry.list("prod").len() >= 2
+    })
+    .await;
+
+    let (spawn_tx, spawn_rx) = tokio::sync::oneshot::channel();
+    handle
+        .submit(ClientCommand::Spawn {
+            request: SpawnRequest {
+                delegation_id: "d-oversized".into(),
+                target: SpawnTarget::by_name("worker-1"),
+                prompt: "x".repeat(1024 * 1024 + 4096),
+                deadline: chrono::Utc::now() + chrono::Duration::seconds(60),
+                parent: None,
+            },
+            reply: spawn_tx,
+        })
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), spawn_rx)
+        .await
+        .expect("oversized request is answered locally")
+        .unwrap();
+    assert!(matches!(result, Err(CommandError::InvalidRequest(_))));
+
+    // The same connection remains usable: a subsequent list request reaches
+    // the real CP and returns the worker instead of reconnecting/flapping.
+    let (list_tx, list_rx) = tokio::sync::oneshot::channel();
+    handle
+        .submit(ClientCommand::ListAgents { reply: list_tx })
+        .await
+        .unwrap();
+    let agents = tokio::time::timeout(Duration::from_secs(5), list_rx)
+        .await
+        .expect("connection remains usable")
+        .unwrap()
+        .unwrap();
+    assert!(agents.iter().any(|agent| agent.name == "worker-1"));
+    assert_eq!(
+        state
+            .registry
+            .list("prod")
+            .into_iter()
+            .filter(|agent| agent.name == "koudu")
+            .count(),
+        1,
+        "primary stayed registered on the same live connection"
+    );
+
+    let _ = primary_shutdown.send(true);
+    let _ = worker_shutdown.send(true);
     let _ = primary_task.await;
     let _ = worker_task.await;
 }

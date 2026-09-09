@@ -832,9 +832,11 @@ remote delegations; primaries initiate through the owner-only local socket,
 ### Operational notes
 
 - **Local agent API.** `$OPENAB_AGENT_SOCKET` overrides the default
-  `$HOME/.openab/agent.sock`. The runtime creates an owner-only directory
-  (`0700`) and socket (`0600`); filesystems without Unix sockets are not
-  supported by this v1 local transport.
+  `$HOME/.openab/run/agent.sock`. The runtime creates an owner-only directory
+  (`0700`) and socket (`0600`). The transport is a **Unix-domain socket and is
+  Unix-only**: non-Unix builds compile (the server and client are stubbed) but
+  fail loudly at runtime, and **no Windows support is planned** — CP
+  deployments are Linux containers or macOS.
 - **Primary MCP tools are automatic.** A primary starts the loopback facade on
   `127.0.0.1:8848` when `[mcp]` is absent, or adds the four direct CP tools to
   the configured facade listener when `[mcp]` is present. Tools are visible
@@ -853,6 +855,12 @@ remote delegations; primaries initiate through the owner-only local socket,
 - **Per-turn ceiling.** A delegation is bounded by the nearer of its CP
   deadline and `[pool].prompt_hard_timeout_secs`; exceeding the local one is
   reported to the initiator as `timeout`.
+- **Delegation deadlines are `1..=1800` seconds.** The MCP `spawn_agent` tool
+  (`deadline_secs`) and the `openab agent spawn --deadline-secs` CLI both
+  validate this 1-second..=30-minute window before any frame leaves the host,
+  and a blocking spawn bounds the whole operation — admission plus the await of
+  the result — under one `deadline_secs + 5` ceiling, so a hung admission
+  cannot block the caller past its deadline.
 - **One session per delegation.** Each delegation runs in a fresh ACP session
   that is discarded when it ends, so delegations never see each other's
   conversation and none of them counts against the pool afterwards.

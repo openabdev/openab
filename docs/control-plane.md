@@ -124,7 +124,7 @@ A runtime configured as `type = "primary"` automatically starts two local
 surfaces backed by one implementation:
 
 1. an owner-only Unix socket (`$OPENAB_AGENT_SOCKET`, otherwise
-   `$HOME/.openab/agent.sock`), with parent directory mode `0700` and socket
+   `$HOME/.openab/run/agent.sock`), with parent directory mode `0700` and socket
    mode `0600`;
 2. the loopback MCP facade, automatically injected into each agent session
    with a broker-minted session credential.
@@ -133,15 +133,22 @@ The MCP facade publishes these direct tools:
 
 | Tool | Behavior |
 |------|----------|
-| `spawn_agent` | Delegate by exact name or label selector. Blocking by default; `async: true` returns an opaque handle immediately. Deadlines are 1–1800 seconds. |
+| `spawn_agent` | Delegate by exact name or a **non-empty** label selector (schema `minProperties: 1`). Blocking by default; `async: true` returns an opaque handle immediately. Deadlines are 1–1800 seconds. |
 | `check_delegation` | Return `pending`, `running` (including assigned peer), or the terminal result without waiting. |
 | `list_agents` | Return the authenticated namespace roster, labels, and current capacity. |
 | `cancel_delegation` | Cancel an in-flight admission by opaque handle. |
 
 Direct tools are session-bound: an anonymous loopback MCP client cannot list or
 call them. The provider forwards every operation through the Unix socket, so
-MCP and CLI share validation, admission-token correlation, deadline clamping,
+MCP and CLI share validation, admission-token correlation, deadline enforcement,
 and audit behavior. The CP URL and bearer key never enter the agent process.
+
+A blocking `spawn` is bounded as **one** operation: the admission round-trip
+and the await of the terminal result run together under a single
+`deadline_secs + 5` ceiling, shared verbatim by the MCP tool and the CLI, so a
+hung admission cannot block the caller past its deadline. The same generator
+mints every delegation id, so a delegation started from the CLI is
+indistinguishable on the wire from one started by the model.
 
 The opaque handle is a random 256-bit token stored in the runtime; it does not
 encode `delegation_id` or `admission`. Local handle storage is bounded and
@@ -163,10 +170,18 @@ openab agent cancel <opaque-handle> --reason "superseded"
 ```
 
 Use `--socket PATH` or `OPENAB_AGENT_SOCKET` to override the socket location.
+`--deadline-secs` is validated to `1..=1800` client-side before any frame
+leaves the host — the same window the MCP schema and the socket server enforce.
 Primary-only headless deployments are valid: the MCP tools and CLI are their
 initiating surfaces. Workers also expose the socket for operator `list` and
 status diagnostics, but the runtime refuses primary-only spawn/cancel commands
 locally before any frame leaves the host.
+
+The local API is **Unix-only**: it is a Unix-domain socket with owner-only
+permissions and has no non-Unix transport. The binary still compiles for
+non-Unix targets (the socket server and client have stubs that fail loudly at
+runtime), but no Windows support is planned — CP deployments are Linux
+containers or macOS.
 
 ## Delegated prompt context (`openab.delegation.v1`)
 

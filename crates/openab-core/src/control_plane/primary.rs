@@ -238,6 +238,10 @@ pub enum CommandError {
     UnknownDelegation,
     /// The connection dropped while this request/delegation was outstanding.
     Disconnected,
+    /// The request could not be represented on the wire (e.g. its serialized
+    /// frame exceeds the transport limit). Distinct from `Internal`: it names
+    /// a caller-side fault the caller could fix (a smaller prompt), not a bug.
+    InvalidRequest(String),
     /// The command channel or reply path was torn down (shutdown).
     Internal(String),
 }
@@ -263,6 +267,7 @@ impl std::fmt::Display for CommandError {
                     "control-plane connection dropped before the delegation finished"
                 )
             }
+            CommandError::InvalidRequest(m) => write!(f, "invalid request: {m}"),
             CommandError::Internal(m) => write!(f, "internal error: {m}"),
         }
     }
@@ -301,6 +306,14 @@ enum PendingRequest {
 /// Lifecycle of one initiated delegation, from ack to terminal.
 struct TrackedDelegation {
     state: DelegationLifecycle,
+    /// The peer the CP assigned this delegation to, learned at ack time and
+    /// retained so it can be accounted into the terminal-history byte bound
+    /// (the terminal `DelegationOutcome` does not itself carry it).
+    assigned_to: String,
+    /// Bytes this entry contributes to [`PrimaryState::terminal_bytes`] while
+    /// it is terminal; 0 while live. Stored per-entry so eviction subtracts
+    /// exactly what insertion added, with no re-measurement.
+    accounted_bytes: usize,
 }
 
 /// The observable state of a tracked delegation.
@@ -318,8 +331,16 @@ pub enum DelegationLifecycle {
 type DelegationKey = (String, AdmissionToken);
 /// A parked reply for a caller awaiting a delegation's terminal outcome.
 type AwaitReply = oneshot::Sender<Result<DelegationOutcome, CommandError>>;
-/// Retained terminal-history ceiling. Live delegations are never evicted.
+/// Retained terminal-history entry ceiling. Live delegations are never
+/// evicted; this bounds only the count of retained TERMINAL outcomes plus the
+/// live entries that share the map.
 const MAX_TRACKED_DELEGATIONS: usize = 4096;
+/// Retained terminal-history byte ceiling (16 MiB). A second, independent
+/// bound alongside the count: a few very large terminal payloads can pin far
+/// more memory than 4096 tiny ones, so history is capped on BOTH axes.
+/// Only terminal entries contribute to (and are evicted to satisfy) this
+/// bound; live delegations carry no accounted bytes until they terminate.
+const MAX_TRACKED_BYTES: usize = 16 * 1024 * 1024;
 
 /// Primary-side correlation and delegation tracking for one runtime instance.
 ///
@@ -337,6 +358,10 @@ pub struct PrimaryState {
     /// Callers awaiting a terminal result, keyed by the same composite key.
     /// A caller can await before OR after the terminal arrives.
     awaiters: HashMap<DelegationKey, Vec<AwaitReply>>,
+    /// Running total of bytes accounted to TERMINAL entries currently retained
+    /// (delegation_id + result + error + assigned_to). Kept incrementally so
+    /// eviction does not re-scan the whole map; live entries contribute 0.
+    terminal_bytes: usize,
 }
 
 /// Outcome of feeding a spawn command to the state: the params to emit, already
@@ -386,6 +411,32 @@ impl PrimaryState {
             },
         );
         SpawnEmission { rpc_id, params }
+    }
+
+    /// Remove a parked pending request (a spawn whose frame the serve loop
+    /// could not put on the wire) and answer its caller
+    /// [`CommandError::InvalidRequest`]. Used for an outbound frame that is
+    /// well-formed but too large for the transport: the serve loop parks the
+    /// spawn in `begin_spawn`, discovers the serialized frame exceeds the
+    /// limit, and calls this to fail the caller WITHOUT tearing down the
+    /// connection. Returns true if a pending request was parked under
+    /// `rpc_id` (so this was ours to fail); false otherwise. Tracks nothing.
+    pub(crate) fn fail_pending_invalid_request(&mut self, rpc_id: u64, message: String) -> bool {
+        let Some(pending) = self.pending.remove(&rpc_id) else {
+            return false;
+        };
+        match pending {
+            PendingRequest::Spawn { reply, .. } => {
+                let _ = reply.send(Err(CommandError::InvalidRequest(message)));
+            }
+            PendingRequest::Cancel { reply } => {
+                let _ = reply.send(Err(CommandError::InvalidRequest(message)));
+            }
+            PendingRequest::ListAgents { reply } => {
+                let _ = reply.send(Err(CommandError::InvalidRequest(message)));
+            }
+        }
+        true
     }
 
     /// Register a cancel: park its reply under `rpc_id` and return the wire
@@ -459,14 +510,17 @@ impl PrimaryState {
         let snapshot = match self.tracked.get(&handle.key()) {
             Some(TrackedDelegation {
                 state: DelegationLifecycle::Pending,
+                ..
             }) => Some(DelegationSnapshot::Pending),
             Some(TrackedDelegation {
                 state: DelegationLifecycle::Running { assigned_to },
+                ..
             }) => Some(DelegationSnapshot::Running {
                 assigned_to: assigned_to.clone(),
             }),
             Some(TrackedDelegation {
                 state: DelegationLifecycle::Terminal(outcome),
+                ..
             }) => Some(DelegationSnapshot::Terminal(outcome.clone())),
             None => None,
         };
@@ -504,6 +558,23 @@ impl PrimaryState {
                 let ack: Option<DelegateAck> = result.and_then(|v| serde_json::from_value(v).ok());
                 match ack {
                     Some(ack) => {
+                        // The ack MUST name the delegation we asked to spawn.
+                        // A mismatched delegation_id is a protocol violation
+                        // (a routing bug or a crossed reply): fail the caller
+                        // and track NOTHING, so a foreign id can never seed the
+                        // correlation table under this rpc id.
+                        if ack.delegation_id != delegation_id {
+                            warn!(
+                                requested = %delegation_id,
+                                acked = %ack.delegation_id,
+                                "cp/delegate ack named a different delegation_id — rejecting"
+                            );
+                            let _ = reply.send(Err(CommandError::Internal(format!(
+                                "cp/delegate ack delegation_id {:?} does not match the request {:?}",
+                                ack.delegation_id, delegation_id
+                            ))));
+                            return true;
+                        }
                         let handle =
                             DelegationHandle::new(ack.delegation_id.clone(), ack.admission);
                         // Track the admission so the later result frame routes.
@@ -515,6 +586,8 @@ impl PrimaryState {
                                 state: DelegationLifecycle::Running {
                                     assigned_to: ack.assigned_to.clone(),
                                 },
+                                assigned_to: ack.assigned_to.clone(),
+                                accounted_bytes: 0,
                             },
                         );
                         self.tracked_order.push_back(key);
@@ -569,24 +642,51 @@ impl PrimaryState {
         }
     }
 
-    /// Evict oldest terminal history until a new tracked admission fits.
-    /// Running/Pending work is never evicted; CP/global capacity bounds it.
+    /// Evict oldest terminal history until BOTH bounds are satisfied for a new
+    /// tracked admission: at most [`MAX_TRACKED_DELEGATIONS`] entries AND at
+    /// most [`MAX_TRACKED_BYTES`] of accounted terminal payload. Running or
+    /// Pending work is never evicted; the CP/global capacity bounds it and the
+    /// count bound is expressed against the whole map so live work still
+    /// pushes out old history. Eviction always removes the OLDEST terminal
+    /// entry in insertion order, so it is deterministic and never touches live
+    /// delegations.
     fn make_history_room(&mut self) {
-        while self.tracked.len() >= MAX_TRACKED_DELEGATIONS {
+        while self.tracked.len() >= MAX_TRACKED_DELEGATIONS
+            || self.terminal_bytes > MAX_TRACKED_BYTES
+        {
             let Some(index) = self.tracked_order.iter().position(|key| {
                 self.tracked.get(key).is_some_and(|tracked| {
                     matches!(tracked.state, DelegationLifecycle::Terminal(_))
                 })
             }) else {
+                // No terminal entry left to evict: only live work remains, and
+                // live work is never evicted. Both bounds are best-effort
+                // against a flood of live delegations, which CP capacity caps.
                 break;
             };
             let key = self
                 .tracked_order
                 .remove(index)
                 .expect("index came from position");
-            self.tracked.remove(&key);
+            if let Some(tracked) = self.tracked.remove(&key) {
+                self.terminal_bytes = self.terminal_bytes.saturating_sub(tracked.accounted_bytes);
+            }
             self.awaiters.remove(&key);
         }
+    }
+
+    /// Bytes a terminal entry contributes to the history byte bound:
+    /// delegation_id + result + error + assigned_to. Counts the payload that
+    /// is actually retained; the admission (a `u64`) is negligible and fixed.
+    fn terminal_entry_bytes(
+        delegation_id: &str,
+        assigned_to: &str,
+        outcome: &DelegationOutcome,
+    ) -> usize {
+        delegation_id.len()
+            + assigned_to.len()
+            + outcome.result.as_deref().map_or(0, str::len)
+            + outcome.error.as_deref().map_or(0, str::len)
     }
 
     /// Route an initiator-bound `cp/delegate_result` to its tracked delegation
@@ -615,12 +715,21 @@ impl PrimaryState {
             return true;
         }
         let outcome = DelegationOutcome::from_result(params);
+        let assigned_to = tracked.assigned_to.clone();
+        let entry_bytes = Self::terminal_entry_bytes(&params.delegation_id, &assigned_to, &outcome);
         tracked.state = DelegationLifecycle::Terminal(outcome.clone());
+        tracked.accounted_bytes = entry_bytes;
+        self.terminal_bytes = self.terminal_bytes.saturating_add(entry_bytes);
         if let Some(waiters) = self.awaiters.remove(&key) {
             for w in waiters {
                 let _ = w.send(Ok(outcome.clone()));
             }
         }
+        // This entry just became terminal and is retained forever until
+        // evicted; enforce the byte bound now so one huge result cannot pin
+        // memory past the ceiling. The just-terminal entry is the newest in
+        // insertion order, so older terminals are evicted before it.
+        self.make_history_room();
         true
     }
 
@@ -971,6 +1080,8 @@ mod tests {
             handle.key(),
             TrackedDelegation {
                 state: DelegationLifecycle::Pending,
+                assigned_to: String::new(),
+                accounted_bytes: 0,
             },
         );
         let (ctx, crx) = oneshot::channel();
@@ -1000,16 +1111,21 @@ mod tests {
         let mut state = PrimaryState::new();
         for admission in 1..=MAX_TRACKED_DELEGATIONS as u64 {
             let key = (format!("d-{admission}"), admission);
+            let outcome = DelegationOutcome {
+                status: DelegationStatus::Completed,
+                result: Some("done".into()),
+                error: None,
+            };
+            let bytes = PrimaryState::terminal_entry_bytes(&key.0, "prod/w", &outcome);
             state.tracked.insert(
                 key.clone(),
                 TrackedDelegation {
-                    state: DelegationLifecycle::Terminal(DelegationOutcome {
-                        status: DelegationStatus::Completed,
-                        result: Some("done".into()),
-                        error: None,
-                    }),
+                    state: DelegationLifecycle::Terminal(outcome),
+                    assigned_to: "prod/w".into(),
+                    accounted_bytes: bytes,
                 },
             );
+            state.terminal_bytes += bytes;
             state.tracked_order.push_back(key);
         }
         state.make_history_room();
@@ -1020,6 +1136,8 @@ mod tests {
                 state: DelegationLifecycle::Running {
                     assigned_to: "prod/w".into(),
                 },
+                assigned_to: "prod/w".into(),
+                accounted_bytes: 0,
             },
         );
         state.tracked_order.push_back(new_key);
@@ -1087,5 +1205,242 @@ mod tests {
         );
         // The running delegation is no longer tracked (it was live).
         assert_eq!(st.lifecycle(&running), None);
+    }
+
+    #[tokio::test]
+    async fn a_completed_delegation_survives_repeated_fail_all_live_reconnect_cycles() {
+        // Process-lifetime PrimaryState: the same instance is reused across
+        // reconnects. fail_all_live runs once per lost connection; a terminal
+        // outcome recorded before the first disconnect must remain queryable
+        // through every later cycle, while live/pending work is failed each
+        // time. This is the regression proving terminal history is preserved
+        // across the fail_all_live / reconnect-cycle semantics.
+        let mut st = PrimaryState::new();
+
+        // Complete a delegation while "connected".
+        let (tx, rx) = oneshot::channel();
+        let emission = st.begin_spawn(1, spawn_request("d-done"), tx);
+        st.on_reply(
+            emission.rpc_id,
+            Some(ack_value("d-done", 1, "prod/w1")),
+            None,
+        );
+        let done = rx.await.unwrap().unwrap().handle;
+        st.on_delegate_result(&DelegateResultParams {
+            delegation_id: "d-done".into(),
+            admission: 1,
+            status: DelegationStatus::Completed,
+            result: Some("done-payload".into()),
+            error: None,
+        });
+        let terminal = DelegationLifecycle::Terminal(DelegationOutcome {
+            status: DelegationStatus::Completed,
+            result: Some("done-payload".into()),
+            error: None,
+        });
+        assert_eq!(st.lifecycle(&done), Some(terminal.clone()));
+        let bytes_after_completion = st.terminal_bytes;
+        assert!(
+            bytes_after_completion > 0,
+            "a terminal payload is accounted"
+        );
+
+        // Simulate three reconnect cycles: each loses the connection (a live
+        // spawn is parked, then fail_all_live fires), then the connection is
+        // re-established (a new spawn is admitted and completes).
+        for cycle in 0..3u64 {
+            // A live spawn outstanding when the connection drops.
+            let (ptx, prx) = oneshot::channel();
+            let _ = st.begin_spawn(100 + cycle, spawn_request("d-live"), ptx);
+
+            st.fail_all_live();
+
+            // The live spawn is failed on every cycle.
+            assert!(matches!(
+                prx.await.unwrap(),
+                Err(CommandError::Disconnected)
+            ));
+            // The completed delegation survives, unchanged, with its payload
+            // still accounted; other cycles' terminals only add to the total.
+            assert_eq!(st.lifecycle(&done), Some(terminal.clone()));
+            assert!(st.terminal_bytes >= bytes_after_completion);
+            // An await against it still answers immediately from history.
+            let (atx, arx) = oneshot::channel();
+            st.begin_await(&done, atx);
+            assert_eq!(
+                arx.await.unwrap().unwrap().result.as_deref(),
+                Some("done-payload")
+            );
+
+            // Reconnect: admit and complete another delegation this cycle.
+            let id = format!("d-cycle-{cycle}");
+            let admission = 200 + cycle;
+            let (tx, rx) = oneshot::channel();
+            let e = st.begin_spawn(300 + cycle, spawn_request(&id), tx);
+            st.on_reply(e.rpc_id, Some(ack_value(&id, admission, "prod/w1")), None);
+            let h = rx.await.unwrap().unwrap().handle;
+            st.on_delegate_result(&DelegateResultParams {
+                delegation_id: id.clone(),
+                admission,
+                status: DelegationStatus::Completed,
+                result: Some("ok".into()),
+                error: None,
+            });
+            assert!(matches!(
+                st.lifecycle(&h),
+                Some(DelegationLifecycle::Terminal(_))
+            ));
+        }
+
+        // The original completed delegation is still there after all cycles.
+        assert_eq!(st.lifecycle(&done), Some(terminal));
+    }
+
+    #[tokio::test]
+    async fn an_ack_naming_a_different_delegation_id_tracks_nothing() {
+        // The CP acked with a delegation_id we never asked to spawn: a routing
+        // bug or crossed reply. The caller must be failed and NOTHING tracked,
+        // so a foreign id can never seed correlation under our rpc id.
+        let mut st = PrimaryState::new();
+        let (tx, rx) = oneshot::channel();
+        let emission = st.begin_spawn(1, spawn_request("d-requested"), tx);
+        assert!(st.on_reply(
+            emission.rpc_id,
+            Some(ack_value("d-foreign", 5, "prod/w1")),
+            None
+        ));
+        let outcome = rx.await.unwrap();
+        assert!(matches!(outcome, Err(CommandError::Internal(_))));
+        assert_eq!(st.tracked_len(), 0, "a mismatched ack tracks nothing");
+        assert_eq!(st.terminal_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn an_ack_with_the_matching_delegation_id_is_tracked() {
+        // The complement: an exact match is admitted normally.
+        let mut st = PrimaryState::new();
+        let (tx, rx) = oneshot::channel();
+        let emission = st.begin_spawn(1, spawn_request("d-1"), tx);
+        st.on_reply(emission.rpc_id, Some(ack_value("d-1", 5, "prod/w1")), None);
+        let handle = rx.await.unwrap().unwrap().handle;
+        assert_eq!(
+            st.lifecycle(&handle),
+            Some(DelegationLifecycle::Running {
+                assigned_to: "prod/w1".into()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_pending_invalid_request_fails_the_caller_without_tracking() {
+        // The serve loop's oversized-outbound-Spawn path: the spawn was parked
+        // by begin_spawn, the serialized frame turned out too large, so the
+        // loop fails the parked pending request with InvalidRequest and tracks
+        // nothing — the connection is untouched.
+        let mut st = PrimaryState::new();
+        let (tx, rx) = oneshot::channel();
+        let emission = st.begin_spawn(7, spawn_request("d-huge"), tx);
+        assert!(st.fail_pending_invalid_request(emission.rpc_id, "frame too large".into()));
+        let outcome = rx.await.unwrap();
+        assert!(matches!(outcome, Err(CommandError::InvalidRequest(_))));
+        assert_eq!(st.tracked_len(), 0, "an oversized spawn tracks nothing");
+        // A later reply for the same id is no longer ours (it was removed).
+        assert!(!st.on_reply(7, Some(ack_value("d-huge", 1, "prod/w1")), None));
+    }
+
+    #[tokio::test]
+    async fn fail_pending_invalid_request_is_a_noop_for_an_unknown_id() {
+        let mut st = PrimaryState::new();
+        assert!(!st.fail_pending_invalid_request(999, "nope".into()));
+    }
+
+    #[test]
+    fn terminal_history_is_bounded_by_retained_bytes_not_only_count() {
+        // A handful of very large terminal payloads must be evicted on the
+        // byte bound even though the count bound (4096 entries) is nowhere
+        // near reached. Oldest terminal goes first; live work is never touched.
+        let mut state = PrimaryState::new();
+        // ~2 MiB result each; 16 MiB ceiling means ~8 fit, so inserting 12
+        // must evict the oldest few to satisfy MAX_TRACKED_BYTES.
+        let big = "x".repeat(2 * 1024 * 1024);
+        for admission in 1..=12u64 {
+            let key = (format!("d-{admission}"), admission);
+            let outcome = DelegationOutcome {
+                status: DelegationStatus::Completed,
+                result: Some(big.clone()),
+                error: None,
+            };
+            let bytes = PrimaryState::terminal_entry_bytes(&key.0, "prod/w", &outcome);
+            state.tracked.insert(
+                key.clone(),
+                TrackedDelegation {
+                    state: DelegationLifecycle::Terminal(outcome),
+                    assigned_to: "prod/w".into(),
+                    accounted_bytes: bytes,
+                },
+            );
+            state.terminal_bytes += bytes;
+            state.tracked_order.push_back(key);
+            state.make_history_room();
+        }
+        assert!(
+            state.terminal_bytes <= MAX_TRACKED_BYTES,
+            "retained terminal bytes ({}) must stay within the 16 MiB bound",
+            state.terminal_bytes
+        );
+        assert!(
+            state.tracked.len() < 12,
+            "the byte bound must have evicted some entries (count bound was never hit)"
+        );
+        // The oldest entries went first; the newest survives.
+        assert!(state.tracked.contains_key(&("d-12".to_string(), 12)));
+        assert!(!state.tracked.contains_key(&("d-1".to_string(), 1)));
+    }
+
+    #[test]
+    fn a_live_delegation_is_never_evicted_by_the_byte_bound() {
+        // Even with the byte bound blown past, a live (Running) entry stays;
+        // only terminal history is evictable.
+        let mut state = PrimaryState::new();
+        // One live entry first.
+        let live_key = ("d-live".to_string(), 1);
+        state.tracked.insert(
+            live_key.clone(),
+            TrackedDelegation {
+                state: DelegationLifecycle::Running {
+                    assigned_to: "prod/w".into(),
+                },
+                assigned_to: "prod/w".into(),
+                accounted_bytes: 0,
+            },
+        );
+        state.tracked_order.push_back(live_key.clone());
+        // Then enough terminal bytes to exceed the ceiling.
+        let big = "x".repeat(9 * 1024 * 1024);
+        for admission in 2..=4u64 {
+            let key = (format!("d-{admission}"), admission);
+            let outcome = DelegationOutcome {
+                status: DelegationStatus::Completed,
+                result: Some(big.clone()),
+                error: None,
+            };
+            let bytes = PrimaryState::terminal_entry_bytes(&key.0, "prod/w", &outcome);
+            state.tracked.insert(
+                key.clone(),
+                TrackedDelegation {
+                    state: DelegationLifecycle::Terminal(outcome),
+                    assigned_to: "prod/w".into(),
+                    accounted_bytes: bytes,
+                },
+            );
+            state.terminal_bytes += bytes;
+            state.tracked_order.push_back(key);
+            state.make_history_room();
+        }
+        assert!(state.terminal_bytes <= MAX_TRACKED_BYTES);
+        assert!(
+            state.tracked.contains_key(&live_key),
+            "the live delegation must survive byte-bound eviction"
+        );
     }
 }
