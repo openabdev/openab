@@ -725,10 +725,14 @@ impl PrimaryState {
                 let _ = w.send(Ok(outcome.clone()));
             }
         }
-        // This entry just became terminal and is retained forever until
-        // evicted; enforce the byte bound now so one huge result cannot pin
-        // memory past the ceiling. The just-terminal entry is the newest in
-        // insertion order, so older terminals are evicted before it.
+        // Move this entry to the back so terminal history is ordered by
+        // completion rather than admission. Enforce the byte bound now: older
+        // completions are evicted first, while this entry is evicted only if
+        // the retained set still cannot fit (for example, it alone is huge).
+        if let Some(index) = self.tracked_order.iter().position(|queued| queued == &key) {
+            self.tracked_order.remove(index);
+        }
+        self.tracked_order.push_back(key);
         self.make_history_room();
         true
     }
@@ -1395,6 +1399,44 @@ mod tests {
         // The oldest entries went first; the newest survives.
         assert!(state.tracked.contains_key(&("d-12".to_string(), 12)));
         assert!(!state.tracked.contains_key(&("d-1".to_string(), 1)));
+    }
+
+    #[test]
+    fn out_of_order_completion_evicts_the_oldest_completion_not_oldest_admission() {
+        let mut state = PrimaryState::new();
+        for admission in 1..=3u64 {
+            let key = (format!("d-{admission}"), admission);
+            state.tracked.insert(
+                key.clone(),
+                TrackedDelegation {
+                    state: DelegationLifecycle::Running {
+                        assigned_to: "prod/w".into(),
+                    },
+                    assigned_to: "prod/w".into(),
+                    accounted_bytes: 0,
+                },
+            );
+            state.tracked_order.push_back(key);
+        }
+
+        // d-1 was admitted first but completes last. Three 6 MiB outcomes do
+        // not fit under the 16 MiB cap, so the oldest completion (d-2) must be
+        // evicted while the just-completed d-1 remains queryable.
+        let result = "x".repeat(6 * 1024 * 1024);
+        for admission in [2u64, 3, 1] {
+            assert!(state.on_delegate_result(&DelegateResultParams {
+                delegation_id: format!("d-{admission}"),
+                admission,
+                status: DelegationStatus::Completed,
+                result: Some(result.clone()),
+                error: None,
+            }));
+        }
+
+        assert!(!state.tracked.contains_key(&("d-2".to_string(), 2)));
+        assert!(state.tracked.contains_key(&("d-3".to_string(), 3)));
+        assert!(state.tracked.contains_key(&("d-1".to_string(), 1)));
+        assert!(state.terminal_bytes <= MAX_TRACKED_BYTES);
     }
 
     #[test]
