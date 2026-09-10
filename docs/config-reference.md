@@ -773,6 +773,109 @@ permissions scoped to the bucket.
 
 ---
 
+## `[control_plane]`
+
+Enrol this runtime with an [Agent Control Plane](adr/agent-control-plane.md) so
+it can delegate to, or serve delegations from, other OAB agents.
+
+Presence of the section is the opt-in — there is no cargo feature and no
+env-var switch. Absent section = no outbound connection, no delegation serving,
+and no behaviour change. Unknown keys are a hard startup failure.
+
+```toml
+[control_plane]
+url = "wss://cp.example.internal/cp"   # the CP mounts the socket at /cp
+# allow_insecure_transport = true       # only for explicit non-loopback ws:// exceptions
+auth_key = "${OPENAB_CP_KEY}"          # per-agent credential, never shared
+namespace = "prod"
+name = "koudu"
+type = "worker"                        # "primary" | "worker"
+max_delegated_sessions = 2             # local concurrency budget
+
+[control_plane.labels]                 # optional selector labels
+backend = "kiro"
+tier = "batch"
+```
+
+| Field | Required | Default | Description |
+|-------|----------|---------|-------------|
+| `url` | ✅ | — | CP WebSocket endpoint, path `/cp`. Remote endpoints should use `wss://`; `ws://` is accepted only on loopback unless explicitly overridden |
+| `allow_insecure_transport` | — | `false` | Permit non-loopback cleartext `ws://`. This sends the bearer key without connection-level encryption and logs a startup warning |
+| `auth_key` | ✅ | — | Bearer key sent on the upgrade request. Use `${ENV}` or `[secrets.refs]` — never a literal |
+| `namespace` | ✅ | — | Asserted namespace; the CP verifies it against the key's claims |
+| `name` | ✅ | — | Asserted logical agent name; likewise verified |
+| `type` | ✅ | — | `primary` (initiates delegations) or `worker` (serves them) |
+| `labels` | — | `{}` | Selector labels other agents can target by |
+| `max_delegated_sessions` | — | `1` | Concurrency advertised at registration; the CP may clamp it, and the runtime enforces whatever the ack returns |
+
+`namespace`, `name`, and `type` are **assertions the CP verifies**, not
+authorization inputs: each auth key is bound to immutable claims in CP config,
+and a mismatch is rejected at registration. They live in config so a
+misconfigured runtime fails loudly instead of being silently re-identified.
+`observer` is not accepted here — it is a read-only lobby role, not a runtime
+one.
+
+### Headless (no chat adapter)
+
+Any `[control_plane]` runtime may run without a chat adapter. Workers receive
+remote delegations; primaries initiate through the owner-only local socket and
+`openab agent`. The four-tool MCP facade is also started, but its tools are
+session-token gated and in v1 only `acp:` (ACP-gateway) sessions receive a
+token — so an adapter-less or chat-adapter primary's model does not see them
+and the CLI is its initiating surface.
+
+| Config | Result |
+|--------|--------|
+| `[control_plane] type = "worker"`, no adapter | Full runtime — pool + control-plane client, no chat platform |
+| `[control_plane] type = "primary"`, no adapter and no `[mcp]` | Full runtime — auto-started CP MCP tools + local CLI socket |
+| `[mcp]` only, no adapter | Facade-only mode (unchanged) |
+| `[mcp]` + worker, no adapter | Full runtime — facade listener + worker-side control-plane client |
+| `[mcp]` + primary, no adapter | Full runtime — configured facade capabilities + four direct CP tools + primary registration |
+
+### Operational notes
+
+- **Local agent API.** `$OPENAB_AGENT_SOCKET` overrides the default
+  `$HOME/.openab/run/agent.sock`. The runtime creates an owner-only directory
+  (`0700`) and socket (`0600`). The transport is a **Unix-domain socket and is
+  Unix-only**: non-Unix builds compile (the server and client are stubbed) but
+  fail loudly at runtime, and **no Windows support is planned** — CP
+  deployments are Linux containers or macOS.
+- **Primary MCP tools are automatic, but session-gated.** A primary starts the
+  loopback facade on `127.0.0.1:8848` when `[mcp]` is absent, or adds the four
+  direct CP tools to the configured facade listener when `[mcp]` is present.
+  Tools are visible only to sessions holding a broker-minted token, which in
+  v1 means `acp:` (ACP-gateway) sessions; the startup log names the mode
+  (`[mcp]` configured vs automatic) and this reach explicitly.
+- **One runtime per socket path.** Two runtimes under one user must set a
+  distinct `OPENAB_AGENT_SOCKET` for at least one of them: the runtime refuses
+  to start over a socket that answers a connect probe and only unlinks a node
+  nobody is listening on.
+- **The key never reaches the agent.** Agent subprocesses start from
+  `env_clear()` with a fixed baseline plus explicit `[agent].env` keys;
+  `auth_key` is in neither, and it is never logged.
+- **Reconnects are automatic** with equal jitter over 1/2/4/8/16/30s base
+  backoff and a 10-second connect deadline. One instance id is generated per
+  process and reused across reconnects, so the CP can tell a reconnecting
+  replica from a new one without a fleet-wide reconnect herd.
+- **Transport is fail-closed.** Remote bearer credentials require `wss://` by
+  default. Loopback `ws://` is allowed for local development; a non-loopback
+  cleartext exception requires `allow_insecure_transport = true` and emits a
+  warning because the bearer key is not encrypted by that connection.
+- **Per-turn ceiling.** A delegation is bounded by the nearer of its CP
+  deadline and `[pool].prompt_hard_timeout_secs`; exceeding the local one is
+  reported to the initiator as `timeout`.
+- **Delegation deadlines are `1..=1800` seconds.** The MCP `spawn_agent` tool
+  (`deadline_secs`) and the `openab agent spawn --deadline-secs` CLI both
+  validate this 1-second..=30-minute window before any frame leaves the host,
+  and a blocking spawn bounds the whole operation — admission plus the await of
+  the result — under one `deadline_secs + 5` ceiling, so a hung admission
+  cannot block the caller past its deadline.
+- **One session per delegation.** Each delegation runs in a fresh ACP session
+  that is discarded when it ends, so delegations never see each other's
+  conversation and none of them counts against the pool afterwards.
+
+---
+
 ## `[cron]`
 
 Everything cron-related lives under `[cron]`.

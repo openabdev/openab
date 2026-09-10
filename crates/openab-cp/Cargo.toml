@@ -6,19 +6,52 @@ license = "MIT"
 description = "OpenAB Agent Control Plane — registry, router, and policy for direct inter-agent delegation"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-axum = { version = "0.8", features = ["ws"] }
-futures-util = "0.3"
+# --- wire types (always compiled) ---
+# `proto` is the shared contract between the CP and every runtime that speaks
+# to it, so it must be usable WITHOUT the server: `openab-core` depends on this
+# crate with `default-features = false` purely for these types, and must not
+# inherit axum/tokio/hyper through that edge (the runtime image would otherwise
+# grow a whole HTTP server it never binds).
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
-parking_lot = "0.12"
-clap = { version = "4", features = ["derive"] }
-subtle = "2"
+
+# --- server-only (feature `server`, on by default) ---
+tokio = { version = "1", features = ["full"], optional = true }
+axum = { version = "0.8", features = ["ws"], optional = true }
+futures-util = { version = "0.3", optional = true }
+toml = { version = "0.8", optional = true }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+anyhow = { version = "1", optional = true }
+parking_lot = { version = "0.12", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+subtle = { version = "2", optional = true }
+
+[features]
+# Default: the full control plane (config, registry, policy, router, events,
+# WebSocket server) plus the `openab-cp` binary. Turning it off leaves only
+# `proto` — the wire contract — which is what runtime clients need.
+default = ["server"]
+server = [
+    "dep:tokio",
+    "dep:axum",
+    "dep:futures-util",
+    "dep:toml",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+    "dep:anyhow",
+    "dep:parking_lot",
+    "dep:clap",
+    "dep:subtle",
+]
+
+# The binary IS the server; without the feature there is nothing for it to
+# start, so it is skipped instead of failing to compile.
+[[bin]]
+name = "openab-cp"
+path = "src/main.rs"
+required-features = ["server"]
 
 [dev-dependencies]
 # WebSocket client for the end-to-end admission/lifecycle tests. Same version

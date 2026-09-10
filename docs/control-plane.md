@@ -5,15 +5,10 @@ WebSocket JSON-RPC, so agents delegate work to each other without
 round-tripping through a chat platform. Design and wire contract:
 [ADR: Agent Control Plane](adr/agent-control-plane.md).
 
-> **Status: PR 2/4 of the control-plane stack.** PR 1/4 shipped the CP
-> server binary (registry, policy, router, wire protocol); this slice adds
-> the observer/lobby surface — the read-only `observer` agent type, the
-> `cp/event` notification stream, and `cp/list_agents` (see
-> [Observer surface](#observer-surface-lobby) below). The OAB-runtime
-> client (`[control_plane]` config + registration), the MCP facade/CLI, and
-> client relay land in the follow-up slices — until then nothing connects
-> to this server in a stock deployment, and there is no packaged container
-> image yet.
+> **Status: PR 4/4 of the control-plane v1 stack.** The standalone CP,
+> observer/lobby surface, runtime client/worker serving, and primary-side local
+> API are all implemented. Primary agent sessions receive four direct MCP
+> tools; operators and hooks use the same API through `openab agent`.
 
 ## Run
 
@@ -122,6 +117,130 @@ issue #1474).
   The ack's `effective_max_delegated_sessions` is the value that counts.
 - After a lease expires or the CP restarts, in-flight delegations are gone:
   initiators reconcile against their own deadlines and re-delegate.
+
+## Primary agent tools and local API
+
+A runtime configured as `type = "primary"` automatically starts two local
+surfaces backed by one implementation:
+
+1. an owner-only Unix socket (`$OPENAB_AGENT_SOCKET`, otherwise
+   `$HOME/.openab/run/agent.sock`), with parent directory mode `0700` and socket
+   mode `0600`;
+2. the loopback MCP facade (the configured `[mcp]` listener, or
+   `127.0.0.1:8848` when `[mcp]` is absent), which publishes four direct
+   delegation tools.
+
+**Who can reach the MCP tools in v1.** The direct tools are session-token
+gated, and the only production path that mints a session token — and writes
+the agent's facade entry — is an `acp:` session, i.e. one opened through the
+ACP-over-WebSocket gateway. A primary whose sessions come from a chat adapter
+(Discord, Slack, Telegram, …) or that has no agent session at all does not
+mint one, so its model cannot list or call the tools. For those deployments
+the `openab agent` CLI is the initiating surface; the MCP tools are reachable
+today by ACP-gateway-driven primaries, and per-session injection for the
+remaining adapters is a follow-up, not a v1 guarantee.
+
+The MCP facade publishes these direct tools:
+
+| Tool | Behavior |
+|------|----------|
+| `spawn_agent` | Delegate by exact name or a **non-empty** label selector (schema `minProperties: 1`). Blocking by default; `async: true` returns an opaque handle immediately. Deadlines are 1–1800 seconds. |
+| `check_delegation` | Return `pending`, `running` (including assigned peer), or the terminal result without waiting. |
+| `list_agents` | Return the authenticated namespace roster, labels, and current capacity. |
+| `cancel_delegation` | Cancel an in-flight admission by opaque handle. |
+
+Direct tools are session-bound: an anonymous loopback MCP client cannot list or
+call them. The provider forwards every operation through the Unix socket, so
+MCP and CLI share validation, admission-token correlation, deadline enforcement,
+and audit behavior. The CP URL and bearer key never enter the agent process.
+
+A blocking `spawn` is bounded as **one** operation: the admission round-trip
+and the await of the terminal result run together under a single
+`deadline_secs + 5` ceiling, shared verbatim by the MCP tool and the CLI, so a
+hung admission cannot block the caller past its deadline. The same generator
+mints every delegation id, so a delegation started from the CLI is
+indistinguishable on the wire from one started by the model.
+
+The opaque handle is a random 256-bit token stored in the runtime; it does not
+encode `delegation_id` or `admission`. Local handle storage is bounded and
+oldest-first evicted after 4096 tokens.
+
+### CLI
+
+```bash
+# Exact-name delegation (blocking by default)
+openab agent spawn --target worker-1 --prompt "review this patch" --deadline-secs 300
+
+# Label-targeted asynchronous delegation
+openab agent spawn --label backend=kiro --label tier=batch \
+  --prompt "run the test matrix" --async
+
+openab agent list
+openab agent status <opaque-handle>
+openab agent cancel <opaque-handle> --reason "superseded"
+```
+
+Use `--socket PATH` or `OPENAB_AGENT_SOCKET` to override the socket location.
+`--deadline-secs` is validated to `1..=1800` client-side before any frame
+leaves the host — the same window the MCP schema and the socket server enforce.
+Primary-only headless deployments are valid: the CLI is their initiating
+surface (there is no agent session to hold an MCP credential). Workers also
+expose the socket for operator `list` and status diagnostics, but the runtime
+refuses primary-only spawn/cancel commands locally before any frame leaves the
+host.
+
+**One runtime per socket path.** The default path is per user, so two runtimes
+under the same account must give at least one of them a distinct
+`OPENAB_AGENT_SOCKET`. A runtime refuses to start over a socket that answers a
+connect probe (a live sibling) and only unlinks a node nobody is listening on;
+on shutdown it removes the node only if it is still the one it bound, so an
+older instance never deletes a successor's socket.
+
+The local server is bounded on every axis a stuck peer could push on: at most
+64 concurrent connections (further connections get one error line and are
+closed), a 5-minute idle limit between requests, a 60-second bound on each
+CP round trip, and an `Await` bound of the maximum deadline plus grace. On the
+control-plane side, at most 256 requests may be outstanding to the CP
+(`Overloaded` beyond that), an unanswered request is failed `Timeout` after
+60 seconds, and a delegation still non-terminal 60 seconds past its own
+deadline is dropped from local tracking with its waiters answered `Timeout`.
+
+The local API is **Unix-only**: it is a Unix-domain socket with owner-only
+permissions and has no non-Unix transport. The binary still compiles for
+non-Unix targets (the socket server and client have stubs that fail loudly at
+runtime), but no Windows support is planned — CP deployments are Linux
+containers or macOS.
+
+## Delegated prompt context (`openab.delegation.v1`)
+
+When an OAB runtime serves a `cp/delegate`, it prepends one standalone
+`<sender_context>` text block before the delegated prompt. The XML-shaped
+block is a structural envelope shared with normal chat arrivals, but the JSON
+inside is **multi-schema**: consumers MUST inspect `schema` before interpreting
+any other field. Chat arrivals use `openab.sender.v1`; delegated work uses
+`openab.delegation.v1`.
+
+```text
+<sender_context>
+{"schema":"openab.delegation.v1","delegation_id":"d-01J...","from":"prod/koudu","chain":["prod/koudu"],"deadline":"2026-09-08T20:30:00Z"}
+</sender_context>
+```
+
+| Field | Meaning |
+|-------|---------|
+| `schema` | Always `openab.delegation.v1` for this context shape |
+| `delegation_id` | Caller-supplied delegation id; useful for logs, but reusable and therefore not an admission identity |
+| `from` | CP-authenticated logical initiator (`namespace/name`) |
+| `chain` | CP-constructed delegation ancestry, root first |
+| `deadline` | Absolute RFC 3339 deadline enforced by both CP and serving runtime |
+
+`from`, `chain`, and `deadline` are stamped by the control plane rather than
+accepted from the agent prompt, so a serving agent may trust them as routing
+and policy provenance. The protocol-visible `admission` token is intentionally
+not placed in the prompt context: it is runtime bookkeeping echoed on result
+and cancel frames, not an agent instruction. Agents written for chat arrivals
+must not assume every `<sender_context>` body is `openab.sender.v1`; unknown
+schemas should be preserved or ignored safely.
 
 ## Observer surface (lobby)
 

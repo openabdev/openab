@@ -179,11 +179,27 @@ fn purge_session_entries(state: &mut PoolState, key: &str) {
     state.pgids.remove(key);
     state.suspended.remove(key);
     state.persisted.remove(key);
-    // Do NOT remove the creating gate: it is concurrency control, not session
-    // state. Removing it while a holder still owns the old gate Arc would let
-    // a concurrent get_or_create mint a fresh gate and run two creations for
-    // the same key.
+    drop_idle_gate(&mut state.creating, key);
     state.session_workdirs.remove(key);
+}
+
+/// Remove `key`'s creating gate ONLY when the map holds the last reference.
+///
+/// The gate is concurrency control, not session state: removing it while a
+/// `get_or_create` still owns a clone would let a concurrent caller mint a
+/// fresh gate and run two creations for the same key. The strong count is
+/// authoritative here because every clone is taken under the same state
+/// write lock the caller holds (`get_or_insert_gate`), so a count of one
+/// means no creation is in progress or about to be.
+///
+/// Without this, keys that are used exactly once — the control-plane
+/// executor's admission-scoped `control-plane:<sha256>` sessions — would each
+/// leave a permanent `String` + `Arc<Mutex<()>>` behind for the process
+/// lifetime, a map `max_sessions` does not bound (F5).
+fn drop_idle_gate(map: &mut HashMap<String, Arc<Mutex<()>>>, key: &str) {
+    if map.get(key).is_some_and(|g| Arc::strong_count(g) == 1) {
+        map.remove(key);
+    }
 }
 
 /// Escalating kill for a hung agent's process group: wait 10s after the
@@ -856,6 +872,35 @@ impl SessionPool {
         }
     }
 
+    /// Drop a session and all its bookkeeping WITHOUT sending
+    /// `session/cancel` first. Returns `true` when there was an active
+    /// connection to drop.
+    ///
+    /// [`Self::reset_session`] is the same teardown *plus* a cancel and an
+    /// error when the session is unknown, which suits the interactive
+    /// `/reset` it serves. Non-interactive owners of single-use sessions —
+    /// the control-plane executor, which runs one fresh session per
+    /// delegation — need neither: after a completed turn there is nothing to
+    /// cancel, and after a cancelled one the cancel has already been sent.
+    /// Calling `reset_session` there would emit a spurious `session/cancel`
+    /// at the agent and log an error for the benign already-gone case.
+    ///
+    /// The ACP process exits once the last `Arc` to its connection drops, so
+    /// removing the map entry is what reclaims the pool slot.
+    pub async fn discard_session(&self, thread_id: &str) -> bool {
+        let mut state = self.state.write().await;
+        let had_active = state.active.remove(thread_id).is_some();
+        purge_session_entries(&mut state, thread_id);
+        #[cfg(feature = "acp-mcp")]
+        revoke_facade_token_for_key(&mut state, thread_id, self.session_registrar.as_ref());
+        self.save_mapping(&state.persisted);
+        self.save_meta(&state.session_workdirs);
+        if had_active {
+            info!(thread_id = %crate::redact::redact_session_ids(thread_id), "session discarded");
+        }
+        had_active
+    }
+
     pub async fn cleanup_idle(&self, ttl_secs: u64) {
         let cutoff = Instant::now() - std::time::Duration::from_secs(ttl_secs);
         let hung_threshold = std::time::Duration::from_secs(self.hung_threshold_secs);
@@ -1349,6 +1394,8 @@ mod tests {
             creating: HashMap::from([("hung".to_string(), Arc::new(Mutex::new(())))]),
             session_workdirs: HashMap::from([("hung".to_string(), "/tmp/ws".to_string())]),
         };
+        // A get_or_create in flight for "hung" holds a clone of its gate.
+        let held_gate = Arc::clone(state.creating.get("hung").unwrap());
 
         purge_session_entries(&mut state, "hung");
 
@@ -1359,9 +1406,11 @@ mod tests {
         assert!(!state.suspended.contains_key("hung"));
         assert!(!state.persisted.contains_key("hung"));
         assert!(!state.session_workdirs.contains_key("hung"));
-        // The creating gate is concurrency control, not session state: it must
-        // survive so an in-flight get_or_create holder stays serialized.
+        // The creating gate is concurrency control, not session state: while a
+        // get_or_create holder still owns a clone it must survive so that
+        // holder stays serialized against the next creation.
         assert!(state.creating.contains_key("hung"));
+        assert!(Arc::ptr_eq(&held_gate, state.creating.get("hung").unwrap()));
         assert_eq!(state.pgids.get("other"), Some(&5678));
         // Other keys survive untouched.
         assert_eq!(
@@ -1373,6 +1422,37 @@ mod tests {
             Some(&"session-other".to_string())
         );
         assert!(state.activity.contains_key("other"));
+    }
+
+    /// F5: single-use keys (one fresh session per control-plane delegation)
+    /// must not leave a gate behind. Mirrors the pool's own sequence — the
+    /// gate is minted under the state lock and the clone released when the
+    /// creation finishes — then purges, and asserts the map does not grow.
+    #[test]
+    fn purge_drops_a_gate_nobody_holds_so_single_use_keys_stay_bounded() {
+        let mut state = empty_pool_state();
+        for i in 0..1_000 {
+            let key = format!("control-plane:{i:064x}");
+            let gate = get_or_insert_gate(&mut state.creating, &key);
+            // ... creation happens under `gate.lock()` and then the caller
+            // returns, dropping its clone ...
+            drop(gate);
+            purge_session_entries(&mut state, &key);
+            assert!(
+                !state.creating.contains_key(&key),
+                "an unheld gate must be dropped with the rest of the key's entries"
+            );
+        }
+        assert!(state.creating.is_empty(), "no gate may outlive its single-use key");
+
+        // The guard the purge relies on: a clone still held keeps the gate.
+        let key = "control-plane:held";
+        let held = get_or_insert_gate(&mut state.creating, key);
+        purge_session_entries(&mut state, key);
+        assert!(state.creating.contains_key(key));
+        drop(held);
+        purge_session_entries(&mut state, key);
+        assert!(state.creating.is_empty());
     }
 
     #[test]
