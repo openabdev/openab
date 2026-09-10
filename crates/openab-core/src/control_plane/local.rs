@@ -320,8 +320,10 @@ mod unix_impl {
         handlers.abort_all();
         while handlers.join_next().await.is_some() {}
         // Best-effort cleanup so the next boot does not trip over the node —
-        // but only if the path still names OUR node.
-        remove_if_same_node(&path, ours);
+        // but never a successor's. Stop listening first so a connect probe
+        // cannot be answered by us, then unlink only if nobody else answers.
+        drop(listener);
+        remove_if_ours_and_dead(&path, ours);
         Ok(())
     }
 
@@ -528,22 +530,47 @@ mod unix_impl {
         })
     }
 
-    /// Unlink `path` only if it is still the node THIS server created. An older
-    /// runtime shutting down after a successor bound the same pathname must
-    /// not remove the successor's socket (F6); with the liveness probe above
-    /// that succession is refused, but the check keeps cleanup correct even if
-    /// the path was replaced by other means.
-    fn remove_if_same_node(path: &Path, ours: Option<NodeIdentity>) {
+    /// Shutdown cleanup: unlink `path` only if it still looks like the node
+    /// THIS server created AND nobody is listening on it. An older runtime
+    /// shutting down after a successor bound the same pathname must not
+    /// remove the successor's socket (F6); the liveness probe at startup
+    /// refuses that succession, but this keeps cleanup correct even if the
+    /// path was replaced by other means (an operator `rm`, a crash).
+    ///
+    /// Two checks, because neither is sufficient alone. `(dev, ino)` catches
+    /// a replaced node on filesystems that hand out fresh inode numbers, but
+    /// ext4 reuses a freed inode number for the very next create in the
+    /// directory, so a successor can carry OUR identity. The connect probe
+    /// catches that case: the caller has already closed its own listener, so
+    /// anyone who answers is a successor. `ECONNREFUSED` is the only state
+    /// that is unlinked.
+    fn remove_if_ours_and_dead(path: &Path, ours: Option<NodeIdentity>) {
         let Some(ours) = ours else {
             return;
         };
-        if node_identity(path) == Some(ours) {
-            let _ = std::fs::remove_file(path);
-        } else {
+        if node_identity(path) != Some(ours) {
             debug!(
                 socket = %path.display(),
                 "socket path no longer names the node this server bound; leaving it in place"
             );
+            return;
+        }
+        match std::os::unix::net::UnixStream::connect(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                let _ = std::fs::remove_file(path);
+            }
+            Ok(_live) => {
+                debug!(
+                    socket = %path.display(),
+                    "a successor is listening on the socket path; leaving it in place"
+                );
+            }
+            Err(e) => {
+                debug!(
+                    socket = %path.display(), error = %e,
+                    "cannot tell whether the socket path is live; leaving it in place"
+                );
+            }
         }
     }
 
@@ -1511,34 +1538,59 @@ mod unix_impl {
         }
 
         /// An older runtime's shutdown cleanup must not remove a successor's
-        /// node that took the same pathname. The identity recorded at bind
-        /// time is what cleanup compares against.
+        /// node that took the same pathname. On ext4 the successor is even
+        /// handed the predecessor's inode number back, so identity alone is
+        /// not enough: the connect probe is what protects the successor.
         #[tokio::test]
-        async fn cleanup_leaves_a_successors_node_alone() {
+        async fn cleanup_leaves_a_live_successors_node_alone() {
             let root = tempfile::tempdir().unwrap();
             let sock = root.path().join("agent.sock");
 
-            // Predecessor binds and remembers its node.
+            // Predecessor binds, remembers its node, and later closes its
+            // listener (the first step of its shutdown).
             let predecessor = UnixListener::bind(&sock).unwrap();
             let ours = node_identity(&sock);
             assert!(ours.is_some());
             drop(predecessor);
+
+            // The pathname is replaced by other means and a successor binds it.
+            // (Deliberately no assertion that the identity differs: on ext4 it
+            // does not.)
             std::fs::remove_file(&sock).unwrap();
-
-            // Successor takes the pathname (a different inode).
-            let _successor = UnixListener::bind(&sock).unwrap();
+            let successor = UnixListener::bind(&sock).unwrap();
             let theirs = node_identity(&sock);
-            assert_ne!(ours, theirs, "a fresh bind is a fresh node");
 
-            // Predecessor's cleanup runs late: must be a no-op.
-            remove_if_same_node(&sock, ours);
+            // Predecessor's cleanup runs late: the successor answers the probe,
+            // so it must be a no-op.
+            remove_if_ours_and_dead(&sock, ours);
             assert!(
                 std::fs::symlink_metadata(&sock).is_ok(),
-                "the successor's socket must survive the predecessor's cleanup"
+                "the successor's live socket must survive the predecessor's cleanup"
             );
 
-            // The successor's own cleanup does remove it.
-            remove_if_same_node(&sock, theirs);
+            // The successor's own shutdown: close, then clean up — removed.
+            drop(successor);
+            remove_if_ours_and_dead(&sock, theirs);
+            assert!(std::fs::symlink_metadata(&sock).is_err());
+        }
+
+        /// A node that no longer matches our identity is left alone even when
+        /// nothing is listening on it (a stranger's stale node is theirs to
+        /// clean up).
+        #[tokio::test]
+        async fn cleanup_leaves_a_foreign_dead_node_alone() {
+            let root = tempfile::tempdir().unwrap();
+            let sock = root.path().join("agent.sock");
+            let dead = UnixListener::bind(&sock).unwrap();
+            drop(dead);
+            let not_ours = Some(NodeIdentity {
+                dev: u64::MAX,
+                ino: u64::MAX,
+            });
+            remove_if_ours_and_dead(&sock, not_ours);
+            assert!(std::fs::symlink_metadata(&sock).is_ok());
+            // And with the right identity, a dead node is removed.
+            remove_if_ours_and_dead(&sock, node_identity(&sock));
             assert!(std::fs::symlink_metadata(&sock).is_err());
         }
 
