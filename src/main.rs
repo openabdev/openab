@@ -808,8 +808,13 @@ async fn main() -> anyhow::Result<()> {
     // reports the variable now.
     // Gated on `acp` (the root feature that pulls in core's `acp-mcp`), not on `acp-mcp` itself —
     // that is a core feature and naming it here is an unknown-cfg error.
+    //
+    // Keyed on `facade_serving`, NOT `cfg.mcp.is_some()`: a headless control-plane primary
+    // without `[mcp]` still gets the automatic loopback facade (see `facade_listen` above), and
+    // reporting "nothing was started — add [mcp]" while that listener is up would contradict
+    // the running process.
     #[cfg(feature = "acp")]
-    openab_core::acp_mcp::report_facade_status(cfg.mcp.is_some(), &cfg.agent.working_dir);
+    openab_core::acp_mcp::report_facade_status(facade_serving, &cfg.agent.working_dir);
     if let Some(listen) = facade_listen.clone() {
         let tokens = facade_sessions.clone();
         #[cfg(feature = "acp")]
