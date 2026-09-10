@@ -216,7 +216,19 @@ pub trait SessionTokenRegistrar: Send + Sync {
     fn revoke(&self, token: &str);
 }
 
-/// Report, once at startup, whether browser control is enabled.
+/// How the OAB MCP Facade came to be serving, for [`report_facade_status`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FacadeMode {
+    /// No facade listener at all.
+    Off,
+    /// `[mcp]` is present: the operator asked for it, at the configured listen address.
+    Configured,
+    /// No `[mcp]`, but a `[control_plane]` primary started the automatic loopback facade so its
+    /// four delegation tools have somewhere to live. Carries the listen address it chose.
+    AutomaticControlPlane { listen: &'static str },
+}
+
+/// Report, once at startup, whether the facade is serving and how an agent can reach it.
 ///
 /// Call this from configuration/startup, **not** from a session path: nothing per-session is
 /// decided by it, and a warning on that path would repeat for every spawn.
@@ -225,41 +237,64 @@ pub trait SessionTokenRegistrar: Send + Sync {
 /// 2026-07-31 (D-23): that variable was introduced and retired entirely within this changeset and
 /// never appeared in any release, so the notice told operators that something they never had is
 /// now ignored.
-pub fn report_facade_status(mcp_configured: bool, workdir: &str) {
-    if mcp_configured {
-        // "enabled" alone became false when openab stopped wiring vendor configs (D-15). The
-        // facade IS running, but no agent can reach it until the entry is placed, and an operator
-        // reading "enabled" would go looking for a bug instead of doing the remaining step. So the
-        // line reports the facade AND names the step, with the exact commands.
-        //
-        // `workdir` here is the CONFIGURED default. A session may resolve a different one
-        // (`effective_workdir`: a stored per-session value, or an explicit override), and the file
-        // is written under whichever that session used. Startup cannot know those, so the path
-        // below is the default rather than a promise about every session — which is also why the
-        // deployed default matters: with `working_dir == $HOME` the two coincide.
-        let path = facade_config_path(workdir);
-        tracing::info!(
-            facade_config = %path.display(),
-            "browser control: the OAB MCP Facade is running ([mcp] configured), and openab has \
-             written its entry to the file above. openab does NOT modify your agent's MCP config, \
-             so browser tools stay unavailable until that entry is in place."
-        );
-        tracing::info!(
-            "browser control — to finish wiring, run ONE of these for your agent:  \
-             kiro:  kiro-cli mcp import --file {path} workspace   (do not pass --force)  |  \
-             cursor: no import mechanism exists — paste the contents of {path} into the \
-             \"mcpServers\" object of .cursor/mcp.json yourself",
-            path = path.display()
-        );
-    } else {
-        // Unconditional, and the whole point of the change: with the proxy fallback gone, an
-        // unconfigured deployment has NO browser control. Saying nothing would leave that to be
-        // inferred from tools that never appear — which is the failure this replaced, not a
-        // quieter version of it.
-        tracing::info!(
-            "browser control: unconfigured — no [mcp] section in config.toml, so browser tools \
-             are unavailable and nothing was started. Add [mcp] to enable them."
-        );
+pub fn report_facade_status(mode: FacadeMode, workdir: &str) {
+    // `workdir` here is the CONFIGURED default. A session may resolve a different one
+    // (`effective_workdir`: a stored per-session value, or an explicit override), and the file
+    // is written under whichever that session used. Startup cannot know those, so the path
+    // below is the default rather than a promise about every session — which is also why the
+    // deployed default matters: with `working_dir == $HOME` the two coincide.
+    let path = facade_config_path(workdir);
+    match mode {
+        FacadeMode::Configured => {
+            // "enabled" alone became false when openab stopped wiring vendor configs (D-15). The
+            // facade IS running, but no agent can reach it until the entry is placed, and an
+            // operator reading "enabled" would go looking for a bug instead of doing the
+            // remaining step. So the line reports the facade AND names the step, with the exact
+            // commands.
+            tracing::info!(
+                facade_config = %path.display(),
+                "browser control: the OAB MCP Facade is running ([mcp] configured); openab writes \
+                 its entry to the file above when a session starts. openab does NOT modify your \
+                 agent's MCP config, so browser tools stay unavailable until that entry is in \
+                 place."
+            );
+            tracing::info!(
+                "browser control — to finish wiring, run ONE of these for your agent:  \
+                 kiro:  kiro-cli mcp import --file {path} workspace   (do not pass --force)  |  \
+                 cursor: no import mechanism exists — paste the contents of {path} into the \
+                 \"mcpServers\" object of .cursor/mcp.json yourself",
+                path = path.display()
+            );
+        }
+        FacadeMode::AutomaticControlPlane { listen } => {
+            // Honest about reach: the facade's direct tools are session-token gated, and the
+            // only production path that mints a session token is an `acp:` session (the
+            // ACP-over-WebSocket gateway). A primary driven by a chat adapter or only by the
+            // `openab agent` CLI never mints one, so its agent cannot see the tools — the CLI is
+            // the initiating surface there. Saying "running" without this would send an
+            // operator hunting for tools their agent can never list.
+            tracing::info!(
+                listen,
+                facade_config = %path.display(),
+                "control plane: starting the loopback MCP facade automatically for this primary \
+                 (no [mcp] section; a bind failure is fatal and logged as such). It publishes \
+                 spawn_agent / check_delegation / list_agents / cancel_delegation. They are \
+                 session-token gated: an agent reaches \
+                 them only from an `acp:` session (ACP gateway), which is where openab mints the \
+                 token and writes the entry above. Chat-adapter and CLI-driven primaries \
+                 initiate delegations through `openab agent` instead."
+            );
+        }
+        FacadeMode::Off => {
+            // Unconditional, and the whole point of the change: with the proxy fallback gone, an
+            // unconfigured deployment has NO browser control. Saying nothing would leave that to
+            // be inferred from tools that never appear — which is the failure this replaced, not
+            // a quieter version of it.
+            tracing::info!(
+                "browser control: unconfigured — no [mcp] section in config.toml, so browser \
+                 tools are unavailable and nothing was started. Add [mcp] to enable them."
+            );
+        }
     }
 }
 

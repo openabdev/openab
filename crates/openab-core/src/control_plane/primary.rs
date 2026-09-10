@@ -242,6 +242,14 @@ pub enum CommandError {
     /// frame exceeds the transport limit). Distinct from `Internal`: it names
     /// a caller-side fault the caller could fix (a smaller prompt), not a bug.
     InvalidRequest(String),
+    /// The CP did not answer this request within [`PENDING_REQUEST_TTL`], or a
+    /// delegation reached its deadline plus [`LATE_TERMINAL_GRACE`] without a
+    /// terminal frame. Local state for it has been dropped; a terminal that
+    /// arrives later is acked and ignored.
+    Timeout,
+    /// Too many requests are already outstanding to the CP
+    /// ([`MAX_PENDING_REQUESTS`]). Nothing was sent; the caller may retry.
+    Overloaded,
     /// The command channel or reply path was torn down (shutdown).
     Internal(String),
 }
@@ -268,6 +276,15 @@ impl std::fmt::Display for CommandError {
                 )
             }
             CommandError::InvalidRequest(m) => write!(f, "invalid request: {m}"),
+            CommandError::Timeout => write!(
+                f,
+                "the control plane did not answer in time; local tracking for this request \
+                 was dropped"
+            ),
+            CommandError::Overloaded => write!(
+                f,
+                "too many control-plane requests are outstanding from this runtime; retry later"
+            ),
             CommandError::Internal(m) => write!(f, "internal error: {m}"),
         }
     }
@@ -293,6 +310,9 @@ impl CommandError {
 enum PendingRequest {
     Spawn {
         delegation_id: String,
+        /// Carried through to the tracked entry so a delegation the CP never
+        /// terminates can be aged out locally (see [`PrimaryState::prune`]).
+        deadline: chrono::DateTime<chrono::Utc>,
         reply: oneshot::Sender<Result<SpawnAck, CommandError>>,
     },
     Cancel {
@@ -303,9 +323,63 @@ enum PendingRequest {
     },
 }
 
+impl PendingRequest {
+    /// Whether the caller that parked this request has gone away (its receiver
+    /// dropped — a timed-out or disconnected local handler). Such an entry
+    /// has nobody to answer and is pruned without a reply.
+    fn caller_gone(&self) -> bool {
+        match self {
+            PendingRequest::Spawn { reply, .. } => reply.is_closed(),
+            PendingRequest::Cancel { reply } => reply.is_closed(),
+            PendingRequest::ListAgents { reply } => reply.is_closed(),
+        }
+    }
+
+    fn fail(self, error: CommandError) {
+        match self {
+            PendingRequest::Spawn { reply, .. } => {
+                let _ = reply.send(Err(error));
+            }
+            PendingRequest::Cancel { reply } => {
+                let _ = reply.send(Err(error));
+            }
+            PendingRequest::ListAgents { reply } => {
+                let _ = reply.send(Err(error));
+            }
+        }
+    }
+}
+
+/// A parked request plus when it was parked, so [`PrimaryState::prune`] can
+/// age it out if the CP keeps accepting writes but never answers (F3).
+struct Parked {
+    since: std::time::Instant,
+    request: PendingRequest,
+}
+
+/// Ceiling on requests outstanding to the CP at once. The command ingress
+/// queue is bounded separately; this bounds what has already been consumed
+/// from it and is waiting on a reply, so a withholding peer cannot grow
+/// `pending` for the process lifetime.
+pub const MAX_PENDING_REQUESTS: usize = 256;
+
+/// How long a parked request may wait for its JSON-RPC reply. The CP answers
+/// spawn/cancel/list synchronously from its own state, so a minute is
+/// generous; a longer silence means the reply is not coming.
+pub const PENDING_REQUEST_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Grace past a delegation's own deadline before local tracking of a still
+/// non-terminal entry is dropped and its awaiters answered `Timeout`. The CP
+/// sweeps deadlines itself and sends `timed_out`; this is the fallback for a
+/// CP that does not.
+pub const LATE_TERMINAL_GRACE: chrono::Duration = chrono::Duration::seconds(60);
+
 /// Lifecycle of one initiated delegation, from ack to terminal.
 struct TrackedDelegation {
     state: DelegationLifecycle,
+    /// The deadline the initiator asked for; live entries older than this
+    /// plus [`LATE_TERMINAL_GRACE`] are aged out by [`PrimaryState::prune`].
+    deadline: chrono::DateTime<chrono::Utc>,
     /// The peer the CP assigned this delegation to, learned at ack time and
     /// retained so it can be accounted into the terminal-history byte bound
     /// (the terminal `DelegationOutcome` does not itself carry it).
@@ -350,7 +424,7 @@ const MAX_TRACKED_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Default)]
 pub struct PrimaryState {
     /// JSON-RPC id → the request the loop originated and awaits a reply for.
-    pending: HashMap<u64, PendingRequest>,
+    pending: HashMap<u64, Parked>,
     /// (delegation_id, admission) → its lifecycle.
     tracked: HashMap<DelegationKey, TrackedDelegation>,
     /// Insertion order for deterministic oldest-terminal history eviction.
@@ -385,12 +459,20 @@ impl PrimaryState {
     /// params. The caller is answered later, when the ack lands. `rpc_id` is
     /// allocated by the serve loop so every outbound frame — heartbeat,
     /// delegate_result ack, and these primary requests — shares one id space.
+    ///
+    /// Returns `None` — and answers the caller [`CommandError::Overloaded`] —
+    /// when [`MAX_PENDING_REQUESTS`] are already outstanding, so nothing is
+    /// sent and `pending` cannot grow past its cap.
     pub(crate) fn begin_spawn(
         &mut self,
         rpc_id: u64,
         request: SpawnRequest,
         reply: oneshot::Sender<Result<SpawnAck, CommandError>>,
-    ) -> SpawnEmission {
+    ) -> Option<SpawnEmission> {
+        if self.pending_full() {
+            let _ = reply.send(Err(CommandError::Overloaded));
+            return None;
+        }
         let (parent_delegation_id, parent_admission) = match request.parent {
             Some(h) => (Some(h.delegation_id), Some(h.admission)),
             None => (None, None),
@@ -403,14 +485,106 @@ impl PrimaryState {
             parent_delegation_id,
             parent_admission,
         };
-        self.pending.insert(
+        self.park(
             rpc_id,
             PendingRequest::Spawn {
                 delegation_id: request.delegation_id,
+                deadline: request.deadline,
                 reply,
             },
         );
-        SpawnEmission { rpc_id, params }
+        Some(SpawnEmission { rpc_id, params })
+    }
+
+    fn pending_full(&self) -> bool {
+        self.pending.len() >= MAX_PENDING_REQUESTS
+    }
+
+    fn park(&mut self, rpc_id: u64, request: PendingRequest) {
+        self.pending.insert(
+            rpc_id,
+            Parked {
+                since: std::time::Instant::now(),
+                request,
+            },
+        );
+    }
+
+    /// Number of requests parked awaiting a CP reply.
+    pub fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Number of parked awaiters (callers blocked on a terminal).
+    pub fn awaiters_len(&self) -> usize {
+        self.awaiters.values().map(Vec::len).sum()
+    }
+
+    /// Age out state a connected-but-withholding CP would otherwise let grow
+    /// for the process lifetime (F3). Called by the serve loop on every
+    /// heartbeat tick, so the bound holds without any local caller doing
+    /// anything.
+    ///
+    /// - A parked request whose caller has gone (receiver dropped) is removed
+    ///   silently: there is nobody to answer.
+    /// - A parked request older than [`PENDING_REQUEST_TTL`] is failed
+    ///   [`CommandError::Timeout`] and removed.
+    /// - An awaiter whose caller has gone is removed.
+    /// - A non-terminal delegation past `deadline + LATE_TERMINAL_GRACE` is
+    ///   dropped from tracking and its awaiters answered `Timeout`. A terminal
+    ///   frame that arrives for it afterwards is acked and ignored, exactly
+    ///   like any other untracked terminal.
+    ///
+    /// Terminal history is untouched: it has its own count/byte bound.
+    pub fn prune(&mut self, now: std::time::Instant, wall: chrono::DateTime<chrono::Utc>) {
+        let expired: Vec<u64> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| {
+                p.request.caller_gone() || now.duration_since(p.since) > PENDING_REQUEST_TTL
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            if let Some(parked) = self.pending.remove(&id) {
+                if !parked.request.caller_gone() {
+                    debug!(
+                        rpc_id = id,
+                        "pending control-plane request timed out locally"
+                    );
+                    parked.request.fail(CommandError::Timeout);
+                }
+            }
+        }
+
+        for waiters in self.awaiters.values_mut() {
+            waiters.retain(|w| !w.is_closed());
+        }
+        self.awaiters.retain(|_, w| !w.is_empty());
+
+        let overdue: Vec<DelegationKey> = self
+            .tracked
+            .iter()
+            .filter(|(_, t)| {
+                !matches!(t.state, DelegationLifecycle::Terminal(_))
+                    && wall > t.deadline + LATE_TERMINAL_GRACE
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in overdue {
+            debug!(
+                delegation_id = %key.0,
+                admission = key.1,
+                "delegation passed its deadline without a terminal frame; dropping local tracking"
+            );
+            if let Some(waiters) = self.awaiters.remove(&key) {
+                for w in waiters {
+                    let _ = w.send(Err(CommandError::Timeout));
+                }
+            }
+            self.tracked.remove(&key);
+            self.tracked_order.retain(|k| k != &key);
+        }
     }
 
     /// Remove a parked pending request (a spawn whose frame the serve loop
@@ -422,20 +596,10 @@ impl PrimaryState {
     /// connection. Returns true if a pending request was parked under
     /// `rpc_id` (so this was ours to fail); false otherwise. Tracks nothing.
     pub(crate) fn fail_pending_invalid_request(&mut self, rpc_id: u64, message: String) -> bool {
-        let Some(pending) = self.pending.remove(&rpc_id) else {
+        let Some(parked) = self.pending.remove(&rpc_id) else {
             return false;
         };
-        match pending {
-            PendingRequest::Spawn { reply, .. } => {
-                let _ = reply.send(Err(CommandError::InvalidRequest(message)));
-            }
-            PendingRequest::Cancel { reply } => {
-                let _ = reply.send(Err(CommandError::InvalidRequest(message)));
-            }
-            PendingRequest::ListAgents { reply } => {
-                let _ = reply.send(Err(CommandError::InvalidRequest(message)));
-            }
-        }
+        parked.request.fail(CommandError::InvalidRequest(message));
         true
     }
 
@@ -454,24 +618,33 @@ impl PrimaryState {
             let _ = reply.send(Err(CommandError::UnknownDelegation));
             return None;
         }
+        if self.pending_full() {
+            let _ = reply.send(Err(CommandError::Overloaded));
+            return None;
+        }
         let params = openab_cp::proto::CancelParams {
             delegation_id: handle.delegation_id.clone(),
             admission: handle.admission,
             reason,
         };
-        self.pending
-            .insert(rpc_id, PendingRequest::Cancel { reply });
+        self.park(rpc_id, PendingRequest::Cancel { reply });
         Some(params)
     }
 
-    /// Register a list_agents: park its reply under `rpc_id`.
+    /// Register a list_agents: park its reply under `rpc_id`. Returns `false`
+    /// (caller answered `Overloaded`, no frame to send) when the pending cap
+    /// is reached.
     pub(crate) fn begin_list_agents(
         &mut self,
         rpc_id: u64,
         reply: oneshot::Sender<Result<Vec<AgentSummary>, CommandError>>,
-    ) {
-        self.pending
-            .insert(rpc_id, PendingRequest::ListAgents { reply });
+    ) -> bool {
+        if self.pending_full() {
+            let _ = reply.send(Err(CommandError::Overloaded));
+            return false;
+        }
+        self.park(rpc_id, PendingRequest::ListAgents { reply });
+        true
     }
 
     /// Await a delegation's terminal outcome. If it already ended, the caller
@@ -543,12 +716,13 @@ impl PrimaryState {
         result: Option<serde_json::Value>,
         error: Option<ErrorObject>,
     ) -> bool {
-        let Some(pending) = self.pending.remove(&id) else {
+        let Some(parked) = self.pending.remove(&id) else {
             return false;
         };
-        match pending {
+        match parked.request {
             PendingRequest::Spawn {
                 delegation_id,
+                deadline,
                 reply,
             } => {
                 if let Some(err) = error {
@@ -577,15 +751,32 @@ impl PrimaryState {
                         }
                         let handle =
                             DelegationHandle::new(ack.delegation_id.clone(), ack.admission);
+                        let key = handle.key();
+                        // A conforming CP mints one admission per ack; a repeat
+                        // of an already-tracked (id, admission) would overwrite
+                        // an entry (orphaning its accounted bytes) and push a
+                        // permanent duplicate into the order queue. Refuse it.
+                        if self.tracked.contains_key(&key) {
+                            warn!(
+                                delegation_id = %delegation_id,
+                                admission = ack.admission,
+                                "cp/delegate ack repeats an admission already tracked — rejecting"
+                            );
+                            let _ = reply.send(Err(CommandError::Internal(format!(
+                                "cp/delegate ack repeated admission {} of {:?}",
+                                ack.admission, delegation_id
+                            ))));
+                            return true;
+                        }
                         // Track the admission so the later result frame routes.
                         self.make_history_room();
-                        let key = handle.key();
                         self.tracked.insert(
                             key.clone(),
                             TrackedDelegation {
                                 state: DelegationLifecycle::Running {
                                     assigned_to: ack.assigned_to.clone(),
                                 },
+                                deadline,
                                 assigned_to: ack.assigned_to.clone(),
                                 accounted_bytes: 0,
                             },
@@ -753,18 +944,8 @@ impl PrimaryState {
     /// worker side — no local state may claim a delegation is live once the
     /// only connection that could complete it is gone.
     pub fn fail_all_live(&mut self) {
-        for (_id, pending) in self.pending.drain() {
-            match pending {
-                PendingRequest::Spawn { reply, .. } => {
-                    let _ = reply.send(Err(CommandError::Disconnected));
-                }
-                PendingRequest::Cancel { reply } => {
-                    let _ = reply.send(Err(CommandError::Disconnected));
-                }
-                PendingRequest::ListAgents { reply } => {
-                    let _ = reply.send(Err(CommandError::Disconnected));
-                }
-            }
+        for (_id, parked) in self.pending.drain() {
+            parked.request.fail(CommandError::Disconnected);
         }
         // Mark non-terminal delegations failed and answer their awaiters.
         let live_keys: Vec<DelegationKey> = self
@@ -848,7 +1029,7 @@ mod tests {
     fn begin_spawn_parks_the_reply_and_produces_wire_params() {
         let mut st = PrimaryState::new();
         let (tx, _rx) = oneshot::channel();
-        let emission = st.begin_spawn(1, spawn_request("d-1"), tx);
+        let emission = st.begin_spawn(1, spawn_request("d-1"), tx).unwrap();
         assert_eq!(emission.rpc_id, 1);
         assert_eq!(emission.params.delegation_id, "d-1");
         assert_eq!(emission.params.target.name.as_deref(), Some("worker-1"));
@@ -863,7 +1044,7 @@ mod tests {
         let (tx, _rx) = oneshot::channel();
         let mut req = spawn_request("child");
         req.parent = Some(DelegationHandle::new("parent", 42));
-        let emission = st.begin_spawn(7, req, tx);
+        let emission = st.begin_spawn(7, req, tx).unwrap();
         assert_eq!(
             emission.params.parent_delegation_id.as_deref(),
             Some("parent")
@@ -875,7 +1056,7 @@ mod tests {
     async fn a_delegate_ack_resolves_the_spawn_and_starts_tracking() {
         let mut st = PrimaryState::new();
         let (tx, rx) = oneshot::channel();
-        let emission = st.begin_spawn(1, spawn_request("d-1"), tx);
+        let emission = st.begin_spawn(1, spawn_request("d-1"), tx).unwrap();
         assert!(st.on_reply(
             emission.rpc_id,
             Some(ack_value("d-1", 5, "prod/worker-1")),
@@ -898,7 +1079,7 @@ mod tests {
     async fn a_delegate_error_reply_fails_the_spawn_and_tracks_nothing() {
         let mut st = PrimaryState::new();
         let (tx, rx) = oneshot::channel();
-        let emission = st.begin_spawn(1, spawn_request("d-1"), tx);
+        let emission = st.begin_spawn(1, spawn_request("d-1"), tx).unwrap();
         let err = ErrorObject::new(openab_cp::proto::codes::NO_TARGET, "no such worker");
         assert!(st.on_reply(emission.rpc_id, None, Some(err)));
         let outcome = rx.await.unwrap();
@@ -917,7 +1098,7 @@ mod tests {
         let mut st = PrimaryState::new();
         // Spawn + ack.
         let (tx, rx) = oneshot::channel();
-        let emission = st.begin_spawn(1, spawn_request("d-1"), tx);
+        let emission = st.begin_spawn(1, spawn_request("d-1"), tx).unwrap();
         st.on_reply(emission.rpc_id, Some(ack_value("d-1", 3, "prod/w1")), None);
         let handle = rx.await.unwrap().unwrap().handle;
 
@@ -942,7 +1123,7 @@ mod tests {
     async fn awaiting_an_already_terminal_delegation_answers_immediately() {
         let mut st = PrimaryState::new();
         let (tx, rx) = oneshot::channel();
-        let emission = st.begin_spawn(1, spawn_request("d-1"), tx);
+        let emission = st.begin_spawn(1, spawn_request("d-1"), tx).unwrap();
         st.on_reply(emission.rpc_id, Some(ack_value("d-1", 3, "prod/w1")), None);
         let handle = rx.await.unwrap().unwrap().handle;
         let result = DelegateResultParams {
@@ -965,7 +1146,7 @@ mod tests {
     async fn a_stale_admission_result_is_dropped() {
         let mut st = PrimaryState::new();
         let (tx, rx) = oneshot::channel();
-        let emission = st.begin_spawn(1, spawn_request("d-1"), tx);
+        let emission = st.begin_spawn(1, spawn_request("d-1"), tx).unwrap();
         st.on_reply(emission.rpc_id, Some(ack_value("d-1", 10, "prod/w1")), None);
         let _handle = rx.await.unwrap().unwrap().handle;
         // A result for the same id but a different admission is not ours.
@@ -998,7 +1179,7 @@ mod tests {
     async fn cancel_of_a_tracked_handle_emits_and_resolves_on_ok() {
         let mut st = PrimaryState::new();
         let (tx, rx) = oneshot::channel();
-        let emission = st.begin_spawn(1, spawn_request("d-1"), tx);
+        let emission = st.begin_spawn(1, spawn_request("d-1"), tx).unwrap();
         st.on_reply(emission.rpc_id, Some(ack_value("d-1", 3, "prod/w1")), None);
         let handle = rx.await.unwrap().unwrap().handle;
 
@@ -1017,7 +1198,7 @@ mod tests {
     async fn list_agents_resolves_with_the_roster() {
         let mut st = PrimaryState::new();
         let (tx, rx) = oneshot::channel();
-        st.begin_list_agents(1, tx);
+        assert!(st.begin_list_agents(1, tx));
         let result = openab_cp::proto::ListAgentsResult {
             namespace: "prod".into(),
             agents: vec![AgentSummary {
@@ -1038,7 +1219,7 @@ mod tests {
     async fn check_reports_running_then_terminal_without_blocking() {
         let mut st = PrimaryState::new();
         let (tx, rx) = oneshot::channel();
-        let emission = st.begin_spawn(1, spawn_request("d-1"), tx);
+        let emission = st.begin_spawn(1, spawn_request("d-1"), tx).unwrap();
         st.on_reply(emission.rpc_id, Some(ack_value("d-1", 4, "prod/w1")), None);
         let handle = rx.await.unwrap().unwrap().handle;
 
@@ -1084,6 +1265,7 @@ mod tests {
             handle.key(),
             TrackedDelegation {
                 state: DelegationLifecycle::Pending,
+                deadline: chrono::Utc::now() + chrono::Duration::seconds(60),
                 assigned_to: String::new(),
                 accounted_bytes: 0,
             },
@@ -1125,6 +1307,7 @@ mod tests {
                 key.clone(),
                 TrackedDelegation {
                     state: DelegationLifecycle::Terminal(outcome),
+                    deadline: chrono::Utc::now() + chrono::Duration::seconds(60),
                     assigned_to: "prod/w".into(),
                     accounted_bytes: bytes,
                 },
@@ -1140,6 +1323,7 @@ mod tests {
                 state: DelegationLifecycle::Running {
                     assigned_to: "prod/w".into(),
                 },
+                deadline: chrono::Utc::now() + chrono::Duration::seconds(60),
                 assigned_to: "prod/w".into(),
                 accounted_bytes: 0,
             },
@@ -1155,7 +1339,7 @@ mod tests {
 
         // A running delegation with a parked awaiter.
         let (tx, rx) = oneshot::channel();
-        let emission = st.begin_spawn(1, spawn_request("d-run"), tx);
+        let emission = st.begin_spawn(1, spawn_request("d-run"), tx).unwrap();
         st.on_reply(
             emission.rpc_id,
             Some(ack_value("d-run", 1, "prod/w1")),
@@ -1167,7 +1351,7 @@ mod tests {
 
         // A terminal delegation: its awaiter was already answered.
         let (tx2, rx2) = oneshot::channel();
-        let emission2 = st.begin_spawn(2, spawn_request("d-done"), tx2);
+        let emission2 = st.begin_spawn(2, spawn_request("d-done"), tx2).unwrap();
         st.on_reply(
             emission2.rpc_id,
             Some(ack_value("d-done", 2, "prod/w1")),
@@ -1223,7 +1407,7 @@ mod tests {
 
         // Complete a delegation while "connected".
         let (tx, rx) = oneshot::channel();
-        let emission = st.begin_spawn(1, spawn_request("d-done"), tx);
+        let emission = st.begin_spawn(1, spawn_request("d-done"), tx).unwrap();
         st.on_reply(
             emission.rpc_id,
             Some(ack_value("d-done", 1, "prod/w1")),
@@ -1280,7 +1464,7 @@ mod tests {
             let id = format!("d-cycle-{cycle}");
             let admission = 200 + cycle;
             let (tx, rx) = oneshot::channel();
-            let e = st.begin_spawn(300 + cycle, spawn_request(&id), tx);
+            let e = st.begin_spawn(300 + cycle, spawn_request(&id), tx).unwrap();
             st.on_reply(e.rpc_id, Some(ack_value(&id, admission, "prod/w1")), None);
             let h = rx.await.unwrap().unwrap().handle;
             st.on_delegate_result(&DelegateResultParams {
@@ -1307,7 +1491,7 @@ mod tests {
         // so a foreign id can never seed correlation under our rpc id.
         let mut st = PrimaryState::new();
         let (tx, rx) = oneshot::channel();
-        let emission = st.begin_spawn(1, spawn_request("d-requested"), tx);
+        let emission = st.begin_spawn(1, spawn_request("d-requested"), tx).unwrap();
         assert!(st.on_reply(
             emission.rpc_id,
             Some(ack_value("d-foreign", 5, "prod/w1")),
@@ -1324,7 +1508,7 @@ mod tests {
         // The complement: an exact match is admitted normally.
         let mut st = PrimaryState::new();
         let (tx, rx) = oneshot::channel();
-        let emission = st.begin_spawn(1, spawn_request("d-1"), tx);
+        let emission = st.begin_spawn(1, spawn_request("d-1"), tx).unwrap();
         st.on_reply(emission.rpc_id, Some(ack_value("d-1", 5, "prod/w1")), None);
         let handle = rx.await.unwrap().unwrap().handle;
         assert_eq!(
@@ -1343,7 +1527,7 @@ mod tests {
         // nothing — the connection is untouched.
         let mut st = PrimaryState::new();
         let (tx, rx) = oneshot::channel();
-        let emission = st.begin_spawn(7, spawn_request("d-huge"), tx);
+        let emission = st.begin_spawn(7, spawn_request("d-huge"), tx).unwrap();
         assert!(st.fail_pending_invalid_request(emission.rpc_id, "frame too large".into()));
         let outcome = rx.await.unwrap();
         assert!(matches!(outcome, Err(CommandError::InvalidRequest(_))));
@@ -1379,6 +1563,7 @@ mod tests {
                 key.clone(),
                 TrackedDelegation {
                     state: DelegationLifecycle::Terminal(outcome),
+                    deadline: chrono::Utc::now() + chrono::Duration::seconds(60),
                     assigned_to: "prod/w".into(),
                     accounted_bytes: bytes,
                 },
@@ -1412,6 +1597,7 @@ mod tests {
                     state: DelegationLifecycle::Running {
                         assigned_to: "prod/w".into(),
                     },
+                    deadline: chrono::Utc::now() + chrono::Duration::seconds(60),
                     assigned_to: "prod/w".into(),
                     accounted_bytes: 0,
                 },
@@ -1452,6 +1638,7 @@ mod tests {
                 state: DelegationLifecycle::Running {
                     assigned_to: "prod/w".into(),
                 },
+                deadline: chrono::Utc::now() + chrono::Duration::seconds(60),
                 assigned_to: "prod/w".into(),
                 accounted_bytes: 0,
             },
@@ -1471,6 +1658,7 @@ mod tests {
                 key.clone(),
                 TrackedDelegation {
                     state: DelegationLifecycle::Terminal(outcome),
+                    deadline: chrono::Utc::now() + chrono::Duration::seconds(60),
                     assigned_to: "prod/w".into(),
                     accounted_bytes: bytes,
                 },
@@ -1484,5 +1672,152 @@ mod tests {
             state.tracked.contains_key(&live_key),
             "the live delegation must survive byte-bound eviction"
         );
+    }
+
+    // ---- F3: bounded pending state ----------------------------------------
+
+    #[tokio::test]
+    async fn pending_requests_are_capped_and_the_overflow_is_answered_overloaded() {
+        let mut st = PrimaryState::new();
+        let mut parked = Vec::new();
+        for i in 0..MAX_PENDING_REQUESTS as u64 {
+            let (tx, rx) = oneshot::channel();
+            assert!(st.begin_list_agents(i, tx), "under the cap");
+            parked.push(rx);
+        }
+        assert_eq!(st.pending_len(), MAX_PENDING_REQUESTS);
+
+        // One more of each kind: refused locally, nothing parked.
+        let (tx, rx) = oneshot::channel();
+        assert!(!st.begin_list_agents(9_000, tx));
+        assert!(matches!(rx.await, Ok(Err(CommandError::Overloaded))));
+
+        let (tx, rx) = oneshot::channel();
+        assert!(st.begin_spawn(9_001, spawn_request("d-over"), tx).is_none());
+        assert!(matches!(rx.await, Ok(Err(CommandError::Overloaded))));
+        assert_eq!(st.pending_len(), MAX_PENDING_REQUESTS, "the cap holds");
+
+        // Replies drain the map and make room again.
+        st.on_reply(0, Some(serde_json::json!({"agents": []})), None);
+        assert_eq!(st.pending_len(), MAX_PENDING_REQUESTS - 1);
+        let (tx, _rx) = oneshot::channel();
+        assert!(st.begin_list_agents(9_002, tx));
+    }
+
+    #[tokio::test]
+    async fn prune_times_out_stale_pending_and_forgets_callers_that_left() {
+        let mut st = PrimaryState::new();
+        let t0 = std::time::Instant::now();
+        let wall = chrono::Utc::now();
+
+        // A spawn the CP never answers.
+        let (tx, rx) = oneshot::channel();
+        st.begin_spawn(1, spawn_request("d-silent"), tx).unwrap();
+        // A list whose local caller already gave up (receiver dropped).
+        let (tx2, rx2) = oneshot::channel();
+        assert!(st.begin_list_agents(2, tx2));
+        drop(rx2);
+        assert_eq!(st.pending_len(), 2);
+
+        // Young: the silent one stays; the orphan goes.
+        st.prune(t0 + std::time::Duration::from_secs(1), wall);
+        assert_eq!(st.pending_len(), 1);
+
+        // Past the TTL: the silent one is failed Timeout and removed.
+        st.prune(
+            t0 + PENDING_REQUEST_TTL + std::time::Duration::from_secs(1),
+            wall,
+        );
+        assert_eq!(st.pending_len(), 0);
+        assert!(matches!(rx.await, Ok(Err(CommandError::Timeout))));
+    }
+
+    #[tokio::test]
+    async fn prune_drops_orphaned_awaiters_and_ages_out_overdue_live_delegations() {
+        let mut st = PrimaryState::new();
+        let now = std::time::Instant::now();
+
+        // Admit a delegation with a 60s deadline.
+        let (tx, rx) = oneshot::channel();
+        let e = st.begin_spawn(1, spawn_request("d-late"), tx).unwrap();
+        st.on_reply(e.rpc_id, Some(ack_value("d-late", 11, "prod/w1")), None);
+        let handle = rx.await.unwrap().unwrap().handle;
+
+        // Two awaiters: one whose caller left, one still waiting.
+        let (gone_tx, gone_rx) = oneshot::channel();
+        st.begin_await(&handle, gone_tx);
+        drop(gone_rx);
+        let (live_tx, live_rx) = oneshot::channel();
+        st.begin_await(&handle, live_tx);
+        assert_eq!(st.awaiters_len(), 2);
+
+        // Before deadline + grace: the orphan is dropped, the live one kept,
+        // and the delegation is still tracked.
+        st.prune(now, chrono::Utc::now());
+        assert_eq!(st.awaiters_len(), 1);
+        assert_eq!(st.tracked_len(), 1);
+
+        // Past deadline + grace with no terminal frame: tracking is dropped and
+        // the remaining awaiter is answered Timeout.
+        let overdue = chrono::Utc::now()
+            + chrono::Duration::seconds(60)
+            + LATE_TERMINAL_GRACE
+            + chrono::Duration::seconds(1);
+        st.prune(now, overdue);
+        assert_eq!(st.tracked_len(), 0);
+        assert_eq!(st.awaiters_len(), 0);
+        assert!(matches!(live_rx.await, Ok(Err(CommandError::Timeout))));
+
+        // A terminal that arrives afterwards names nothing we track: the
+        // serve loop acks it regardless (its contract for untracked results),
+        // and it must not resurrect tracking here.
+        let ours = st.on_delegate_result(&DelegateResultParams {
+            delegation_id: "d-late".into(),
+            admission: 11,
+            status: DelegationStatus::Completed,
+            result: Some("too late".into()),
+            error: None,
+        });
+        assert!(!ours, "no longer ours");
+        assert_eq!(st.tracked_len(), 0, "and it does not resurrect tracking");
+    }
+
+    #[tokio::test]
+    async fn prune_never_touches_terminal_history() {
+        let mut st = PrimaryState::new();
+        let (tx, rx) = oneshot::channel();
+        let e = st.begin_spawn(1, spawn_request("d-done"), tx).unwrap();
+        st.on_reply(e.rpc_id, Some(ack_value("d-done", 1, "prod/w1")), None);
+        let _ = rx.await.unwrap().unwrap();
+        st.on_delegate_result(&DelegateResultParams {
+            delegation_id: "d-done".into(),
+            admission: 1,
+            status: DelegationStatus::Completed,
+            result: Some("ok".into()),
+            error: None,
+        });
+        // Far in the future: terminal history has its own bound and survives.
+        st.prune(
+            std::time::Instant::now(),
+            chrono::Utc::now() + chrono::Duration::days(365),
+        );
+        assert_eq!(st.tracked_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_repeated_admission_in_a_delegate_ack_is_rejected_not_overwritten() {
+        let mut st = PrimaryState::new();
+        let (tx, rx) = oneshot::channel();
+        let e = st.begin_spawn(1, spawn_request("d-dup"), tx).unwrap();
+        st.on_reply(e.rpc_id, Some(ack_value("d-dup", 3, "prod/w1")), None);
+        let _ = rx.await.unwrap().unwrap();
+
+        // A second spawn of the same id gets an ack that repeats admission 3.
+        let (tx2, rx2) = oneshot::channel();
+        let e2 = st.begin_spawn(2, spawn_request("d-dup"), tx2).unwrap();
+        st.on_reply(e2.rpc_id, Some(ack_value("d-dup", 3, "prod/w1")), None);
+        assert!(matches!(rx2.await, Ok(Err(CommandError::Internal(_)))));
+        assert_eq!(st.tracked_len(), 1, "the original entry stands");
+        assert_eq!(st.tracked_order.len(), 1, "no duplicate in the order queue");
     }
 }

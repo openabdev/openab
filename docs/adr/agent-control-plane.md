@@ -156,12 +156,20 @@ via the CP.
 
 A **primary** may run headless too: with no chat adapter it still starts its
 two local initiating surfaces — the owner-only Unix socket and the
-auto-injected four-tool MCP facade — so `openab agent …` and the model's
-`spawn_agent` tool can initiate delegations even though no human is on a chat
-platform. `type` remains the policy axis (only a primary initiates); "headless"
-describes the *absence of a chat adapter*, not the role. The two headless
-shapes are therefore orthogonal: worker-headless serves delegations, and
-primary-headless initiates them.
+automatically started four-tool MCP facade — so `openab agent …` can initiate
+delegations even though no human is on a chat platform. `type` remains the
+policy axis (only a primary initiates); "headless" describes the *absence of a
+chat adapter*, not the role. The two headless shapes are therefore orthogonal:
+worker-headless serves delegations, and primary-headless initiates them.
+
+> **v1 reach of the MCP tools.** The facade's direct tools are session-token
+> gated, and in v1 the only production path that mints that token (and writes
+> the agent's facade entry) is an `acp:` session — one opened through the
+> ACP-over-WebSocket gateway. Chat-adapter sessions (`discord:`, `slack:`, …)
+> and adapter-less primaries mint nothing, so their models cannot see the
+> tools; the CLI is their initiating surface. Extending per-session injection
+> to every adapter is deliberately deferred (see "Explicitly deferred from
+> v1" in §6) rather than implied.
 
 > **Platform support: the local agent surface is Unix-only.** The local API is
 > a Unix-domain socket (owner-only `0600` inside an owner-only `0700`
@@ -642,9 +650,12 @@ caller.
 
 ### MCP facade (primary interface)
 
-Injected per-session via ACP `session/new` `mcpServers`, so every backend
-(Kiro, Claude, Codex, Gemini, …) gets the same tools with zero per-backend
-integration. v1 tool surface, intentionally minimal:
+Reached per-session through the OAB MCP Facade's session token: openab writes
+the agent's facade entry and mints the token when the session starts, so every
+backend (Kiro, Claude, Codex, Gemini, …) gets the same tools with zero
+per-backend integration. In v1 that happens for `acp:` sessions only (see the
+headless note above); other adapters' sessions use the CLI. v1 tool surface,
+intentionally minimal:
 
 | Tool | Behavior |
 |------|----------|
@@ -703,6 +714,14 @@ bound.
 Kiro-style session-management primitives — inbox messaging, `interrupt`,
 `inject_context`, group broadcast — arrive later behind the same socket and
 facade without changing anything shipped in v1.
+
+Per-session facade injection for non-`acp:` sessions. v1 mints the facade
+session token — and writes the agent's facade entry — only for sessions
+opened through the ACP-over-WebSocket gateway. Chat-adapter sessions and
+adapter-less primaries therefore initiate through the CLI. Extending the mint
+to every adapter needs a decision on how a long-lived chat session's
+credential is rotated and revoked, and is tracked as a follow-up rather than
+implied by the tool table above.
 
 ---
 

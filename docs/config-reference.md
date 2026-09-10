@@ -818,8 +818,11 @@ one.
 ### Headless (no chat adapter)
 
 Any `[control_plane]` runtime may run without a chat adapter. Workers receive
-remote delegations; primaries initiate through the owner-only local socket,
-`openab agent`, and the automatically injected four-tool MCP facade.
+remote delegations; primaries initiate through the owner-only local socket and
+`openab agent`. The four-tool MCP facade is also started, but its tools are
+session-token gated and in v1 only `acp:` (ACP-gateway) sessions receive a
+token — so an adapter-less or chat-adapter primary's model does not see them
+and the CLI is its initiating surface.
 
 | Config | Result |
 |--------|--------|
@@ -837,10 +840,16 @@ remote delegations; primaries initiate through the owner-only local socket,
   Unix-only**: non-Unix builds compile (the server and client are stubbed) but
   fail loudly at runtime, and **no Windows support is planned** — CP
   deployments are Linux containers or macOS.
-- **Primary MCP tools are automatic.** A primary starts the loopback facade on
-  `127.0.0.1:8848` when `[mcp]` is absent, or adds the four direct CP tools to
-  the configured facade listener when `[mcp]` is present. Tools are visible
-  only to broker-authenticated agent sessions.
+- **Primary MCP tools are automatic, but session-gated.** A primary starts the
+  loopback facade on `127.0.0.1:8848` when `[mcp]` is absent, or adds the four
+  direct CP tools to the configured facade listener when `[mcp]` is present.
+  Tools are visible only to sessions holding a broker-minted token, which in
+  v1 means `acp:` (ACP-gateway) sessions; the startup log names the mode
+  (`[mcp]` configured vs automatic) and this reach explicitly.
+- **One runtime per socket path.** Two runtimes under one user must set a
+  distinct `OPENAB_AGENT_SOCKET` for at least one of them: the runtime refuses
+  to start over a socket that answers a connect probe and only unlinks a node
+  nobody is listening on.
 - **The key never reaches the agent.** Agent subprocesses start from
   `env_clear()` with a fixed baseline plus explicit `[agent].env` keys;
   `auth_key` is in neither, and it is never logged.

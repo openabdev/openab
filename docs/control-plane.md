@@ -126,8 +126,19 @@ surfaces backed by one implementation:
 1. an owner-only Unix socket (`$OPENAB_AGENT_SOCKET`, otherwise
    `$HOME/.openab/run/agent.sock`), with parent directory mode `0700` and socket
    mode `0600`;
-2. the loopback MCP facade, automatically injected into each agent session
-   with a broker-minted session credential.
+2. the loopback MCP facade (the configured `[mcp]` listener, or
+   `127.0.0.1:8848` when `[mcp]` is absent), which publishes four direct
+   delegation tools.
+
+**Who can reach the MCP tools in v1.** The direct tools are session-token
+gated, and the only production path that mints a session token — and writes
+the agent's facade entry — is an `acp:` session, i.e. one opened through the
+ACP-over-WebSocket gateway. A primary whose sessions come from a chat adapter
+(Discord, Slack, Telegram, …) or that has no agent session at all does not
+mint one, so its model cannot list or call the tools. For those deployments
+the `openab agent` CLI is the initiating surface; the MCP tools are reachable
+today by ACP-gateway-driven primaries, and per-session injection for the
+remaining adapters is a follow-up, not a v1 guarantee.
 
 The MCP facade publishes these direct tools:
 
@@ -172,10 +183,27 @@ openab agent cancel <opaque-handle> --reason "superseded"
 Use `--socket PATH` or `OPENAB_AGENT_SOCKET` to override the socket location.
 `--deadline-secs` is validated to `1..=1800` client-side before any frame
 leaves the host — the same window the MCP schema and the socket server enforce.
-Primary-only headless deployments are valid: the MCP tools and CLI are their
-initiating surfaces. Workers also expose the socket for operator `list` and
-status diagnostics, but the runtime refuses primary-only spawn/cancel commands
-locally before any frame leaves the host.
+Primary-only headless deployments are valid: the CLI is their initiating
+surface (there is no agent session to hold an MCP credential). Workers also
+expose the socket for operator `list` and status diagnostics, but the runtime
+refuses primary-only spawn/cancel commands locally before any frame leaves the
+host.
+
+**One runtime per socket path.** The default path is per user, so two runtimes
+under the same account must give at least one of them a distinct
+`OPENAB_AGENT_SOCKET`. A runtime refuses to start over a socket that answers a
+connect probe (a live sibling) and only unlinks a node nobody is listening on;
+on shutdown it removes the node only if it is still the one it bound, so an
+older instance never deletes a successor's socket.
+
+The local server is bounded on every axis a stuck peer could push on: at most
+64 concurrent connections (further connections get one error line and are
+closed), a 5-minute idle limit between requests, a 60-second bound on each
+CP round trip, and an `Await` bound of the maximum deadline plus grace. On the
+control-plane side, at most 256 requests may be outstanding to the CP
+(`Overloaded` beyond that), an unanswered request is failed `Timeout` after
+60 seconds, and a delegation still non-terminal 60 seconds past its own
+deadline is dropped from local tracking with its waiters answered `Timeout`.
 
 The local API is **Unix-only**: it is a Unix-domain socket with owner-only
 permissions and has no non-Unix transport. The binary still compiles for

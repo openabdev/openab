@@ -162,8 +162,10 @@ impl DelegationExecutor {
         delegation_id: &str,
         admission: AdmissionToken,
     ) -> std::result::Result<Arc<Notify>, Refusal> {
-        let max = self.effective_max();
         let mut g = self.lock_inflight();
+        // Read the ceiling under the same lock as the count so a concurrent
+        // re-register ack cannot make one decision against a stale pair.
+        let max = self.effective_max();
         if g.contains_key(delegation_id) {
             return Err(Refusal::Duplicate);
         }
@@ -234,31 +236,54 @@ impl DelegationExecutor {
         }
     }
 
-    /// Admit, run, and classify one forwarded delegation.
+    /// Reserve the slot for one forwarded delegation — SYNCHRONOUSLY, on the
+    /// caller's task — or explain why not as a ready-to-send result payload.
     ///
-    /// Always resolves to a result frame payload — the refusal paths included,
-    /// so the initiator is never left waiting on its deadline for a runtime
-    /// that had already decided not to run.
-    pub async fn serve(self: Arc<Self>, forward: DelegateForward) -> DelegateResultParams {
+    /// Admission is deliberately split from execution ([`Admitted::run`]) so
+    /// the connection loop can reserve the slot *before* it yields. If the loop
+    /// instead spawned a task that admitted on its first poll, a `cp/cancel`
+    /// arriving as the very next frame would find nothing in flight, be acked
+    /// as "unknown", and the still-unpolled task would then admit and run work
+    /// the initiator had already cancelled — CP frame order does not imply
+    /// Tokio task scheduling order. With admission on the loop's own task,
+    /// every later frame observes the reservation.
+    ///
+    /// The refusal paths resolve to a result frame payload rather than an
+    /// error so the initiator is never left waiting on its deadline for a
+    /// runtime that had already decided not to run.
+    pub fn admit_delegation(
+        self: &Arc<Self>,
+        forward: DelegateForward,
+    ) -> std::result::Result<Admitted, DelegateResultParams> {
         let id = forward.delegation_id.clone();
-        let cancel = match self.admit(&id, forward.admission) {
-            Ok(signal) => signal,
+        match self.admit(&id, forward.admission) {
+            Ok(cancel) => Ok(Admitted {
+                reservation: SlotReservation {
+                    executor: Arc::clone(self),
+                    id,
+                },
+                forward,
+                cancel,
+            }),
             Err(refusal) => {
                 let error = refusal.message();
                 warn!(delegation_id = %id, from = %forward.from, %error, "delegation refused");
-                return failed(&id, forward.admission, error);
+                Err(failed(&id, forward.admission, error))
             }
-        };
-        // RAII: the slot must free even if this task is ABORTED mid-await —
-        // the client aborts serving tasks that outlive the drain window on
-        // disconnect, and a plain post-await release would be skipped there,
-        // leaking the inflight entry forever (with the default cap of 1, the
-        // worker would refuse every delegation after reconnecting).
-        let _slot = SlotGuard {
-            executor: self.as_ref(),
-            id: id.clone(),
-        };
-        self.execute(&forward, cancel).await
+        }
+    }
+
+    /// Admit, run, and classify one forwarded delegation in one step.
+    ///
+    /// Convenience for callers that do not need to separate admission from
+    /// execution (tests, single-shot drivers). The connection loop uses
+    /// [`Self::admit_delegation`] + [`Admitted::run`] so admission happens
+    /// before it yields — see that method for why.
+    pub async fn serve(self: Arc<Self>, forward: DelegateForward) -> DelegateResultParams {
+        match self.admit_delegation(forward) {
+            Ok(admitted) => admitted.run().await,
+            Err(refused) => refused,
+        }
     }
 
     async fn execute(
@@ -485,14 +510,57 @@ fn cap_result(text: String) -> String {
 
 /// Frees a delegation's inflight slot on drop — including the drop that
 /// happens when the serving task is aborted at an await point.
-struct SlotGuard<'a> {
-    executor: &'a DelegationExecutor,
+/// Owned RAII reservation of one inflight slot. Dropping it releases the
+/// slot; it is created only by [`DelegationExecutor::admit_delegation`] after
+/// a successful `admit`, so the release always pairs with a real insert.
+struct SlotReservation {
+    executor: Arc<DelegationExecutor>,
     id: String,
 }
 
-impl Drop for SlotGuard<'_> {
+impl Drop for SlotReservation {
     fn drop(&mut self) {
         self.executor.release(&self.id);
+    }
+}
+
+/// A delegation whose slot is reserved but whose turn has not started.
+///
+/// Produced by [`DelegationExecutor::admit_delegation`]; consumed by
+/// [`Admitted::run`]. Owning this value IS holding the slot: dropping it
+/// without running (or aborting the task that is running it) releases the
+/// reservation — the same RAII guarantee the previous single-step `serve`
+/// gave, now spanning the gap between admission on the connection loop and
+/// execution on the spawned task.
+#[must_use = "dropping an admitted delegation releases its slot without running it"]
+pub struct Admitted {
+    reservation: SlotReservation,
+    forward: DelegateForward,
+    cancel: Arc<Notify>,
+}
+
+impl Admitted {
+    /// The id this reservation is for.
+    pub fn delegation_id(&self) -> &str {
+        &self.forward.delegation_id
+    }
+
+    /// Run the admitted turn to a result payload. The slot is released when
+    /// this future completes or is dropped mid-await (task abort included —
+    /// the client aborts serving tasks that outlive the drain window on
+    /// disconnect, and a plain post-await release would be skipped there,
+    /// leaking the inflight entry forever; with the default cap of 1 the
+    /// worker would then refuse every delegation after reconnecting).
+    pub async fn run(self) -> DelegateResultParams {
+        let Admitted {
+            reservation,
+            forward,
+            cancel,
+        } = self;
+        let executor = Arc::clone(&reservation.executor);
+        // Held across the await so an abort releases the slot.
+        let _slot = reservation;
+        executor.execute(&forward, cancel).await
     }
 }
 
@@ -875,8 +943,8 @@ mod tests {
         assert!(poisoned.is_err());
         assert_eq!(ex.active(), 0);
         {
-            let _slot = SlotGuard {
-                executor: ex.as_ref(),
+            let _slot = SlotReservation {
+                executor: Arc::clone(&ex),
                 id: "missing".into(),
             };
         }

@@ -760,11 +760,15 @@ async fn main() -> anyhow::Result<()> {
         .as_ref()
         .map(|_| openab_core::control_plane::default_socket_path())
         .transpose()?;
+    // Loopback address of the facade a `[control_plane]` primary starts on its
+    // own when no `[mcp]` is configured. One constant, so the listener and the
+    // startup report cannot disagree about it.
+    const AUTO_FACADE_LISTEN: &str = "127.0.0.1:8848";
     let facade_listen = cfg
         .mcp
         .as_ref()
         .map(|m| m.listen.clone())
-        .or_else(|| cp_primary.then(|| "127.0.0.1:8848".to_string()));
+        .or_else(|| cp_primary.then(|| AUTO_FACADE_LISTEN.to_string()));
 
     // Shared MCP-over-ACP tunnel registry (D6-a'): the gateway populates it per session; the
     // core's `acp_mcp` module reads it through the `RootAcpTunnel` implementation below.
@@ -809,12 +813,24 @@ async fn main() -> anyhow::Result<()> {
     // Gated on `acp` (the root feature that pulls in core's `acp-mcp`), not on `acp-mcp` itself —
     // that is a core feature and naming it here is an unknown-cfg error.
     //
-    // Keyed on `facade_serving`, NOT `cfg.mcp.is_some()`: a headless control-plane primary
-    // without `[mcp]` still gets the automatic loopback facade (see `facade_listen` above), and
-    // reporting "nothing was started — add [mcp]" while that listener is up would contradict
-    // the running process.
+    // Three states, not a bool: `[mcp]` configured, the automatic control-plane facade (a
+    // primary without `[mcp]` — see `facade_listen` above), or nothing. The automatic case
+    // gets its own wording because its tools are reachable only from `acp:` sessions, and
+    // reporting it as "[mcp] configured" — or as "nothing was started" — would both mislead.
     #[cfg(feature = "acp")]
-    openab_core::acp_mcp::report_facade_status(facade_serving, &cfg.agent.working_dir);
+    {
+        use openab_core::acp_mcp::FacadeMode;
+        let mode = if cfg.mcp.is_some() {
+            FacadeMode::Configured
+        } else if facade_serving {
+            FacadeMode::AutomaticControlPlane {
+                listen: AUTO_FACADE_LISTEN,
+            }
+        } else {
+            FacadeMode::Off
+        };
+        openab_core::acp_mcp::report_facade_status(mode, &cfg.agent.working_dir);
+    }
     if let Some(listen) = facade_listen.clone() {
         let tokens = facade_sessions.clone();
         #[cfg(feature = "acp")]
