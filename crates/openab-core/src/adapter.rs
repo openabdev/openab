@@ -352,6 +352,26 @@ pub trait ChatAdapter: Send + Sync + 'static {
         title: &str,
     ) -> Result<ChannelRef>;
 
+    /// Create a standalone thread in a channel (not from a specific message).
+    ///
+    /// Used by the MCP facade's `create_thread` capability so agents can open
+    /// threads in a target channel without directly handling platform
+    /// credentials. The adapter uses its own authenticated HTTP client, so
+    /// the thread owner is the bot itself — no token is exposed to the agent.
+    ///
+    /// `content` is sent as the thread's starter message (Discord requires a
+    /// message body when creating a thread via `POST /channels/{id}/threads`).
+    ///
+    /// Default: unsupported (platforms that don't support standalone threads).
+    async fn create_thread_in_channel(
+        &self,
+        _channel: &ChannelRef,
+        _title: &str,
+        _content: &str,
+    ) -> Result<ChannelRef> {
+        Err(anyhow::anyhow!("create_thread_in_channel not supported"))
+    }
+
     /// Add a reaction/emoji to a message.
     async fn add_reaction(&self, msg: &MessageRef, emoji: &str) -> Result<()>;
 

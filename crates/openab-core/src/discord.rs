@@ -18,7 +18,7 @@ use serenity::builder::{
 use serenity::http::Http;
 use serenity::model::application::ButtonStyle;
 use serenity::model::application::{Command, CommandOptionType, ComponentInteractionDataKind, Interaction};
-use serenity::model::channel::{AutoArchiveDuration, Message, MessageType, Reaction, ReactionType};
+use serenity::model::channel::{AutoArchiveDuration, ChannelType, Message, MessageType, Reaction, ReactionType};
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, MessageId, UserId};
 use serenity::prelude::*;
@@ -180,6 +180,38 @@ impl ChatAdapter for DiscordAdapter {
             parent_id: Some(channel.channel_id.clone()),
             origin_event_id: None,
         })
+    }
+
+    async fn create_thread_in_channel(
+        &self,
+        channel: &ChannelRef,
+        title: &str,
+        content: &str,
+    ) -> anyhow::Result<ChannelRef> {
+        let ch_id: u64 = channel.channel_id.parse()?;
+        // Truncate title at char boundary to avoid panic on multi-byte chars.
+        let truncated_title: String = title.chars().take(100).collect();
+        // Create the thread (Discord "start thread without message").
+        let thread = ChannelId::new(ch_id)
+            .create_thread(
+                &self.http,
+                CreateThread::new(&truncated_title)
+                    .auto_archive_duration(AutoArchiveDuration::OneDay)
+                    .kind(ChannelType::PublicThread),
+            )
+            .await?;
+        let thread_ref = ChannelRef {
+            platform: "discord".into(),
+            channel_id: thread.id.to_string(),
+            thread_id: None,
+            parent_id: Some(channel.channel_id.clone()),
+            origin_event_id: None,
+        };
+        // Send the starter message so the thread has visible content.
+        if !content.is_empty() {
+            self.send_message(&thread_ref, content).await?;
+        }
+        Ok(thread_ref)
     }
 
     async fn add_reaction(&self, msg: &MessageRef, emoji: &str) -> anyhow::Result<()> {

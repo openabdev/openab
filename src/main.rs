@@ -14,6 +14,7 @@ mod unified_adapter;
 mod acp_tunnel;
 #[cfg(feature = "acp")]
 mod acp_tunnel_source;
+mod thread_source;
 use openab_core::acp;
 use openab_core::adapter::{self, AdapterRouter};
 use openab_core::bot_turns;
@@ -536,6 +537,16 @@ async fn main() -> anyhow::Result<()> {
     // that is a core feature and naming it here is an unknown-cfg error.
     #[cfg(feature = "acp")]
     openab_core::acp_mcp::report_facade_status(cfg.mcp.is_some(), &cfg.agent.working_dir);
+    // Pre-build shared Discord adapter (used by both the MCP facade thread
+    // source and the cron scheduler).
+    #[cfg(feature = "discord")]
+    let shared_discord_adapter: Option<Arc<dyn adapter::ChatAdapter>> =
+        cfg.discord.as_ref().map(|dc| {
+            let http = Arc::new(serenity::http::Http::new(&dc.bot_token));
+            Arc::new(discord::DiscordAdapter::new(http)) as Arc<dyn adapter::ChatAdapter>
+        });
+    #[cfg(not(feature = "discord"))]
+    let shared_discord_adapter: Option<Arc<dyn adapter::ChatAdapter>> = None;
     if let Some(mcp_cfg) = cfg.mcp.clone() {
         let listen = mcp_cfg.listen.clone();
         let tokens = facade_sessions.clone();
@@ -543,12 +554,17 @@ async fn main() -> anyhow::Result<()> {
         // be skipped in bridge mode; with the bridge gone there is no mode in which the facade
         // runs without it.
         #[cfg(feature = "acp")]
-        let sources: Vec<Arc<dyn openab_mcp::mcp::sources::CapabilitySource>> =
+        let mut sources: Vec<Arc<dyn openab_mcp::mcp::sources::CapabilitySource>> =
             vec![Arc::new(acp_tunnel_source::AcpTunnelSource::new(
                 acp_tunnel.clone(),
             ))];
         #[cfg(not(feature = "acp"))]
-        let sources: Vec<Arc<dyn openab_mcp::mcp::sources::CapabilitySource>> = Vec::new();
+        let mut sources: Vec<Arc<dyn openab_mcp::mcp::sources::CapabilitySource>> = Vec::new();
+        // Register the thread-creation capability so agents can open threads
+        // via `execute_capability` without handling platform credentials.
+        if let Some(ref discord) = shared_discord_adapter {
+            sources.push(Arc::new(thread_source::ThreadSource::new(discord.clone())));
+        }
         tokio::spawn(async move {
             if let Err(e) =
                 openab_mcp::mcp::facade::serve_http_with(&listen, sources, tokens).await
@@ -891,16 +907,6 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     });
-
-    // Pre-build shared adapters for cron scheduler
-    #[cfg(feature = "discord")]
-    let shared_discord_adapter: Option<Arc<dyn adapter::ChatAdapter>> =
-        cfg.discord.as_ref().map(|dc| {
-            let http = Arc::new(serenity::http::Http::new(&dc.bot_token));
-            Arc::new(discord::DiscordAdapter::new(http)) as Arc<dyn adapter::ChatAdapter>
-        });
-    #[cfg(not(feature = "discord"))]
-    let shared_discord_adapter: Option<Arc<dyn adapter::ChatAdapter>> = None;
 
     let session_ttl_dur = std::time::Duration::from_secs(ttl_secs);
 
