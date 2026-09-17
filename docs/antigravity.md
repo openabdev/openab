@@ -111,11 +111,18 @@ is available:
 
 When a user selects a model with `/models`, OpenAB sends
 `session/set_config_option`. `agy-acp` stores the selected model for that session
-and adds `--model <model_id>` to subsequent `agy` invocations.
+and adds `--model <slug>` to subsequent `agy` invocations.
 
-To select a default model for every new session, set `default_config_options`:
+`agy models` in agy 1.1.27+ emits tab-separated `<model-id>\t<display name>`
+records; `agy-acp` advertises the first field as the option `value` and the
+second as the option `name`. Older one-field output and the static fallback
+list keep the whole line as both value and name.
+
+To select a default model for every new session, set `default_config_options`
+to a model slug (the `value` field of an advertised option, not its display
+name):
 
 ```toml
 [pool]
-default_config_options = { model = "Gemini 3.5 Flash (Medium)" }
+default_config_options = { model = "gemini-3.8-flash-high" }
 ```

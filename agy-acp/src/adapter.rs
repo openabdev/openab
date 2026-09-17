@@ -9,6 +9,25 @@ use crate::types::*;
 
 const DEFAULT_PRINT_TIMEOUT: &str = "20m";
 
+/// Split one `agy models` output line into (slug, display name).
+/// agy 1.1.27+ emits `<model-id>\t<display name>`; older versions emit a
+/// single field, which doubles as both value and name (as does the static
+/// fallback list).
+fn parse_model_line(line: &str) -> (String, String) {
+    let (slug, name) = match line.split_once('\t') {
+        Some((slug, name)) => (slug.trim(), name.trim()),
+        None => (line.trim(), line.trim()),
+    };
+    (slug.to_string(), if name.is_empty() { slug.to_string() } else { name.to_string() })
+}
+
+/// Normalize a stored or client-sent model value down to the slug passed to
+/// `agy --model`. Values recorded before tab-separated `agy models` output was
+/// parsed may still hold the whole `<slug>\t<name>` line.
+fn model_slug(value: &str) -> String {
+    parse_model_line(value).0
+}
+
 fn prompt_extra_args(extra: &str) -> Vec<String> {
     let mut args = shell_words::split(extra).unwrap_or_else(|_| {
         eprintln!("[agy-acp] WARN: failed to parse AGY_EXTRA_ARGS, ignoring");
@@ -130,16 +149,20 @@ impl Adapter {
     }
 
     pub fn config_options_json(&mut self, model_id: Option<&str>) -> Value {
-        let models = self.get_available_models();
-        if models.is_empty() {
+        let parsed: Vec<(String, String)> = self.get_available_models().iter()
+            .map(|line| parse_model_line(line))
+            .filter(|(slug, _)| !slug.is_empty())
+            .collect();
+        if parsed.is_empty() {
             return json!([]);
         }
         let current = model_id
-            .or_else(|| models.first().map(|s| s.as_str()))
-            .unwrap_or("");
-        let options: Vec<Value> = models
+            .map(model_slug)
+            .filter(|slug| !slug.is_empty())
+            .unwrap_or_else(|| parsed[0].0.clone());
+        let options: Vec<Value> = parsed
             .iter()
-            .map(|name| json!({ "value": name, "name": name }))
+            .map(|(slug, name)| json!({ "value": slug, "name": name }))
             .collect();
         json!([{
             "id": "model",
@@ -183,7 +206,11 @@ impl Adapter {
     pub fn restore_session(&self, session_id: &str) -> Option<(String, i64, Option<String>)> {
         let store = self.load_store();
         store.sessions.get(session_id).and_then(|s| {
-            s.conversation_id.clone().map(|cid| (cid, s.last_step_idx, s.model_id.clone()))
+            // Sessions persisted before tab-separated `agy models` output was
+            // parsed may hold the whole `<slug>\t<name>` line; normalize so
+            // in-memory state (and the next persist) carries only the slug.
+            let model_id = s.model_id.clone().map(|m| model_slug(&m)).filter(|m| !m.is_empty());
+            s.conversation_id.clone().map(|cid| (cid, s.last_step_idx, model_id))
         })
     }
 
@@ -311,8 +338,9 @@ impl Adapter {
         let session_id = params.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
         let config_id = params.get("configId").and_then(|v| v.as_str()).unwrap_or("");
         let value = params.get("value").and_then(|v| v.as_str()).unwrap_or("");
+        let slug = model_slug(value);
 
-        if session_id.is_empty() || config_id != "model" || value.is_empty() {
+        if session_id.is_empty() || config_id != "model" || slug.is_empty() {
             return JsonRpcResponse { jsonrpc: "2.0", id, result: None,
                 error: Some(json!({"code":-32602,"message":"missing sessionId, configId, or value"})) };
         }
@@ -323,11 +351,11 @@ impl Adapter {
             return JsonRpcResponse { jsonrpc: "2.0", id, result: None,
                 error: Some(json!({"code":-32000,"message":format!("unknown sessionId: {session_id}")})) };
         };
-        session.model_id = Some(value.to_string());
+        session.model_id = Some(slug.clone());
         let conv_id = session.conversation_id.clone();
         let last_step_idx = session.last_step_idx;
-        self.persist_session(session_id, conv_id.as_deref(), last_step_idx, Some(value));
-        let config_options = self.config_options_json(Some(value));
+        self.persist_session(session_id, conv_id.as_deref(), last_step_idx, Some(&slug));
+        let config_options = self.config_options_json(Some(&slug));
         JsonRpcResponse { jsonrpc: "2.0", id, result: Some(json!({ "configOptions": config_options })), error: None }
     }
 
@@ -365,8 +393,11 @@ impl Adapter {
                 args.push(conv_id.clone());
             }
             if let Some(model_id) = &session.model_id {
-                args.push("--model".to_string());
-                args.push(model_id.clone());
+                let slug = model_slug(model_id);
+                if !slug.is_empty() {
+                    args.push("--model".to_string());
+                    args.push(slug);
+                }
             }
         }
         args.push("-p".to_string());
@@ -381,7 +412,202 @@ impl Adapter {
 
 #[cfg(test)]
 mod tests {
-    use super::prompt_extra_args;
+    use super::{parse_model_line, prompt_extra_args, Adapter};
+    use crate::types::Session;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::fs;
+    use uuid::Uuid;
+
+    /// RAII guard for a temp-dir test fixture: removes the directory on drop,
+    /// so cleanup still runs if an assertion panics mid-test.
+    struct TempDirGuard(std::path::PathBuf);
+    impl std::ops::Deref for TempDirGuard {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path { &self.0 }
+    }
+    impl AsRef<std::path::Path> for TempDirGuard {
+        fn as_ref(&self) -> &std::path::Path { &self.0 }
+    }
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    }
+
+    fn adapter_with_models(root: &std::path::Path, models: Vec<String>) -> Adapter {
+        Adapter {
+            sessions: HashMap::new(),
+            working_dir: root.to_string_lossy().to_string(),
+            conversations_dir: root.join("conversations"),
+            state_file: root.join("sessions.json"),
+            available_models: Some(models),
+        }
+    }
+
+    #[test]
+    fn parse_model_line_splits_tab_separated_slug_and_name() {
+        assert_eq!(
+            parse_model_line("gemini-3.8-flash-high\tGemini 3.8 Flash (High)"),
+            ("gemini-3.8-flash-high".to_string(), "Gemini 3.8 Flash (High)".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_model_line_legacy_single_field_doubles_as_name() {
+        assert_eq!(
+            parse_model_line("Gemini 3.5 Flash (Medium)"),
+            ("Gemini 3.5 Flash (Medium)".to_string(), "Gemini 3.5 Flash (Medium)".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_model_line_empty_display_name_falls_back_to_slug() {
+        assert_eq!(
+            parse_model_line("gemini-3.8-flash-high\t"),
+            ("gemini-3.8-flash-high".to_string(), "gemini-3.8-flash-high".to_string())
+        );
+        assert_eq!(
+            parse_model_line("gemini-3.8-flash-high\t   "),
+            ("gemini-3.8-flash-high".to_string(), "gemini-3.8-flash-high".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_model_line_trims_fields() {
+        assert_eq!(
+            parse_model_line("  gemini-3.8-flash-high \t Gemini 3.8 Flash (High) "),
+            ("gemini-3.8-flash-high".to_string(), "Gemini 3.8 Flash (High)".to_string())
+        );
+    }
+
+    #[test]
+    fn config_options_split_tab_separated_lines_into_value_and_name() {
+        let root = TempDirGuard(std::env::temp_dir().join(format!("agy-acp-cfgopt-tab-{}", Uuid::new_v4())));
+        let mut adapter = adapter_with_models(&root, vec![
+            "gemini-3.8-flash-high\tGemini 3.8 Flash (High)".to_string(),
+            "gemini-3.1-pro-low\tGemini 3.1 Pro (Low)".to_string(),
+        ]);
+        let options = adapter.config_options_json(None);
+        let model = &options[0];
+        assert_eq!(model["currentValue"], json!("gemini-3.8-flash-high"));
+        let opts = model["options"].as_array().unwrap();
+        assert_eq!(opts.len(), 2);
+        assert_eq!(opts[0], json!({"value": "gemini-3.8-flash-high", "name": "Gemini 3.8 Flash (High)"}));
+        assert_eq!(opts[1], json!({"value": "gemini-3.1-pro-low", "name": "Gemini 3.1 Pro (Low)"}));
+        for o in opts {
+            assert!(!o["value"].as_str().unwrap().contains('\t'), "option value must be a bare slug: {o}");
+        }
+    }
+
+    #[test]
+    fn config_options_legacy_single_field_lines_keep_value_and_name_identical() {
+        let root = TempDirGuard(std::env::temp_dir().join(format!("agy-acp-cfgopt-legacy-{}", Uuid::new_v4())));
+        let mut adapter = adapter_with_models(&root, Adapter::static_fallback_models());
+        let options = adapter.config_options_json(None);
+        let opts = options[0]["options"].as_array().unwrap();
+        assert_eq!(opts.len(), 5);
+        assert_eq!(opts[0], json!({"value": "Gemini 3.5 Flash (Medium)", "name": "Gemini 3.5 Flash (Medium)"}));
+        assert_eq!(options[0]["currentValue"], json!("Gemini 3.5 Flash (Medium)"));
+    }
+
+    #[test]
+    fn config_options_normalizes_legacy_persisted_current_value() {
+        // Sessions persisted before tab-separated output was parsed may hold the
+        // whole `<slug>\t<name>` line as model_id; currentValue must still be a
+        // bare slug.
+        let root = TempDirGuard(std::env::temp_dir().join(format!("agy-acp-cfgopt-cur-{}", Uuid::new_v4())));
+        let mut adapter = adapter_with_models(&root, vec![
+            "gemini-3.8-flash-high\tGemini 3.8 Flash (High)".to_string(),
+        ]);
+        let options = adapter.config_options_json(Some("gemini-3.8-flash-high\tGemini 3.8 Flash (High)"));
+        assert_eq!(options[0]["currentValue"], json!("gemini-3.8-flash-high"));
+    }
+
+    #[test]
+    fn config_options_drops_lines_without_a_slug() {
+        let root = TempDirGuard(std::env::temp_dir().join(format!("agy-acp-cfgopt-noslug-{}", Uuid::new_v4())));
+        let mut adapter = adapter_with_models(&root, vec!["\tNo slug here".to_string()]);
+        assert_eq!(adapter.config_options_json(None), json!([]));
+    }
+
+    #[test]
+    #[ignore]
+    fn set_config_option_persists_only_the_slug() {
+        let root = TempDirGuard(std::env::temp_dir().join(format!("agy-acp-setcfg-{}", Uuid::new_v4())));
+        let _ = fs::create_dir_all(&root);
+        let mut adapter = adapter_with_models(&root, vec![
+            "gemini-3.8-flash-high\tGemini 3.8 Flash (High)".to_string(),
+        ]);
+        adapter.sessions.insert("sess-1".to_string(), Session {
+            conversation_id: Some("conv-1".to_string()), last_step_idx: -1, model_id: None,
+        });
+        // A client may still send a whole tab-separated record (cached picker
+        // value or operator-provided default_config_options); only the slug is
+        // kept.
+        let response = adapter.handle_session_set_config_option(json!(9), &json!({
+            "sessionId": "sess-1", "configId": "model",
+            "value": "gemini-3.8-flash-high\tGemini 3.8 Flash (High)"
+        }));
+        assert!(response.error.is_none());
+        assert_eq!(adapter.sessions["sess-1"].model_id.as_deref(), Some("gemini-3.8-flash-high"));
+        assert_eq!(
+            adapter.restore_session("sess-1"),
+            Some(("conv-1".to_string(), -1, Some("gemini-3.8-flash-high".to_string())))
+        );
+        let result = response.result.unwrap();
+        assert_eq!(result["configOptions"][0]["currentValue"], json!("gemini-3.8-flash-high"));
+    }
+
+    #[test]
+    #[ignore]
+    fn set_config_option_rejects_value_without_a_slug() {
+        // `"\tname"` normalizes to an empty slug — reject like an empty value.
+        let root = TempDirGuard(std::env::temp_dir().join(format!("agy-acp-setcfg-empty-{}", Uuid::new_v4())));
+        let _ = fs::create_dir_all(&root);
+        let mut adapter = adapter_with_models(&root, vec![]);
+        adapter.sessions.insert("sess-1".to_string(), Session {
+            conversation_id: Some("conv-1".to_string()), last_step_idx: -1, model_id: None,
+        });
+        let response = adapter.handle_session_set_config_option(json!(9), &json!({
+            "sessionId": "sess-1", "configId": "model", "value": "\tOnly Name"
+        }));
+        assert!(response.error.is_some());
+        assert!(adapter.sessions["sess-1"].model_id.is_none());
+    }
+
+    #[test]
+    #[ignore]
+    fn restore_session_normalizes_legacy_persisted_model_id() {
+        let root = TempDirGuard(std::env::temp_dir().join(format!("agy-acp-restore-{}", Uuid::new_v4())));
+        let _ = fs::create_dir_all(&root);
+        let adapter = adapter_with_models(&root, vec![]);
+        adapter.persist_session(
+            "sess-1", Some("conv-1"), 7,
+            Some("gemini-3.8-flash-high\tGemini 3.8 Flash (High)"),
+        );
+        assert_eq!(
+            adapter.restore_session("sess-1"),
+            Some(("conv-1".to_string(), 7, Some("gemini-3.8-flash-high".to_string())))
+        );
+    }
+
+    #[test]
+    fn prompt_args_pass_a_single_slug_to_the_model_flag() {
+        let root = TempDirGuard(std::env::temp_dir().join(format!("agy-acp-prompt-model-{}", Uuid::new_v4())));
+        let mut adapter = adapter_with_models(&root, vec![]);
+        adapter.sessions.insert("sess-1".to_string(), Session {
+            conversation_id: Some("conv-1".to_string()), last_step_idx: 0,
+            // Legacy-persisted value: whole tab-separated record.
+            model_id: Some("gemini-3.8-flash-high\tGemini 3.8 Flash (High)".to_string()),
+        });
+        let (_sid, _prompt, args, _snap, _conv, _idx) = adapter.prepare_prompt_state(&json!({
+            "sessionId": "sess-1", "prompt": [{"type": "text", "text": "hi"}]
+        }));
+        let positions: Vec<usize> = args.iter().enumerate()
+            .filter(|(_, a)| *a == "--model").map(|(i, _)| i).collect();
+        assert_eq!(positions.len(), 1, "expected exactly one --model flag in {args:?}");
+        assert_eq!(args[positions[0] + 1], "gemini-3.8-flash-high");
+        assert!(args.iter().all(|a| !a.contains('\t')), "no arg may contain a tab: {args:?}");
+    }
 
     #[test]
     fn default_timeout_is_added_without_discarding_extra_args() {
