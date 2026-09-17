@@ -36,6 +36,10 @@ wiremock = "0.6"
 
 [features]
 default = ["telegram", "line", "feishu", "googlechat", "wecom", "teams", "lineworks"]
+# Cross-crate seam-test fixtures (`adapters::acp_server::test_tunnel_handle`,
+# `TunnelTestPeer`). Pulled in by the root package's dev-dependency so the items
+# exist only in test builds — never in production `acp` binaries (issue #1527).
+test-fixtures = []
 telegram = []
 line = []
 feishu = []

@@ -1262,4 +1262,205 @@ mod tests {
         assert_eq!(fwd[0].1, "uuid-k", "routed to katashiro, not the 'browser' prefix");
         assert_eq!(fwd[0].2["name"], "browser.click", "the original tool name is forwarded unchanged");
     }
+
+    // -----------------------------------------------------------------------
+    // Real-machinery seam tests for issue #1527.
+    //
+    // Every test above drives `AcpTunnelSource` through `FakeTunnel`, a double
+    // that replaces the registry lookup, the `TunnelHandle` framing, and
+    // `RootAcpTunnel`'s delegation wholesale — so a break in any of those
+    // product-owned parts would leave this suite green (Claim 2). The tests
+    // below keep only the wire peer faked (the browser extension is the
+    // external boundary) and run the source through the REAL registry +
+    // `TunnelHandle` + `RootAcpTunnel`, via the gateway's `test_tunnel_handle`
+    // fixture.
+    // -----------------------------------------------------------------------
+
+    use openab_gateway::adapters::acp_server::{new_tunnel_registry, test_tunnel_handle};
+
+    /// Build a source over the REAL `RootAcpTunnel` + registry with `handles`
+    /// inserted under `(channel_id, server_id)`, and the peers to answer with.
+    fn real_source(
+        handles: Vec<(
+            String,
+            String,
+            openab_gateway::adapters::acp_server::TunnelHandle,
+        )>,
+    ) -> (
+        AcpTunnelSource,
+        openab_gateway::adapters::acp_server::AcpTunnelRegistry,
+    ) {
+        let registry = new_tunnel_registry();
+        {
+            let mut reg = registry.lock().unwrap();
+            for (channel, id, handle) in handles {
+                reg.insert((channel, id), handle);
+            }
+        }
+        let tunnel: Arc<dyn AcpMcpTunnel> =
+            Arc::new(crate::acp_tunnel::RootAcpTunnel::new(registry.clone(), 5));
+        (AcpTunnelSource::new(tunnel), registry)
+    }
+
+    /// `tools/call` must traverse `RootAcpTunnel` → `resolve_by_name` → the
+    /// registry → `TunnelHandle::mcp_message` — asserting the emitted
+    /// `mcp/message` frame, not a fake's recorded call. The answer round-trips
+    /// through the real pending-request correlation.
+    #[tokio::test]
+    async fn real_registry_routes_call_to_the_matching_tunnel() {
+        let (handle, mut peer) = test_tunnel_handle("katashiro", "conn-1", "owner-a", 1, 1);
+        let (src, _registry) = real_source(vec![("acp_x".into(), "srv-1".into(), handle)]);
+
+        // Answer in a spawned task: the call below awaits the tunnel's reply.
+        let answer = tokio::spawn(async move {
+            let f = peer.next_frame().await;
+            assert_eq!(f["method"], json!("mcp/message"));
+            assert_eq!(f["params"]["connectionId"], json!("conn-1"));
+            assert_eq!(f["params"]["method"], json!("tools/call"));
+            assert_eq!(f["params"]["params"]["name"], json!("katashiro.click"));
+            peer.reply(
+                f["id"].as_u64().unwrap(),
+                json!({"content": [{"type": "text", "text": "real-ok"}]}),
+            )
+            .await;
+        });
+
+        let (v, is_err) = src
+            .call(Some(&ctx()), "katashiro.click", &Map::new())
+            .await
+            .unwrap();
+        // Bounded: a routing break means no frame ever arrives and an unbounded
+        // await would hang the suite instead of failing it.
+        tokio::time::timeout(std::time::Duration::from_secs(5), answer)
+            .await
+            .expect("the tunnel should emit a request frame within 5s")
+            .unwrap();
+        assert!(!is_err);
+        assert_eq!(v["content"][0]["text"], json!("real-ok"));
+    }
+
+    /// A reconnect leaves two same-named handles in the registry mid-eviction;
+    /// `resolve_by_name` must pick the ranked winner — the frame must arrive on
+    /// the NEW connection's peer, not whichever entry the map yields first.
+    #[tokio::test]
+    async fn real_registry_routes_to_the_newest_attach_after_reattach() {
+        // `_old_peer` stays bound: dropping its receiver would make a frame sent
+        // to the stale handle fail outright rather than sit unanswered — the test
+        // then passes only if the call never touches conn-old at all.
+        let (old, _old_peer) = test_tunnel_handle("katashiro", "conn-old", "owner-a", 1, 1);
+        let (new, mut new_peer) = test_tunnel_handle("katashiro", "conn-new", "owner-b", 2, 2);
+        let (src, _registry) = real_source(vec![
+            ("acp_x".into(), "srv-old".into(), old),
+            ("acp_x".into(), "srv-new".into(), new),
+        ]);
+
+        let answer = tokio::spawn(async move {
+            let f = new_peer.next_frame().await;
+            assert_eq!(f["params"]["connectionId"], json!("conn-new"));
+            peer_reply(&mut new_peer, &f).await;
+        });
+
+        let (_v, is_err) = src
+            .call(Some(&ctx()), "katashiro.click", &Map::new())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), answer)
+            .await
+            .expect("the call should reach the newest attach's tunnel within 5s")
+            .unwrap();
+        assert!(!is_err);
+    }
+
+    /// Discovery (`tools/list`) and the advertised catalog must come through a
+    /// real handle too: `tools()` → `attached_server_names` → `resolve_by_name`
+    /// → background `mcp/message` → cached `Discovered` → `catalog`.
+    #[tokio::test]
+    async fn real_registry_discovers_and_advertises_tools() {
+        let (handle, mut peer) = test_tunnel_handle("katashiro", "conn-1", "owner-a", 1, 1);
+        let (src, _registry) = real_source(vec![("acp_x".into(), "srv-1".into(), handle)]);
+
+        let answer = tokio::spawn(async move {
+            let f = peer.next_frame().await;
+            assert_eq!(f["params"]["connectionId"], json!("conn-1"));
+            assert_eq!(f["params"]["method"], json!("tools/list"));
+            peer.reply(
+                f["id"].as_u64().unwrap(),
+                json!({"tools": [{"name": "katashiro.click", "inputSchema": {"type": "object"}}]}),
+            )
+            .await;
+        });
+
+        // Cold start: this read kicks the background fetch off; the catalog
+        // lands on a subsequent read once the reply is routed and cached.
+        let _ = src.tools(Some(&ctx()));
+        tokio::time::timeout(std::time::Duration::from_secs(5), answer)
+            .await
+            .expect("discovery should emit a tools/list frame within 5s")
+            .unwrap();
+
+        let tools = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let found = src.tools(Some(&ctx()));
+                if !found.is_empty() {
+                    return found;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("discovery should land within 5s");
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name.as_ref(), "katashiro.click");
+    }
+
+    /// Helper for peers whose reply content doesn't matter.
+    async fn peer_reply(
+        peer: &mut openab_gateway::adapters::acp_server::TunnelTestPeer,
+        frame: &Value,
+    ) {
+        peer.reply(
+            frame["id"].as_u64().unwrap(),
+            json!({"content": [{"type": "text", "text": "ok"}]}),
+        )
+        .await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Claim 3: `FacadeRegistrar` through the REAL `SessionTokens`.
+    //
+    // The `CountingRegistrar` suite in `pool.rs` asserts call ORDERING at a
+    // genuine crate boundary — that use is sound. What it cannot see is this
+    // adapter's own mapping: a `revoke` that reached `revoke_channel` instead of
+    // `revoke_token` would pass every counter-based test while stripping a
+    // successor's live token in production (the R1 regression this adapter's
+    // doc comment names). Only the real registry can answer that.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn facade_registrar_mint_resolves_and_revoke_is_token_specific() {
+        use openab_core::acp_mcp::SessionTokenRegistrar;
+
+        let tokens = openab_mcp::mcp::sources::SessionTokens::new();
+        let registrar = super::FacadeRegistrar(tokens.clone());
+
+        let first = registrar.mint("acp_x");
+        let second = registrar.mint("acp_x");
+        assert_eq!(tokens.resolve(&first).unwrap().channel_id, "acp_x");
+        assert_eq!(tokens.resolve(&second).unwrap().channel_id, "acp_x");
+
+        // The predecessor's late teardown retires ONLY its own credential — a
+        // revoke-by-channel here would kill `second` too.
+        registrar.revoke(&first);
+        assert!(tokens.resolve(&first).is_none());
+        assert!(
+            tokens.resolve(&second).is_some(),
+            "the successor's token must survive a late teardown of the session it replaced"
+        );
+
+        registrar.revoke(&second);
+        assert!(tokens.resolve(&second).is_none());
+        // Revocation is idempotent — an overlapping drop guard is harmless.
+        registrar.revoke(&second);
+    }
 }

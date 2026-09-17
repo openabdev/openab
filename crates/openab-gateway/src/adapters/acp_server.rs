@@ -557,6 +557,84 @@ pub fn new_tunnel_registry() -> AcpTunnelRegistry {
     Arc::new(std::sync::Mutex::new(HashMap::new()))
 }
 
+/// Test-fixture constructor for seam tests in OTHER crates — the root binary's
+/// `acp_tunnel_source` tests exercise `AcpTunnelSource` through the REAL
+/// `RootAcpTunnel` → registry → `TunnelHandle` path, which needs a handle that
+/// never touched a WebSocket (issue #1527, Claim 2).
+///
+/// Gated on `test-fixtures`, which only the root package's dev-dependency
+/// enables: production `acp` builds never link this — a `#[cfg(test)]` helper
+/// cannot serve dependents because a dependency builds without test cfg, and a
+/// `#[doc(hidden)] pub` alone would still ship in release binaries.
+/// `TunnelHandle`'s fields stay private so only this path can hand-mint one.
+/// `owner`, `connection_generation`, and `generation` are the ordering identity
+/// the establish path normally stamps; a fixture must reproduce them faithfully —
+/// give every handle a DISTINCT rank, because `resolve_by_name` compares with a
+/// strict `>` and a tie resolves to whichever entry the map yields first.
+///
+/// The returned [`TunnelTestPeer`] is the wire end: it reads the frames the
+/// handle emits and answers them through the real `route_client_response`
+/// correlation path, so only the remote MCP server (the external boundary) is
+/// simulated — never the registry, the handle, or the framing.
+#[cfg(feature = "test-fixtures")]
+#[doc(hidden)]
+pub fn test_tunnel_handle(
+    server_name: &str,
+    connection_id: &str,
+    owner: &str,
+    connection_generation: u64,
+    generation: u64,
+) -> (TunnelHandle, TunnelTestPeer) {
+    let (out_tx, out_rx) = mpsc::unbounded_channel();
+    let pending = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    (
+        TunnelHandle {
+            out_tx,
+            pending: pending.clone(),
+            next_id: Arc::new(AtomicU64::new(1)),
+            connection_id: connection_id.into(),
+            server_name: server_name.into(),
+            owner: owner.into(),
+            connection_generation,
+            generation,
+        },
+        TunnelTestPeer { out_rx, pending },
+    )
+}
+
+/// The peer end of a [`test_tunnel_handle`] fixture: the outbound frames a real
+/// WebSocket would have carried, plus a responder that routes replies through
+/// the same correlation path a real client response takes.
+#[cfg(feature = "test-fixtures")]
+#[doc(hidden)]
+pub struct TunnelTestPeer {
+    out_rx: mpsc::UnboundedReceiver<String>,
+    pending: Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<Value>>>>,
+}
+
+#[cfg(feature = "test-fixtures")]
+impl TunnelTestPeer {
+    /// Await the next outbound frame the tunnel sent, parsed.
+    pub async fn next_frame(&mut self) -> Value {
+        let raw = self
+            .out_rx
+            .recv()
+            .await
+            .expect("tunnel closed its outbound channel");
+        serde_json::from_str(&raw).expect("tunnel emitted a non-JSON frame")
+    }
+
+    /// Answer the request frame `id` with `result`, routed through the real
+    /// `route_client_response` — the same correlation a client reply takes.
+    pub async fn reply(&mut self, id: u64, result: Value) {
+        let frame = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+        assert!(
+            route_client_response(&self.pending, &frame).await,
+            "reply was not correlated to a pending request"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // JSON-RPC types (minimal subset for ACP)
 // ---------------------------------------------------------------------------
