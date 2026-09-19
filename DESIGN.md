@@ -95,7 +95,7 @@ This is a fundamental architectural difference. OpenClaw, for example, was origi
 
 **Gateway adapters** (Telegram, LINE, Feishu/Lark, Google Chat) run through the standalone Custom Gateway service. The gateway handles inbound webhooks and platform credentials; OpenAB connects to it via outbound WebSocket. This separation keeps webhook complexity and platform secrets out of the core binary.
 
-The preferred future direction is for all platforms — including Discord and Slack — to go through the gateway, making OpenAB purely outbound. This is tracked in [ADR: Custom Gateway](adr/custom-gateway.md).
+The preferred future direction is for all platforms — including Discord and Slack — to go through the gateway, making OpenAB purely outbound. This is tracked in [ADR: Custom Gateway](docs/adr/custom-gateway.md).
 
 ### The ACP Bridge
 

@@ -53,7 +53,7 @@ export PATH="$HOME/.local/bin:$PATH"
 cargo test e2e -- --ignored --nocapture
 ```
 
-**CI:** The GitHub Actions workflow (`.github/workflows/e2e-agy-acp.yml`) handles everything automatically. It uses the `GEMINI_API_KEY` repo secret.
+**CI:** The GitHub Actions workflow (`.github/workflows/ci-agy-acp.yml`) handles everything automatically. It uses the `GEMINI_API_KEY` repo secret.
 
 ### Updating the API key
 

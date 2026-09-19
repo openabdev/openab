@@ -3,7 +3,7 @@
 - **Status:** Proposed
 - **Date:** 2026-04-26
 - **Author:** @chaodu-agent
-- **Related:** [K8s CronJob Reference Architecture](../cronjob_k8s_refarch.md)
+- **Related:** [K8s CronJob Reference Architecture](../refarch/cronjob_k8s_refarch.md)
 
 ---
 
@@ -275,7 +275,7 @@ The schedule field uses standard POSIX cron syntax, compatible with:
 
 ## References
 
-- [K8s CronJob Reference Architecture](../cronjob_k8s_refarch.md) — external scheduler approach for heavy workloads
+- [K8s CronJob Reference Architecture](../refarch/cronjob_k8s_refarch.md) — external scheduler approach for heavy workloads
 - [OpenAB Configuration Reference](../config-reference.md) — existing config.toml structure
 - [ADR: Custom Gateway](./custom-gateway.md) — gateway architecture context (scheduled triggers via webhook)
 - [cron(5) man page](https://man7.org/linux/man-pages/man5/crontab.5.html) — POSIX cron expression syntax

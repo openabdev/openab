@@ -367,7 +367,7 @@ Config-driven cron covers the 80% use case: "send this message at this time." Fo
 | Multi-step workflows / DAGs | GitHub Actions or Step Functions |
 | Per-execution isolation | K8s CronJob (separate Pod per run) |
 
-See [Kubernetes CronJob Reference Architecture](cronjob_k8s_refarch.md) for the external scheduler approach.
+See [Kubernetes CronJob Reference Architecture](refarch/cronjob_k8s_refarch.md) for the external scheduler approach.
 
 ## Known Limitations
 
