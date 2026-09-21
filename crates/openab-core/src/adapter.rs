@@ -462,6 +462,20 @@ pub trait ChatAdapter: Send + Sync + 'static {
     fn show_streaming_placeholder(&self) -> bool {
         true
     }
+
+    /// Upload a local file to the thread. Used by the auto-upload-generated-files
+    /// feature: after a turn completes, newly created files in `[agent].auto_upload_dirs`
+    /// are uploaded to the originating thread via this method.
+    /// Default: no-op (returns Ok). Platforms that support file attachments (Slack,
+    /// Discord) override this.
+    async fn upload_file(
+        &self,
+        _channel: &ChannelRef,
+        _file_path: &std::path::Path,
+        _title: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 // --- AdapterRouter ---
@@ -483,6 +497,11 @@ pub struct AdapterRouter {
     /// [`AdapterRouter::with_trust`]; empty default = deny-all per platform
     /// (only consulted by paths wired to the gate — currently the gateway path).
     trust: crate::trust::PlatformTrustConfigs,
+    /// Directories to scan for new files after each ACP turn. Populated from
+    /// `[agent].auto_upload_dirs` in config.toml. When non-empty, files created
+    /// during a turn are auto-uploaded to the originating thread via the adapter's
+    /// `upload_file` method. Empty = feature disabled (default).
+    auto_upload_dirs: Vec<std::path::PathBuf>,
 }
 
 impl AdapterRouter {
@@ -513,6 +532,7 @@ impl AdapterRouter {
             workspace_aliases,
             bot_home,
             trust: crate::trust::PlatformTrustConfigs::default(),
+            auto_upload_dirs: Vec::new(),
         }
     }
 
@@ -551,6 +571,13 @@ impl AdapterRouter {
     /// Workspace aliases for control directive resolution.
     pub fn workspace_aliases_map(&self) -> std::collections::HashMap<String, String> {
         self.workspace_aliases.clone()
+    }
+
+    /// Set auto-upload directories from `[agent].auto_upload_dirs` config.
+    /// Chainable builder pattern (matches `with_trust`).
+    pub fn with_auto_upload_dirs(mut self, dirs: Vec<std::path::PathBuf>) -> Self {
+        self.auto_upload_dirs = dirs;
+        self
     }
 
     /// Bot home path for workspace security boundary.
@@ -752,6 +779,7 @@ impl AdapterRouter {
         let platform_is_acp = thread_channel.platform == "acp";
         let prompt_hard_timeout = self.prompt_hard_timeout;
         let liveness_check_interval = self.liveness_check_interval;
+        let auto_upload_dirs = self.auto_upload_dirs.clone();
 
         self.pool
             .with_connection(thread_key, |conn| {
@@ -759,6 +787,9 @@ impl AdapterRouter {
                 Box::pin(async move {
                     let reset = conn.session_reset;
                     conn.session_reset = false;
+
+                    // Record turn start for auto-upload file detection
+                    let turn_start = std::time::SystemTime::now();
 
                     let (mut rx, request_id) = conn.session_prompt(content_blocks).await?;
                     if assistant_status {
@@ -1362,6 +1393,34 @@ impl AdapterRouter {
                                 delivery_failed = true;
                             }
                             first = false;
+                        }
+                    }
+
+                    // Auto-upload files created during this turn (best-effort; delivery
+                    // failures above take priority).
+                    if !delivery_failed && !auto_upload_dirs.is_empty() {
+                        let new_files = scan_new_files(&auto_upload_dirs, turn_start).await;
+                        for path in &new_files {
+                            let title = path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("file");
+                            if let Err(e) =
+                                adapter.upload_file(&thread_channel, path, title).await
+                            {
+                                tracing::warn!(
+                                    error = %e,
+                                    file = %path.display(),
+                                    "auto-upload failed (non-fatal)"
+                                );
+                            }
+                        }
+                        if !new_files.is_empty() {
+                            tracing::info!(
+                                count = new_files.len(),
+                                "auto-uploaded {} file(s) from watched directories",
+                                new_files.len()
+                            );
                         }
                     }
 
@@ -2586,4 +2645,33 @@ mod directive_tests {
         let result = classify_empty_turn(None, &tr);
         assert_eq!(result, "_(no response)_");
     }
+}
+
+/// Recursively scan `dirs` for files whose mtime is newer than `since`.
+/// Used by the auto-upload-generated-files feature to detect files created
+/// during an ACP turn.
+async fn scan_new_files(
+    dirs: &[std::path::PathBuf],
+    since: std::time::SystemTime,
+) -> Vec<std::path::PathBuf> {
+    let mut result = Vec::new();
+    for dir in dirs {
+        if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                if path.is_dir() {
+                    // Recurse one level (e.g. generated_images/<session-id>/<file>.png)
+                    let sub = Box::pin(scan_new_files(&[path], since)).await;
+                    result.extend(sub);
+                } else if let Ok(meta) = tokio::fs::metadata(&path).await {
+                    if let Ok(mtime) = meta.modified() {
+                        if mtime > since {
+                            result.push(path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    result
 }

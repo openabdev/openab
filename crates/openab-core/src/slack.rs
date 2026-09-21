@@ -684,6 +684,72 @@ impl ChatAdapter for SlackAdapter {
         }
         Ok(())
     }
+
+    async fn upload_file(
+        &self,
+        channel: &ChannelRef,
+        file_path: &std::path::Path,
+        title: &str,
+    ) -> Result<()> {
+        use tokio::fs;
+
+        let metadata = fs::metadata(file_path).await?;
+        let file_size = metadata.len();
+        let filename = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file");
+
+        // Step 1: get upload URL
+        let step1 = self
+            .api_post(
+                "files.getUploadURLExternal",
+                serde_json::json!({
+                    "filename": filename,
+                    "length": file_size,
+                }),
+            )
+            .await?;
+        let upload_url = step1["upload_url"]
+            .as_str()
+            .ok_or_else(|| anyhow!("missing upload_url in getUploadURLExternal response"))?;
+        let file_id = step1["file_id"]
+            .as_str()
+            .ok_or_else(|| anyhow!("missing file_id in getUploadURLExternal response"))?;
+
+        // Step 2: upload binary to the presigned URL
+        let file_bytes = fs::read(file_path).await?;
+        let part = reqwest::multipart::Part::bytes(file_bytes)
+            .file_name(filename.to_string())
+            .mime_str("application/octet-stream")?;
+        let form = reqwest::multipart::Form::new().part("file", part);
+        let upload_resp = self.client.post(upload_url).multipart(form).send().await?;
+        if !upload_resp.status().is_success() {
+            return Err(anyhow!(
+                "file upload POST failed: HTTP {}",
+                upload_resp.status()
+            ));
+        }
+
+        // Step 3: complete upload and share to thread
+        let mut complete_body = serde_json::json!({
+            "files": [{ "id": file_id, "title": title }],
+            "channel_id": channel.channel_id,
+        });
+        if let Some(ref thread_ts) = channel.thread_id {
+            complete_body["thread_ts"] = serde_json::json!(thread_ts);
+        }
+        self.api_post("files.completeUploadExternal", complete_body)
+            .await?;
+
+        info!(
+            file = %file_path.display(),
+            file_id,
+            channel = %channel.channel_id,
+            "auto-uploaded file to Slack thread"
+        );
+        Ok(())
+    }
 }
 
 // --- Socket Mode event loop ---

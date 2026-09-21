@@ -233,4 +233,47 @@ A: Not currently. OpenAB streams text via ACP JSON-RPC. File sending is done out
 A: Use the [Large Files & Enterprise Best Practice](#large-files--enterprise-best-practice) pattern — upload to S3/R2/Google Drive, generate a temporary link, and send the URL in the message.
 
 **Q: Does this work with Slack / Telegram / LINE?**
-A: Same concept — call the platform's file upload API using the channel ID from `sender_context`. API details differ per platform. For Slack, use [`files.upload`](https://api.slack.com/methods/files.upload). For Telegram, use [`sendDocument`](https://core.telegram.org/bots/api#senddocument).
+A: Same concept — call the platform's file upload API using the channel ID from `sender_context`. API details differ per platform. For Slack, use the v2 external upload flow (`files.getUploadURLExternal` + POST binary + `files.completeUploadExternal`); the legacy `files.upload` is deprecated. For Telegram, use [`sendDocument`](https://core.telegram.org/bots/api#senddocument).
+
+**Q: My agent generates images (e.g. `image_gen`) but the user never sees them. How do I fix this?**
+A: OpenAB does not relay inline images from ACP. Use `[agent].auto_upload_dirs` in `config.toml` to auto-upload files created during a turn:
+
+```toml
+[agent]
+auto_upload_dirs = ["/home/node/.codex/generated_images"]
+```
+
+After each turn completes, OpenAB scans these directories for newly created files and uploads them to the originating Slack/Discord thread using the bot token. The Slack bot needs `files:write` scope. See below for the Slack-specific details.
+
+## Auto-Upload Generated Files
+
+When `[agent].auto_upload_dirs` is set, OpenAB automatically uploads files
+created during an ACP turn to the originating thread. This is designed for
+agent-generated assets (images, PDFs, reports) that the text-only ACP stream
+cannot deliver.
+
+### How it works
+
+1. Before dispatching the ACP prompt, OpenAB records the current timestamp.
+2. After the turn completes and text is delivered, it scans the configured
+   directories (recursively, one level deep) for files whose mtime is newer
+   than the turn start.
+3. Each new file is uploaded to the thread via the platform's file upload API.
+4. Upload failures are logged but non-fatal — the text reply is always delivered.
+
+### Configuration
+
+```toml
+[agent]
+auto_upload_dirs = ["/home/node/.codex/generated_images"]
+```
+
+Multiple directories are supported. Paths are absolute or relative to the
+agent's working directory.
+
+### Slack requirements
+
+- Bot token must have `files:write` scope (add via api.slack.com/apps → OAuth & Permissions)
+- The token is already available to OpenAB via `[slack] bot_token`; no additional
+  `[agent] env` configuration is needed for the auto-upload (OpenAB uploads directly,
+  not the agent subprocess)

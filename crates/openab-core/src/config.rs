@@ -1668,6 +1668,7 @@ struct AgentConfigRaw {
     working_dir: String,
     env: HashMap<String, String>,
     inherit_env: Vec<String>,
+    auto_upload_dirs: Vec<String>,
 }
 
 impl Default for AgentConfigRaw {
@@ -1678,6 +1679,7 @@ impl Default for AgentConfigRaw {
             working_dir: default_working_dir(),
             env: HashMap::new(),
             inherit_env: Vec::new(),
+            auto_upload_dirs: Vec::new(),
         }
     }
 }
@@ -1691,6 +1693,12 @@ pub struct AgentConfig {
     pub inherit_env: Vec<String>,
     /// Whether the command was explicitly set in config (vs defaulted from env/fallback).
     pub command_explicit: bool,
+    /// Directories to scan for new files after each turn. When non-empty, any file
+    /// created during the turn is auto-uploaded to the originating thread. Paths are
+    /// relative to `working_dir` (or absolute). Designed for agent-generated assets
+    /// (e.g. codex `~/.codex/generated_images/`) that the text-only ACP stream
+    /// cannot deliver.
+    pub auto_upload_dirs: Vec<String>,
 }
 
 impl Default for AgentConfig {
@@ -1702,6 +1710,7 @@ impl Default for AgentConfig {
             env: HashMap::new(),
             inherit_env: Vec::new(),
             command_explicit: false,
+            auto_upload_dirs: Vec::new(),
         }
     }
 }
@@ -1728,6 +1737,7 @@ impl<'de> serde::Deserialize<'de> for AgentConfig {
             env: raw.env,
             inherit_env: raw.inherit_env,
             command_explicit: cmd_explicit,
+            auto_upload_dirs: raw.auto_upload_dirs,
         })
     }
 }
@@ -2307,6 +2317,7 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
                 env: config.agent.env.clone(),
                 inherit_env: config.agent.inherit_env.clone(),
                 command_explicit: true, // synthesized counts as explicit
+                auto_upload_dirs: config.agent.auto_upload_dirs.clone(),
             };
         }
     }

@@ -559,6 +559,13 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    let auto_upload_dirs: Vec<std::path::PathBuf> = cfg
+        .agent
+        .auto_upload_dirs
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+
     let pool_inner = acp::SessionPool::new(
         cfg.agent,
         cfg.pool.max_sessions,
@@ -871,7 +878,8 @@ async fn main() -> anyhow::Result<()> {
                 "/tmp".into()
             })),
         )
-        .with_trust(gateway_trust),
+        .with_trust(gateway_trust)
+        .with_auto_upload_dirs(auto_upload_dirs),
     );
 
     // Shutdown signal for Slack adapter
