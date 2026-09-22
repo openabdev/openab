@@ -419,9 +419,9 @@ fn section_pool() -> (usize, u64) {
     println!();
 
     let max_sessions: usize = prompt_default("  Max sessions", "10").parse().unwrap_or(10);
-    let ttl_hours: u64 = prompt_default("  Session TTL (hours)", "24")
+    let ttl_hours: u64 = prompt_default("  Session TTL (hours)", "720")
         .parse()
-        .unwrap_or(24);
+        .unwrap_or(720);
 
     cprintln!(
         C.green,
@@ -482,7 +482,7 @@ fn print_noninteractive_guide() {
         "",
         "  [pool]",
         "  max_sessions = 10",
-        "  session_ttl_hours = 24",
+        "  session_ttl_hours = 720",
         "",
         "  [reactions]",
         "  enabled = true",

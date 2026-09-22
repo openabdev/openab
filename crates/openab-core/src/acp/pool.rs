@@ -594,19 +594,20 @@ impl SessionPool {
         if !resumed {
             new_conn.session_new(&effective_workdir).await?;
 
-            // Apply default config options (e.g. mode=bypass, model=swe-1-6)
-            for (config_id, value) in &self.default_config_options {
-                if let Err(e) = new_conn.set_config_option(config_id, value).await {
-                    warn!(config_id, value, error = %e, "failed to set default config option");
-                }
-            }
-
             // Surface the reset banner both for restored sessions and for stale
             // live entries that died before we could recover a resumable
             // session id. In both cases the caller is continuing after an
             // unexpected session loss.
             if had_existing || saved_session_id.is_some() {
                 new_conn.session_reset = true;
+            }
+        }
+
+        // default_config_options are process-level, so they must be reapplied
+        // on every spawn, including a resumed session/load.
+        for (config_id, value) in &self.default_config_options {
+            if let Err(e) = new_conn.set_config_option(config_id, value).await {
+                warn!(config_id, value, error = %e, "failed to set default config option");
             }
         }
 

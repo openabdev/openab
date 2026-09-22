@@ -1932,7 +1932,7 @@ fn default_max_sessions() -> usize {
     10
 }
 fn default_ttl_hours() -> u64 {
-    4
+    24 * 30
 }
 pub(crate) fn default_prompt_hard_timeout_secs() -> u64 {
     30 * 60
