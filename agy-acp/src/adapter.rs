@@ -7,7 +7,10 @@ use uuid::Uuid;
 
 use crate::types::*;
 
-const DEFAULT_PRINT_TIMEOUT: &str = "20m";
+// Default print timeout raised from the stock 20m to 60m so slow model
+// turns aren't killed before the harness's own (60m) idle window fires.
+// Still overridable per-invocation via AGY_EXTRA_ARGS / --print-timeout.
+const DEFAULT_PRINT_TIMEOUT: &str = "60m";
 
 fn prompt_extra_args(extra: &str) -> Vec<String> {
     let mut args = shell_words::split(extra).unwrap_or_else(|_| {
@@ -35,7 +38,11 @@ pub struct Adapter {
 impl Adapter {
     pub fn new() -> Self {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let state_dir = PathBuf::from(&home).join(".openab/agy-acp");
+        // State dir is configurable via AGY_ACP_STATE_DIR (so a harness can own
+        // it, e.g. ~/.vibe-station/agy-acp/); defaults to ~/.openab/agy-acp.
+        let state_dir = std::env::var("AGY_ACP_STATE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(&home).join(".openab/agy-acp"));
         Self {
             sessions: HashMap::new(),
             working_dir: std::env::current_dir()
@@ -81,9 +88,11 @@ impl Adapter {
         ]
     }
 
-    /// Resolve the `agy` binary path.
-    pub fn agy_bin() -> &'static str {
-        "/usr/local/bin/agy"
+    /// Resolve the `agy` binary path. Honors the `AGY_BIN` env override so a
+    /// harness can point the adapter at the user's own `agy` install; falls
+    /// back to the conventional location.
+    pub fn agy_bin() -> String {
+        std::env::var("AGY_BIN").unwrap_or_else(|_| "/usr/local/bin/agy".to_string())
     }
 
     /// Build PATH with common agent binary locations prepended.
@@ -385,10 +394,10 @@ mod tests {
 
     #[test]
     fn default_timeout_is_added_without_discarding_extra_args() {
-        assert_eq!(prompt_extra_args(""), ["--print-timeout", "20m"]);
+        assert_eq!(prompt_extra_args(""), ["--print-timeout", "60m"]);
         assert_eq!(
             prompt_extra_args("--model 'model with spaces'"),
-            ["--model", "model with spaces", "--print-timeout", "20m"]
+            ["--model", "model with spaces", "--print-timeout", "60m"]
         );
     }
 
@@ -421,7 +430,7 @@ mod tests {
     fn similar_flag_does_not_suppress_default() {
         assert_eq!(
             prompt_extra_args("--print-timeout-other 1s"),
-            ["--print-timeout-other", "1s", "--print-timeout", "20m"]
+            ["--print-timeout-other", "1s", "--print-timeout", "60m"]
         );
     }
 
@@ -429,7 +438,7 @@ mod tests {
     fn malformed_extra_args_still_get_default_timeout() {
         assert_eq!(
             prompt_extra_args("--print-timeout '5m"),
-            ["--print-timeout", "20m"]
+            ["--print-timeout", "60m"]
         );
     }
 }
