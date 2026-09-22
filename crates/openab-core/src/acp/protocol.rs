@@ -1,6 +1,38 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// JSON-RPC 2.0 request/response id.
+///
+/// Deserialization is untagged and tries the variants in declaration order, so
+/// every non-negative integer (up to `u64::MAX`) lands in `Unsigned` and
+/// `Signed` only ever holds negative values. Do not construct
+/// `Signed(n)` for `n >= 0` by hand: the derived `PartialEq`/`Hash` are
+/// structural, so `Unsigned(5) != Signed(5)`. Compare via [`Self::as_u64`]
+/// when correlating against OpenAB's own `u64` request ids.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum JsonRpcId {
+    Unsigned(u64),
+    Signed(i64),
+    String(String),
+}
+
+impl JsonRpcId {
+    pub fn as_u64(&self) -> Option<u64> {
+        match self {
+            Self::Unsigned(id) => Some(*id),
+            Self::Signed(id) => (*id).try_into().ok(),
+            Self::String(_) => None,
+        }
+    }
+}
+
+impl From<u64> for JsonRpcId {
+    fn from(value: u64) -> Self {
+        Self::Unsigned(value)
+    }
+}
+
 // --- Outgoing ---
 
 #[derive(Debug, Serialize)]
@@ -26,16 +58,37 @@ impl JsonRpcRequest {
 #[derive(Debug, Serialize)]
 pub struct JsonRpcResponse {
     pub jsonrpc: &'static str,
-    pub id: u64,
+    pub id: JsonRpcId,
     pub result: Value,
 }
 
 impl JsonRpcResponse {
-    pub fn new(id: u64, result: Value) -> Self {
+    pub fn new(id: impl Into<JsonRpcId>, result: Value) -> Self {
         Self {
             jsonrpc: "2.0",
-            id,
+            id: id.into(),
             result,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct JsonRpcErrorResponse {
+    pub jsonrpc: &'static str,
+    pub id: JsonRpcId,
+    pub error: JsonRpcError,
+}
+
+impl JsonRpcErrorResponse {
+    pub fn new(id: impl Into<JsonRpcId>, code: i64, message: impl Into<String>) -> Self {
+        Self {
+            jsonrpc: "2.0",
+            id: id.into(),
+            error: JsonRpcError {
+                code,
+                message: message.into(),
+                data: None,
+            },
         }
     }
 }
@@ -44,19 +97,20 @@ impl JsonRpcResponse {
 
 #[derive(Debug, Deserialize)]
 pub struct JsonRpcMessage {
-    pub id: Option<u64>,
+    pub id: Option<JsonRpcId>,
     pub method: Option<String>,
     pub result: Option<Value>,
     pub error: Option<JsonRpcError>,
     pub params: Option<Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcError {
     pub code: i64,
     pub message: String,
     /// Optional structured data from the agent (JSON-RPC `error.data`).
     /// Agents like codex-acp include `{"message": "...", "codex_error_info": "..."}`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
 }
 
@@ -421,6 +475,31 @@ pub fn classify_notification(msg: &JsonRpcMessage) -> Option<AcpEvent> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn json_rpc_ids_preserve_all_supported_integer_ranges() {
+        for value in [0, i64::MAX as u64, (i64::MAX as u64) + 1, u64::MAX] {
+            let message: JsonRpcMessage = serde_json::from_value(json!({ "id": value })).unwrap();
+            let id = message.id.unwrap();
+
+            assert_eq!(id.as_u64(), Some(value));
+            assert_eq!(serde_json::to_value(&id).unwrap(), json!(value));
+            assert_eq!(JsonRpcId::from(value).as_u64(), Some(value));
+        }
+
+        for value in [-1, i64::MIN] {
+            let message: JsonRpcMessage = serde_json::from_value(json!({ "id": value })).unwrap();
+            let id = message.id.unwrap();
+
+            assert_eq!(id.as_u64(), None);
+            assert_eq!(serde_json::to_value(id).unwrap(), json!(value));
+        }
+
+        let message: JsonRpcMessage =
+            serde_json::from_value(json!({ "id": "agent-request" })).unwrap();
+        assert_eq!(message.id.unwrap().as_u64(), None);
+        assert!(serde_json::from_value::<JsonRpcMessage>(json!({ "id": 1.5 })).is_err());
+    }
 
     #[test]
     fn parse_standard_config_options() {
