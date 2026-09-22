@@ -1399,7 +1399,7 @@ impl AdapterRouter {
                     // Auto-upload files created during this turn (best-effort; delivery
                     // failures above take priority).
                     if !delivery_failed && !auto_upload_dirs.is_empty() {
-                        let new_files = scan_new_files(&auto_upload_dirs, turn_start).await;
+                        let new_files = scan_new_files(&auto_upload_dirs, turn_start, 1).await;
                         for path in &new_files {
                             let title = path
                                 .file_name()
@@ -2647,26 +2647,30 @@ mod directive_tests {
     }
 }
 
-/// Recursively scan `dirs` for files whose mtime is newer than `since`.
+/// Scan `dirs` for files whose mtime is newer than `since`, recursing up to
+/// `depth` levels into subdirectories (depth 0 = files in the directory only).
 /// Used by the auto-upload-generated-files feature to detect files created
 /// during an ACP turn.
 async fn scan_new_files(
     dirs: &[std::path::PathBuf],
     since: std::time::SystemTime,
+    depth: usize,
 ) -> Vec<std::path::PathBuf> {
     let mut result = Vec::new();
     for dir in dirs {
         if let Ok(mut entries) = tokio::fs::read_dir(dir).await {
             while let Ok(Some(entry)) = entries.next_entry().await {
                 let path = entry.path();
-                if path.is_dir() {
-                    // Recurse one level (e.g. generated_images/<session-id>/<file>.png)
-                    let sub = Box::pin(scan_new_files(&[path], since)).await;
+                if path.is_dir() && depth > 0 {
+                    let sub =
+                        Box::pin(scan_new_files(&[path], since, depth - 1)).await;
                     result.extend(sub);
-                } else if let Ok(meta) = tokio::fs::metadata(&path).await {
-                    if let Ok(mtime) = meta.modified() {
-                        if mtime > since {
-                            result.push(path);
+                } else if !path.is_dir() {
+                    if let Ok(meta) = tokio::fs::metadata(&path).await {
+                        if let Ok(mtime) = meta.modified() {
+                            if mtime > since {
+                                result.push(path);
+                            }
                         }
                     }
                 }
@@ -2674,4 +2678,90 @@ async fn scan_new_files(
         }
     }
     result
+}
+
+#[cfg(test)]
+mod scan_new_files_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn excludes_files_before_since() {
+        let tmp = TempDir::new().unwrap();
+        let old_file = tmp.path().join("old.txt");
+        tokio::fs::write(&old_file, b"old").await.unwrap();
+
+        let since = SystemTime::now() + Duration::from_secs(1);
+        let found = scan_new_files(&[tmp.path().into()], since, 0).await;
+        assert!(found.is_empty(), "files before since should be excluded");
+    }
+
+    #[tokio::test]
+    async fn includes_files_after_since() {
+        let tmp = TempDir::new().unwrap();
+        let since = SystemTime::now() - Duration::from_secs(1);
+        let new_file = tmp.path().join("new.png");
+        tokio::fs::write(&new_file, b"img").await.unwrap();
+
+        let found = scan_new_files(&[tmp.path().into()], since, 0).await;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].file_name().unwrap(), "new.png");
+    }
+
+    #[tokio::test]
+    async fn depth_zero_skips_subdirectories() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("sub");
+        tokio::fs::create_dir(&sub).await.unwrap();
+        let since = SystemTime::now() - Duration::from_secs(1);
+        let nested = sub.join("nested.txt");
+        tokio::fs::write(&nested, b"data").await.unwrap();
+
+        let found = scan_new_files(&[tmp.path().into()], since, 0).await;
+        assert!(found.is_empty(), "depth 0 should not recurse into subdirs");
+    }
+
+    #[tokio::test]
+    async fn depth_one_finds_in_subdirectory() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("session-1");
+        tokio::fs::create_dir(&sub).await.unwrap();
+        let since = SystemTime::now() - Duration::from_secs(1);
+        let nested = sub.join("image.png");
+        tokio::fs::write(&nested, b"png").await.unwrap();
+
+        let found = scan_new_files(&[tmp.path().into()], since, 1).await;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].file_name().unwrap(), "image.png");
+    }
+
+    #[tokio::test]
+    async fn depth_one_stops_at_second_level() {
+        let tmp = TempDir::new().unwrap();
+        let l1 = tmp.path().join("l1");
+        let l2 = l1.join("l2");
+        tokio::fs::create_dir_all(&l2).await.unwrap();
+        let since = SystemTime::now() - Duration::from_secs(1);
+        tokio::fs::write(l2.join("deep.txt"), b"deep").await.unwrap();
+
+        let found = scan_new_files(&[tmp.path().into()], since, 1).await;
+        assert!(found.is_empty(), "depth 1 should not reach level 2 subdirs");
+    }
+
+    #[tokio::test]
+    async fn empty_dir_returns_empty() {
+        let tmp = TempDir::new().unwrap();
+        let since = SystemTime::now() - Duration::from_secs(1);
+        let found = scan_new_files(&[tmp.path().into()], since, 1).await;
+        assert!(found.is_empty());
+    }
+
+    #[tokio::test]
+    async fn nonexistent_dir_returns_empty() {
+        let since = SystemTime::now() - Duration::from_secs(1);
+        let found =
+            scan_new_files(&[std::path::PathBuf::from("/nonexistent/path")], since, 1).await;
+        assert!(found.is_empty());
+    }
 }

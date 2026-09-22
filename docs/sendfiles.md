@@ -11,8 +11,10 @@
 
 ---
 
-OpenAB streams text only — it does **not** relay file attachments from the agent.
-To send a file back to the user, the agent must call the Discord API directly.
+OpenAB streams text only via ACP — it does **not** relay file attachments inline.
+To send a file back to the user, either configure `[agent].auto_upload_dirs` for
+automatic post-turn upload (see [Auto-Upload Generated Files](#auto-upload-generated-files)
+below), or have the agent call the Discord API directly.
 
 > For image-specific guidance (formats, sidecar pattern), see [sendimages.md](sendimages.md).
 
@@ -50,8 +52,9 @@ To send a file back to the user, the agent must call the Discord API directly.
                               ◄─────────────────────────────────────────────┘
 ```
 
-OpenAB only streams text via ACP. To send a file, the agent calls the
-Discord API directly using the `thread_id` from `sender_context`.
+OpenAB only streams text via ACP. To send a file, use `[agent].auto_upload_dirs`
+(recommended) or have the agent call the Discord API directly using the
+`thread_id` from `sender_context`.
 
 ## Step-by-Step
 
