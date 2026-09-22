@@ -1196,6 +1196,7 @@ mod tests {
             env: std::collections::HashMap::new(),
             inherit_env: vec![],
             command_explicit: true,
+            auto_upload_dirs: vec![],
         };
         let pool = Arc::new(SessionPool::new(
             agent_cfg,
