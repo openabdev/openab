@@ -121,7 +121,7 @@ The root cause is a combination of two Slack-specific platform constraints, neit
 2. **Channel-level slash command payloads have no thread context.** If the user types `/models` in the channel's main composer instead of a thread, Slack delivers the command but the payload carries no `thread_ts`. Since openab keys each ACP session by thread (`slack:<thread_ts>` or `slack:<trigger_ts>`), the command cannot be routed to the right session. Sessions are never keyed by `channel_id` alone, so there's no workaround on the adapter side.
 
 Backend model-selection support also varies; see the current
-[slash-command compatibility table](slash-commands.md#models-and-agents). This
+[slash-command compatibility table](slash-commands.md#models-effort-and-agents). This
 does not change Slack support: the two routing constraints above prevent the
 menu from reaching the correct session even when a backend emits model
 `configOptions`.

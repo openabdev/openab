@@ -208,7 +208,7 @@ pr      = ""
 [[openab_features]]
 feature = "slash_commands"
 status  = "implemented"
-note    = "Global commands registered on ready via set_global_commands: /models, /agents, /cancel, /cancel-all, /reset, /remind, /auth, /export-thread; dispatched via interaction_create."
+note    = "Global commands registered on ready via set_global_commands: /models, /effort, /agents, /cancel, /cancel-all, /reset, /remind, /auth, /export-thread; dispatched via interaction_create."
 source  = ["crates/openab-core/src/discord.rs#set_global_commands", "crates/openab-core/src/discord.rs#interaction_create"]
 pr      = ""
 

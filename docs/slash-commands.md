@@ -7,6 +7,7 @@ OpenAB registers Discord slash commands for session control and agent management
 | Command | Description | Requires active session? |
 |---------|-------------|--------------------------|
 | `/models` | Select the AI model via dropdown menu | Yes |
+| `/effort` | Select the reasoning effort via dropdown menu | Yes |
 | `/agents` | Select the agent mode via dropdown menu | Yes |
 | `/cancel` | Cancel the current in-flight operation | Yes |
 | `/reset` | Reset the conversation session (clear history, start fresh) | Yes |
@@ -26,28 +27,34 @@ All responses are **ephemeral** — only the user who invoked the command sees t
 
 ## How They Work
 
-### `/models` and `/agents`
+### `/models`, `/effort`, and `/agents`
 
 These read `configOptions` from the ACP `initialize` / `session/new` response and present them as a Discord Select Menu.
 
+`/models` uses the `model` category, `/effort` uses `thought_level`, and `/agents` uses `agent`. Commands are available only when the active backend advertises the corresponding category.
+
 When the user picks an option, OpenAB sends `session/set_config_option` to the ACP backend.
+
+#### `/effort` compatibility
+
+`/effort` is not supported by every coding CLI. It is available only when the active CLI exposes an ACP `configOptions` entry with the `thought_level` category. OpenAB uses the values advertised by that backend instead of hardcoding a common set of effort levels, so the available choices may vary by CLI and model. If the backend does not expose `thought_level`, `/effort` displays: `⚠️ No reasoning effort options available. Start a conversation first by @mentioning the bot.` The conversation-start hint also appears when a session is already active but the backend does not advertise this category; starting another conversation does not add support.
 
 **Agent support varies:**
 
-| Agent | `/models` | `/agents` |
-|-------|-----------|-----------|
-| openab-agent | ✅ Returns available models via `configOptions` in `session/new` response | ❌ |
-| kiro-cli | ✅ Returns available models via `models` fallback | ✅ Returns modes (`kiro_default`, `kiro_planner`) via `modes` fallback |
-| claude-code | ❌ No `configOptions` emitted | ❌ |
-| codex | ❌ | ❌ |
-| gemini | ❌ No `configOptions` emitted; see [Gemini CLI account migration guidance](gemini.md) | ❌ |
-| antigravity | ✅ Returns available models via `configOptions`; `agy-acp` fetches them from `agy models`, with cache and static fallback | ❌ |
-| opencode | ✅ Emits model `configOptions` at session creation in OpenCode 1.17.9 (source-confirmed; live OpenAB session capture pending) | ❌ |
-| devin | ✅ Emits model `configOptions` at session creation (ACP client evidence; live OpenAB session capture pending) | ❌ |
-| cursor-agent | ❌ (tracking: #493) | ❌ |
-| copilot | ❌ (tracking: #496) | ❌ |
+| Agent | `/models` | `/effort` | `/agents` |
+|-------|-----------|-----------|-----------|
+| openab-agent | ✅ Returns available models via `configOptions` in `session/new` response | ❌ | ❌ |
+| kiro-cli | ✅ Returns available models via `models` fallback | ❌ | ✅ Returns modes (`kiro_default`, `kiro_planner`) via `modes` fallback |
+| claude-code | ❌ No `configOptions` emitted | ❌ | ❌ |
+| codex | ✅ Returns available models via `configOptions` | ✅ Returns the selected model's supported reasoning efforts via `configOptions` | ❌ |
+| gemini | ❌ No `configOptions` emitted; see [Gemini CLI account migration guidance](gemini.md) | ❌ | ❌ |
+| antigravity | ✅ Returns available models via `configOptions`; `agy-acp` fetches them from `agy models`, with cache and static fallback | ❌ | ❌ |
+| opencode | ✅ Emits model `configOptions` at session creation in OpenCode 1.17.9 (source-confirmed; live OpenAB session capture pending) | ❌ | ❌ |
+| devin | ✅ Emits model `configOptions` at session creation (ACP client evidence; live OpenAB session capture pending) | ❌ | ❌ |
+| cursor-agent | ❌ (tracking: #493) | ❌ | ❌ |
+| copilot | ❌ (tracking: #496) | ❌ | ❌ |
 
-If the agent doesn't expose options, the user sees: `⚠️ No model options available. Start a conversation first by @mentioning the bot.`
+If the agent doesn't expose the requested category, the user sees a corresponding message such as: `⚠️ No reasoning effort options available. Start a conversation first by @mentioning the bot.`
 
 > **Backward compatibility:** `openab-agent` returns `configOptions` in the `session/new` response (alongside `sessionId`). ACP clients that only read `sessionId` will continue to work — `configOptions` is additive. Clients that support `/models` should read `configOptions[].options` to populate the model picker. Each model option includes a `provider` field (`"anthropic"` or `"openai"`) for routing.
 
