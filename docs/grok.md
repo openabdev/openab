@@ -133,7 +133,7 @@ kubectl exec -it <pod> -- grok update
 
 # Or rebuild the image with a new pinned version:
 docker build -f Dockerfile.grok \
-  --build-arg GROK_VERSION=0.1.220 \
+  --build-arg GROK_VERSION=1.0.44 \
   --build-arg GROK_SHA256_AMD64=... \
   --build-arg GROK_SHA256_ARM64=... \
   -t openab-grok:latest .

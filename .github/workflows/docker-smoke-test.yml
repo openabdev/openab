@@ -169,21 +169,21 @@ jobs:
             }
           }
 
-          assert_line 'ARG KIRO_CLI_VERSION=2.13.0' Dockerfile Dockerfile.package Dockerfile.unified
-          assert_line 'ARG KIRO_SHA256_AMD64=d8c5277358b4a82b2d9a9ed2d52e110862536dc82b9e32c3719fc5f5a9834c94' Dockerfile Dockerfile.package Dockerfile.unified
-          assert_line 'ARG KIRO_SHA256_ARM64=95972602568c2065b7d8cc28924730304d40e612c0984ee0144d8ba452000be3' Dockerfile Dockerfile.package Dockerfile.unified
-          assert_line 'ARG CODEX_ACP_VERSION=1.1.4' Dockerfile.codex Dockerfile.package Dockerfile.unified
-          assert_line 'ARG CODEX_VERSION=0.144.1' Dockerfile.codex Dockerfile.package Dockerfile.unified
-          assert_line 'ARG COPILOT_VERSION=1.0.71' Dockerfile.copilot Dockerfile.package Dockerfile.unified
-          assert_line 'ARG DEVIN_VERSION=3000.2.17' Dockerfile.devin Dockerfile.package Dockerfile.unified
-          assert_line 'ARG DEVIN_SHA256_AMD64=f0e1e9363afc6ee68c4ef87bab4aeb7ff5cc08a5fa838350ef3ceefdbb2a2be2' Dockerfile.devin Dockerfile.package Dockerfile.unified
-          assert_line 'ARG DEVIN_SHA256_ARM64=116dc71ef085a922bc3ff0ea0377d4b26c529a431d58246e36572913e2d25624' Dockerfile.devin Dockerfile.package Dockerfile.unified
-          assert_line 'ENV AGY_VERSION=1.1.13' Dockerfile.antigravity Dockerfile.unified Dockerfile.final Dockerfile.ci
-          assert_line 'ARG AGY_VERSION=1.1.13' Dockerfile.package
+          assert_line 'ARG KIRO_CLI_VERSION=2.25.0' Dockerfile Dockerfile.package Dockerfile.unified
+          assert_line 'ARG KIRO_SHA256_AMD64=3e924de9697717b99891bb5f7d2a4bd9c768b8bfa1c498b35b3d242948512984' Dockerfile Dockerfile.package Dockerfile.unified
+          assert_line 'ARG KIRO_SHA256_ARM64=cc8a2df90cd354b569b81ed4653db4796c86a69866568b4eb7fa7906afc95309' Dockerfile Dockerfile.package Dockerfile.unified
+          assert_line 'ARG CODEX_ACP_VERSION=2.0.0' Dockerfile.codex Dockerfile.package Dockerfile.unified
+          assert_line 'ARG CODEX_VERSION=0.159.0' Dockerfile.codex Dockerfile.package Dockerfile.unified
+          assert_line 'ARG COPILOT_VERSION=1.0.89' Dockerfile.copilot Dockerfile.package Dockerfile.unified
+          assert_line 'ARG DEVIN_VERSION=3000.11.3' Dockerfile.devin Dockerfile.package Dockerfile.unified
+          assert_line 'ARG DEVIN_SHA256_AMD64=83b3b113c01bf2a3e9e100db08d77e6b086806a7754f091e20831bdfe215157e' Dockerfile.devin Dockerfile.package Dockerfile.unified
+          assert_line 'ARG DEVIN_SHA256_ARM64=21a2d7a8dea67987067cde7eb3fe7193a48daa8f8c3d50d414c603c4a2b67f15' Dockerfile.devin Dockerfile.package Dockerfile.unified
+          assert_line 'ENV AGY_VERSION=1.2.13' Dockerfile.antigravity Dockerfile.unified Dockerfile.final Dockerfile.ci
+          assert_line 'ARG AGY_VERSION=1.2.13' Dockerfile.package
           assert_line 'ENV AGY_VERSION="${AGY_VERSION}"' Dockerfile.package
           assert_line 'LABEL dev.openab.agy.version="${AGY_VERSION}"' Dockerfile.package
-          assert_line 'ARG AGY_SHA256_AMD64=edc7c32b5ab4fc2e4da03381fee83ed566dea6b56b56f9329cd13cd77947a1d9' Dockerfile.antigravity Dockerfile.package Dockerfile.unified Dockerfile.final Dockerfile.ci
-          assert_line 'ARG AGY_SHA256_ARM64=a9fdd2a386770c27dbf784436bd4de70d4d4901c832d5ec6abf27758d5c370f8' Dockerfile.antigravity Dockerfile.package Dockerfile.unified Dockerfile.final Dockerfile.ci
+          assert_line 'ARG AGY_SHA256_AMD64=b0f195d37973be7b08c3b705d7fbbcd948dacb4a3c2176ee52ca29f7159bdc21' Dockerfile.antigravity Dockerfile.package Dockerfile.unified Dockerfile.final Dockerfile.ci
+          assert_line 'ARG AGY_SHA256_ARM64=43bf59be5895475f8a32d4f94f1241f665986ea41a3622579e03b74e1b63dcfb' Dockerfile.antigravity Dockerfile.package Dockerfile.unified Dockerfile.final Dockerfile.ci
 
           # Nightly checksum relaxation must be explicit and limited to the two
           # TLS-only vendor paths. These substring checks intentionally ignore

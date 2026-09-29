@@ -36,9 +36,9 @@ FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps ripgrep tini unzip && rm -rf /var/lib/apt/lists/*
 
 # Install kiro-cli (auto-detect arch, copy binary directly)
-ARG KIRO_CLI_VERSION=2.13.0
-ARG KIRO_SHA256_AMD64=d8c5277358b4a82b2d9a9ed2d52e110862536dc82b9e32c3719fc5f5a9834c94
-ARG KIRO_SHA256_ARM64=95972602568c2065b7d8cc28924730304d40e612c0984ee0144d8ba452000be3
+ARG KIRO_CLI_VERSION=2.25.0
+ARG KIRO_SHA256_AMD64=3e924de9697717b99891bb5f7d2a4bd9c768b8bfa1c498b35b3d242948512984
+ARG KIRO_SHA256_ARM64=cc8a2df90cd354b569b81ed4653db4796c86a69866568b4eb7fa7906afc95309
 RUN ARCH=$(dpkg --print-architecture) && \
     if [ "$ARCH" = "arm64" ]; then \
       URL="https://prod.download.cli.kiro.dev/stable/${KIRO_CLI_VERSION}/kirocli-aarch64-linux.zip"; \

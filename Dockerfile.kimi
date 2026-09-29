@@ -28,7 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl procps ripgrep tini bubblewrap socat unzip git \
     && rm -rf /var/lib/apt/lists/*
 
-ARG KIMI_CODE_VERSION=0.28.1
+ARG KIMI_CODE_VERSION=2.1.1
 RUN npm install -g @moonshot-ai/kimi-code@${KIMI_CODE_VERSION} --retry 3
 
 # Install gh CLI for agent shell workflows.

@@ -31,9 +31,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install Grok Build CLI — pinned version with SHA256 checksum verification.
 # Binary sourced from xAI's public artifacts bucket (same source the official
 # `https://x.ai/cli/install.sh` resolves to) so the build is reproducible.
-ARG GROK_VERSION=0.2.106
-ARG GROK_SHA256_AMD64=7180d0e03cc2a496033ff3aae2223ce239446a9827a59faa76091c7edd5e1c38
-ARG GROK_SHA256_ARM64=d12be1698d56d4543f1f1095c2c26cd3d17a64e88772629673740991c188e4ff
+ARG GROK_VERSION=1.0.44
+ARG GROK_SHA256_AMD64=f76431873efc5c8a50892d1e1247eaee23f6664bca385fbd55a06a8e7d3caedc
+ARG GROK_SHA256_ARM64=a31506d73b4454bbf70c3c2821e41a042fa7838058ba1b271b009a926d175239
 ARG TARGETPLATFORM
 RUN set -eux; \
     case "${TARGETPLATFORM:-linux/amd64}" in \

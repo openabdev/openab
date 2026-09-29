@@ -23,7 +23,7 @@ FROM node:22-trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps ripgrep tini unzip && rm -rf /var/lib/apt/lists/*
 
 # Install Gemini CLI (native ACP support via --acp)
-ARG GEMINI_CLI_VERSION=0.47.0
+ARG GEMINI_CLI_VERSION=0.61.0
 RUN npm install -g @google/gemini-cli@${GEMINI_CLI_VERSION} --retry 3
 
 # Install gh CLI

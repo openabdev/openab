@@ -48,7 +48,7 @@ FROM node:22-trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps ripgrep tini unzip && rm -rf /var/lib/apt/lists/*
 
 # Install opencode
-ARG OPENCODE_VERSION=1.17.9
+ARG OPENCODE_VERSION=1.18.33
 RUN npm install -g opencode-ai@${OPENCODE_VERSION} --retry 3
 
 # Install gh CLI (matches Dockerfile.claude / Dockerfile.gemini / Dockerfile.codex)
