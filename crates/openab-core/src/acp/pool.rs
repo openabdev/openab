@@ -162,12 +162,13 @@ async fn setup_facade_session(
     }
 }
 
-/// Remove every non-`active` pool entry for `key`.
+/// Remove every non-`active` pool entry for `key`, except its creating gate and its workspace.
 ///
 /// The single implementation for both hung eviction and [`SessionPool::reset_session`]; the latter
-/// removes `active` itself and then calls this. It used to be a second copy of the same list, which
-/// is how the two could drift — and the line most likely to be lost from a copy is the one below
-/// about the creating gate, because it says *not* to remove something.
+/// removes `active` itself and then calls this through [`purge_for_reset`]. It used to be a second
+/// copy of the same list, which is how the two could drift — and the lines most likely to be lost
+/// from a copy are the ones below about the creating gate and the workspace, because they say
+/// *not* to remove something.
 ///
 /// Hung eviction must NOT leave the session resumable: the old streaming task still holds an Arc
 /// clone of the connection, so the agent process may be alive and mid-turn. If the session id
@@ -183,6 +184,19 @@ fn purge_session_entries(state: &mut PoolState, key: &str) {
     // state. Removing it while a holder still owns the old gate Arc would let
     // a concurrent get_or_create mint a fresh gate and run two creations for
     // the same key.
+    //
+    // Do NOT remove `session_workdirs` either: the `[[ws:]]` workspace belongs to the thread, not
+    // to the evicted session, and must survive an eviction rebuild (ADR control-directives §3.1).
+    // Without it the replacement session starts in the default `working_dir`.
+}
+
+/// [`purge_session_entries`], plus the thread's `[[ws:]]` workspace.
+///
+/// A reset is the user asking for a new session, and the only way to give a thread a different
+/// workspace: a stored workspace outranks a new `[[ws:]]` in `get_or_create`. Hung eviction keeps
+/// the workspace; reset is the one path that forgets it.
+fn purge_for_reset(state: &mut PoolState, key: &str) {
+    purge_session_entries(state, key);
     state.session_workdirs.remove(key);
 }
 
@@ -837,11 +851,12 @@ impl SessionPool {
 
         let mut state = self.state.write().await;
         let had_active = state.active.remove(thread_id).is_some();
-        // Everything else a reset clears is exactly what hung eviction clears, including the rule
-        // that the creating gate survives. Call the one implementation rather than keeping a second
-        // copy of the list: the copies are what let the two drift, and the gate rule is precisely
-        // the kind of line that gets dropped from a duplicate without anyone noticing.
-        purge_session_entries(&mut state, thread_id);
+        // Everything else a reset clears is what hung eviction clears, including the rule that the
+        // creating gate survives, plus the thread's workspace. Call the one implementation rather
+        // than keeping a second copy of the list: the copies are what let the two drift, and the
+        // gate rule is precisely the kind of line that gets dropped from a duplicate without anyone
+        // noticing.
+        purge_for_reset(&mut state, thread_id);
         // Resetting a hung session drops the map's Arc but not the one the stuck task holds, so the
         // guard cannot revoke — do it synchronously here too (F3).
         #[cfg(feature = "acp-mcp")]
@@ -1021,8 +1036,8 @@ impl SessionPool {
 #[cfg(test)]
 mod tests {
     use super::{
-        better_candidate, classify_hung, classify_idle, get_or_insert_gate, purge_session_entries,
-        remove_if_same_handle, PoolState,
+        better_candidate, classify_hung, classify_idle, get_or_insert_gate, purge_for_reset,
+        purge_session_entries, remove_if_same_handle, PoolState,
     };
     use crate::acp::connection::SessionActivity;
     use std::collections::HashMap;
@@ -1358,7 +1373,6 @@ mod tests {
         assert!(!state.pgids.contains_key("hung"));
         assert!(!state.suspended.contains_key("hung"));
         assert!(!state.persisted.contains_key("hung"));
-        assert!(!state.session_workdirs.contains_key("hung"));
         // The creating gate is concurrency control, not session state: it must
         // survive so an in-flight get_or_create holder stays serialized.
         assert!(state.creating.contains_key("hung"));
@@ -1373,6 +1387,58 @@ mod tests {
             Some(&"session-other".to_string())
         );
         assert!(state.activity.contains_key("other"));
+    }
+
+    /// A `PoolState` holding only `[[ws:]]` workspaces, one per `(key, workdir)` pair.
+    fn pool_state_with_workdirs(workdirs: &[(&str, &str)]) -> PoolState {
+        PoolState {
+            active: HashMap::new(),
+            cancel_handles: HashMap::new(),
+            #[cfg(feature = "acp-mcp")]
+            facade_tokens: HashMap::new(),
+            activity: HashMap::new(),
+            pgids: HashMap::new(),
+            suspended: HashMap::new(),
+            persisted: HashMap::new(),
+            creating: HashMap::new(),
+            session_workdirs: workdirs
+                .iter()
+                .map(|(key, dir)| (key.to_string(), dir.to_string()))
+                .collect(),
+        }
+    }
+
+    /// Hung eviction drops the session, not the thread's workspace. `get_or_create` resolves the
+    /// stored workspace ahead of the configured default, so the session that replaces an evicted
+    /// one only lands back in its `[[ws:]]` directory if the entry is still there. Dropping it sent
+    /// the replacement to the default `working_dir` whenever the next message carried no directive
+    /// (a cron fire, or any follow-up in the thread).
+    #[test]
+    fn hung_eviction_purge_keeps_the_workspace() {
+        let mut state = pool_state_with_workdirs(&[("hung", "/tmp/ws")]);
+
+        purge_session_entries(&mut state, "hung");
+
+        assert_eq!(
+            state.session_workdirs.get("hung").map(String::as_str),
+            Some("/tmp/ws")
+        );
+    }
+
+    /// A reset is how a thread gets a different workspace (directives only apply to a session's
+    /// first message, and a stored workspace outranks a new `[[ws:]]`), so it must forget the old
+    /// one — for the reset key only.
+    #[test]
+    fn reset_purge_forgets_the_workspace_of_the_reset_key_only() {
+        let mut state = pool_state_with_workdirs(&[("reset", "/tmp/ws"), ("other", "/tmp/other")]);
+
+        purge_for_reset(&mut state, "reset");
+
+        assert!(!state.session_workdirs.contains_key("reset"));
+        assert_eq!(
+            state.session_workdirs.get("other").map(String::as_str),
+            Some("/tmp/other")
+        );
     }
 
     #[test]
