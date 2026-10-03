@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use openab_cp::config::CpConfig;
-use openab_cp::server::{app, sweep_leases, AppState};
+use openab_cp::server::{app, graceful_shutdown, sweep_leases, AppState, REASON_SHUTDOWN};
 
 const KEY: &str = "k-primary";
 const KEY_WORKER: &str = "k-worker";
@@ -743,4 +743,276 @@ max_outbound_queue_bytes = 67108864"
         1,
         "the released slot must be reusable by the same identity"
     );
+}
+
+// --- Graceful shutdown: SIGTERM/SIGHUP/SIGINT drain ---
+
+/// The close every connection must see on CP shutdown: 1012 (service
+/// restart — the client should reconnect) carrying the shutdown reason,
+/// distinct from the 1008 policy closes the CP sends for misbehaviour.
+fn shutdown_close() -> Closed {
+    Closed::Frame {
+        code: 1012,
+        reason: REASON_SHUTDOWN.to_string(),
+    }
+}
+
+#[tokio::test]
+async fn shutdown_synthesizes_terminals_then_closes_with_restart() {
+    // The container-stop path: every in-flight delegation gets a synthesized
+    // terminal — the initiator sees `target_disconnected` and the serving
+    // runtime a `cp/cancel` — riding out BEFORE the sockets close, and each
+    // socket closes with a 1012 frame naming the reason instead of a bare
+    // TCP reset.
+    let (state, url) = spawn_cp(cfg(
+        "register_timeout_secs = 30\nmax_connections_per_identity = 2\nshutdown_drain_secs = 5",
+    ))
+    .await;
+
+    let mut initiator = connect(&url).await.expect("initiator accepted");
+    assert_eq!(
+        register(&mut initiator, "i-1").await["result"]["protocol_version"],
+        1
+    );
+    let mut worker = connect_as(&url, KEY_WORKER).await.expect("worker accepted");
+    assert_eq!(
+        register_worker(&mut worker, "i-w", 2).await["result"]["protocol_version"],
+        1
+    );
+
+    let deadline = (chrono::Utc::now() + chrono::Duration::seconds(600)).to_rfc3339();
+    let delegate = serde_json::json!({
+        "jsonrpc": "2.0", "id": 10, "method": "cp/delegate",
+        "params": {
+            "delegation_id": "d-1",
+            "target": {"name": "worker-1"},
+            "prompt": "do it",
+            "deadline": deadline
+        }
+    })
+    .to_string();
+    initiator
+        .send(Message::Text(delegate.into()))
+        .await
+        .unwrap();
+    let ack = await_frame(&mut initiator, "delegate ack", |v| v["id"] == 10).await;
+    let admission = ack["result"]["admission"]
+        .as_u64()
+        .expect("ack must carry the admission token");
+    await_frame(&mut worker, "forwarded delegate", |v| {
+        v["method"] == "cp/delegate"
+    })
+    .await;
+    assert_eq!(state.router.inflight_count(), 1, "delegation in flight");
+
+    graceful_shutdown(&state).await;
+
+    // The synthesized terminal reaches the initiator ahead of the close.
+    let terminal = await_frame(&mut initiator, "synthesized terminal", |v| {
+        v["method"] == "cp/delegate_result"
+    })
+    .await;
+    assert_eq!(terminal["params"]["delegation_id"], "d-1");
+    assert_eq!(
+        terminal["params"]["admission"].as_u64(),
+        Some(admission),
+        "the terminal must name the admission it ends"
+    );
+    assert_eq!(terminal["params"]["status"], "target_disconnected");
+    assert_eq!(terminal["params"]["error"], REASON_SHUTDOWN);
+
+    // The serving runtime is told to stop working on the same admission.
+    let cancel = await_frame(&mut worker, "synthesized cancel", |v| {
+        v["method"] == "cp/cancel"
+    })
+    .await;
+    assert_eq!(cancel["params"]["delegation_id"], "d-1");
+    assert_eq!(cancel["params"]["admission"].as_u64(), Some(admission));
+    assert_eq!(cancel["params"]["reason"], REASON_SHUTDOWN);
+
+    // Then every connection gets the restart close, not a TCP reset.
+    for (ws, who) in [(&mut initiator, "initiator"), (&mut worker, "worker")] {
+        let closed = wait_closed(ws, Duration::from_secs(5))
+            .await
+            .unwrap_or_else(|| panic!("{who} must observe a close"));
+        assert_eq!(
+            closed,
+            shutdown_close(),
+            "{who}: shutdown must close with 1012 + reason, got {closed:?}"
+        );
+    }
+
+    assert_eq!(state.router.inflight_count(), 0);
+    assert!(
+        state.registry.list("prod").is_empty(),
+        "every registration is torn down"
+    );
+}
+
+#[tokio::test]
+async fn shutdown_closes_sockets_that_never_registered() {
+    // The per-connection close signal lives in the registry, so a socket
+    // that has not completed `cp/register` is invisible to it. Shutdown must
+    // still reach it: the process-wide signal is what every connection task
+    // subscribes to from the upgrade on.
+    let (state, url) = spawn_cp(cfg("register_timeout_secs = 30")).await;
+    let mut ws = connect(&url).await.expect("connection accepted");
+
+    graceful_shutdown(&state).await;
+
+    let closed = wait_closed(&mut ws, Duration::from_secs(5)).await;
+    assert_eq!(
+        closed,
+        Some(shutdown_close()),
+        "a parked pre-registration socket must get the shutdown close, got {closed:?}"
+    );
+}
+
+/// The temp config a spawned CP reads, removed when the guard drops — including
+/// on a panicking assert, which otherwise leaves one file per failed run in
+/// `/tmp`.
+#[cfg(unix)]
+struct CfgGuard(std::path::PathBuf);
+
+#[cfg(unix)]
+impl Drop for CfgGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Spawn a real `openab-cp` process bound to an ephemeral port; returns the
+/// child, its WS URL, and a guard that cleans up its config. This is the only
+/// proof the OS-level path works: `docker stop`, ECS, and k8s all deliver
+/// SIGTERM before SIGKILL, and the binary used to die by default disposition
+/// without ever running a shutdown path.
+#[cfg(unix)]
+async fn spawn_cp_process() -> (tokio::process::Child, String, CfgGuard) {
+    // Grab an ephemeral port, release it, hand it to the child — the usual
+    // tiny race, absorbed by `connect_retry`.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind ephemeral")
+        .local_addr()
+        .unwrap()
+        .port();
+    let cfg_path = std::env::temp_dir().join(format!(
+        "openab-cp-shutdown-{}-{port}.toml",
+        std::process::id()
+    ));
+    std::fs::write(
+        &cfg_path,
+        format!(
+            "listen = \"127.0.0.1:{port}\"\n\n\
+             [[agents]]\nkey = \"{KEY}\"\nnamespace = \"prod\"\nname = \"koudu\"\ntype = \"primary\"\n\n\
+             [[agents]]\nkey = \"{KEY_WORKER}\"\nnamespace = \"prod\"\nname = \"worker-1\"\ntype = \"worker\"\n"
+        ),
+    )
+    .expect("write cp config");
+    let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_openab-cp"))
+        .arg("--config")
+        .arg(&cfg_path)
+        // Not inherited and not piped: the child's `tracing` output would
+        // otherwise interleave with the harness log, and a pipe nobody drains
+        // can block the child mid-write.
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("spawn openab-cp");
+    (
+        child,
+        format!("ws://127.0.0.1:{port}/cp"),
+        CfgGuard(cfg_path),
+    )
+}
+
+#[tokio::test]
+async fn a_second_signal_latching_mid_close_still_sends_a_close_frame() {
+    // The close a connection is promised must not be eaten by a second
+    // signal latching while its frame is still on the wire: a lease sweep
+    // firing during the shutdown drain (or the process signal landing
+    // during a per-connection close) previously aborted the close write —
+    // the peer saw a bare TCP reset instead of the Close frame. Whichever
+    // shutdown path wins, some Close frame must always be observed.
+    let (state, url) = spawn_cp(cfg("register_timeout_secs = 30")).await;
+    let mut ws = connect(&url).await.expect("connection accepted");
+    assert_eq!(
+        register(&mut ws, "i-1").await["result"]["protocol_version"],
+        1
+    );
+    let handle = state.registry.list("prod")[0].handle;
+
+    // Latch the per-connection signal the way the sweeper does, then the
+    // process-wide one immediately behind it — the second latch can land
+    // while the first close frame is still being written.
+    assert!(state.registry.signal_shutdown(handle, "lease expired"));
+    graceful_shutdown(&state).await;
+
+    let closed = wait_closed(&mut ws, Duration::from_secs(5)).await;
+    assert_eq!(
+        closed,
+        Some(shutdown_close()),
+        "a second signal mid-close must not reduce the peer's close frame to \
+         a bare reset — nor downgrade the reason it is being told: got {closed:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_socket_upgraded_after_the_drain_latched_is_never_registered() {
+    // The drain's first act is to latch the process-wide reason; a socket that
+    // completes its upgrade after that must be closed with the reason instead
+    // of registering into a CP that is leaving. Deterministic here on purpose:
+    // racing a real process's drain would only prove that the process was
+    // usually already gone.
+    let (state, url) = spawn_cp(cfg("register_timeout_secs = 30")).await;
+    state.begin_shutdown(REASON_SHUTDOWN);
+
+    let mut ws = connect(&url)
+        .await
+        .expect("the upgrade itself still completes");
+    let closed = wait_closed(&mut ws, Duration::from_secs(5)).await;
+    assert_eq!(
+        closed,
+        Some(shutdown_close()),
+        "a socket arriving after the latch must get the shutdown close, never a \
+         registration: got {closed:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sigterm_and_sighup_run_the_drain_and_exit_cleanly() {
+    // SIGTERM is what every containerized deployment actually sends;
+    // SIGHUP shares the path. Each must produce the graceful close on live
+    // sockets and a clean exit code — never the old default-disposition kill.
+    for sig in ["TERM", "HUP"] {
+        let (mut child, url, _cfg) = spawn_cp_process().await;
+        let mut ws = connect_retry(&url).await;
+        assert_eq!(
+            register(&mut ws, "i-1").await["result"]["protocol_version"],
+            1
+        );
+
+        let status = std::process::Command::new("kill")
+            .arg(format!("-{sig}"))
+            .arg(child.id().expect("child pid").to_string())
+            .status()
+            .expect("kill must run");
+        assert!(status.success(), "kill -{sig} failed: {status}");
+
+        let closed = wait_closed(&mut ws, Duration::from_secs(10)).await;
+        assert_eq!(
+            closed,
+            Some(shutdown_close()),
+            "SIG{sig}: the socket must see a graceful close, got {closed:?}"
+        );
+        let status = tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .unwrap_or_else(|_| panic!("SIG{sig}: the CP must exit"))
+            .expect("wait must succeed");
+        assert!(
+            status.success(),
+            "SIG{sig}: the CP must exit cleanly, got {status}"
+        );
+    }
 }

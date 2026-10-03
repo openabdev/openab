@@ -745,10 +745,10 @@ async fn route_client_response(
     }
     // Accept a numeric id (what we mint) or a stringified number ("1") from a spec-loose
     // client, so its responses still correlate to the pending request instead of being dropped.
-    let Some(id) = raw
-        .get("id")
-        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
-    else {
+    let Some(id) = raw.get("id").and_then(|v| {
+        v.as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+    }) else {
         return false;
     };
     if let Some(tx) = pending.lock().await.remove(&id) {
@@ -757,7 +757,10 @@ async fn route_client_response(
         // `debug!`, not `warn!`: since the tunnel cancels on expiry, a reply arriving after we
         // gave up is EXPECTED traffic from a well-behaved peer, not a client defect. Logging it at
         // warn made a correct peer look broken.
-        debug!(id, "acp: client response arrived after its request was abandoned; discarding");
+        debug!(
+            id,
+            "acp: client response arrived after its request was abandoned; discarding"
+        );
     }
     true
 }
@@ -831,7 +834,15 @@ async fn mcp_connect(
         acp_id: acp_id.to_string(),
     })
     .unwrap();
-    let frame = send_request(out_tx, pending, next_id, "mcp/connect", params, timeout_secs).await?;
+    let frame = send_request(
+        out_tx,
+        pending,
+        next_id,
+        "mcp/connect",
+        params,
+        timeout_secs,
+    )
+    .await?;
     let result: McpConnectResult = serde_json::from_value(frame_result(frame)?)
         .map_err(|e| format!("mcp/connect: malformed result: {e}"))?;
     Ok(result.connection_id)
@@ -871,9 +882,16 @@ async fn mcp_disconnect(
         connection_id: connection_id.to_string(),
     })
     .unwrap();
-    send_request(out_tx, pending, next_id, "mcp/disconnect", params, timeout_secs)
-        .await
-        .map(|_| ())
+    send_request(
+        out_tx,
+        pending,
+        next_id,
+        "mcp/disconnect",
+        params,
+        timeout_secs,
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Monotonic attach ordering for last-attach-wins (ADR §6.1).
@@ -1007,8 +1025,7 @@ const INNER_MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 /// in the abstract, so a transport or framing change can invalidate the set while the method list
 /// stays identical. A bare list of version strings with no stated reason is how this becomes
 /// silently wrong later.
-const SUPPORTED_INNER_MCP_PROTOCOL_VERSIONS: [&str; 3] =
-    ["2025-06-18", "2025-03-26", "2024-11-05"];
+const SUPPORTED_INNER_MCP_PROTOCOL_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 
 /// Perform the inner MCP handshake on a freshly connected tunnel.
 ///
@@ -1332,8 +1349,17 @@ fn spawn_acp_tunnels(
         }
         establish_tasks.push(tokio::spawn(async move {
             if let Err(e) = establish_and_register_tunnel(
-                out_tx, pending, next_id, srv.id, srv.name, channel_id, registry, 30, owner,
-                connection_generation, connection_closed,
+                out_tx,
+                pending,
+                next_id,
+                srv.id,
+                srv.name,
+                channel_id,
+                registry,
+                30,
+                owner,
+                connection_generation,
+                connection_closed,
             )
             .await
             {
@@ -1493,8 +1519,11 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
             Ok(r) => r,
             Err(e) => {
                 if !is_notification {
-                    let err_resp =
-                        JsonRpcResponse::error(Value::Null, -32600, format!("Invalid Request: {e}"));
+                    let err_resp = JsonRpcResponse::error(
+                        Value::Null,
+                        -32600,
+                        format!("Invalid Request: {e}"),
+                    );
                     let _ = out_tx.send(serde_json::to_string(&err_resp).unwrap());
                 }
                 continue;
@@ -1545,9 +1574,9 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                     continue;
                 }
                 // Required params per schema: { cwd, mcpServers }.
-                if let Err(msg) =
-                    validate_params::<crate::adapters::acp_schema::NewSessionRequest>(req.params.as_ref())
-                {
+                if let Err(msg) = validate_params::<crate::adapters::acp_schema::NewSessionRequest>(
+                    req.params.as_ref(),
+                ) {
                     let resp = JsonRpcResponse::error(id, -32602, msg);
                     let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
                     continue;
@@ -1564,18 +1593,16 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                 }
                 // Bound the declaration fan-out BEFORE the session exists or any task is
                 // spawned (R3-F1): an over-declaring request must cost nothing.
-                let acp_mcp_servers = match accept_acp_servers(parse_acp_mcp_servers(
-                    req.params.as_ref(),
-                )) {
-                    Ok(list) => list,
-                    Err(msg) => {
-                        let resp = JsonRpcResponse::error(id, ACP_OVERLOADED, msg);
-                        let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
-                        continue;
-                    }
-                };
-                let (resp, channel_id) =
-                    handle_session_new(&sessions, id.clone()).await;
+                let acp_mcp_servers =
+                    match accept_acp_servers(parse_acp_mcp_servers(req.params.as_ref())) {
+                        Ok(list) => list,
+                        Err(msg) => {
+                            let resp = JsonRpcResponse::error(id, ACP_OVERLOADED, msg);
+                            let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
+                            continue;
+                        }
+                    };
+                let (resp, channel_id) = handle_session_new(&sessions, id.clone()).await;
                 let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
 
                 // If the client declared "type":"acp" MCP servers, open + register a tunnel to
@@ -1605,9 +1632,9 @@ async fn handle_acp_connection(state: Arc<crate::AppState>, socket: WebSocket) {
                 }
                 // Required params per schema: { sessionId, cwd, mcpServers? }. The
                 // sessionId's `sess_<uuid>` shape is checked further in the handler.
-                if let Err(msg) =
-                    validate_params::<crate::adapters::acp_schema::ResumeSessionRequest>(req.params.as_ref())
-                {
+                if let Err(msg) = validate_params::<crate::adapters::acp_schema::ResumeSessionRequest>(
+                    req.params.as_ref(),
+                ) {
                     let resp = JsonRpcResponse::error(id, -32602, msg);
                     let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
                     continue;
@@ -1918,7 +1945,11 @@ fn handle_initialize(req: &JsonRpcRequest) -> JsonRpcResponse {
         match serde_json::from_value(req.params.clone().unwrap_or(Value::Null)) {
             Ok(r) => r,
             Err(e) => {
-                return JsonRpcResponse::error(id, -32602, format!("Invalid initialize params: {e}"));
+                return JsonRpcResponse::error(
+                    id,
+                    -32602,
+                    format!("Invalid initialize params: {e}"),
+                );
             }
         };
     // Negotiate: respond with the version we will use = the lower of the client's and
@@ -2054,7 +2085,10 @@ async fn handle_session_resume(
     id: Value,
     params: Option<&Value>,
 ) -> (JsonRpcResponse, Option<String>) {
-    let session_id = match params.and_then(|p| p.get("sessionId")).and_then(|v| v.as_str()) {
+    let session_id = match params
+        .and_then(|p| p.get("sessionId"))
+        .and_then(|v| v.as_str())
+    {
         Some(s) => s.to_string(),
         None => {
             return (
@@ -2147,7 +2181,9 @@ async fn handle_session_cancel(
             "session/cancel is a notification and must not carry an id",
         ));
     }
-    let sess_key = params.and_then(|p| p.get("sessionId")).and_then(|v| v.as_str());
+    let sess_key = params
+        .and_then(|p| p.get("sessionId"))
+        .and_then(|v| v.as_str());
     if let Some(k) = sess_key {
         let notify = sessions.lock().await.get(k).and_then(|s| s.cancel.clone());
         if let Some(n) = notify {
@@ -2178,7 +2214,10 @@ pub(crate) fn redact_id(id: &str) -> String {
     // and `prompt dispatched` prints two of them on a single line. Correlating a session across
     // logs is the entire reason the tag exists, so producing several defeats the purpose more
     // completely than not redacting would.
-    let uuid = id.strip_prefix("acp_").or_else(|| id.strip_prefix("sess_")).unwrap_or(id);
+    let uuid = id
+        .strip_prefix("acp_")
+        .or_else(|| id.strip_prefix("sess_"))
+        .unwrap_or(id);
     use sha2::{Digest as _, Sha256};
     let digest = Sha256::digest(uuid.as_bytes());
     let short: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
@@ -2212,7 +2251,13 @@ mod redact_id_cross_encoding {
     fn openab_core_tag(uuid: &str) -> String {
         use sha2::{Digest as _, Sha256};
         let d = Sha256::digest(uuid.as_bytes());
-        format!("#{}", d.iter().take(4).map(|b| format!("{b:02x}")).collect::<String>())
+        format!(
+            "#{}",
+            d.iter()
+                .take(4)
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        )
     }
 }
 
@@ -2270,12 +2315,11 @@ async fn handle_session_prompt(
     let channel_id = match sessions.lock().await.get(&session_id) {
         Some(s) => s.channel_id.clone(),
         None => {
-            let resp =
-                JsonRpcResponse::error(
-                    id,
-                    -32602,
-                    format!("Unknown session: {}", redact_id(&session_id)),
-                );
+            let resp = JsonRpcResponse::error(
+                id,
+                -32602,
+                format!("Unknown session: {}", redact_id(&session_id)),
+            );
             let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
             release_prompt(sessions, &session_id).await;
             return;
@@ -2325,11 +2369,7 @@ async fn handle_session_prompt(
             if state.event_tx.send(json).is_err() {
                 // No receivers — agent/core not connected
                 warn!("ACP: event_tx send failed — no agent connected");
-                let resp = JsonRpcResponse::error(
-                    id,
-                    -32603,
-                    "No agent backend connected",
-                );
+                let resp = JsonRpcResponse::error(id, -32603, "No agent backend connected");
                 let _ = out_tx.send(serde_json::to_string(&resp).unwrap());
                 release_prompt(sessions, &session_id).await;
                 // Cleanup registry — only this turn's own sink (F4).
@@ -2527,7 +2567,10 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
                 sink.tx.clone()
             }
             Some(_) => {
-                debug!(channel = key, "ACP dropping stale reply from a superseded turn");
+                debug!(
+                    channel = key,
+                    "ACP dropping stale reply from a superseded turn"
+                );
                 return;
             }
             None => return,
@@ -2538,15 +2581,24 @@ pub async fn handle_reply(reply: &GatewayReply, registry: &AcpReplyRegistry) {
         Some("edit_message") => {
             // Streaming update — send as text snapshot
             if tx.send(ReplyChunk::Text(full_text)).is_err() {
-                debug!(channel = key, "ACP reply send failed (client likely disconnected)");
-                registry.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
+                debug!(
+                    channel = key,
+                    "ACP reply send failed (client likely disconnected)"
+                );
+                registry
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(key);
             }
         }
         None | Some("send_message") => {
             // Final message
             let _ = tx.send(ReplyChunk::Text(full_text));
             let _ = tx.send(ReplyChunk::Done);
-            registry.lock().unwrap_or_else(|e| e.into_inner()).remove(key);
+            registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(key);
         }
         Some("add_reaction") | Some("remove_reaction") => {
             // Reactions are agent state indicators — could map to notifications later
@@ -2576,12 +2628,21 @@ mod acp_conformance {
     where
         T: serde::Serialize + serde::de::DeserializeOwned,
     {
-        let a: T = serde_json::from_value(wire.clone())
-            .unwrap_or_else(|e| panic!("emitted wire is not valid ACP {}: {e}\n  wire={wire}", std::any::type_name::<T>()));
+        let a: T = serde_json::from_value(wire.clone()).unwrap_or_else(|e| {
+            panic!(
+                "emitted wire is not valid ACP {}: {e}\n  wire={wire}",
+                std::any::type_name::<T>()
+            )
+        });
         let v1 = serde_json::to_value(&a).unwrap();
         let b: T = serde_json::from_value(v1.clone()).expect("re-parse of generated form");
         let v2 = serde_json::to_value(&b).unwrap();
-        assert_eq!(v1, v2, "ACP serde is not a stable fixed point for {}", std::any::type_name::<T>());
+        assert_eq!(
+            v1,
+            v2,
+            "ACP serde is not a stable fixed point for {}",
+            std::any::type_name::<T>()
+        );
     }
 
     // --- outbound responses (exact shapes handle_* emit) ---
@@ -2608,7 +2669,9 @@ mod acp_conformance {
 
     #[test]
     fn new_session_response() {
-        conforms::<sc::NewSessionResponse>(json!({ "sessionId": "sess_00000000-0000-0000-0000-000000000000" }));
+        conforms::<sc::NewSessionResponse>(
+            json!({ "sessionId": "sess_00000000-0000-0000-0000-000000000000" }),
+        );
     }
 
     #[test]
@@ -2652,12 +2715,12 @@ mod acp_conformance {
     // astral-plane emoji, ZWJ sequence, regional-indicator flag, VS16 emoji,
     // astral-plane CJK, and a mixed run.
     const EDGE_TEXT: &[&str] = &[
-        "🎉",                     // U+1F389, 4-byte astral emoji
-        "👨‍👩‍👧‍👦",                 // ZWJ family (7 codepoints joined by ZWJ)
-        "🇹🇼",                     // regional-indicator pair (flag)
-        "❤️",                     // U+2764 + U+FE0F (VS16)
-        "𠀀",                     // U+20000, astral-plane CJK
-        "🎉 你好 (๑•̀ㅂ•́)و ❤️",      // mixed emoji + CJK + kaomoji + VS16
+        "🎉",                  // U+1F389, 4-byte astral emoji
+        "👨‍👩‍👧‍👦",                  // ZWJ family (7 codepoints joined by ZWJ)
+        "🇹🇼",                  // regional-indicator pair (flag)
+        "❤️",                  // U+2764 + U+FE0F (VS16)
+        "𠀀",                  // U+20000, astral-plane CJK
+        "🎉 你好 (๑•̀ㅂ•́)و ❤️", // mixed emoji + CJK + kaomoji + VS16
     ];
 
     #[test]
@@ -2698,7 +2761,13 @@ mod acp_conformance {
 
     #[test]
     fn prompt_response_all_stop_reasons() {
-        for sr in ["end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled"] {
+        for sr in [
+            "end_turn",
+            "max_tokens",
+            "max_turn_requests",
+            "refusal",
+            "cancelled",
+        ] {
             conforms::<sc::PromptResponse>(json!({ "stopReason": sr }));
         }
     }
@@ -2725,8 +2794,12 @@ mod acp_conformance {
             serde_json::from_str(r#"{"jsonrpc":"2.0","method":"session/cancel"}"#).unwrap();
         assert!(notif.get("id").is_none(), "no id member → notification");
         let req_null: Value =
-            serde_json::from_str(r#"{"jsonrpc":"2.0","method":"session/cancel","id":null}"#).unwrap();
-        assert!(req_null.get("id").is_some(), "explicit id:null → request (id member present)");
+            serde_json::from_str(r#"{"jsonrpc":"2.0","method":"session/cancel","id":null}"#)
+                .unwrap();
+        assert!(
+            req_null.get("id").is_some(),
+            "explicit id:null → request (id member present)"
+        );
         let req_num: Value =
             serde_json::from_str(r#"{"jsonrpc":"2.0","method":"initialize","id":7}"#).unwrap();
         assert_eq!(req_num.get("id"), Some(&json!(7)));
@@ -2738,14 +2811,36 @@ mod acp_conformance {
     fn session_param_validation() {
         use super::validate_params;
         // session/new requires { cwd, mcpServers }
-        assert!(validate_params::<sc::NewSessionRequest>(Some(&json!({"cwd": "/w", "mcpServers": []}))).is_ok());
-        assert!(validate_params::<sc::NewSessionRequest>(Some(&json!({"mcpServers": []}))).is_err(), "missing cwd");
-        assert!(validate_params::<sc::NewSessionRequest>(Some(&json!({"cwd": "/w"}))).is_err(), "missing mcpServers");
-        assert!(validate_params::<sc::NewSessionRequest>(None).is_err(), "missing params");
+        assert!(validate_params::<sc::NewSessionRequest>(Some(
+            &json!({"cwd": "/w", "mcpServers": []})
+        ))
+        .is_ok());
+        assert!(
+            validate_params::<sc::NewSessionRequest>(Some(&json!({"mcpServers": []}))).is_err(),
+            "missing cwd"
+        );
+        assert!(
+            validate_params::<sc::NewSessionRequest>(Some(&json!({"cwd": "/w"}))).is_err(),
+            "missing mcpServers"
+        );
+        assert!(
+            validate_params::<sc::NewSessionRequest>(None).is_err(),
+            "missing params"
+        );
         // session/resume requires { sessionId, cwd }
-        assert!(validate_params::<sc::ResumeSessionRequest>(Some(&json!({"sessionId": "sess_x", "cwd": "/w", "mcpServers": []}))).is_ok());
-        assert!(validate_params::<sc::ResumeSessionRequest>(Some(&json!({"cwd": "/w"}))).is_err(), "missing sessionId");
-        assert!(validate_params::<sc::ResumeSessionRequest>(Some(&json!({"sessionId": "sess_x"}))).is_err(), "missing cwd");
+        assert!(validate_params::<sc::ResumeSessionRequest>(Some(
+            &json!({"sessionId": "sess_x", "cwd": "/w", "mcpServers": []})
+        ))
+        .is_ok());
+        assert!(
+            validate_params::<sc::ResumeSessionRequest>(Some(&json!({"cwd": "/w"}))).is_err(),
+            "missing sessionId"
+        );
+        assert!(
+            validate_params::<sc::ResumeSessionRequest>(Some(&json!({"sessionId": "sess_x"})))
+                .is_err(),
+            "missing cwd"
+        );
     }
 
     // --- prompt content blocks (F10): unsupported block types rejected, not dropped ---
@@ -2796,13 +2891,16 @@ mod acp_conformance {
         // R17-F3a — a plain-string prompt is non-conformant (schema requires
         // `prompt: [ContentBlock]`) → rejected, surfaced as -32602 at the call site.
         assert!(
-            extract_prompt_params(Some(&json!({"sessionId": "sess_x", "prompt": "hello"}))).is_err(),
+            extract_prompt_params(Some(&json!({"sessionId": "sess_x", "prompt": "hello"})))
+                .is_err(),
             "a bare string prompt must be rejected, not coerced"
         );
         // an object (non-array, non-string) prompt is likewise rejected.
         assert!(
-            extract_prompt_params(Some(&json!({"sessionId": "sess_x", "prompt": {"type": "text"}})))
-                .is_err(),
+            extract_prompt_params(Some(
+                &json!({"sessionId": "sess_x", "prompt": {"type": "text"}})
+            ))
+            .is_err(),
             "a non-array prompt must be rejected"
         );
     }
@@ -2833,8 +2931,11 @@ mod acp_conformance {
         use axum::http::HeaderMap;
         let mut h = HeaderMap::new();
         assert_eq!(subprotocol_token(&h), None); // no header
-        // the browser offers "openab.bearer.<token>, acp.v1" → extract the token
-        h.insert("sec-websocket-protocol", "openab.bearer.abc123, acp.v1".parse().unwrap());
+                                                 // the browser offers "openab.bearer.<token>, acp.v1" → extract the token
+        h.insert(
+            "sec-websocket-protocol",
+            "openab.bearer.abc123, acp.v1".parse().unwrap(),
+        );
         assert_eq!(subprotocol_token(&h), Some("abc123"));
         // only the real protocol, no bearer entry → None
         h.insert("sec-websocket-protocol", "acp.v1".parse().unwrap());
@@ -2873,14 +2974,7 @@ mod acp_streaming {
     #[test]
     fn multibyte_codepoints_never_split() {
         // each snapshot appends a whole multi-byte grapheme; reconstruction is exact
-        let snaps = [
-            "a",
-            "a🎉",
-            "a🎉你",
-            "a🎉你👨‍👩‍👧‍👦",
-            "a🎉你👨‍👩‍👧‍👦🇹🇼",
-            "a🎉你👨‍👩‍👧‍👦🇹🇼❤️",
-        ];
+        let snaps = ["a", "a🎉", "a🎉你", "a🎉你👨‍👩‍👧‍👦", "a🎉你👨‍👩‍👧‍👦🇹🇼", "a🎉你👨‍👩‍👧‍👦🇹🇼❤️"];
         assert_eq!(replay(&snaps), *snaps.last().unwrap());
     }
 
@@ -2936,7 +3030,11 @@ mod acp_requests {
         pending: &Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>>,
     ) {
         let f: serde_json::Value = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
-        assert_eq!(f["params"]["method"], json!("initialize"), "expected the inner MCP initialize");
+        assert_eq!(
+            f["params"]["method"],
+            json!("initialize"),
+            "expected the inner MCP initialize"
+        );
         route_client_response(
             pending,
             &json!({"jsonrpc":"2.0","id":f["id"],"result":{
@@ -2951,8 +3049,7 @@ mod acp_requests {
         assert_eq!(n["params"]["method"], json!("notifications/initialized"));
     }
 
-    fn new_pending(
-    ) -> Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>> {
+    fn new_pending() -> Arc<tokio::sync::Mutex<HashMap<u64, oneshot::Sender<serde_json::Value>>>> {
         Arc::new(tokio::sync::Mutex::new(HashMap::new()))
     }
 
@@ -2967,8 +3064,7 @@ mod acp_requests {
         let p2 = pending.clone();
         let version = version.map(str::to_string);
         let responder = tokio::spawn(async move {
-            let f: serde_json::Value =
-                serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
+            let f: serde_json::Value = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
             let result = match version {
                 Some(v) => json!({
                     "protocolVersion": v, "capabilities": {"tools": {}},
@@ -2984,7 +3080,8 @@ mod acp_requests {
             route_client_response(&p2, &json!({"jsonrpc":"2.0","id":f["id"],"result":result}))
                 .await;
             // Drain `notifications/initialized` if the handshake got far enough to send it.
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(200), out_rx.recv()).await;
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_millis(200), out_rx.recv()).await;
         });
         let r = super::inner_mcp_handshake(&out_tx, &pending, &next_id, "conn-1", 5).await;
         let _ = responder.await;
@@ -3013,7 +3110,10 @@ mod acp_requests {
         let err = handshake_answering(Some("1999-01-01"))
             .await
             .expect_err("an unknown revision must not be negotiated into");
-        assert!(err.contains("1999-01-01"), "the error must name what the peer answered: {err}");
+        assert!(
+            err.contains("1999-01-01"),
+            "the error must name what the peer answered: {err}"
+        );
         assert!(
             err.contains(super::INNER_MCP_PROTOCOL_VERSION),
             "the error must name what we requested: {err}"
@@ -3031,7 +3131,10 @@ mod acp_requests {
         let err = handshake_answering(None)
             .await
             .expect_err("no protocolVersion is not a compliant initialize result");
-        assert!(err.contains("no `protocolVersion`"), "unexpected error: {err}");
+        assert!(
+            err.contains("no `protocolVersion`"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
@@ -3039,9 +3142,11 @@ mod acp_requests {
         let pending = new_pending();
         let (tx, rx) = oneshot::channel();
         pending.lock().await.insert(5, tx);
-        let consumed =
-            route_client_response(&pending, &json!({"jsonrpc":"2.0","id":5,"result":{"ok":true}}))
-                .await;
+        let consumed = route_client_response(
+            &pending,
+            &json!({"jsonrpc":"2.0","id":5,"result":{"ok":true}}),
+        )
+        .await;
         assert!(consumed, "an id+result frame is a response we consume");
         assert_eq!(rx.await.unwrap()["result"]["ok"], json!(true));
         assert!(
@@ -3054,7 +3159,9 @@ mod acp_requests {
     async fn route_client_response_ignores_requests_and_notifications() {
         let pending = new_pending();
         // has `method` → a request, not a response
-        assert!(!route_client_response(&pending, &json!({"jsonrpc":"2.0","id":1,"method":"foo"})).await);
+        assert!(
+            !route_client_response(&pending, &json!({"jsonrpc":"2.0","id":1,"method":"foo"})).await
+        );
         // notification-shaped, no result/error → not a response
         assert!(!route_client_response(&pending, &json!({"jsonrpc":"2.0","method":"bar"})).await);
         // id present but neither result nor error → not a response
@@ -3069,7 +3176,10 @@ mod acp_requests {
             &json!({"jsonrpc":"2.0","id":99,"error":{"code":-1,"message":"x"}}),
         )
         .await;
-        assert!(consumed, "an unmatched response is still consumed (logged, no panic)");
+        assert!(
+            consumed,
+            "an unmatched response is still consumed (logged, no panic)"
+        );
     }
 
     #[tokio::test]
@@ -3088,8 +3198,11 @@ mod acp_requests {
             assert_eq!(v["method"], json!("mcp/message"));
             assert_eq!(v["params"]["connectionId"], json!("conn-1"));
             let id = v["id"].as_u64().unwrap();
-            route_client_response(&pending2, &json!({"jsonrpc":"2.0","id":id,"result":{"pong":true}}))
-                .await;
+            route_client_response(
+                &pending2,
+                &json!({"jsonrpc":"2.0","id":id,"result":{"pong":true}}),
+            )
+            .await;
         });
 
         let resp = send_request(
@@ -3104,7 +3217,11 @@ mod acp_requests {
         .unwrap();
         assert_eq!(resp["result"]["pong"], json!(true));
         driver.await.unwrap();
-        assert_eq!(next_id.load(Ordering::Relaxed), 2, "the id counter advanced");
+        assert_eq!(
+            next_id.load(Ordering::Relaxed),
+            2,
+            "the id counter advanced"
+        );
     }
 
     #[tokio::test]
@@ -3117,7 +3234,8 @@ mod acp_requests {
         // tools/list into an inner result, routing each reply by the frame's own outer id.
         let pending2 = pending.clone();
         let ext = tokio::spawn(async move {
-            let f1: serde_json::Value = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
+            let f1: serde_json::Value =
+                serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
             assert_eq!(f1["method"], json!("mcp/connect"));
             assert_eq!(f1["params"]["acpId"], json!("srv-1"));
             route_client_response(
@@ -3126,7 +3244,8 @@ mod acp_requests {
             )
             .await;
 
-            let f2: serde_json::Value = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
+            let f2: serde_json::Value =
+                serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
             assert_eq!(f2["method"], json!("mcp/message"));
             assert_eq!(f2["params"]["connectionId"], json!("conn-9"));
             assert_eq!(f2["params"]["method"], json!("tools/list"));
@@ -3170,8 +3289,11 @@ mod acp_requests {
             assert_eq!(f["method"], json!("mcp/message"));
             assert_eq!(f["params"]["connectionId"], json!("conn-9"));
             assert_eq!(f["params"]["method"], json!("tools/call"));
-            route_client_response(&pending2, &json!({"jsonrpc":"2.0","id":f["id"],"result":{"ok":true}}))
-                .await;
+            route_client_response(
+                &pending2,
+                &json!({"jsonrpc":"2.0","id":f["id"],"result":{"ok":true}}),
+            )
+            .await;
         });
 
         let result = handle
@@ -3224,14 +3346,23 @@ mod acp_requests {
             let mut reg = registry.lock().unwrap();
             // Deliberately out of insertion order relative to rank, so a "first match" answer and a
             // "newest" answer differ.
-            reg.insert(("acp_1".into(), "srv-new".into()), tunnel_ranked("conn-b", 7, 2));
-            reg.insert(("acp_1".into(), "srv-old".into()), tunnel_ranked("conn-a", 3, 9));
+            reg.insert(
+                ("acp_1".into(), "srv-new".into()),
+                tunnel_ranked("conn-b", 7, 2),
+            );
+            reg.insert(
+                ("acp_1".into(), "srv-old".into()),
+                tunnel_ranked("conn-a", 3, 9),
+            );
             reg.insert(("acp_1".into(), "other".into()), {
                 let mut h = tunnel_ranked("conn-c", 9, 9);
                 h.server_name = "notes".into();
                 h
             });
-            reg.insert(("acp_2".into(), "elsewhere".into()), tunnel_ranked("conn-d", 99, 99));
+            reg.insert(
+                ("acp_2".into(), "elsewhere".into()),
+                tunnel_ranked("conn-d", 99, 99),
+            );
         }
         assert_eq!(
             super::resolve_by_name(&registry, "acp_1", "katashiro").as_deref(),
@@ -3370,8 +3501,11 @@ mod acp_requests {
             let f: serde_json::Value = serde_json::from_str(&out_rx.recv().await.unwrap()).unwrap();
             assert_eq!(f["method"], json!("mcp/connect"));
             assert_eq!(f["params"]["acpId"], json!("srv-1"));
-            route_client_response(&pending2, &json!({"jsonrpc":"2.0","id":f["id"],"result":{"connectionId":"conn-9"}}))
-                .await;
+            route_client_response(
+                &pending2,
+                &json!({"jsonrpc":"2.0","id":f["id"],"result":{"connectionId":"conn-9"}}),
+            )
+            .await;
             answer_inner_handshake(&mut out_rx, &pending2).await;
         });
 
@@ -3563,7 +3697,10 @@ mod acp_handlers {
 
     #[test]
     fn initialize_returns_conformant_capabilities() {
-        let v = serde_json::to_value(handle_initialize(&init_req(Some(json!({"protocolVersion": 1}))))).unwrap();
+        let v = serde_json::to_value(handle_initialize(&init_req(Some(
+            json!({"protocolVersion": 1}),
+        ))))
+        .unwrap();
         assert_eq!(v["id"], json!(1));
         let result = &v["result"];
         assert_eq!(result["protocolVersion"], json!(1));
@@ -3575,26 +3712,44 @@ mod acp_handlers {
         // the serde default {http:false, sse:false} — the same VALUES, but arrived at by silence
         // while the gateway ships MCP-over-ACP and says so nowhere.
         let mcp = &result["agentCapabilities"]["mcpCapabilities"];
-        assert_eq!(mcp["http"], json!(false), "no code forwards an http declaration anywhere");
-        assert_eq!(mcp["sse"], json!(false), "same for sse — parse_acp_mcp_servers drops both");
         assert_eq!(
-            mcp["_meta"]["dev.openab/acp"], json!(true),
+            mcp["http"],
+            json!(false),
+            "no code forwards an http declaration anywhere"
+        );
+        assert_eq!(
+            mcp["sse"],
+            json!(false),
+            "same for sse — parse_acp_mcp_servers drops both"
+        );
+        assert_eq!(
+            mcp["_meta"]["dev.openab/acp"],
+            json!(true),
             "the ACP capability is a reverse-DNS-namespaced extension under _meta (F1(b))"
         );
         assert!(
             mcp["_meta"]["acp"].is_null(),
             "the bare `_meta.acp` key is gone — the informal convention the framework supersedes"
         );
-        assert!(mcp.get("acp").is_none(), "no core mcpCapabilities.acp field (would fork the schema)");
+        assert!(
+            mcp.get("acp").is_none(),
+            "no core mcpCapabilities.acp field (would fork the schema)"
+        );
     }
 
     #[test]
     fn initialize_negotiates_version_and_rejects_bad() {
         // a higher client version negotiates down to ours (1)
-        let v = serde_json::to_value(handle_initialize(&init_req(Some(json!({"protocolVersion": 5}))))).unwrap();
+        let v = serde_json::to_value(handle_initialize(&init_req(Some(
+            json!({"protocolVersion": 5}),
+        ))))
+        .unwrap();
         assert_eq!(v["result"]["protocolVersion"], json!(1));
         // version 0 is below our minimum → -32602
-        let v = serde_json::to_value(handle_initialize(&init_req(Some(json!({"protocolVersion": 0}))))).unwrap();
+        let v = serde_json::to_value(handle_initialize(&init_req(Some(
+            json!({"protocolVersion": 0}),
+        ))))
+        .unwrap();
         assert_eq!(v["error"]["code"], json!(-32602));
         // missing protocolVersion → -32602
         let v = serde_json::to_value(handle_initialize(&init_req(Some(json!({}))))).unwrap();
@@ -3607,11 +3762,16 @@ mod acp_handlers {
     #[tokio::test]
     async fn session_new_mints_and_stores_a_session() {
         let sessions = new_sessions();
-        let v =
-            serde_json::to_value(handle_session_new(&sessions, json!(2)).await.0).unwrap();
+        let v = serde_json::to_value(handle_session_new(&sessions, json!(2)).await.0).unwrap();
         let sid = v["result"]["sessionId"].as_str().unwrap();
-        assert!(sid.starts_with("sess_"), "sessionId must be sess_<uuid>: {sid}");
-        assert!(sessions.lock().await.contains_key(sid), "session must be stored");
+        assert!(
+            sid.starts_with("sess_"),
+            "sessionId must be sess_<uuid>: {sid}"
+        );
+        assert!(
+            sessions.lock().await.contains_key(sid),
+            "session must be stored"
+        );
     }
 
     #[test]
@@ -3627,8 +3787,14 @@ mod acp_handlers {
         assert_eq!(
             parse_acp_mcp_servers(Some(&params)),
             vec![
-                AcpMcpServer { id: "srv-1".into(), name: "browser".into() },
-                AcpMcpServer { id: "srv-2".into(), name: "other".into() },
+                AcpMcpServer {
+                    id: "srv-1".into(),
+                    name: "browser".into()
+                },
+                AcpMcpServer {
+                    id: "srv-2".into(),
+                    name: "other".into()
+                },
             ]
         );
         // no mcpServers -> empty
@@ -3636,25 +3802,34 @@ mod acp_handlers {
         assert!(parse_acp_mcp_servers(None).is_empty());
     }
 
-
     #[tokio::test]
     async fn session_resume_valid_stores_and_invalid_errors() {
         let sessions = new_sessions();
         // valid sess_<uuid> → {} and the session is (re)stored
         let sid = format!("sess_{}", Uuid::new_v4());
         let params = json!({"sessionId": sid, "cwd": "/w", "mcpServers": []});
-        let v = serde_json::to_value(handle_session_resume(&sessions, json!(3), Some(&params)).await.0)
-            .unwrap();
+        let v = serde_json::to_value(
+            handle_session_resume(&sessions, json!(3), Some(&params))
+                .await
+                .0,
+        )
+        .unwrap();
         assert_eq!(v["result"], json!({}));
         assert!(sessions.lock().await.contains_key(&sid));
         // malformed sessionId shape → -32602
         let bad = json!({"sessionId": "not-a-session", "cwd": "/w", "mcpServers": []});
-        let v = serde_json::to_value(handle_session_resume(&sessions, json!(4), Some(&bad)).await.0)
-            .unwrap();
+        let v = serde_json::to_value(
+            handle_session_resume(&sessions, json!(4), Some(&bad))
+                .await
+                .0,
+        )
+        .unwrap();
         assert_eq!(v["error"]["code"], json!(-32602));
         // missing sessionId → -32602
         let v = serde_json::to_value(
-            handle_session_resume(&sessions, json!(5), Some(&json!({"cwd": "/w"}))).await.0,
+            handle_session_resume(&sessions, json!(5), Some(&json!({"cwd": "/w"})))
+                .await
+                .0,
         )
         .unwrap();
         assert_eq!(v["error"]["code"], json!(-32602));
@@ -3685,23 +3860,39 @@ mod acp_review_fixes {
         for _ in 0..MAX_SESSIONS_PER_CONNECTION {
             let sid = format!("sess_{}", Uuid::new_v4());
             let p = json!({ "sessionId": sid });
-            let v = serde_json::to_value(handle_session_resume(&sessions, json!(1), Some(&p)).await.0)
-                .unwrap();
+            let v =
+                serde_json::to_value(handle_session_resume(&sessions, json!(1), Some(&p)).await.0)
+                    .unwrap();
             assert_eq!(v["result"], json!({}), "resume under cap should succeed");
             ids.push(sid);
         }
         assert_eq!(sessions.lock().await.len(), MAX_SESSIONS_PER_CONNECTION);
         // A new distinct session over the cap is refused with ACP_OVERLOADED.
         let over = json!({ "sessionId": format!("sess_{}", Uuid::new_v4()) });
-        let v = serde_json::to_value(handle_session_resume(&sessions, json!(2), Some(&over)).await.0)
-            .unwrap();
-        assert_eq!(v["error"]["code"], json!(ACP_OVERLOADED), "over-cap resume must be refused");
+        let v = serde_json::to_value(
+            handle_session_resume(&sessions, json!(2), Some(&over))
+                .await
+                .0,
+        )
+        .unwrap();
+        assert_eq!(
+            v["error"]["code"],
+            json!(ACP_OVERLOADED),
+            "over-cap resume must be refused"
+        );
         // Re-resuming an already-present session is exempt (idempotent).
         let existing = json!({ "sessionId": ids[0] });
-        let v =
-            serde_json::to_value(handle_session_resume(&sessions, json!(3), Some(&existing)).await.0)
-                .unwrap();
-        assert_eq!(v["result"], json!({}), "re-resume of existing session must bypass the cap");
+        let v = serde_json::to_value(
+            handle_session_resume(&sessions, json!(3), Some(&existing))
+                .await
+                .0,
+        )
+        .unwrap();
+        assert_eq!(
+            v["result"],
+            json!({}),
+            "re-resume of existing session must bypass the cap"
+        );
     }
 
     // --- R3-F1: declaration fan-out is bounded before it costs anything ---
@@ -3855,14 +4046,23 @@ mod acp_review_fixes {
         // 1. missing sessionId
         let (resp, chan) =
             handle_session_resume(&sessions, json!(1), Some(&json!({"cwd": "/w"}))).await;
-        assert_eq!(serde_json::to_value(resp).unwrap()["error"]["code"], json!(-32602));
+        assert_eq!(
+            serde_json::to_value(resp).unwrap()["error"]["code"],
+            json!(-32602)
+        );
         assert!(chan.is_none(), "missing sessionId must not yield a channel");
 
         // 2. malformed sessionId
         let bad = json!({"sessionId": "not-a-session", "cwd": "/w"});
         let (resp, chan) = handle_session_resume(&sessions, json!(2), Some(&bad)).await;
-        assert_eq!(serde_json::to_value(resp).unwrap()["error"]["code"], json!(-32602));
-        assert!(chan.is_none(), "malformed sessionId must not yield a channel");
+        assert_eq!(
+            serde_json::to_value(resp).unwrap()["error"]["code"],
+            json!(-32602)
+        );
+        assert!(
+            chan.is_none(),
+            "malformed sessionId must not yield a channel"
+        );
 
         // 3. over the per-connection cap — note the id IS well formed, so the old
         //    derive-from-params guard would have happily produced a channel here.
@@ -3877,7 +4077,10 @@ mod acp_review_fixes {
             serde_json::to_value(resp).unwrap()["error"]["code"],
             json!(ACP_OVERLOADED)
         );
-        assert!(chan.is_none(), "an over-cap resume must not yield a channel");
+        assert!(
+            chan.is_none(),
+            "an over-cap resume must not yield a channel"
+        );
 
         // 4. busy — likewise a well-formed id on a session that really exists.
         let busy_sid = format!("sess_{}", Uuid::new_v4());
@@ -3891,8 +4094,14 @@ mod acp_review_fixes {
         );
         let (resp, chan) =
             handle_session_resume(&sessions, json!(5), Some(&json!({"sessionId": busy_sid}))).await;
-        assert_eq!(serde_json::to_value(resp).unwrap()["error"]["code"], json!(-32001));
-        assert!(chan.is_none(), "a busy-rejected resume must not yield a channel");
+        assert_eq!(
+            serde_json::to_value(resp).unwrap()["error"]["code"],
+            json!(-32001)
+        );
+        assert!(
+            chan.is_none(),
+            "a busy-rejected resume must not yield a channel"
+        );
     }
 
     fn reply(channel_id: &str, reply_to: &str, text: &str, command: Option<&str>) -> GatewayReply {
@@ -3900,7 +4109,10 @@ mod acp_review_fixes {
             schema: "openab.gateway.reply.v1".into(),
             reply_to: reply_to.into(),
             platform: "acp".into(),
-            channel: crate::schema::ReplyChannel { id: channel_id.into(), thread_id: None },
+            channel: crate::schema::ReplyChannel {
+                id: channel_id.into(),
+                thread_id: None,
+            },
             content: crate::schema::Content {
                 content_type: "text".into(),
                 text: text.into(),
@@ -3918,22 +4130,33 @@ mod acp_review_fixes {
     async fn handle_reply_fences_stale_turn() {
         let registry = new_reply_registry();
         let (tx, mut rx) = mpsc::unbounded_channel::<ReplyChunk>();
-        registry
-            .lock()
-            .unwrap()
-            .insert(
-                "acp_chan".into(),
-                ReplySink { turn_id: "evt_current".into(), tx, owner: "conn-test".into(), generation: 0 },
-            );
+        registry.lock().unwrap().insert(
+            "acp_chan".into(),
+            ReplySink {
+                turn_id: "evt_current".into(),
+                tx,
+                owner: "conn-test".into(),
+                generation: 0,
+            },
+        );
 
         // Stale reply (previous turn's event id) → dropped.
-        handle_reply(&reply("acp_chan", "evt_stale", "leaked", Some("edit_message")), &registry)
-            .await;
-        assert!(rx.try_recv().is_err(), "stale reply must not reach the active turn");
+        handle_reply(
+            &reply("acp_chan", "evt_stale", "leaked", Some("edit_message")),
+            &registry,
+        )
+        .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "stale reply must not reach the active turn"
+        );
 
         // Matching reply → delivered.
-        handle_reply(&reply("acp_chan", "evt_current", "hello", Some("edit_message")), &registry)
-            .await;
+        handle_reply(
+            &reply("acp_chan", "evt_current", "hello", Some("edit_message")),
+            &registry,
+        )
+        .await;
         match rx.try_recv() {
             Ok(ReplyChunk::Text(t)) => assert_eq!(t, "hello"),
             _ => panic!("expected the matching reply to be delivered"),
@@ -3948,30 +4171,64 @@ mod acp_review_fixes {
         let registry = new_reply_registry();
         let sink = |turn: &str, owner: &str, generation: u64| {
             let (tx, _rx) = mpsc::unbounded_channel::<ReplyChunk>();
-            super::ReplySink { turn_id: turn.into(), tx, owner: owner.into(), generation }
+            super::ReplySink {
+                turn_id: turn.into(),
+                tx,
+                owner: owner.into(),
+                generation,
+            }
         };
-        let current_turn = || registry.lock().unwrap().get("acp_x").map(|s| s.turn_id.clone());
+        let current_turn = || {
+            registry
+                .lock()
+                .unwrap()
+                .get("acp_x")
+                .map(|s| s.turn_id.clone())
+        };
 
         // Connection A (gen 1) installs its sink.
-        assert!(super::install_reply_sink(&registry, "acp_x", sink("evt_a", "conn-A", 1)));
+        assert!(super::install_reply_sink(
+            &registry,
+            "acp_x",
+            sink("evt_a", "conn-A", 1)
+        ));
         // Newer connection B (gen 2) resumes the same session and takes over (reconnect semantics).
-        assert!(super::install_reply_sink(&registry, "acp_x", sink("evt_b", "conn-B", 2)));
-        assert_eq!(current_turn().as_deref(), Some("evt_b"), "the newer connection owns the sink");
+        assert!(super::install_reply_sink(
+            &registry,
+            "acp_x",
+            sink("evt_b", "conn-B", 2)
+        ));
+        assert_eq!(
+            current_turn().as_deref(),
+            Some("evt_b"),
+            "the newer connection owns the sink"
+        );
 
         // The older connection A, its prompt processed late, must NOT clobber B's live sink.
         assert!(
             !super::install_reply_sink(&registry, "acp_x", sink("evt_a2", "conn-A", 1)),
             "an older connection cannot install over a newer one"
         );
-        assert_eq!(current_turn().as_deref(), Some("evt_b"), "B's sink survives A's late install");
+        assert_eq!(
+            current_turn().as_deref(),
+            Some("evt_b"),
+            "B's sink survives A's late install"
+        );
 
         // A's turn completing must not remove B's sink (turn-scoped removal).
         super::remove_reply_sink_if_owner(&registry, "acp_x", "evt_a");
-        assert_eq!(current_turn().as_deref(), Some("evt_b"), "A's completion must not remove B's sink");
+        assert_eq!(
+            current_turn().as_deref(),
+            Some("evt_b"),
+            "A's completion must not remove B's sink"
+        );
 
         // B's own completion removes B's sink.
         super::remove_reply_sink_if_owner(&registry, "acp_x", "evt_b");
-        assert!(current_turn().is_none(), "the owner's completion removes its own sink");
+        assert!(
+            current_turn().is_none(),
+            "the owner's completion removes its own sink"
+        );
     }
 
     // F4 — the SAME connection starting its next turn replaces its own sink; the stale prior turn's
@@ -3981,14 +4238,24 @@ mod acp_review_fixes {
         let registry = new_reply_registry();
         let sink = |turn: &str| {
             let (tx, _rx) = mpsc::unbounded_channel::<ReplyChunk>();
-            super::ReplySink { turn_id: turn.into(), tx, owner: "conn-A".into(), generation: 5 }
+            super::ReplySink {
+                turn_id: turn.into(),
+                tx,
+                owner: "conn-A".into(),
+                generation: 5,
+            }
         };
         assert!(super::install_reply_sink(&registry, "acp_x", sink("evt_1")));
         assert!(super::install_reply_sink(&registry, "acp_x", sink("evt_2")));
         // Stale turn 1's completion must not remove turn 2's sink.
         super::remove_reply_sink_if_owner(&registry, "acp_x", "evt_1");
         assert_eq!(
-            registry.lock().unwrap().get("acp_x").map(|s| s.turn_id.clone()).as_deref(),
+            registry
+                .lock()
+                .unwrap()
+                .get("acp_x")
+                .map(|s| s.turn_id.clone())
+                .as_deref(),
             Some("evt_2"),
             "the stale turn must not remove the same connection's newer sink"
         );
@@ -4001,10 +4268,19 @@ mod acp_review_fixes {
     // the `else` of the bearer branch), so a keyed bind is unaffected by the allowlist.
     #[test]
     fn acp_origin_ok_keyless_gating() {
-        let allow = vec!["https://app.example".to_string(), "http://localhost:5173".to_string()];
+        let allow = vec![
+            "https://app.example".to_string(),
+            "http://localhost:5173".to_string(),
+        ];
         // Absent Origin (non-browser client) → accept, regardless of allowlist.
-        assert!(acp_origin_ok(None, &allow), "no Origin (non-browser) must be admitted");
-        assert!(acp_origin_ok(None, &[]), "no Origin must be admitted even with empty allowlist");
+        assert!(
+            acp_origin_ok(None, &allow),
+            "no Origin (non-browser) must be admitted"
+        );
+        assert!(
+            acp_origin_ok(None, &[]),
+            "no Origin must be admitted even with empty allowlist"
+        );
         // Allowlisted browser Origin → accept (exact match, both entries).
         assert!(acp_origin_ok(Some("https://app.example"), &allow));
         assert!(acp_origin_ok(Some("http://localhost:5173"), &allow));
@@ -4034,7 +4310,10 @@ mod acp_review_fixes {
         assert_eq!(ws_bearer_token(&h), Some("sekret"));
         // The subprotocol path still carries the key.
         let mut h = HeaderMap::new();
-        h.insert("sec-websocket-protocol", "openab.bearer.sekret, acp.v1".parse().unwrap());
+        h.insert(
+            "sec-websocket-protocol",
+            "openab.bearer.sekret, acp.v1".parse().unwrap(),
+        );
         assert_eq!(ws_bearer_token(&h), Some("sekret"));
     }
 
@@ -4043,10 +4322,18 @@ mod acp_review_fixes {
     #[test]
     fn ws_subprotocol_token_charset() {
         for &b in b"AZaz09._~+-!#$%&'*^`|" {
-            assert!(is_ws_subprotocol_token_char(b), "{} should be token-safe", b as char);
+            assert!(
+                is_ws_subprotocol_token_char(b),
+                "{} should be token-safe",
+                b as char
+            );
         }
         for &b in b"=/,; @\"" {
-            assert!(!is_ws_subprotocol_token_char(b), "{} should be rejected", b as char);
+            assert!(
+                !is_ws_subprotocol_token_char(b),
+                "{} should be rejected",
+                b as char
+            );
         }
     }
 
@@ -4079,8 +4366,18 @@ mod acp_review_fixes {
 
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
         let params = json!({"sessionId": sid, "prompt": [{"type": "text", "text": "hi"}]});
-        handle_session_prompt(&state, &sessions, json!(7), Some(&params), &out_tx, sid.clone(), cancel, "conn-test", 0)
-            .await;
+        handle_session_prompt(
+            &state,
+            &sessions,
+            json!(7),
+            Some(&params),
+            &out_tx,
+            sid.clone(),
+            cancel,
+            "conn-test",
+            0,
+        )
+        .await;
 
         // The final response (matching our request id) must carry stopReason "cancelled".
         let mut final_resp = None;
@@ -4099,7 +4396,10 @@ mod acp_review_fixes {
         // And the reservation is released.
         let g = sessions.lock().await;
         let s = g.get(&sid).unwrap();
-        assert!(!s.busy && s.cancel.is_none(), "cancel must release busy + cancel handle");
+        assert!(
+            !s.busy && s.cancel.is_none(),
+            "cancel must release busy + cancel handle"
+        );
     }
 
     // R16-F2 — session/resume on a session with a prompt in flight is rejected (busy), so the
@@ -4121,7 +4421,11 @@ mod acp_review_fixes {
         let params = json!({"sessionId": sid, "cwd": "/w", "mcpServers": []});
         let (resp, resumed) = handle_session_resume(&sessions, json!(9), Some(&params)).await;
         let v = serde_json::to_value(resp).unwrap();
-        assert_eq!(v["error"]["code"], json!(-32001), "resume while busy must be rejected");
+        assert_eq!(
+            v["error"]["code"],
+            json!(-32001),
+            "resume while busy must be rejected"
+        );
         assert!(
             resumed.is_none(),
             "a rejected resume must not hand back a channel — that value is the caller's \
@@ -4132,7 +4436,10 @@ mod acp_review_fixes {
         let g = sessions.lock().await;
         let s = g.get(&sid).unwrap();
         assert!(s.busy, "busy must remain set after a rejected resume");
-        assert!(s.cancel.is_some(), "the active prompt's cancel handle must survive resume");
+        assert!(
+            s.cancel.is_some(),
+            "the active prompt's cancel handle must survive resume"
+        );
     }
 
     // R16-F3(A) — Phase-1 send-once: the ACP path streams the whole reply as a SINGLE terminal
@@ -4152,7 +4459,11 @@ mod acp_review_fixes {
         let cancel = Arc::new(tokio::sync::Notify::new());
         sessions.lock().await.insert(
             sid.clone(),
-            AcpSession { channel_id: channel_id.clone(), busy: true, cancel: Some(cancel.clone()) },
+            AcpSession {
+                channel_id: channel_id.clone(),
+                busy: true,
+                cancel: Some(cancel.clone()),
+            },
         );
 
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
@@ -4161,21 +4472,40 @@ mod acp_review_fixes {
         let sid2 = sid.clone();
         let handle = tokio::spawn(async move {
             let params = json!({"sessionId": sid2, "prompt": [{"type": "text", "text": "hi"}]});
-            handle_session_prompt(&st2, &sessions2, json!(11), Some(&params), &out_tx, sid2.clone(), cancel, "conn-test", 0)
-                .await;
+            handle_session_prompt(
+                &st2,
+                &sessions2,
+                json!(11),
+                Some(&params),
+                &out_tx,
+                sid2.clone(),
+                cancel,
+                "conn-test",
+                0,
+            )
+            .await;
         });
 
         // Wait for the handler to register its reply sink, then feed one final reply.
         let mut turn_id = None;
         for _ in 0..10_000 {
-            if let Some(t) = registry.lock().unwrap().get(&channel_id).map(|s| s.turn_id.clone()) {
+            if let Some(t) = registry
+                .lock()
+                .unwrap()
+                .get(&channel_id)
+                .map(|s| s.turn_id.clone())
+            {
                 turn_id = Some(t);
                 break;
             }
             tokio::task::yield_now().await;
         }
         let turn_id = turn_id.expect("handler must register a reply sink");
-        handle_reply(&reply(&channel_id, &turn_id, "hello world", Some("send_message")), &registry).await;
+        handle_reply(
+            &reply(&channel_id, &turn_id, "hello world", Some("send_message")),
+            &registry,
+        )
+        .await;
         handle.await.unwrap();
 
         let mut chunks = Vec::new();
@@ -4185,15 +4515,28 @@ mod acp_review_fixes {
             if v["method"] == json!("session/update")
                 && v["params"]["update"]["sessionUpdate"] == json!("agent_message_chunk")
             {
-                chunks.push(v["params"]["update"]["content"]["text"].as_str().unwrap_or("").to_string());
+                chunks.push(
+                    v["params"]["update"]["content"]["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string(),
+                );
             }
             if v.get("id") == Some(&json!(11)) {
                 final_stop = v["result"]["stopReason"].as_str().map(str::to_string);
             }
         }
-        assert_eq!(chunks.len(), 1, "Phase-1 must stream exactly one terminal chunk, got {chunks:?}");
+        assert_eq!(
+            chunks.len(),
+            1,
+            "Phase-1 must stream exactly one terminal chunk, got {chunks:?}"
+        );
         assert_eq!(chunks[0], "hello world");
-        assert_eq!(final_stop.as_deref(), Some("end_turn"), "a completed turn ends end_turn");
+        assert_eq!(
+            final_stop.as_deref(),
+            Some("end_turn"),
+            "a completed turn ends end_turn"
+        );
     }
 
     // R17-F3c — a request-shaped `session/cancel` (id present) must NOT be acknowledged with
@@ -4207,7 +4550,11 @@ mod acp_review_fixes {
             .await
             .expect("a request-shaped cancel must produce a response, not silence");
         let v = serde_json::to_value(&resp).unwrap();
-        assert_eq!(v["error"]["code"], json!(-32600), "request-shaped cancel must be -32600");
+        assert_eq!(
+            v["error"]["code"],
+            json!(-32600),
+            "request-shaped cancel must be -32600"
+        );
         assert_eq!(v["id"], json!(42));
         assert!(
             v.get("result").is_none(),
@@ -4232,7 +4579,10 @@ mod acp_review_fixes {
         );
         let params = json!({"sessionId": sid});
         let resp = handle_session_cancel(&sessions, Value::Null, Some(&params), true).await;
-        assert!(resp.is_none(), "a notification cancel must produce no response frame");
+        assert!(
+            resp.is_none(),
+            "a notification cancel must produce no response frame"
+        );
         // notify_one stored a permit, so notified() resolves immediately — the signal fired.
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(200), cancel.notified())
@@ -4328,14 +4678,18 @@ mod acp_ws_integration {
         }
         match frame["params"]["method"].as_str() {
             Some("initialize") => {
-                send(ws, json!({
-                    "jsonrpc": "2.0", "id": frame["id"].clone(),
-                    "result": {
-                        "protocolVersion": "2025-06-18",
-                        "capabilities": { "tools": {} },
-                        "serverInfo": { "name": "test-ext", "version": "0" }
-                    }
-                })).await;
+                send(
+                    ws,
+                    json!({
+                        "jsonrpc": "2.0", "id": frame["id"].clone(),
+                        "result": {
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": { "tools": {} },
+                            "serverInfo": { "name": "test-ext", "version": "0" }
+                        }
+                    }),
+                )
+                .await;
                 Some("initialize")
             }
             // A notification: no reply is owed, but it must still be taken off the socket or the
@@ -4348,20 +4702,28 @@ mod acp_ws_integration {
     /// Drive `initialize` + `session/new` declaring one `type:acp` server, then answer the
     /// `mcp/connect` the gateway sends back. Returns the session id.
     async fn handshake(ws: &mut Ws, acp_id: &str, name: &str, connection_id: &str) -> String {
-        send(ws, json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": 1, "clientCapabilities": {}}
-        })).await;
+        send(
+            ws,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}}
+            }),
+        )
+        .await;
         let init = recv(ws).await;
         assert!(init.get("result").is_some(), "initialize failed: {init}");
 
-        send(ws, json!({
-            "jsonrpc": "2.0", "id": 2, "method": "session/new",
-            "params": {
-                "cwd": "/w",
-                "mcpServers": [{"type": "acp", "id": acp_id, "name": name}]
-            }
-        })).await;
+        send(
+            ws,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "session/new",
+                "params": {
+                    "cwd": "/w",
+                    "mcpServers": [{"type": "acp", "id": acp_id, "name": name}]
+                }
+            }),
+        )
+        .await;
 
         // The gateway now does two things concurrently: answer session/new, and open the tunnel
         // by sending mcp/connect. Order is not guaranteed, so accept either first.
@@ -4381,17 +4743,25 @@ mod acp_ws_integration {
             }
             if frame.get("method").and_then(Value::as_str) == Some("mcp/connect") {
                 assert_eq!(
-                    frame["params"]["acpId"], json!(acp_id),
+                    frame["params"]["acpId"],
+                    json!(acp_id),
                     "mcp/connect must name the declared id"
                 );
-                send(ws, json!({
-                    "jsonrpc": "2.0", "id": frame["id"].clone(),
-                    "result": {"connectionId": connection_id}
-                })).await;
+                send(
+                    ws,
+                    json!({
+                        "jsonrpc": "2.0", "id": frame["id"].clone(),
+                        "result": {"connectionId": connection_id}
+                    }),
+                )
+                .await;
                 connected = true;
             } else if frame.get("id") == Some(&json!(2)) {
                 session_id = Some(
-                    frame["result"]["sessionId"].as_str().expect("sessionId").to_string(),
+                    frame["result"]["sessionId"]
+                        .as_str()
+                        .expect("sessionId")
+                        .to_string(),
                 );
             }
         }
@@ -4429,10 +4799,14 @@ mod acp_ws_integration {
     async fn the_inner_mcp_lifecycle_completes_before_the_tunnel_is_registered() {
         let (url, registry) = serve().await;
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-        send(&mut ws, json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": 1, "clientCapabilities": {}}
-        })).await;
+        send(
+            &mut ws,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}}
+            }),
+        )
+        .await;
         let _ = recv(&mut ws).await;
         send(&mut ws, json!({
             "jsonrpc": "2.0", "id": 2, "method": "session/new",
@@ -4445,40 +4819,48 @@ mod acp_ws_integration {
         // should also say which bug.
         let collect = async {
             let mut order: Vec<String> = Vec::new();
-        let mut connected = false;
-        let mut lifecycle = 0;
-        while !connected || lifecycle < 2 {
-            let f = recv(&mut ws).await;
-            if f.get("method").and_then(Value::as_str) == Some("mcp/connect") {
-                order.push("mcp/connect".into());
-                send(&mut ws, json!({
-                    "jsonrpc": "2.0", "id": f["id"].clone(),
-                    "result": {"connectionId": "conn-1"}
-                })).await;
-                connected = true;
-            } else if f.get("method").and_then(Value::as_str) == Some("mcp/message") {
-                let inner = f["params"]["method"].as_str().unwrap_or("").to_string();
-                order.push(inner.clone());
-                if inner == "initialize" {
-                    // The registry must still be empty: a server that has not answered
-                    // `initialize` has not agreed to serve anything yet.
-                    assert!(
-                        registry.lock().unwrap().is_empty(),
-                        "the tunnel was registered before the MCP handshake completed"
-                    );
-                    send(&mut ws, json!({
-                        "jsonrpc": "2.0", "id": f["id"].clone(),
-                        "result": {
-                            "protocolVersion": "2025-06-18",
-                            "capabilities": { "tools": {} },
-                            "serverInfo": { "name": "test-ext", "version": "0" }
-                        }
-                    })).await;
+            let mut connected = false;
+            let mut lifecycle = 0;
+            while !connected || lifecycle < 2 {
+                let f = recv(&mut ws).await;
+                if f.get("method").and_then(Value::as_str) == Some("mcp/connect") {
+                    order.push("mcp/connect".into());
+                    send(
+                        &mut ws,
+                        json!({
+                            "jsonrpc": "2.0", "id": f["id"].clone(),
+                            "result": {"connectionId": "conn-1"}
+                        }),
+                    )
+                    .await;
+                    connected = true;
+                } else if f.get("method").and_then(Value::as_str) == Some("mcp/message") {
+                    let inner = f["params"]["method"].as_str().unwrap_or("").to_string();
+                    order.push(inner.clone());
+                    if inner == "initialize" {
+                        // The registry must still be empty: a server that has not answered
+                        // `initialize` has not agreed to serve anything yet.
+                        assert!(
+                            registry.lock().unwrap().is_empty(),
+                            "the tunnel was registered before the MCP handshake completed"
+                        );
+                        send(
+                            &mut ws,
+                            json!({
+                                "jsonrpc": "2.0", "id": f["id"].clone(),
+                                "result": {
+                                    "protocolVersion": "2025-06-18",
+                                    "capabilities": { "tools": {} },
+                                    "serverInfo": { "name": "test-ext", "version": "0" }
+                                }
+                            }),
+                        )
+                        .await;
+                    }
+                    lifecycle += 1;
                 }
-                lifecycle += 1;
             }
-        }
-        order
+            order
         };
         let order = tokio::time::timeout(std::time::Duration::from_secs(10), collect)
             .await
@@ -4511,10 +4893,14 @@ mod acp_ws_integration {
     async fn a_server_that_refuses_initialize_is_not_registered() {
         let (url, registry) = serve().await;
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-        send(&mut ws, json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": 1, "clientCapabilities": {}}
-        })).await;
+        send(
+            &mut ws,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}}
+            }),
+        )
+        .await;
         let _ = recv(&mut ws).await;
         send(&mut ws, json!({
             "jsonrpc": "2.0", "id": 2, "method": "session/new",
@@ -4529,16 +4915,24 @@ mod acp_ws_integration {
             let f = recv(&mut ws).await;
             match f.get("method").and_then(Value::as_str) {
                 Some("mcp/connect") => {
-                    send(&mut ws, json!({
-                        "jsonrpc": "2.0", "id": f["id"].clone(),
-                        "result": {"connectionId": "conn-1"}
-                    })).await;
+                    send(
+                        &mut ws,
+                        json!({
+                            "jsonrpc": "2.0", "id": f["id"].clone(),
+                            "result": {"connectionId": "conn-1"}
+                        }),
+                    )
+                    .await;
                 }
                 Some("mcp/message") if f["params"]["method"] == json!("initialize") => {
-                    send(&mut ws, json!({
-                        "jsonrpc": "2.0", "id": f["id"].clone(),
-                        "error": {"code": -32603, "message": "not accepting connections"}
-                    })).await;
+                    send(
+                        &mut ws,
+                        json!({
+                            "jsonrpc": "2.0", "id": f["id"].clone(),
+                            "error": {"code": -32603, "message": "not accepting connections"}
+                        }),
+                    )
+                    .await;
                     refused = true;
                 }
                 _ => {}
@@ -4614,15 +5008,23 @@ mod acp_ws_integration {
 
         // B opens FIRST — older connection — and declares nothing yet.
         let (mut b, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-        send(&mut b, json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": 1, "clientCapabilities": {}}
-        })).await;
+        send(
+            &mut b,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}}
+            }),
+        )
+        .await;
         let _ = recv(&mut b).await;
-        send(&mut b, json!({
-            "jsonrpc": "2.0", "id": 2, "method": "session/new",
-            "params": {"cwd": "/w", "mcpServers": []}
-        })).await;
+        send(
+            &mut b,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "session/new",
+                "params": {"cwd": "/w", "mcpServers": []}
+            }),
+        )
+        .await;
         let session_id = loop {
             let f = recv(&mut b).await;
             if f.get("id") == Some(&json!(2)) {
@@ -4634,16 +5036,24 @@ mod acp_ws_integration {
         // `mcp/connect` is captured and deliberately left unanswered, so it takes the LOWER attach
         // number while making no progress.
         let (mut c, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-        send(&mut c, json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": 1, "clientCapabilities": {}}
-        })).await;
+        send(
+            &mut c,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}}
+            }),
+        )
+        .await;
         let _ = recv(&mut c).await;
-        send(&mut c, json!({
-            "jsonrpc": "2.0", "id": 2, "method": "session/resume",
-            "params": {"sessionId": session_id.clone(), "cwd": "/w",
-                       "mcpServers": [{"type": "acp", "id": "srv-c", "name": "katashiro"}]}
-        })).await;
+        send(
+            &mut c,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "session/resume",
+                "params": {"sessionId": session_id.clone(), "cwd": "/w",
+                           "mcpServers": [{"type": "acp", "id": "srv-c", "name": "katashiro"}]}
+            }),
+        )
+        .await;
         let c_connect_id = loop {
             let f = recv(&mut c).await;
             if f.get("method").and_then(Value::as_str) == Some("mcp/connect") {
@@ -4653,19 +5063,27 @@ mod acp_ws_integration {
 
         // Now the OLDER connection declares the same name under a different id and completes, so it
         // registers with the HIGHER attach number.
-        send(&mut b, json!({
-            "jsonrpc": "2.0", "id": 9, "method": "session/resume",
-            "params": {"sessionId": session_id, "cwd": "/w",
-                       "mcpServers": [{"type": "acp", "id": "srv-b", "name": "katashiro"}]}
-        })).await;
+        send(
+            &mut b,
+            json!({
+                "jsonrpc": "2.0", "id": 9, "method": "session/resume",
+                "params": {"sessionId": session_id, "cwd": "/w",
+                           "mcpServers": [{"type": "acp", "id": "srv-b", "name": "katashiro"}]}
+            }),
+        )
+        .await;
         let mut done = false;
         while !done {
             let f = recv(&mut b).await;
             if f.get("method").and_then(Value::as_str) == Some("mcp/connect") {
-                send(&mut b, json!({
-                    "jsonrpc": "2.0", "id": f["id"].clone(),
-                    "result": {"connectionId": "conn-b"}
-                })).await;
+                send(
+                    &mut b,
+                    json!({
+                        "jsonrpc": "2.0", "id": f["id"].clone(),
+                        "result": {"connectionId": "conn-b"}
+                    }),
+                )
+                .await;
             } else if handled_inner_lifecycle(&mut b, &f).await == Some("initialize") {
                 done = true;
             }
@@ -4673,10 +5091,14 @@ mod acp_ws_integration {
         wait_for_tunnels(&registry, 1).await;
 
         // Finally let the stalled, newer-connection establish finish.
-        send(&mut c, json!({
-            "jsonrpc": "2.0", "id": c_connect_id,
-            "result": {"connectionId": "conn-c"}
-        })).await;
+        send(
+            &mut c,
+            json!({
+                "jsonrpc": "2.0", "id": c_connect_id,
+                "result": {"connectionId": "conn-c"}
+            }),
+        )
+        .await;
         loop {
             let f = recv(&mut c).await;
             if handled_inner_lifecycle(&mut c, &f).await == Some("initialize") {
@@ -4725,15 +5147,23 @@ mod acp_ws_integration {
     async fn within_one_connection_a_late_finishing_older_establish_loses_to_its_successor() {
         let (url, registry) = serve().await;
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-        send(&mut ws, json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": 1, "clientCapabilities": {}}
-        })).await;
+        send(
+            &mut ws,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}}
+            }),
+        )
+        .await;
         let _ = recv(&mut ws).await;
-        send(&mut ws, json!({
-            "jsonrpc": "2.0", "id": 2, "method": "session/new",
-            "params": {"cwd": "/w", "mcpServers": []}
-        })).await;
+        send(
+            &mut ws,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "session/new",
+                "params": {"cwd": "/w", "mcpServers": []}
+            }),
+        )
+        .await;
         let session_id = loop {
             let f = recv(&mut ws).await;
             if f.get("id") == Some(&json!(2)) {
@@ -4743,11 +5173,15 @@ mod acp_ws_integration {
 
         // First resume: declare srv-1 and PARK it — its `mcp/connect` is captured, not answered, so
         // it holds the lower attach number while making no progress.
-        send(&mut ws, json!({
-            "jsonrpc": "2.0", "id": 3, "method": "session/resume",
-            "params": {"sessionId": session_id.clone(), "cwd": "/w",
-                       "mcpServers": [{"type": "acp", "id": "srv-1", "name": "katashiro"}]}
-        })).await;
+        send(
+            &mut ws,
+            json!({
+                "jsonrpc": "2.0", "id": 3, "method": "session/resume",
+                "params": {"sessionId": session_id.clone(), "cwd": "/w",
+                           "mcpServers": [{"type": "acp", "id": "srv-1", "name": "katashiro"}]}
+            }),
+        )
+        .await;
         let parked_connect_id = loop {
             let f = recv(&mut ws).await;
             if f.get("method").and_then(Value::as_str) == Some("mcp/connect") {
@@ -4757,21 +5191,29 @@ mod acp_ws_integration {
         };
 
         // Second resume on the SAME connection: same name, new id, driven to completion.
-        send(&mut ws, json!({
-            "jsonrpc": "2.0", "id": 4, "method": "session/resume",
-            "params": {"sessionId": session_id, "cwd": "/w",
-                       "mcpServers": [{"type": "acp", "id": "srv-2", "name": "katashiro"}]}
-        })).await;
+        send(
+            &mut ws,
+            json!({
+                "jsonrpc": "2.0", "id": 4, "method": "session/resume",
+                "params": {"sessionId": session_id, "cwd": "/w",
+                           "mcpServers": [{"type": "acp", "id": "srv-2", "name": "katashiro"}]}
+            }),
+        )
+        .await;
         let mut registered = false;
         while !registered {
             let f = recv(&mut ws).await;
             if f.get("method").and_then(Value::as_str) == Some("mcp/connect")
                 && f["params"]["acpId"] == json!("srv-2")
             {
-                send(&mut ws, json!({
-                    "jsonrpc": "2.0", "id": f["id"].clone(),
-                    "result": {"connectionId": "conn-2"}
-                })).await;
+                send(
+                    &mut ws,
+                    json!({
+                        "jsonrpc": "2.0", "id": f["id"].clone(),
+                        "result": {"connectionId": "conn-2"}
+                    }),
+                )
+                .await;
             } else if handled_inner_lifecycle(&mut ws, &f).await == Some("initialize") {
                 registered = true;
             }
@@ -4779,10 +5221,14 @@ mod acp_ws_integration {
         wait_for_tunnels(&registry, 1).await;
 
         // Now release the parked, EARLIER establish.
-        send(&mut ws, json!({
-            "jsonrpc": "2.0", "id": parked_connect_id,
-            "result": {"connectionId": "conn-1"}
-        })).await;
+        send(
+            &mut ws,
+            json!({
+                "jsonrpc": "2.0", "id": parked_connect_id,
+                "result": {"connectionId": "conn-1"}
+            }),
+        )
+        .await;
         loop {
             let f = recv(&mut ws).await;
             if handled_inner_lifecycle(&mut ws, &f).await == Some("initialize") {
@@ -4825,15 +5271,23 @@ mod acp_ws_integration {
 
         // B opens first, so its connection is the OLDER one. It declares nothing yet.
         let (mut b, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-        send(&mut b, json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": 1, "clientCapabilities": {}}
-        })).await;
+        send(
+            &mut b,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}}
+            }),
+        )
+        .await;
         let _ = recv(&mut b).await;
-        send(&mut b, json!({
-            "jsonrpc": "2.0", "id": 2, "method": "session/new",
-            "params": {"cwd": "/w", "mcpServers": []}
-        })).await;
+        send(
+            &mut b,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "session/new",
+                "params": {"cwd": "/w", "mcpServers": []}
+            }),
+        )
+        .await;
         let session_id = loop {
             let f = recv(&mut b).await;
             if f.get("id") == Some(&json!(2)) {
@@ -4843,23 +5297,35 @@ mod acp_ws_integration {
 
         // C opens second (NEWER connection) and establishes srv-3 under the shared name.
         let (mut c, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-        send(&mut c, json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": 1, "clientCapabilities": {}}
-        })).await;
+        send(
+            &mut c,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}}
+            }),
+        )
+        .await;
         let _ = recv(&mut c).await;
-        send(&mut c, json!({
-            "jsonrpc": "2.0", "id": 2, "method": "session/resume",
-            "params": {"sessionId": session_id.clone(), "cwd": "/w",
-                       "mcpServers": [{"type": "acp", "id": "srv-3", "name": "katashiro"}]}
-        })).await;
+        send(
+            &mut c,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "session/resume",
+                "params": {"sessionId": session_id.clone(), "cwd": "/w",
+                           "mcpServers": [{"type": "acp", "id": "srv-3", "name": "katashiro"}]}
+            }),
+        )
+        .await;
         loop {
             let f = recv(&mut c).await;
             if f.get("method").and_then(Value::as_str) == Some("mcp/connect") {
-                send(&mut c, json!({
-                    "jsonrpc": "2.0", "id": f["id"].clone(),
-                    "result": {"connectionId": "conn-c"}
-                })).await;
+                send(
+                    &mut c,
+                    json!({
+                        "jsonrpc": "2.0", "id": f["id"].clone(),
+                        "result": {"connectionId": "conn-c"}
+                    }),
+                )
+                .await;
             } else if handled_inner_lifecycle(&mut c, &f).await == Some("initialize") {
                 break;
             }
@@ -4867,19 +5333,27 @@ mod acp_ws_integration {
         wait_for_tunnels(&registry, 1).await;
 
         // The OLDER connection now declares the same NAME under a different id, and completes.
-        send(&mut b, json!({
-            "jsonrpc": "2.0", "id": 9, "method": "session/resume",
-            "params": {"sessionId": session_id, "cwd": "/w",
-                       "mcpServers": [{"type": "acp", "id": "srv-4", "name": "katashiro"}]}
-        })).await;
+        send(
+            &mut b,
+            json!({
+                "jsonrpc": "2.0", "id": 9, "method": "session/resume",
+                "params": {"sessionId": session_id, "cwd": "/w",
+                           "mcpServers": [{"type": "acp", "id": "srv-4", "name": "katashiro"}]}
+            }),
+        )
+        .await;
         let mut done = false;
         while !done {
             let f = recv(&mut b).await;
             if f.get("method").and_then(Value::as_str) == Some("mcp/connect") {
-                send(&mut b, json!({
-                    "jsonrpc": "2.0", "id": f["id"].clone(),
-                    "result": {"connectionId": "conn-b"}
-                })).await;
+                send(
+                    &mut b,
+                    json!({
+                        "jsonrpc": "2.0", "id": f["id"].clone(),
+                        "result": {"connectionId": "conn-b"}
+                    }),
+                )
+                .await;
             } else if handled_inner_lifecycle(&mut b, &f).await == Some("initialize") {
                 done = true;
             }
@@ -4906,7 +5380,11 @@ mod acp_ws_integration {
             let reg = registry.lock().unwrap();
             reg.keys().map(|(_, id)| id.clone()).collect()
         };
-        assert_eq!(ids, vec!["srv-3".to_string()], "the newer connection's tunnel must hold the name");
+        assert_eq!(
+            ids,
+            vec!["srv-3".to_string()],
+            "the newer connection's tunnel must hold the name"
+        );
     }
 
     /// An older connection's late resume must not TAKE OVER a newer connection's tunnel either.
@@ -4929,15 +5407,23 @@ mod acp_ws_integration {
 
         // Connection B (older) opens the session but establishes nothing yet.
         let (mut b, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-        send(&mut b, json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": 1, "clientCapabilities": {}}
-        })).await;
+        send(
+            &mut b,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}}
+            }),
+        )
+        .await;
         let _ = recv(&mut b).await;
-        send(&mut b, json!({
-            "jsonrpc": "2.0", "id": 2, "method": "session/new",
-            "params": {"cwd": "/w", "mcpServers": []}
-        })).await;
+        send(
+            &mut b,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "session/new",
+                "params": {"cwd": "/w", "mcpServers": []}
+            }),
+        )
+        .await;
         let session_id = loop {
             let f = recv(&mut b).await;
             if f.get("id") == Some(&json!(2)) {
@@ -4947,23 +5433,35 @@ mod acp_ws_integration {
 
         // Connection C (newer) resumes and establishes srv-1.
         let (mut c, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-        send(&mut c, json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": 1, "clientCapabilities": {}}
-        })).await;
+        send(
+            &mut c,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}}
+            }),
+        )
+        .await;
         let _ = recv(&mut c).await;
-        send(&mut c, json!({
-            "jsonrpc": "2.0", "id": 2, "method": "session/resume",
-            "params": {"sessionId": session_id.clone(), "cwd": "/w",
-                       "mcpServers": [{"type": "acp", "id": "srv-1", "name": "katashiro"}]}
-        })).await;
+        send(
+            &mut c,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "session/resume",
+                "params": {"sessionId": session_id.clone(), "cwd": "/w",
+                           "mcpServers": [{"type": "acp", "id": "srv-1", "name": "katashiro"}]}
+            }),
+        )
+        .await;
         loop {
             let f = recv(&mut c).await;
             if f.get("method").and_then(Value::as_str) == Some("mcp/connect") {
-                send(&mut c, json!({
-                    "jsonrpc": "2.0", "id": f["id"].clone(),
-                    "result": {"connectionId": "conn-c"}
-                })).await;
+                send(
+                    &mut c,
+                    json!({
+                        "jsonrpc": "2.0", "id": f["id"].clone(),
+                        "result": {"connectionId": "conn-c"}
+                    }),
+                )
+                .await;
             } else if handled_inner_lifecycle(&mut c, &f).await == Some("initialize") {
                 break;
             }
@@ -4971,19 +5469,27 @@ mod acp_ws_integration {
         wait_for_tunnels(&registry, 1).await;
 
         // The OLDER connection now resumes declaring THE SAME id, and answers its handshake fully.
-        send(&mut b, json!({
-            "jsonrpc": "2.0", "id": 9, "method": "session/resume",
-            "params": {"sessionId": session_id, "cwd": "/w",
-                       "mcpServers": [{"type": "acp", "id": "srv-1", "name": "katashiro"}]}
-        })).await;
+        send(
+            &mut b,
+            json!({
+                "jsonrpc": "2.0", "id": 9, "method": "session/resume",
+                "params": {"sessionId": session_id, "cwd": "/w",
+                           "mcpServers": [{"type": "acp", "id": "srv-1", "name": "katashiro"}]}
+            }),
+        )
+        .await;
         let mut answered = false;
         while !answered {
             let f = recv(&mut b).await;
             if f.get("method").and_then(Value::as_str) == Some("mcp/connect") {
-                send(&mut b, json!({
-                    "jsonrpc": "2.0", "id": f["id"].clone(),
-                    "result": {"connectionId": "conn-b"}
-                })).await;
+                send(
+                    &mut b,
+                    json!({
+                        "jsonrpc": "2.0", "id": f["id"].clone(),
+                        "result": {"connectionId": "conn-b"}
+                    }),
+                )
+                .await;
             } else if handled_inner_lifecycle(&mut b, &f).await == Some("initialize") {
                 answered = true;
             }
@@ -4995,7 +5501,10 @@ mod acp_ws_integration {
             loop {
                 let f = recv(&mut c).await;
                 if f.get("method").and_then(Value::as_str) == Some("mcp/disconnect") {
-                    return f["params"]["connectionId"].as_str().unwrap_or("?").to_string();
+                    return f["params"]["connectionId"]
+                        .as_str()
+                        .unwrap_or("?")
+                        .to_string();
                 }
             }
         })
@@ -5007,7 +5516,11 @@ mod acp_ws_integration {
              late resume wins precisely because it ran late",
             stolen.ok()
         );
-        assert_eq!(registry.lock().unwrap().len(), 1, "exactly one tunnel must hold the slot");
+        assert_eq!(
+            registry.lock().unwrap().len(),
+            1,
+            "exactly one tunnel must hold the slot"
+        );
     }
 
     /// An older connection's late resume must not retire a NEWER connection's tunnel.
@@ -5032,26 +5545,38 @@ mod acp_ws_integration {
 
         // Connection C (newer) resumes the same session and adds srv-3 under a different name.
         let (mut c, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-        send(&mut c, json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": 1, "clientCapabilities": {}}
-        })).await;
+        send(
+            &mut c,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}}
+            }),
+        )
+        .await;
         let _ = recv(&mut c).await;
-        send(&mut c, json!({
-            "jsonrpc": "2.0", "id": 2, "method": "session/resume",
-            "params": {"sessionId": session_id.clone(), "cwd": "/w",
-                       "mcpServers": [{"type": "acp", "id": "srv-2", "name": "katashiro"},
-                                      {"type": "acp", "id": "srv-3", "name": "notes"}]}
-        })).await;
+        send(
+            &mut c,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "session/resume",
+                "params": {"sessionId": session_id.clone(), "cwd": "/w",
+                           "mcpServers": [{"type": "acp", "id": "srv-2", "name": "katashiro"},
+                                          {"type": "acp", "id": "srv-3", "name": "notes"}]}
+            }),
+        )
+        .await;
         loop {
             let f = recv(&mut c).await;
             if f.get("method").and_then(Value::as_str) == Some("mcp/connect")
                 && f["params"]["acpId"] == json!("srv-3")
             {
-                send(&mut c, json!({
-                    "jsonrpc": "2.0", "id": f["id"].clone(),
-                    "result": {"connectionId": "conn-c"}
-                })).await;
+                send(
+                    &mut c,
+                    json!({
+                        "jsonrpc": "2.0", "id": f["id"].clone(),
+                        "result": {"connectionId": "conn-c"}
+                    }),
+                )
+                .await;
             } else if handled_inner_lifecycle(&mut c, &f).await == Some("initialize") {
                 break;
             }
@@ -5059,11 +5584,15 @@ mod acp_ws_integration {
         wait_for_tunnels(&registry, 2).await;
 
         // Now the OLDER connection resumes, still declaring only what it knew about.
-        send(&mut b, json!({
-            "jsonrpc": "2.0", "id": 9, "method": "session/resume",
-            "params": {"sessionId": session_id, "cwd": "/w",
-                       "mcpServers": [{"type": "acp", "id": "srv-2", "name": "katashiro"}]}
-        })).await;
+        send(
+            &mut b,
+            json!({
+                "jsonrpc": "2.0", "id": 9, "method": "session/resume",
+                "params": {"sessionId": session_id, "cwd": "/w",
+                           "mcpServers": [{"type": "acp", "id": "srv-2", "name": "katashiro"}]}
+            }),
+        )
+        .await;
 
         // srv-3 belongs to a newer connection and must survive. Poll: a wrongful retire is async.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -5099,16 +5628,24 @@ mod acp_ws_integration {
         wait_for_tunnels(&registry, 1).await;
 
         let (mut b, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-        send(&mut b, json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": 1, "clientCapabilities": {}}
-        })).await;
+        send(
+            &mut b,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}}
+            }),
+        )
+        .await;
         let _ = recv(&mut b).await;
         // No `mcpServers` key at all.
-        send(&mut b, json!({
-            "jsonrpc": "2.0", "id": 2, "method": "session/resume",
-            "params": {"sessionId": session_id, "cwd": "/w"}
-        })).await;
+        send(
+            &mut b,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "session/resume",
+                "params": {"sessionId": session_id, "cwd": "/w"}
+            }),
+        )
+        .await;
         let resumed = recv(&mut b).await;
         assert!(resumed.get("result").is_some(), "resume failed: {resumed}");
 
@@ -5120,12 +5657,19 @@ mod acp_ws_integration {
         // reads as if it were the only thing standing between `null` and a full sweep, and the next
         // person to relax the schema needs the two facts in one place.
         for shape in [json!(null), json!({}), json!("nonsense")] {
-            send(&mut b, json!({
-                "jsonrpc": "2.0", "id": 3, "method": "session/resume",
-                "params": {"sessionId": session_id, "cwd": "/w", "mcpServers": shape}
-            })).await;
+            send(
+                &mut b,
+                json!({
+                    "jsonrpc": "2.0", "id": 3, "method": "session/resume",
+                    "params": {"sessionId": session_id, "cwd": "/w", "mcpServers": shape}
+                }),
+            )
+            .await;
             let r = recv(&mut b).await;
-            assert!(r.get("result").is_some() || r.get("error").is_some(), "no reply: {r}");
+            assert!(
+                r.get("result").is_some() || r.get("error").is_some(),
+                "no reply: {r}"
+            );
         }
 
         // The tunnel must stay. Poll, because a wrongful teardown is asynchronous.
@@ -5169,11 +5713,15 @@ mod acp_ws_integration {
         wait_for_tunnels(&registry, 1).await;
 
         // Same connection, same id, re-declared.
-        send(&mut a, json!({
-            "jsonrpc": "2.0", "id": 3, "method": "session/resume",
-            "params": {"sessionId": session_id, "cwd": "/w",
-                       "mcpServers": [{"type": "acp", "id": "srv-1", "name": "katashiro"}]}
-        })).await;
+        send(
+            &mut a,
+            json!({
+                "jsonrpc": "2.0", "id": 3, "method": "session/resume",
+                "params": {"sessionId": session_id, "cwd": "/w",
+                           "mcpServers": [{"type": "acp", "id": "srv-1", "name": "katashiro"}]}
+            }),
+        )
+        .await;
 
         // Nothing may be disconnected. A sweep-everything implementation retires conn-1 here and
         // then re-establishes it, which this catches; the correct implementation sends no
@@ -5182,7 +5730,10 @@ mod acp_ws_integration {
             loop {
                 let f = recv(&mut a).await;
                 if f.get("method").and_then(Value::as_str) == Some("mcp/disconnect") {
-                    return f["params"]["connectionId"].as_str().unwrap_or("?").to_string();
+                    return f["params"]["connectionId"]
+                        .as_str()
+                        .unwrap_or("?")
+                        .to_string();
                 }
             }
         })
@@ -5193,7 +5744,11 @@ mod acp_ws_integration {
              set is not 'registered minus declared', it is 'everything'",
             quiet.ok()
         );
-        assert_eq!(registry.lock().unwrap().len(), 1, "the tunnel must still be registered");
+        assert_eq!(
+            registry.lock().unwrap().len(),
+            1,
+            "the tunnel must still be registered"
+        );
     }
 
     /// A resume on a NEW connection that stops declaring a server retires its tunnel.
@@ -5220,15 +5775,23 @@ mod acp_ws_integration {
 
         // Connection 2 — a genuine reconnect — resumes the same session declaring NOTHING.
         let (mut b, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-        send(&mut b, json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": 1, "clientCapabilities": {}}
-        })).await;
+        send(
+            &mut b,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}}
+            }),
+        )
+        .await;
         let _ = recv(&mut b).await;
-        send(&mut b, json!({
-            "jsonrpc": "2.0", "id": 2, "method": "session/resume",
-            "params": {"sessionId": session_id, "cwd": "/w", "mcpServers": []}
-        })).await;
+        send(
+            &mut b,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "session/resume",
+                "params": {"sessionId": session_id, "cwd": "/w", "mcpServers": []}
+            }),
+        )
+        .await;
         let resumed = recv(&mut b).await;
         assert!(resumed.get("result").is_some(), "resume failed: {resumed}");
 
@@ -5285,10 +5848,14 @@ mod acp_ws_integration {
 
         // Socket A: declare `katashiro` as srv-1, then STALL — do not answer its `mcp/connect`.
         let (mut a, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-        send(&mut a, json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": 1, "clientCapabilities": {}}
-        })).await;
+        send(
+            &mut a,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}}
+            }),
+        )
+        .await;
         let _ = recv(&mut a).await;
         send(&mut a, json!({
             "jsonrpc": "2.0", "id": 2, "method": "session/new",
@@ -5311,23 +5878,35 @@ mod acp_ws_integration {
         // Socket B: resume the SAME session — same channel — declaring the same name as srv-2, and
         // carry it all the way to registered. This is the newer attach.
         let (mut b, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-        send(&mut b, json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": 1, "clientCapabilities": {}}
-        })).await;
+        send(
+            &mut b,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}}
+            }),
+        )
+        .await;
         let _ = recv(&mut b).await;
-        send(&mut b, json!({
-            "jsonrpc": "2.0", "id": 2, "method": "session/resume",
-            "params": {"sessionId": session_id, "cwd": "/w",
-                       "mcpServers": [{"type": "acp", "id": "srv-2", "name": "katashiro"}]}
-        })).await;
+        send(
+            &mut b,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "session/resume",
+                "params": {"sessionId": session_id, "cwd": "/w",
+                           "mcpServers": [{"type": "acp", "id": "srv-2", "name": "katashiro"}]}
+            }),
+        )
+        .await;
         loop {
             let f = recv(&mut b).await;
             if f.get("method").and_then(Value::as_str) == Some("mcp/connect") {
-                send(&mut b, json!({
-                    "jsonrpc": "2.0", "id": f["id"].clone(),
-                    "result": {"connectionId": "conn-new"}
-                })).await;
+                send(
+                    &mut b,
+                    json!({
+                        "jsonrpc": "2.0", "id": f["id"].clone(),
+                        "result": {"connectionId": "conn-new"}
+                    }),
+                )
+                .await;
             } else if handled_inner_lifecycle(&mut b, &f).await == Some("initialize") {
                 break;
             }
@@ -5335,10 +5914,14 @@ mod acp_ws_integration {
         wait_for_tunnels(&registry, 1).await;
 
         // Now let the OLDER establish finish.
-        send(&mut a, json!({
-            "jsonrpc": "2.0", "id": a_connect_id.unwrap(),
-            "result": {"connectionId": "conn-old"}
-        })).await;
+        send(
+            &mut a,
+            json!({
+                "jsonrpc": "2.0", "id": a_connect_id.unwrap(),
+                "result": {"connectionId": "conn-old"}
+            }),
+        )
+        .await;
         loop {
             let f = recv(&mut a).await;
             if handled_inner_lifecycle(&mut a, &f).await == Some("initialize") {
@@ -5404,10 +5987,14 @@ mod acp_ws_integration {
 
         // Socket A declares srv-1 and stalls with its `mcp/connect` unanswered.
         let (mut a, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-        send(&mut a, json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": 1, "clientCapabilities": {}}
-        })).await;
+        send(
+            &mut a,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}}
+            }),
+        )
+        .await;
         let _ = recv(&mut a).await;
         send(&mut a, json!({
             "jsonrpc": "2.0", "id": 2, "method": "session/new",
@@ -5426,23 +6013,35 @@ mod acp_ws_integration {
 
         // Socket B reconnects and re-declares THE SAME id, completing fully.
         let (mut b, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-        send(&mut b, json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": 1, "clientCapabilities": {}}
-        })).await;
+        send(
+            &mut b,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}}
+            }),
+        )
+        .await;
         let _ = recv(&mut b).await;
-        send(&mut b, json!({
-            "jsonrpc": "2.0", "id": 2, "method": "session/resume",
-            "params": {"sessionId": session_id.unwrap(), "cwd": "/w",
-                       "mcpServers": [{"type": "acp", "id": "srv-1", "name": "katashiro"}]}
-        })).await;
+        send(
+            &mut b,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "session/resume",
+                "params": {"sessionId": session_id.unwrap(), "cwd": "/w",
+                           "mcpServers": [{"type": "acp", "id": "srv-1", "name": "katashiro"}]}
+            }),
+        )
+        .await;
         loop {
             let f = recv(&mut b).await;
             if f.get("method").and_then(Value::as_str) == Some("mcp/connect") {
-                send(&mut b, json!({
-                    "jsonrpc": "2.0", "id": f["id"].clone(),
-                    "result": {"connectionId": "conn-new"}
-                })).await;
+                send(
+                    &mut b,
+                    json!({
+                        "jsonrpc": "2.0", "id": f["id"].clone(),
+                        "result": {"connectionId": "conn-new"}
+                    }),
+                )
+                .await;
             } else if handled_inner_lifecycle(&mut b, &f).await == Some("initialize") {
                 break;
             }
@@ -5450,10 +6049,14 @@ mod acp_ws_integration {
         wait_for_tunnels(&registry, 1).await;
 
         // Now let the OLDER establish finish, on the same key.
-        send(&mut a, json!({
-            "jsonrpc": "2.0", "id": a_connect_id.unwrap(),
-            "result": {"connectionId": "conn-old"}
-        })).await;
+        send(
+            &mut a,
+            json!({
+                "jsonrpc": "2.0", "id": a_connect_id.unwrap(),
+                "result": {"connectionId": "conn-old"}
+            }),
+        )
+        .await;
         loop {
             let f = recv(&mut a).await;
             if handled_inner_lifecycle(&mut a, &f).await == Some("initialize") {
@@ -5472,15 +6075,21 @@ mod acp_ws_integration {
                 }
             }
         };
-        let disconnected =
-            tokio::time::timeout(std::time::Duration::from_secs(10), wait_disconnect)
-                .await
-                .expect(
-                    "an older establish reusing the same server_id overwrote the newer live handle \
+        let disconnected = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            wait_disconnect,
+        )
+        .await
+        .expect(
+            "an older establish reusing the same server_id overwrote the newer live handle \
                      instead of standing down — same-key ordering is not enforced",
-                );
+        );
         assert_eq!(disconnected, "conn-old");
-        assert_eq!(registry.lock().unwrap().len(), 1, "exactly one tunnel must remain");
+        assert_eq!(
+            registry.lock().unwrap().len(),
+            1,
+            "exactly one tunnel must remain"
+        );
     }
 
     /// A server that *succeeds* at `initialize` but answers a protocol version we do not speak
@@ -5501,10 +6110,14 @@ mod acp_ws_integration {
     async fn a_server_answering_an_unsupported_protocol_version_is_not_registered() {
         let (url, registry) = serve().await;
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-        send(&mut ws, json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": 1, "clientCapabilities": {}}
-        })).await;
+        send(
+            &mut ws,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}}
+            }),
+        )
+        .await;
         let _ = recv(&mut ws).await;
         send(&mut ws, json!({
             "jsonrpc": "2.0", "id": 2, "method": "session/new",
@@ -5528,20 +6141,28 @@ mod acp_ws_integration {
             let f = recv(&mut ws).await;
             match f.get("method").and_then(Value::as_str) {
                 Some("mcp/connect") => {
-                    send(&mut ws, json!({
-                        "jsonrpc": "2.0", "id": f["id"].clone(),
-                        "result": {"connectionId": "conn-1"}
-                    })).await;
+                    send(
+                        &mut ws,
+                        json!({
+                            "jsonrpc": "2.0", "id": f["id"].clone(),
+                            "result": {"connectionId": "conn-1"}
+                        }),
+                    )
+                    .await;
                 }
                 Some("mcp/message") if f["params"]["method"] == json!("initialize") => {
-                    send(&mut ws, json!({
-                        "jsonrpc": "2.0", "id": f["id"].clone(),
-                        "result": {
-                            "protocolVersion": "2019-01-01",
-                            "capabilities": { "tools": {} },
-                            "serverInfo": { "name": "old-ext", "version": "0" }
-                        }
-                    })).await;
+                    send(
+                        &mut ws,
+                        json!({
+                            "jsonrpc": "2.0", "id": f["id"].clone(),
+                            "result": {
+                                "protocolVersion": "2019-01-01",
+                                "capabilities": { "tools": {} },
+                                "serverInfo": { "name": "old-ext", "version": "0" }
+                            }
+                        }),
+                    )
+                    .await;
                     answered = true;
                 }
                 _ => {}
@@ -5600,10 +6221,15 @@ mod acp_ws_integration {
         // Server side, exactly as core reaches a session's tunnel.
         let handle = {
             let reg = registry.lock().unwrap();
-            reg.values().next().expect("a tunnel must be registered").clone()
+            reg.values()
+                .next()
+                .expect("a tunnel must be registered")
+                .clone()
         };
         let call = tokio::spawn(async move {
-            handle.mcp_message("tools/call", Some(json!({"name": "katashiro.click"})), 5).await
+            handle
+                .mcp_message("tools/call", Some(json!({"name": "katashiro.click"})), 5)
+                .await
         });
 
         let framed = recv(&mut ws).await;
@@ -5612,10 +6238,14 @@ mod acp_ws_integration {
         assert_eq!(framed["params"]["method"], json!("tools/call"));
         assert_eq!(framed["params"]["params"]["name"], json!("katashiro.click"));
 
-        send(&mut ws, json!({
-            "jsonrpc": "2.0", "id": framed["id"].clone(),
-            "result": {"content": [{"type": "text", "text": "clicked"}]}
-        })).await;
+        send(
+            &mut ws,
+            json!({
+                "jsonrpc": "2.0", "id": framed["id"].clone(),
+                "result": {"content": [{"type": "text", "text": "clicked"}]}
+            }),
+        )
+        .await;
 
         let got = call.await.unwrap().expect("the call must succeed");
         assert_eq!(got["content"][0]["text"], json!("clicked"));
@@ -5637,12 +6267,19 @@ mod acp_ws_integration {
         let call = tokio::spawn(async move { handle.mcp_message("tools/call", None, 5).await });
 
         let framed = recv(&mut ws).await;
-        send(&mut ws, json!({
-            "jsonrpc": "2.0", "id": framed["id"].clone(),
-            "error": {"code": -32603, "message": "no active tab"}
-        })).await;
+        send(
+            &mut ws,
+            json!({
+                "jsonrpc": "2.0", "id": framed["id"].clone(),
+                "error": {"code": -32603, "message": "no active tab"}
+            }),
+        )
+        .await;
 
-        let err = call.await.unwrap().expect_err("a remote error must not read as success");
+        let err = call
+            .await
+            .unwrap()
+            .expect_err("a remote error must not read as success");
         assert!(
             err.contains("no active tab"),
             "the client's message must reach the caller, got: {err}"
@@ -5690,7 +6327,10 @@ mod acp_ws_integration {
             "a cancellation is a notification: giving it an `id` would oblige a reply nobody reads"
         );
 
-        let err = call.await.unwrap().expect_err("a timed-out call must not read as success");
+        let err = call
+            .await
+            .unwrap()
+            .expect_err("a timed-out call must not read as success");
         assert!(err.contains("timed out"), "got: {err}");
     }
 
@@ -5708,10 +6348,14 @@ mod acp_ws_integration {
     async fn pending_tunnel_establishes_do_not_consume_the_prompt_budget() {
         let (url, _registry) = serve().await;
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-        send(&mut ws, json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": 1, "clientCapabilities": {}}
-        })).await;
+        send(
+            &mut ws,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}}
+            }),
+        )
+        .await;
         let _ = recv(&mut ws).await;
 
         // Enough sessions to park strictly more than MAX_INFLIGHT_PROMPTS establishes.
@@ -5734,10 +6378,14 @@ mod acp_ws_integration {
             let servers: Vec<Value> = (0..MAX_ACP_SERVERS_PER_SESSION)
                 .map(|i| json!({"type": "acp", "id": format!("s{n}-{i}"), "name": format!("n{n}-{i}")}))
                 .collect();
-            send(&mut ws, json!({
-                "jsonrpc": "2.0", "id": req_id, "method": "session/new",
-                "params": {"cwd": "/w", "mcpServers": servers}
-            })).await;
+            send(
+                &mut ws,
+                json!({
+                    "jsonrpc": "2.0", "id": req_id, "method": "session/new",
+                    "params": {"cwd": "/w", "mcpServers": servers}
+                }),
+            )
+            .await;
             // Collect this session's response; mcp/connect frames are observed and NEVER answered,
             // which is what keeps each establish task in flight.
             let mut got_resp = false;
@@ -5810,11 +6458,12 @@ mod acp_ws_integration {
         // substring check is satisfied by every OTHER error too — a session-not-found, a params
         // error, or the budget message itself once someone rewords it — so it could only ever fail
         // for one spelling of one regression, and would pass silently through the rest.
-        let err = f
-            .get("error")
-            .unwrap_or_else(|| panic!("the prompt must reach the backend and fail there, got: {f}"));
+        let err = f.get("error").unwrap_or_else(|| {
+            panic!("the prompt must reach the backend and fail there, got: {f}")
+        });
         assert_eq!(
-            err["message"], json!("No agent backend connected"),
+            err["message"],
+            json!("No agent backend connected"),
             "{connects} parked mcp/connects must not spend the prompt budget; the prompt must \
              reach the backend and fail only for the missing backend, got: {f}"
         );
@@ -5832,18 +6481,26 @@ mod acp_ws_integration {
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
 
         // Declare TWO servers, answer both mcp/connect calls.
-        send(&mut ws, json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": 1, "clientCapabilities": {}}
-        })).await;
+        send(
+            &mut ws,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}}
+            }),
+        )
+        .await;
         let _ = recv(&mut ws).await;
-        send(&mut ws, json!({
-            "jsonrpc": "2.0", "id": 2, "method": "session/new",
-            "params": {"cwd": "/w", "mcpServers": [
-                {"type": "acp", "id": "keep-1", "name": "katashiro"},
-                {"type": "acp", "id": "drop-1", "name": "other"}
-            ]}
-        })).await;
+        send(
+            &mut ws,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "session/new",
+                "params": {"cwd": "/w", "mcpServers": [
+                    {"type": "acp", "id": "keep-1", "name": "katashiro"},
+                    {"type": "acp", "id": "drop-1", "name": "other"}
+                ]}
+            }),
+        )
+        .await;
         // Two servers: two `mcp/connect`s AND two lifecycle pairs (initialize + notification).
         // Exiting on the connects alone leaves the handshakes unread and both establishes fail.
         let mut session_id = None;
@@ -5857,10 +6514,14 @@ mod acp_ws_integration {
             }
             if f.get("method").and_then(Value::as_str) == Some("mcp/connect") {
                 let acp_id = f["params"]["acpId"].as_str().unwrap().to_string();
-                send(&mut ws, json!({
-                    "jsonrpc": "2.0", "id": f["id"].clone(),
-                    "result": {"connectionId": format!("conn-{acp_id}")}
-                })).await;
+                send(
+                    &mut ws,
+                    json!({
+                        "jsonrpc": "2.0", "id": f["id"].clone(),
+                        "result": {"connectionId": format!("conn-{acp_id}")}
+                    }),
+                )
+                .await;
                 connects += 1;
             } else if f.get("id") == Some(&json!(2)) {
                 session_id = Some(f["result"]["sessionId"].as_str().unwrap().to_string());
@@ -5869,14 +6530,18 @@ mod acp_ws_integration {
         wait_for_tunnels(&registry, 2).await;
 
         // Resume declaring ONLY the first — "other" is withdrawn.
-        send(&mut ws, json!({
-            "jsonrpc": "2.0", "id": 3, "method": "session/resume",
-            "params": {
-                "sessionId": session_id.unwrap(),
-                "cwd": "/w",
-                "mcpServers": [{"type": "acp", "id": "keep-2", "name": "katashiro"}]
-            }
-        })).await;
+        send(
+            &mut ws,
+            json!({
+                "jsonrpc": "2.0", "id": 3, "method": "session/resume",
+                "params": {
+                    "sessionId": session_id.unwrap(),
+                    "cwd": "/w",
+                    "mcpServers": [{"type": "acp", "id": "keep-2", "name": "katashiro"}]
+                }
+            }),
+        )
+        .await;
 
         // TWO disconnects are owed here, for different reasons, and both are correct:
         //   - `conn-drop-1` because the resume WITHDREW that declaration (this item), and
@@ -5897,10 +6562,14 @@ mod acp_ws_integration {
                     disconnected.push(f["params"]["connectionId"].as_str().unwrap().to_string());
                 }
                 Some("mcp/connect") => {
-                    send(&mut ws, json!({
-                        "jsonrpc": "2.0", "id": f["id"].clone(),
-                        "result": {"connectionId": "conn-keep-2"}
-                    })).await;
+                    send(
+                        &mut ws,
+                        json!({
+                            "jsonrpc": "2.0", "id": f["id"].clone(),
+                            "result": {"connectionId": "conn-keep-2"}
+                        }),
+                    )
+                    .await;
                     reconnected = true;
                 }
                 _ => {}
@@ -5944,8 +6613,11 @@ mod acp_ws_integration {
         let (url, _registry) = serve().await;
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
         let oversized = "x".repeat(super::MAX_FRAME_BYTES + 64);
-        send(&mut ws, json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "pad": oversized}))
-            .await;
+        send(
+            &mut ws,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "pad": oversized}),
+        )
+        .await;
 
         // The connection must go away rather than answer. Bounded so a regression that keeps it
         // open fails here instead of hanging.
@@ -5979,22 +6651,36 @@ mod acp_ws_integration {
         // Over 1 MiB, comfortably under 8 MiB — so it reaches the per-kind check, not the
         // transport one. Asserting the gap between the two ceilings is the point.
         let pad = "y".repeat(super::MAX_NON_TUNNEL_FRAME_BYTES + 4096);
-        assert!(pad.len() < super::MAX_FRAME_BYTES, "must not trip the transport ceiling");
-        send(&mut ws, json!({
-            "jsonrpc": "2.0", "id": 7, "method": "initialize",
-            "params": {"protocolVersion": 1, "clientCapabilities": {}, "pad": pad}
-        })).await;
+        assert!(
+            pad.len() < super::MAX_FRAME_BYTES,
+            "must not trip the transport ceiling"
+        );
+        send(
+            &mut ws,
+            json!({
+                "jsonrpc": "2.0", "id": 7, "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}, "pad": pad}
+            }),
+        )
+        .await;
 
         let resp = recv(&mut ws).await;
         assert_eq!(resp["id"], json!(7));
-        assert!(resp.get("error").is_some(), "an oversized request must be answered with an error: {resp}");
+        assert!(
+            resp.get("error").is_some(),
+            "an oversized request must be answered with an error: {resp}"
+        );
 
         // And the connection still works — the discriminating half. A regression that closed here
         // would satisfy every assertion above.
-        send(&mut ws, json!({
-            "jsonrpc": "2.0", "id": 8, "method": "initialize",
-            "params": {"protocolVersion": 1, "clientCapabilities": {}}
-        })).await;
+        send(
+            &mut ws,
+            json!({
+                "jsonrpc": "2.0", "id": 8, "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}}
+            }),
+        )
+        .await;
         let after = recv(&mut ws).await;
         assert_eq!(after["id"], json!(8));
         assert!(
@@ -6048,24 +6734,32 @@ mod acp_ws_integration {
     async fn two_same_name_servers_in_one_session_evict_down_to_one() {
         let (url, registry) = serve().await;
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-        send(&mut ws, json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": 1, "clientCapabilities": {}}
-        })).await;
+        send(
+            &mut ws,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}}
+            }),
+        )
+        .await;
         let init = recv(&mut ws).await;
         assert!(init.get("result").is_some(), "initialize failed: {init}");
 
         // Same name, different ids — accepted, because the dedup key is the id.
-        send(&mut ws, json!({
-            "jsonrpc": "2.0", "id": 2, "method": "session/new",
-            "params": {
-                "cwd": "/w",
-                "mcpServers": [
-                    {"type": "acp", "id": "uuid-a", "name": "katashiro"},
-                    {"type": "acp", "id": "uuid-b", "name": "katashiro"}
-                ]
-            }
-        })).await;
+        send(
+            &mut ws,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "session/new",
+                "params": {
+                    "cwd": "/w",
+                    "mcpServers": [
+                        {"type": "acp", "id": "uuid-a", "name": "katashiro"},
+                        {"type": "acp", "id": "uuid-b", "name": "katashiro"}
+                    ]
+                }
+            }),
+        )
+        .await;
 
         // Answer both connects, absorb both inner lifecycles, and wait for the disconnect the
         // loser is owed. Bounded so a regression fails naming what was missing rather than
@@ -6093,28 +6787,45 @@ mod acp_ws_integration {
             }
             match frame.get("method").and_then(Value::as_str) {
                 Some("mcp/connect") => {
-                    let acp_id = frame["params"]["acpId"].as_str().expect("acpId").to_string();
+                    let acp_id = frame["params"]["acpId"]
+                        .as_str()
+                        .expect("acpId")
+                        .to_string();
                     let conn = format!("conn-{}", acp_id.trim_start_matches("uuid-"));
                     connected.insert(acp_id, conn.clone());
-                    send(&mut ws, json!({
-                        "jsonrpc": "2.0", "id": frame["id"].clone(),
-                        "result": {"connectionId": conn}
-                    })).await;
+                    send(
+                        &mut ws,
+                        json!({
+                            "jsonrpc": "2.0", "id": frame["id"].clone(),
+                            "result": {"connectionId": conn}
+                        }),
+                    )
+                    .await;
                 }
                 Some("mcp/disconnect") => {
                     disconnected = Some(
-                        frame["params"]["connectionId"].as_str().expect("connectionId").to_string(),
+                        frame["params"]["connectionId"]
+                            .as_str()
+                            .expect("connectionId")
+                            .to_string(),
                     );
                 }
                 _ => {
                     if frame.get("id") == Some(&json!(2)) {
-                        assert!(frame.get("result").is_some(), "session/new refused: {frame}");
+                        assert!(
+                            frame.get("result").is_some(),
+                            "session/new refused: {frame}"
+                        );
                         session_seen = true;
                     }
                 }
             }
         }
-        assert_eq!(connected.len(), 2, "both declared servers must be asked to connect");
+        assert_eq!(
+            connected.len(),
+            2,
+            "both declared servers must be asked to connect"
+        );
         let evicted = disconnected.expect(
             "the evicted tunnel is owed an mcp/disconnect — if this is missing, the eviction \
              branch did not run and this scenario no longer covers it",
@@ -6125,7 +6836,11 @@ mod acp_ws_integration {
             let reg = registry.lock().unwrap();
             reg.values().map(|h| h.connection_id.clone()).collect()
         };
-        assert_eq!(survivors.len(), 1, "last-attach-wins must collapse the name to one tunnel");
+        assert_eq!(
+            survivors.len(),
+            1,
+            "last-attach-wins must collapse the name to one tunnel"
+        );
         assert_ne!(
             survivors[0], evicted,
             "the disconnect must name the tunnel that LOST, not the one still registered"
@@ -6154,19 +6869,27 @@ mod acp_ws_integration {
         // The client comes back on a fresh socket and resumes, re-declaring under the same name
         // with the fresh id its runtime mints per connection.
         let (mut second, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
-        send(&mut second, json!({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": 1, "clientCapabilities": {}}
-        })).await;
+        send(
+            &mut second,
+            json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": 1, "clientCapabilities": {}}
+            }),
+        )
+        .await;
         let _ = recv(&mut second).await;
-        send(&mut second, json!({
-            "jsonrpc": "2.0", "id": 2, "method": "session/resume",
-            "params": {
-                "sessionId": session_id,
-                "cwd": "/w",
-                "mcpServers": [{"type": "acp", "id": "uuid-new", "name": "katashiro"}]
-            }
-        })).await;
+        send(
+            &mut second,
+            json!({
+                "jsonrpc": "2.0", "id": 2, "method": "session/resume",
+                "params": {
+                    "sessionId": session_id,
+                    "cwd": "/w",
+                    "mcpServers": [{"type": "acp", "id": "uuid-new", "name": "katashiro"}]
+                }
+            }),
+        )
+        .await;
         let mut connected_new = false;
         let mut new_lifecycle = 0;
         while !connected_new || new_lifecycle < 2 {
@@ -6176,10 +6899,14 @@ mod acp_ws_integration {
                 continue;
             }
             if frame.get("method").and_then(Value::as_str) == Some("mcp/connect") {
-                send(&mut second, json!({
-                    "jsonrpc": "2.0", "id": frame["id"].clone(),
-                    "result": {"connectionId": "conn-new"}
-                })).await;
+                send(
+                    &mut second,
+                    json!({
+                        "jsonrpc": "2.0", "id": frame["id"].clone(),
+                        "result": {"connectionId": "conn-new"}
+                    }),
+                )
+                .await;
                 connected_new = true;
             }
             if frame.get("id") == Some(&json!(2)) {
@@ -6214,7 +6941,8 @@ mod acp_ws_integration {
         let framed = recv(&mut first).await;
         assert_eq!(framed["method"], json!("mcp/disconnect"));
         assert_eq!(
-            framed["params"]["connectionId"], json!("conn-old"),
+            framed["params"]["connectionId"],
+            json!("conn-old"),
             "the evicted connection is the one owed a disconnect, not its replacement"
         );
 
@@ -6223,7 +6951,11 @@ mod acp_ws_integration {
             let reg = registry.lock().unwrap();
             reg.values().map(|h| h.connection_id.clone()).collect()
         };
-        assert_eq!(names, vec!["conn-new".to_string()], "only the newest tunnel may remain");
+        assert_eq!(
+            names,
+            vec!["conn-new".to_string()],
+            "only the newest tunnel may remain"
+        );
 
         // The survivor must WORK, not merely be present in the registry: a replacement that
         // registers a handle whose socket is gone satisfies every assertion above. This is the
@@ -6236,23 +6968,36 @@ mod acp_ws_integration {
         // the reason, where a missing-frame check could only time out.
         let handle = {
             let reg = registry.lock().unwrap();
-            reg.values().next().expect("the survivor must be registered").clone()
+            reg.values()
+                .next()
+                .expect("the survivor must be registered")
+                .clone()
         };
         let call = tokio::spawn(async move {
-            handle.mcp_message("tools/call", Some(json!({"name": "katashiro.click"})), 5).await
+            handle
+                .mcp_message("tools/call", Some(json!({"name": "katashiro.click"})), 5)
+                .await
         });
 
         let request = recv(&mut second).await;
         assert_eq!(
-            request["method"], json!("mcp/message"),
+            request["method"],
+            json!("mcp/message"),
             "the next frame owed to the surviving connection is the tool call, not a disconnect"
         );
         assert_eq!(request["params"]["connectionId"], json!("conn-new"));
-        send(&mut second, json!({
-            "jsonrpc": "2.0", "id": request["id"].clone(),
-            "result": {"content": [{"type": "text", "text": "clicked"}]}
-        })).await;
-        let got = call.await.unwrap().expect("the surviving tunnel must carry a call");
+        send(
+            &mut second,
+            json!({
+                "jsonrpc": "2.0", "id": request["id"].clone(),
+                "result": {"content": [{"type": "text", "text": "clicked"}]}
+            }),
+        )
+        .await;
+        let got = call
+            .await
+            .unwrap()
+            .expect("the surviving tunnel must carry a call");
         assert_eq!(got["content"][0]["text"], json!("clicked"));
     }
 }
@@ -6293,14 +7038,25 @@ mod acp_log_redaction {
         let channel_id = format!("acp_{uuid}");
         let tag = redact_id(&channel_id);
 
-        assert_eq!(tag, redact_id(&channel_id), "same id must tag identically, or logs stop \
-                                                 being correlatable across lines");
-        assert!(!tag.contains(&uuid.to_string()), "the uuid must not survive into the tag");
+        assert_eq!(
+            tag,
+            redact_id(&channel_id),
+            "same id must tag identically, or logs stop \
+                                                 being correlatable across lines"
+        );
+        assert!(
+            !tag.contains(&uuid.to_string()),
+            "the uuid must not survive into the tag"
+        );
         assert!(
             !tag.contains(&channel_id) && !channel_id.contains(&tag[1..]),
             "the tag must not be a substring of the id or vice versa"
         );
-        assert_ne!(tag, redact_id(&format!("acp_{}", Uuid::new_v4())), "different ids differ");
+        assert_ne!(
+            tag,
+            redact_id(&format!("acp_{}", Uuid::new_v4())),
+            "different ids differ"
+        );
     }
 
     /// No `info!`/`warn!`/`error!` in this file may carry a raw channel or session id.
@@ -6343,7 +7099,10 @@ mod acp_log_redaction {
                     let line = src[..start].matches('\n').count() + 1;
                     offenders.push(format!(
                         "{line}: {}",
-                        body.split_whitespace().take(8).collect::<Vec<_>>().join(" ")
+                        body.split_whitespace()
+                            .take(8)
+                            .collect::<Vec<_>>()
+                            .join(" ")
                     ));
                 }
             }
@@ -6391,7 +7150,10 @@ mod acp_teardown_ownership {
         {
             let mut r = reg.lock().unwrap();
             // The successor: same channel, fresh server id, different connection.
-            r.insert(("acp_x".into(), "srv-new".into()), tunnel("conn-B", "cid-new"));
+            r.insert(
+                ("acp_x".into(), "srv-new".into()),
+                tunnel("conn-B", "cid-new"),
+            );
         }
         teardown(&reg, &["acp_x"], "conn-A");
 
@@ -6414,8 +7176,14 @@ mod acp_teardown_ownership {
         teardown(&reg, &["acp_x"], "conn-A");
 
         let r = reg.lock().unwrap();
-        assert!(!r.contains_key(&("acp_x".to_string(), "srv-a".to_string())), "conn-A's own tunnel must go");
-        assert!(r.contains_key(&("acp_x".to_string(), "srv-b".to_string())), "conn-B's must stay");
+        assert!(
+            !r.contains_key(&("acp_x".to_string(), "srv-a".to_string())),
+            "conn-A's own tunnel must go"
+        );
+        assert!(
+            r.contains_key(&("acp_x".to_string(), "srv-b".to_string())),
+            "conn-B's must stay"
+        );
         assert_eq!(r.len(), 1);
     }
 
@@ -6430,7 +7198,12 @@ mod acp_teardown_ownership {
             let (tx, _rx) = mpsc::unbounded_channel::<ReplyChunk>();
             reg.lock().unwrap().insert(
                 "acp_x".into(),
-                ReplySink { turn_id: "evt_new".into(), tx, owner: "conn-B".into(), generation: 0 },
+                ReplySink {
+                    turn_id: "evt_new".into(),
+                    tx,
+                    owner: "conn-B".into(),
+                    generation: 0,
+                },
             );
         }
         {
@@ -6445,5 +7218,4 @@ mod acp_teardown_ownership {
             "conn-A's cleanup must leave conn-B's sink in place, or the live session goes mute"
         );
     }
-
 }

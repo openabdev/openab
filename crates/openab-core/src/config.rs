@@ -133,7 +133,8 @@ fn default_mcp_listen() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct AgentCoreConfig {    /// AgentCore Runtime ARN (required)
+pub struct AgentCoreConfig {
+    /// AgentCore Runtime ARN (required)
     pub runtime_arn: String,
     /// ACP agent command to run in the PTY shell (default: kiro-cli acp --trust-all-tools)
     #[serde(default = "default_agentcore_shell_command")]
@@ -3016,9 +3017,7 @@ allowed_users = ["U1234567890abcdef0123456789abcdef"]
         // --- use_adc: config value resolves without touching env ---
         let r = GoogleChatConfig {
             use_adc: Some(true),
-            adc_target_service_account: Some(
-                "chat-bot@project.iam.gserviceaccount.com".into(),
-            ),
+            adc_target_service_account: Some("chat-bot@project.iam.gserviceaccount.com".into()),
             ..Default::default()
         }
         .resolve();

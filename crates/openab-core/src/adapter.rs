@@ -4,7 +4,9 @@ use serde::Serialize;
 use std::sync::Arc;
 use tracing::{error, warn};
 
-use crate::acp::{classify_notification, parse_turn_result, AcpEvent, ContentBlock, SessionPool, TurnResult};
+use crate::acp::{
+    classify_notification, parse_turn_result, AcpEvent, ContentBlock, SessionPool, TurnResult,
+};
 use crate::config::{ReactionsConfig, ToolDisplay};
 use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
@@ -72,7 +74,12 @@ pub fn parse_output_directives(content: &str) -> (OutputDirectives, String) {
                         "reply_to" => {
                             let v = value.trim();
                             // Validate: non-empty, reasonable length, no whitespace/control chars
-                            if !v.is_empty() && v.len() <= 64 && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_') {
+                            if !v.is_empty()
+                                && v.len() <= 64
+                                && v.chars().all(|c| {
+                                    c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_'
+                                })
+                            {
                                 directives.reply_to = Some(v.to_string());
                             }
                         }
@@ -1388,16 +1395,17 @@ fn contains_bot_mention(content: &str) -> bool {
     while i + 2 < bytes.len() {
         if bytes[i] == b'<' && bytes[i + 1] == b'@' {
             // Skip optional '!' (nickname mention) or '&' (role mention)
-            let start = if i + 2 < bytes.len()
-                && (bytes[i + 2] == b'!' || bytes[i + 2] == b'&')
-            {
+            let start = if i + 2 < bytes.len() && (bytes[i + 2] == b'!' || bytes[i + 2] == b'&') {
                 i + 3
             } else {
                 i + 2
             };
             if start < bytes.len() && bytes[start].is_ascii_digit() {
                 if let Some(end) = content[start..].find('>') {
-                    if content[start..start + end].chars().all(|c| c.is_ascii_digit()) {
+                    if content[start..start + end]
+                        .chars()
+                        .all(|c| c.is_ascii_digit())
+                    {
                         return true;
                     }
                 }
@@ -1626,8 +1634,7 @@ fn compose_display(
                         // matches the sibling finished-fallback summary and
                         // the pre-PR raw-count behaviour that users are used
                         // to. A hidden group of `a×2` contributes 2, not 1.
-                        let hidden_groups =
-                            running_groups.len() - TOOL_COLLAPSE_THRESHOLD;
+                        let hidden_groups = running_groups.len() - TOOL_COLLAPSE_THRESHOLD;
                         let hidden_calls: usize = running_groups
                             .iter()
                             .take(hidden_groups)
@@ -1736,7 +1743,11 @@ fn propagate_mentions_to_chunks(
             } else {
                 let footer = format!(
                     "\n{}",
-                    missing.iter().map(|m| m.as_str()).collect::<Vec<_>>().join(" ")
+                    missing
+                        .iter()
+                        .map(|m| m.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
                 );
                 if chunk.chars().count() + footer.chars().count() <= limit {
                     format!("{chunk}{footer}")
@@ -1761,7 +1772,10 @@ mod tests {
         assert_eq!(reply_message_limit("slack", 4096), 4096);
         // and a long reply under the ACP limit is a single chunk (delivered whole)
         let long = "x".repeat(50_000);
-        assert_eq!(crate::format::split_message(&long, reply_message_limit("acp", 4096)).len(), 1);
+        assert_eq!(
+            crate::format::split_message(&long, reply_message_limit("acp", 4096)).len(),
+            1
+        );
     }
 
     #[test]
@@ -2101,7 +2115,10 @@ mod tests {
             tool("3", "grep", ToolState::Completed),
         ];
         let out = compose_display(&tools, "done", false, ToolDisplay::Full);
-        assert!(!out.contains("(×"), "should not collapse across order: {out}");
+        assert!(
+            !out.contains("(×"),
+            "should not collapse across order: {out}"
+        );
         assert_eq!(out.matches("`grep`").count(), 2, "output: {out}");
         assert_eq!(out.matches("`curl`").count(), 1, "output: {out}");
     }

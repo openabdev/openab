@@ -546,10 +546,30 @@ recovery semantics:
   instance's live id return the same `POLICY_DENIED` error object, byte for
   byte, so cancel cannot be used as an existence oracle for other tenants'
   delegation ids. The CP's own logs keep the distinction.
-- **CP restart semantics.** A CP restart is equivalent to every lease
-  expiring at once *with* the connection closure that implies — except that
-  the CP is not there to send it: the in-flight table and the sockets die
-  together with the process, so no synthesized `timeout` or
+- **CP restart semantics.** A *graceful* CP stop (SIGTERM/SIGHUP/SIGINT)
+  drains first: every in-flight delegation is resolved — initiators get a
+  synthesized `target_disconnected` terminal and serving runtimes a
+  `cp/cancel`, both stamped `control plane shutting down`, and admissions
+  racing the drain are refused `SATURATED` — then every connection closes
+  with code 1012. `shutdown_drain_secs` is the single ceiling for all of it
+  (the flush, the close write, and the drain), so a peer that stops reading
+  cannot push it past its budget. The process exits 0 once the drain
+  finishes, plus up to one further second for the listener's own graceful wait
+  (below). A drain that exhausts its budget also exits 0 — with a warning
+  naming it — because a non-zero status would be indistinguishable from a
+  crash to most supervisors, and the frames that did not make it are lost
+  either way. A second shutdown signal before the process is gone is the
+  operator's "stop waiting" and exits immediately with the signal's
+  conventional status (128 + signum — 143 for SIGTERM). The listener runs as
+  its own task so nothing waits on the HTTP listener's own graceful shutdown:
+  a peer that opened a socket and then stopped sending would otherwise pin
+  that wait indefinitely and take the drain down with it. After the drain
+  ends, that wait gets one second of slack and is dropped if it overruns, so
+  no client can delay the exit. A
+  *hard* restart (SIGKILL, crash, drain budget exhausted) is equivalent to
+  every lease expiring at once *with* the connection closure that implies —
+  except that the CP is not there to send it: the in-flight table and the
+  sockets die together with the process, so no synthesized `timeout` or
   `target_disconnected` frame can be emitted for delegations that were in
   flight. Runtimes observe the transport drop, reconnect with backoff, and
   re-register (new handles, empty in-flight table). Initiators reconcile

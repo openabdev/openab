@@ -2355,14 +2355,14 @@ mod tests {
 
         let map = read_auth_file(&path).unwrap();
         assert!(
-            map.get("mcp-pending:stale").is_none(),
+            !map.contains_key("mcp-pending:stale"),
             "stale pending swept"
         );
         assert!(
             matches!(map.get("mcp-pending:fresh"), Some(AuthEntry::Pending(_))),
             "fresh pending kept"
         );
-        assert!(map.get("codex").is_some(), "real tenant untouched");
+        assert!(map.contains_key("codex"), "real tenant untouched");
     }
 
     #[cfg(unix)]

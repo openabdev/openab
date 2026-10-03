@@ -105,7 +105,10 @@ struct EventFilterParams<'a> {
 /// Returns `true` if the event should be skipped (filtered out).
 fn should_skip_event(event: &GatewayEvent, filter: &EventFilterParams) -> bool {
     // Bot filter
-    if event.sender.is_bot && !filter.allow_bot_messages && !filter.trusted_bot_ids.contains(&event.sender.id) {
+    if event.sender.is_bot
+        && !filter.allow_bot_messages
+        && !filter.trusted_bot_ids.contains(&event.sender.id)
+    {
         tracing::info!(sender = %event.sender.id, "gateway: bot not in trusted_bot_ids, skipping");
         return true;
     }
@@ -120,7 +123,8 @@ fn should_skip_event(event: &GatewayEvent, filter: &EventFilterParams) -> bool {
         return true;
     }
     // @mention gating: in groups, only respond if bot is mentioned
-    let is_group = event.channel.channel_type == "group" || event.channel.channel_type == "supergroup";
+    let is_group =
+        event.channel.channel_type == "group" || event.channel.channel_type == "supergroup";
     let in_thread = event.channel.thread_id.is_some();
     if is_group && !in_thread {
         if let Some(bot_name) = filter.bot_username {
@@ -244,7 +248,8 @@ fn gateway_delivery_result(resp: GatewayResponse) -> Result<String> {
     } else {
         Err(anyhow::anyhow!(
             "gateway reported failure: {}",
-            resp.error.unwrap_or_else(|| "unspecified error".to_string())
+            resp.error
+                .unwrap_or_else(|| "unspecified error".to_string())
         ))
     }
 }
@@ -557,7 +562,8 @@ impl ChatAdapter for GatewayAdapter {
         content: &str,
         reply_to_message_id: &str,
     ) -> Result<MessageRef> {
-        self.send_gateway_reply(channel, content, Some(reply_to_message_id)).await
+        self.send_gateway_reply(channel, content, Some(reply_to_message_id))
+            .await
     }
 
     async fn create_thread(
@@ -708,10 +714,14 @@ impl ChatAdapter for GatewayAdapter {
             match tokio::time::timeout(
                 std::time::Duration::from_millis(EDIT_RESPONSE_TIMEOUT_MS),
                 rx,
-            ).await {
+            )
+            .await
+            {
                 Ok(Ok(resp)) if resp.success => Ok(()),
                 Ok(Ok(resp)) => {
-                    let err_msg = resp.error.clone()
+                    let err_msg = resp
+                        .error
+                        .clone()
                         .unwrap_or_else(|| "gateway reported edit failure".to_string());
                     tracing::warn!(request_id = %id, error = %err_msg, "edit_message gateway replied failure");
                     Err(anyhow::anyhow!("edit failure: {err_msg}"))
@@ -1464,7 +1474,11 @@ pub async fn process_gateway_event(
         } else {
             event.timestamp.clone()
         }),
-        message_id: if event.message_id.is_empty() { None } else { Some(event.message_id.clone()) },
+        message_id: if event.message_id.is_empty() {
+            None
+        } else {
+            Some(event.message_id.clone())
+        },
         receiver_id: None,
     };
     let sender_json = serde_json::to_string(&sender_ctx).unwrap_or_default();
@@ -1505,25 +1519,24 @@ pub async fn process_gateway_event(
         };
 
         match att.attachment_type.as_str() {
-            "image" => {
-                match bytes_result {
-                    Ok(bytes) => {
-                        use base64::Engine;
-                        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                        extra_blocks.push(ContentBlock::Image {
-                            media_type: att.mime_type.clone(),
-                            data: b64,
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!(filename = %att.filename, error = %e, "gateway image read failed");
-                    }
+            "image" => match bytes_result {
+                Ok(bytes) => {
+                    use base64::Engine;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    extra_blocks.push(ContentBlock::Image {
+                        media_type: att.mime_type.clone(),
+                        data: b64,
+                    });
                 }
-            }
+                Err(e) => {
+                    tracing::warn!(filename = %att.filename, error = %e, "gateway image read failed");
+                }
+            },
             "text_file" => {
                 match bytes_result {
                     Ok(bytes) => {
-                        let safe_filename: String = att.filename
+                        let safe_filename: String = att
+                            .filename
                             .chars()
                             .filter(|c| !c.is_control())
                             .take(200)
@@ -1538,7 +1551,14 @@ pub async fn process_gateway_event(
                             // Large file — upload to filestore if available
                             #[cfg(feature = "filestore")]
                             if let Some(ref fs) = ctx.filestore {
-                                if let Some((block, _)) = crate::media::upload_bytes_to_filestore_public(&att.filename, &bytes, fs).await {
+                                if let Some((block, _)) =
+                                    crate::media::upload_bytes_to_filestore_public(
+                                        &att.filename,
+                                        &bytes,
+                                        fs,
+                                    )
+                                    .await
+                                {
                                     extra_blocks.push(block);
                                 } else {
                                     // Upload refused (size cap) — emit degraded hint, don't inline oversized body
@@ -1572,35 +1592,38 @@ pub async fn process_gateway_event(
                     }
                 }
             }
-            "audio" if ctx.stt_config.enabled => {
-                match bytes_result {
-                    Ok(bytes) => {
-                        match crate::stt::transcribe(
-                            &crate::media::HTTP_CLIENT,
-                            &ctx.stt_config,
-                            bytes,
-                            att.filename.clone(),
-                            &att.mime_type,
-                        ).await {
-                            Some(transcript) => {
-                                extra_blocks.push(ContentBlock::Text {
-                                    text: format!("[Voice message transcript]: {transcript}"),
-                                });
-                            }
-                            None => {
-                                extra_blocks.push(ContentBlock::Text {
-                                    text: format!("[Voice message — transcription failed for {}]", att.filename),
-                                });
-                            }
+            "audio" if ctx.stt_config.enabled => match bytes_result {
+                Ok(bytes) => {
+                    match crate::stt::transcribe(
+                        &crate::media::HTTP_CLIENT,
+                        &ctx.stt_config,
+                        bytes,
+                        att.filename.clone(),
+                        &att.mime_type,
+                    )
+                    .await
+                    {
+                        Some(transcript) => {
+                            extra_blocks.push(ContentBlock::Text {
+                                text: format!("[Voice message transcript]: {transcript}"),
+                            });
+                        }
+                        None => {
+                            extra_blocks.push(ContentBlock::Text {
+                                text: format!(
+                                    "[Voice message — transcription failed for {}]",
+                                    att.filename
+                                ),
+                            });
                         }
                     }
-                    Err(_) => {
-                        extra_blocks.push(ContentBlock::Text {
-                            text: format!("[Voice message — read failed for {}]", att.filename),
-                        });
-                    }
                 }
-            }
+                Err(_) => {
+                    extra_blocks.push(ContentBlock::Text {
+                        text: format!("[Voice message — read failed for {}]", att.filename),
+                    });
+                }
+            },
             _ => {}
         }
     }
@@ -1609,20 +1632,38 @@ pub async fn process_gateway_event(
     let prompt = event.content.text.clone();
     let trimmed = prompt.trim();
     if trimmed == "/reset" {
-        let thread_id_str = event.channel.thread_id.as_deref().unwrap_or(&event.channel.id);
+        let thread_id_str = event
+            .channel
+            .thread_id
+            .as_deref()
+            .unwrap_or(&event.channel.id);
         let thread_key = format!("{}:{}", event.platform, thread_id_str);
-        let dropped = ctx.dispatcher.cancel_buffered_thread(event.platform.as_str(), thread_id_str);
+        let dropped = ctx
+            .dispatcher
+            .cancel_buffered_thread(event.platform.as_str(), thread_id_str);
         let msg = match (ctx.router.pool().reset_session(&thread_key).await, dropped) {
             (Ok(()), 0) => "🔄 Session reset. Start a new conversation!".to_string(),
-            (Ok(()), n) => format!("🔄 Session reset. Dropped {n} buffered message(s). Start a new conversation!"),
+            (Ok(()), n) => format!(
+                "🔄 Session reset. Dropped {n} buffered message(s). Start a new conversation!"
+            ),
             (Err(_), 0) => "⚠️ No active session to reset.".to_string(),
-            (Err(_), n) => format!("🔄 Dropped {n} buffered message(s). No active session to reset."),
+            (Err(_), n) => {
+                format!("🔄 Dropped {n} buffered message(s). No active session to reset.")
+            }
         };
         let _ = ctx.adapter.send_message(&channel, &msg).await;
         return Ok(false);
     }
     if trimmed == "/cancel" {
-        let thread_key = format!("{}:{}", event.platform, event.channel.thread_id.as_deref().unwrap_or(&event.channel.id));
+        let thread_key = format!(
+            "{}:{}",
+            event.platform,
+            event
+                .channel
+                .thread_id
+                .as_deref()
+                .unwrap_or(&event.channel.id)
+        );
         let msg = match ctx.router.pool().cancel_session(&thread_key).await {
             Ok(()) => "🛑 Cancel signal sent.".to_string(),
             Err(e) => format!("⚠️ {e}"),
@@ -1631,7 +1672,15 @@ pub async fn process_gateway_event(
         return Ok(false);
     }
     {
-        let thread_key = format!("{}:{}", event.platform, event.channel.thread_id.as_deref().unwrap_or(&event.channel.id));
+        let thread_key = format!(
+            "{}:{}",
+            event.platform,
+            event
+                .channel
+                .thread_id
+                .as_deref()
+                .unwrap_or(&event.channel.id)
+        );
         if let Some(msg) = handle_config_command(trimmed, &ctx.router, &thread_key).await {
             let _ = ctx.adapter.send_message(&channel, &msg).await;
             return Ok(false);
@@ -1645,32 +1694,26 @@ pub async fn process_gateway_event(
     let sender_id = event.sender.id.clone();
 
     tokio::spawn(async move {
-        let thread_channel = if event.channel.channel_type == "supergroup"
-            && channel.thread_id.is_none()
-        {
-            let title = crate::format::shorten_thread_name(&prompt);
-            match adapter.create_thread(&channel, &trigger_msg, &title).await {
-                Ok(tc) => tc,
-                Err(e) => {
-                    tracing::warn!("create_thread failed, replying in channel: {e}");
-                    channel.clone()
+        let thread_channel =
+            if event.channel.channel_type == "supergroup" && channel.thread_id.is_none() {
+                let title = crate::format::shorten_thread_name(&prompt);
+                match adapter.create_thread(&channel, &trigger_msg, &title).await {
+                    Ok(tc) => tc,
+                    Err(e) => {
+                        tracing::warn!("create_thread failed, replying in channel: {e}");
+                        channel.clone()
+                    }
                 }
-            }
-        } else {
-            channel.clone()
-        };
+            } else {
+                channel.clone()
+            };
 
         let thread_id = thread_channel
             .thread_id
             .as_deref()
             .unwrap_or(&thread_channel.channel_id);
-        let thread_key = dispatcher.key(
-            &thread_channel.platform,
-            thread_id,
-            &sender_id,
-        );
-        let estimated_tokens =
-            crate::dispatch::estimate_tokens(&prompt, &extra_blocks);
+        let thread_key = dispatcher.key(&thread_channel.platform, thread_id, &sender_id);
+        let estimated_tokens = crate::dispatch::estimate_tokens(&prompt, &extra_blocks);
         let buf_msg = crate::dispatch::BufferedMessage {
             sender_json,
             sender_name,
@@ -1822,7 +1865,14 @@ mod tests {
         assert!(!echo_allowed(key), "still throttled within the window");
     }
 
-    fn make_event(is_bot: bool, sender_id: &str, channel_id: &str, channel_type: &str, thread_id: Option<&str>, mentions: Vec<&str>) -> GatewayEvent {
+    fn make_event(
+        is_bot: bool,
+        sender_id: &str,
+        channel_id: &str,
+        channel_type: &str,
+        thread_id: Option<&str>,
+        mentions: Vec<&str>,
+    ) -> GatewayEvent {
         serde_json::from_value(serde_json::json!({
             "schema": "openab.gateway.event.v1",
             "event_id": "evt1",
@@ -1833,10 +1883,15 @@ mod tests {
             "content": { "type": "text", "text": "hello" },
             "mentions": mentions,
             "message_id": "msg1"
-        })).unwrap()
+        }))
+        .unwrap()
     }
 
-    fn default_filter<'a>(allowed_channels: &'a HashSet<String>, allowed_users: &'a HashSet<String>, trusted_bot_ids: &'a HashSet<String>) -> EventFilterParams<'a> {
+    fn default_filter<'a>(
+        allowed_channels: &'a HashSet<String>,
+        allowed_users: &'a HashSet<String>,
+        trusted_bot_ids: &'a HashSet<String>,
+    ) -> EventFilterParams<'a> {
         EventFilterParams {
             allow_all_channels: true,
             allowed_channels,

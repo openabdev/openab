@@ -9,11 +9,16 @@
 //!   instance fail immediately with `target_disconnected`.
 //! - **Initiator disconnect** — its in-flight delegations are cancelled
 //!   downstream (best effort); nobody is left to receive the result.
-//! - **CP restart** — the table dies with the process, and the connections
-//!   die with it, so the CP cannot synthesize anything: in-flight delegations
-//!   end as initiator-side timeouts against the already-propagated deadline.
-//!   Late `cp/delegate_result` frames for unknown ids are acknowledged and
-//!   dropped (logged), so reconnecting runtimes do not error-loop.
+//! - **CP shutdown** — a *graceful* stop (SIGTERM/SIGHUP/SIGINT) drains the
+//!   table through [`Router::fail_all`]: initiators get a synthesized
+//!   `target_disconnected` terminal, serving runtimes a `cp/cancel`, and the
+//!   `shutting_down` latch refuses any later admission with `SATURATED`. A
+//!   *hard* restart (SIGKILL, crash) is different — the table dies with the
+//!   process and the connections die with it, so the CP cannot synthesize
+//!   anything: in-flight delegations end as initiator-side timeouts against
+//!   the already-propagated deadline. Late `cp/delegate_result` frames for
+//!   unknown ids are acknowledged and dropped (logged), so reconnecting
+//!   runtimes do not error-loop.
 //! - **Saturation** — routing never queues; `SATURATED` is returned
 //!   immediately (fast-fail, no hidden buffer).
 //!
@@ -76,6 +81,7 @@
 //! total and acyclic.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
@@ -198,6 +204,12 @@ pub struct Router {
     /// would disclose other namespaces' delegation volume. Commit matching
     /// only requires never-reuse per `(namespace, delegation_id)` key.
     admission: Mutex<BTreeMap<String, u64>>,
+    /// Latched by [`Router::fail_all`] before the table is drained; checked
+    /// under the `inflight` lock at admission insert so no delegation can be
+    /// admitted after the drain snapshot — without it a late admission would
+    /// be accepted but never terminated (no entry left for `fail_all`, a
+    /// dangling `requested` for observers, a leaked reservation).
+    shutting_down: AtomicBool,
 }
 
 pub enum DelegateOutcome {
@@ -385,6 +397,7 @@ impl Router {
         Self {
             inflight: Mutex::new(BTreeMap::new()),
             admission: Mutex::new(BTreeMap::new()),
+            shutting_down: AtomicBool::new(false),
         }
     }
 
@@ -659,7 +672,26 @@ impl Router {
             // never-announced (no observer terminal, no synthesized frames).
             announced: false,
         };
-        self.inflight.lock().insert(key.clone(), entry.clone());
+        // The insert and the shutdown check share one `inflight` critical
+        // section with `fail_all`'s drain: `fail_all` latches
+        // `shutting_down` before taking the lock, so an insert that reads a
+        // clear latch also committed before the take — `fail_all` removes
+        // the entry and the `Forward::Gone` path below reports the loss —
+        // while one that reads the latched flag is refused here, before the
+        // admission can outlive the in-flight table itself.
+        {
+            let mut g = self.inflight.lock();
+            if self.shutting_down.load(Ordering::SeqCst) {
+                // Roll back the capacity reservation: nothing was inserted,
+                // nothing was announced, and no terminal is owed.
+                registry.adjust_sessions(target.handle, -1);
+                return DelegateOutcome::Rejected(ErrorObject::new(
+                    codes::SATURATED,
+                    "control plane shutting down — not accepting new delegations",
+                ));
+            }
+            g.insert(key.clone(), entry.clone());
+        }
 
         // Admission is committed: the token is minted, capacity is reserved,
         // and the entry is inserted — the duplicate check rides the in-flight
@@ -1377,6 +1409,94 @@ impl Router {
             warn!(delegation = %e.delegation_id, handle, announced = e.announced, "in-flight delegation failed by disconnect");
         }
         affected
+    }
+
+    /// Graceful-shutdown drain: end EVERY in-flight delegation at once.
+    /// Both peers are still connected while the process drains, so unlike
+    /// the per-instance failure paths each initiator gets a synthesized
+    /// `target_disconnected` terminal AND each serving runtime a best-effort
+    /// `cp/cancel` — the same dual emission `sweep_deadlines` uses for the
+    /// case where both peers live. `reason` marks the frames as a CP
+    /// shutdown diagnostic rather than an ordinary peer disconnect.
+    ///
+    /// Same table discipline as `fail_instance`: an entry never announced
+    /// gets no terminal and no frames (its reservation still releases). A
+    /// delegation inserted between the drain below and its own announce
+    /// section finds no entry on re-check, emits nothing, and reports the
+    /// loss to its caller — the `Forward::Gone` path.
+    ///
+    /// The `shutting_down` latch is set BEFORE the drain so `delegate`'s
+    /// insert — checked under the same lock — can never land an entry after
+    /// this take: either the insert runs first and is drained here, or it
+    /// reads the latch and rejects with `SATURATED`. No third interleaving
+    /// exists, so no admission can be accepted-and-never-terminated.
+    pub fn fail_all(
+        &self,
+        registry: &Registry,
+        events: &EventHub,
+        reason: &str,
+        rpc_id: &mut impl FnMut() -> u64,
+    ) -> Vec<(Instance, String)> {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        let entries: Vec<InFlight> = {
+            let mut g = self.inflight.lock();
+            std::mem::take(&mut *g).into_values().collect()
+        };
+        let mut frames = Vec::new();
+        for e in entries {
+            // The serving instance's slot was reserved at admission and is
+            // always released — announced or not.
+            registry.adjust_sessions(e.to_handle, -1);
+            warn!(
+                delegation = %e.delegation_id,
+                announced = e.announced,
+                "in-flight delegation ended by control-plane shutdown"
+            );
+            if !e.announced {
+                continue;
+            }
+            // Completion-shaped, and it must agree with the initiator-bound
+            // terminal below: one announced admission gets exactly one
+            // terminal on each surface.
+            events.emit(
+                registry,
+                &e.namespace,
+                CpEvent::DelegationCompleted {
+                    delegation_id: e.delegation_id.clone(),
+                    admission: e.generation,
+                    from: e.from_logical.clone(),
+                    to: e.to_logical.clone(),
+                    status: DelegationStatus::TargetDisconnected,
+                    result_excerpt: None,
+                    error: Some(events.cp_diagnostic(reason)),
+                },
+            );
+            if let Some(init) = registry.get(e.from_handle) {
+                let params = DelegateResultParams {
+                    delegation_id: e.delegation_id.clone(),
+                    admission: e.generation,
+                    status: DelegationStatus::TargetDisconnected,
+                    result: None,
+                    error: Some(reason.to_string()),
+                };
+                if let Some(text) = synthesized_frame(rpc_id(), methods::DELEGATE_RESULT, &params) {
+                    frames.push((init, text));
+                }
+            }
+            if let Some(target) = registry.get(e.to_handle) {
+                let params = CancelParams {
+                    delegation_id: e.delegation_id.clone(),
+                    // Names the admission that is over, so the frame can
+                    // overtake nothing — the connection is closing anyway.
+                    admission: e.generation,
+                    reason: reason.to_string(),
+                };
+                if let Some(text) = synthesized_frame(rpc_id(), methods::CANCEL, &params) {
+                    frames.push((target, text));
+                }
+            }
+        }
+        frames
     }
 
     /// Deadline sweep: expire overdue delegations. Returns frames to deliver
@@ -5101,6 +5221,118 @@ metadata_only = true
             .as_str()
             .unwrap()
             .contains("initiator prod/koudu disconnected"));
+    }
+
+    #[test]
+    fn fail_all_tells_both_sides_and_releases_capacity() {
+        // Graceful shutdown differs from a single disconnect: both peers are
+        // still alive while the CP drains, so the initiator gets a
+        // `target_disconnected` terminal AND the serving runtime a cancel —
+        // the dual emission the deadline sweep performs.
+        let mut w = world();
+        let mut lobby = observe(&w, "prod");
+        let a = accept(do_delegate(&w, delegate_params("d-1", "worker-1", 60)));
+        w.worker_rx.try_recv().unwrap(); // the forward itself
+        assert_eq!(
+            w.registry.get(w.h_worker).unwrap().active_sessions,
+            1,
+            "the admission reserved a serving slot"
+        );
+
+        let mut id = 0u64;
+        let mut next = || {
+            id += 1;
+            id
+        };
+        let frames = w.router.fail_all(
+            &w.registry,
+            &w.events,
+            "control plane shutting down",
+            &mut next,
+        );
+
+        assert_eq!(w.router.inflight_count(), 0, "the table is empty");
+        assert_eq!(
+            w.registry.get(w.h_worker).unwrap().active_sessions,
+            0,
+            "the reserved slot is released even though both peers still exist"
+        );
+
+        let init_frames: Vec<&String> = frames
+            .iter()
+            .filter(|(i, _)| i.handle == w.h_primary)
+            .map(|(_, t)| t)
+            .collect();
+        let worker_frames: Vec<&String> = frames
+            .iter()
+            .filter(|(i, _)| i.handle == w.h_worker)
+            .map(|(_, t)| t)
+            .collect();
+        assert_eq!(init_frames.len(), 1, "one terminal for the initiator");
+        assert_eq!(worker_frames.len(), 1, "one cancel for the worker");
+
+        let terminal: serde_json::Value = serde_json::from_str(init_frames[0]).unwrap();
+        assert_eq!(terminal["method"], "cp/delegate_result");
+        assert_eq!(terminal["params"]["status"], "target_disconnected");
+        assert_eq!(terminal["params"]["admission"].as_u64(), Some(a.admission));
+        assert_eq!(terminal["params"]["error"], "control plane shutting down");
+
+        let cancel: serde_json::Value = serde_json::from_str(worker_frames[0]).unwrap();
+        assert_eq!(cancel["method"], "cp/cancel");
+        assert_eq!(cancel["params"]["delegation_id"], "d-1");
+        assert_eq!(cancel["params"]["admission"].as_u64(), Some(a.admission));
+
+        // The observer sees the terminal, completion-shaped and agreeing
+        // with the initiator's frame (the terminal contract's "one terminal
+        // per announced admission, agreeing on both surfaces").
+        let ev = events_of(&mut lobby);
+        assert_eq!(ev.len(), 2, "requested + completed");
+        assert_eq!(ev[1]["event"], "delegation_completed");
+        assert_eq!(ev[1]["status"], "target_disconnected");
+        assert_eq!(ev[1]["admission"].as_u64(), Some(a.admission));
+    }
+
+    #[test]
+    fn delegate_after_fail_all_is_refused_instead_of_orphaned() {
+        // The shutdown latch closes the admit-after-drain race: a delegation
+        // arriving after `fail_all` must be refused (SATURATED — back off and
+        // retry), never accepted into a table nobody will drain again.
+        let mut w = world();
+        let mut lobby = observe(&w, "prod");
+        let mut id = 0u64;
+        let mut next = || {
+            id += 1;
+            id
+        };
+        w.router.fail_all(
+            &w.registry,
+            &w.events,
+            "control plane shutting down",
+            &mut next,
+        );
+
+        assert!(matches!(
+            do_delegate(&w, delegate_params("d-late", "worker-1", 60)),
+            DelegateOutcome::Rejected(e) if e.code == codes::SATURATED
+        ));
+        assert_eq!(
+            w.router.inflight_count(),
+            0,
+            "no entry may be inserted once the drain latch is set"
+        );
+        assert_eq!(
+            w.registry.get(w.h_worker).unwrap().active_sessions,
+            0,
+            "a refused admission must not leak the capacity reservation"
+        );
+        assert!(
+            w.worker_rx.try_recv().is_err(),
+            "the refused admission must not forward anything downstream"
+        );
+        assert!(
+            events_of(&mut lobby).is_empty(),
+            "no requested/terminal may be emitted for a refused admission"
+        );
     }
 
     #[test]

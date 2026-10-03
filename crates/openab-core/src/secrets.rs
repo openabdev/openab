@@ -23,9 +23,9 @@ pub async fn resolve(cfg: &SecretsConfig) -> anyhow::Result<ResolvedSecrets> {
         let value = if uri.starts_with("aws-sm://") {
             #[cfg(feature = "secrets-aws")]
             {
-                let client = aws_client.as_ref().ok_or_else(|| {
-                    anyhow::anyhow!("secret '{key}': AWS client not initialized")
-                })?;
+                let client = aws_client
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("secret '{key}': AWS client not initialized"))?;
                 resolve_aws_sm(key, uri, client).await?
             }
             #[cfg(not(feature = "secrets-aws"))]
@@ -81,12 +81,16 @@ async fn resolve_aws_sm(
         .await
         .map_err(|e| {
             error!(secret = key, secret_id = %secret_id, "AWS Secrets Manager error");
-            anyhow::anyhow!("secret '{key}': failed to fetch '{secret_id}' from AWS Secrets Manager: {e}")
+            anyhow::anyhow!(
+                "secret '{key}': failed to fetch '{secret_id}' from AWS Secrets Manager: {e}"
+            )
         })?;
 
-    let secret_string = resp
-        .secret_string()
-        .ok_or_else(|| anyhow::anyhow!("secret '{key}': '{secret_id}' has no string value (binary secrets not supported)"))?;
+    let secret_string = resp.secret_string().ok_or_else(|| {
+        anyhow::anyhow!(
+            "secret '{key}': '{secret_id}' has no string value (binary secrets not supported)"
+        )
+    })?;
 
     // Parse as JSON and extract the key
     let json: serde_json::Value = serde_json::from_str(secret_string)
@@ -95,7 +99,9 @@ async fn resolve_aws_sm(
     let value = json
         .get(&json_key)
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("secret '{key}': JSON key '{json_key}' not found in '{secret_id}'"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("secret '{key}': JSON key '{json_key}' not found in '{secret_id}'")
+        })?;
 
     Ok(value.to_owned())
 }
@@ -117,9 +123,9 @@ fn parse_aws_sm_uri(uri: &str) -> Option<(String, String)> {
 async fn resolve_exec(key: &str, uri: &str, cfg: &SecretsConfig) -> anyhow::Result<String> {
     let rest = uri.strip_prefix("exec://").unwrap();
     let mut parts_iter = rest.splitn(3, ' ');
-    let script = parts_iter.next().ok_or_else(|| {
-        anyhow::anyhow!("secret '{key}': exec:// URI missing script path")
-    })?;
+    let script = parts_iter
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("secret '{key}': exec:// URI missing script path"))?;
     if script.is_empty() {
         anyhow::bail!("secret '{key}': exec:// URI has empty script path");
     }
@@ -240,9 +246,13 @@ mod tests {
     #[cfg(feature = "secrets-aws")]
     #[test]
     fn parse_aws_sm_uri_with_arn() {
-        let uri = "aws-sm://arn:aws:secretsmanager:us-east-1:123456789:secret:my-secret-abc123#api_key";
+        let uri =
+            "aws-sm://arn:aws:secretsmanager:us-east-1:123456789:secret:my-secret-abc123#api_key";
         let (id, key) = parse_aws_sm_uri(uri).unwrap();
-        assert_eq!(id, "arn:aws:secretsmanager:us-east-1:123456789:secret:my-secret-abc123");
+        assert_eq!(
+            id,
+            "arn:aws:secretsmanager:us-east-1:123456789:secret:my-secret-abc123"
+        );
         assert_eq!(key, "api_key");
     }
 
@@ -349,8 +359,7 @@ mod tests {
             exec: ExecSecretsConfig { timeout_seconds: 5 },
             refs: HashMap::new(),
         };
-        let result =
-            resolve_exec("test", "exec:///nonexistent/script arg1 arg2", &cfg).await;
+        let result = resolve_exec("test", "exec:///nonexistent/script arg1 arg2", &cfg).await;
         let err = result.unwrap_err().to_string();
         assert!(err.contains("not found"));
         assert!(err.contains("pre_boot"));
@@ -406,7 +415,10 @@ mod tests {
         };
         let result = resolve(&cfg).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unrecognized URI scheme"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("unrecognized URI scheme"));
     }
 
     #[cfg(feature = "secrets-aws")]
@@ -430,7 +442,9 @@ mod tests {
             refs: HashMap::new(),
         };
         // /usr/bin/env prints all env vars; grep for our dummy var
-        let result = resolve_exec("test", "exec:///usr/bin/env", &cfg).await.unwrap();
+        let result = resolve_exec("test", "exec:///usr/bin/env", &cfg)
+            .await
+            .unwrap();
         assert!(
             !result.contains("OPENAB_TEST_LEAKED_SECRET"),
             "exec script should not see unrelated env vars"
@@ -452,7 +466,10 @@ mod tests {
         // sleep 10 will be killed after 1s timeout
         let result = resolve_exec("test", "exec:///bin/sleep 10", &cfg).await;
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("timed out"), "expected timeout error, got: {err}");
+        assert!(
+            err.contains("timed out"),
+            "expected timeout error, got: {err}"
+        );
     }
 
     #[test]
@@ -471,8 +488,8 @@ args = ["--key", "${secrets.key}"]
 "#;
         let substituted = substitute(raw, &secrets);
         // Verify the substituted text is valid TOML that parses correctly
-        let cfg: crate::config::Config = toml::from_str(&substituted)
-            .expect("substituted config should be valid TOML");
+        let cfg: crate::config::Config =
+            toml::from_str(&substituted).expect("substituted config should be valid TOML");
         assert_eq!(cfg.discord.unwrap().bot_token, "xoxb-secret-value");
         assert_eq!(cfg.agent.args[1], "sk-with\"special\\chars");
     }

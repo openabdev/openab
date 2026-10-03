@@ -121,12 +121,6 @@ impl GmailNative {
         }
     }
 
-    #[cfg(test)]
-    fn with_api_base(mut self, base: &str) -> Self {
-        self.api_base = base.to_string();
-        self
-    }
-
     /// Valid bearer token: cached when fresh, refreshed via the stored
     /// refresh token when near expiry (60s buffer, same policy as the MCP
     /// runtime), otherwise an actionable re-login error.

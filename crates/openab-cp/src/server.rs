@@ -46,7 +46,7 @@ use crate::proto::{
     DelegateResultParams, DeregisterReason, ErrorObject, JsonRpcErrorResponse, JsonRpcMessage,
     JsonRpcResponse, ListAgentsResult, RegisterAck, RegisterParams, PROTOCOL_VERSION,
 };
-use crate::registry::{outbound_channel, shutdown_signal, Instance, Registry};
+use crate::registry::{outbound_channel, shutdown_signal, Instance, Registry, ShutdownTx};
 use crate::router::{CompleteOutcome, DelegateOutcome, Router};
 
 pub struct AppState {
@@ -59,6 +59,14 @@ pub struct AppState {
     /// Live connections per identity (`namespace/name`), counted from the
     /// upgrade so pre-registration sockets are bounded too.
     conns: Mutex<BTreeMap<String, u32>>,
+    /// Process-wide shutdown broadcast, latched once by
+    /// [`graceful_shutdown`] on SIGTERM/SIGHUP/SIGINT. Every connection task
+    /// subscribes — including pre-registration sockets, which the
+    /// per-connection signal held by the registry cannot reach.
+    shutdown: ShutdownTx,
+    /// When the current drain expires, latched together with `shutdown`.
+    /// Every budget in the drain is a remainder of this one instant.
+    shutdown_deadline: Mutex<Option<Instant>>,
 }
 
 impl AppState {
@@ -70,11 +78,55 @@ impl AppState {
             router: Router::new(),
             rpc_id: AtomicU64::new(1),
             conns: Mutex::new(BTreeMap::new()),
+            shutdown: shutdown_signal(),
+            shutdown_deadline: Mutex::new(None),
         }
     }
 
     pub fn next_rpc_id(&self) -> u64 {
         self.rpc_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Subscribe to the process-wide shutdown signal: resolves to the
+    /// shutdown reason once [`AppState::begin_shutdown`] latches it.
+    pub fn shutdown_rx(&self) -> watch::Receiver<Option<&'static str>> {
+        self.shutdown.subscribe()
+    }
+
+    /// Latch the shutdown reason: every live connection task closes, and a
+    /// connection upgraded mid-drain sees the latched reason at subscribe
+    /// time. The drain deadline is latched with it, so every connection
+    /// budgets against the SAME instant rather than each starting a fresh
+    /// `shutdown_drain_secs` when it happens to leave its main loop — a
+    /// connection that noticed the signal late must not be granted a longer
+    /// life than the drain it is part of.
+    pub fn begin_shutdown(&self, reason: &'static str) {
+        let deadline = Instant::now() + Duration::from_secs(self.cfg.shutdown_drain_secs);
+        *self.shutdown_deadline.lock() = Some(deadline);
+        self.shutdown.send_replace(Some(reason));
+    }
+
+    /// The instant the current drain expires. `None` until the CP begins
+    /// shutting down.
+    fn shutdown_deadline(&self) -> Option<Instant> {
+        *self.shutdown_deadline.lock()
+    }
+
+    /// Whether the CP has begun draining. Distinguishes "this peer stopped
+    /// reading" from "the CP is leaving" when a frame cannot be delivered —
+    /// the two deserve different explanations.
+    pub fn shutting_down(&self) -> bool {
+        self.shutdown_deadline.lock().is_some()
+    }
+
+    /// Resolves when no live connection permits remain — every connection
+    /// task (registered or still pre-registration) has exited. Polled:
+    /// drain progress is a wait on an ever-shrinking set, not a precise
+    /// signal.
+    pub async fn connections_drained(&self) {
+        while !self.conns.lock().is_empty() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// Take a connection slot for `identity`, or `None` when the identity is
@@ -151,6 +203,57 @@ fn policy_close(reason: &'static str) -> Message {
     }))
 }
 
+/// Reason every connection gets on its close frame when the CP shuts down
+/// (SIGTERM/SIGHUP/SIGINT), and carried on the terminal/cancel frames
+/// synthesized for in-flight delegations so a runtime can tell "the CP is
+/// going away" from "my peer disconnected".
+pub const REASON_SHUTDOWN: &str = "control plane shutting down";
+
+/// A CP-initiated close for process shutdown: code 1012 (service restart —
+/// the client should reconnect) rather than the 1008 the misbehaviour
+/// closes above use, because nothing about a deploy is a policy violation.
+fn restart_close(reason: &'static str) -> Message {
+    Message::Close(Some(CloseFrame {
+        code: close_code::RESTART,
+        reason: reason.into(),
+    }))
+}
+
+/// The two signals that can terminate a connection: the per-connection one
+/// held by the registry entry (lease expiry, terminal-frame backpressure)
+/// and the process-wide one latched on [`AppState`] when the CP begins
+/// draining. The process signal is subscribed at upgrade time so
+/// pre-registration sockets — which the registry cannot see yet — close
+/// with a reason too.
+struct CloseWatch {
+    conn: watch::Receiver<Option<&'static str>>,
+    process: watch::Receiver<Option<&'static str>>,
+}
+
+impl CloseWatch {
+    /// Wait for the next transition on either signal. `watch` semantics: a
+    /// value already seen is not reported again, so a caller that has
+    /// consumed a reason keeps writing its close frame undisturbed.
+    async fn changed(&mut self) {
+        tokio::select! {
+            _ = self.conn.changed() => {}
+            _ = self.process.changed() => {}
+        }
+    }
+
+    /// The process-wide shutdown reason, when the CP is draining.
+    fn process_reason(&self) -> Option<&'static str> {
+        *self.process.borrow()
+    }
+
+    /// The close reason set on either signal, if any; the process reason
+    /// wins because "the CP is going away" is the actionable fact when both
+    /// are latched (e.g. a lease sweep racing the drain).
+    fn reason(&self) -> Option<&'static str> {
+        (*self.process.borrow()).or(*self.conn.borrow())
+    }
+}
+
 /// Why a bounded write did not complete. Either way the connection ends.
 enum WriteStop {
     /// Transport error, or the peer did not accept the frame within
@@ -178,19 +281,62 @@ enum WriteStop {
 /// A cancelled or timed-out write can leave a partially written frame on the
 /// wire; that is acceptable precisely because both outcomes end the
 /// connection (the caller breaks to teardown, dropping the socket).
+///
+/// `biased` polling order matters for the drain path: the caller has
+/// already dequeued `msg` from the outbound channel, so a close signal that
+/// wins a fair race would destroy a frame that was ready to write. The send
+/// is tried first — an immediately-writable socket completes it and the
+/// close signal is observed on the next call — while a write that cannot
+/// finish now still pends and is interrupted by the signal or the timeout.
 async fn send_bounded(
     sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
     msg: Message,
     write_timeout: Duration,
-    shutdown_rx: &mut watch::Receiver<Option<&'static str>>,
+    close: &mut CloseWatch,
 ) -> Result<(), WriteStop> {
     tokio::select! {
-        _ = shutdown_rx.changed() => Err(WriteStop::Shutdown(*shutdown_rx.borrow_and_update())),
+        biased;
         sent = tokio::time::timeout(write_timeout, sink.send(msg)) => match sent {
             Ok(Ok(())) => Ok(()),
             Ok(Err(_)) => Err(WriteStop::Disconnected),
             Err(_) => Err(WriteStop::Disconnected),
         },
+        _ = close.changed() => Err(WriteStop::Shutdown(close.reason())),
+    }
+}
+
+/// Send the LAST frame a connection will ever get — a close frame, or a
+/// terminal error response written just before teardown. Unlike
+/// [`send_bounded`] this is raced only against `write_timeout`, never the
+/// close watch: the connection is already committed to ending, and a second
+/// signal latching mid-write (e.g. a lease sweep landing during the
+/// shutdown drain, or the process signal during a per-connection close)
+/// must not eat the frame the peer was promised. A peer that has stopped
+/// reading is still bounded by `write_timeout`, so it cannot hold teardown
+/// longer than that.
+async fn send_final_frame(
+    sink: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    msg: Message,
+    write_timeout: Duration,
+) {
+    let _ = tokio::time::timeout(write_timeout, sink.send(msg)).await;
+}
+
+/// Budget for the last frame of a connection that is ending: the write timeout,
+/// clipped to what is left of the drain once the CP is shutting down.
+///
+/// The main-loop teardown already spends the remaining drain directly; this
+/// covers the paths that never reach the main loop — a socket caught mid-upgrade
+/// by the drain, a pre-registration close, a refused register frame. Without it
+/// those writes could still hold their task for a full `write_timeout_secs`
+/// (30s by default) after a 5s drain expired, so `shutdown_drain_secs` would
+/// not really be the ceiling the docs promise.
+fn final_frame_budget(state: &AppState, write_timeout: Duration) -> Duration {
+    match state.shutdown_deadline() {
+        Some(deadline) => deadline
+            .saturating_duration_since(Instant::now())
+            .min(write_timeout),
+        None => write_timeout,
     }
 }
 
@@ -249,35 +395,67 @@ async fn handle_connection(
     let (mut sink, mut stream) = socket.split();
     let write_timeout = Duration::from_secs(state.cfg.write_timeout_secs);
 
-    // Shutdown signal so the CP can close this socket when it drops the
-    // registration on its own initiative (lease expiry) or must terminate the
-    // connection (terminal-frame backpressure).
+    // Shutdown signals so the CP can close this socket when it drops the
+    // registration on its own initiative (lease expiry), must terminate the
+    // connection (terminal-frame backpressure), or the whole process is
+    // draining (SIGTERM/SIGHUP/SIGINT via `graceful_shutdown`).
     //
-    // Created BEFORE the registration read — and therefore before the registry
-    // ever holds a clone — so no signal can be missed, and every write in this
-    // task, registration-phase writes included, can be raced against it. Kept
+    // The per-connection sender is created BEFORE the registration read —
+    // and therefore before the registry ever holds a clone — so no signal
+    // can be missed, and every write in this task, registration-phase writes
+    // included, can be raced against either signal. The senders are kept
     // alive here for the whole connection: closing is driven by an explicit
     // signal, never by the registry happening to drop its side.
     let shutdown = shutdown_signal();
-    let mut shutdown_rx = shutdown.subscribe();
+    let mut close = CloseWatch {
+        conn: shutdown.subscribe(),
+        process: state.shutdown_rx(),
+    };
+
+    // A socket that finished its upgrade while the CP was already draining
+    // must not register into a dying process: close it immediately. `watch`
+    // only reports transitions that postdate the subscription, so the
+    // already-latched reason is checked once explicitly.
+    if let Some(reason) = close.process_reason() {
+        send_final_frame(
+            &mut sink,
+            restart_close(reason),
+            final_frame_budget(&state, write_timeout),
+        )
+        .await;
+        return;
+    }
 
     // --- Registration: mandatory first frame, within a deadline ---
     // An authenticated peer must not be able to park idle sockets: pings keep
     // the transport alive but do not extend this deadline.
-    let register = match tokio::time::timeout(
-        Duration::from_secs(state.cfg.register_timeout_secs),
-        async {
-            loop {
-                match stream.next().await {
-                    Some(Ok(Message::Text(text))) => return Some(text),
-                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
-                    _ => return None,
+    let register = match tokio::select! {
+        res = tokio::time::timeout(
+            Duration::from_secs(state.cfg.register_timeout_secs),
+            async {
+                loop {
+                    match stream.next().await {
+                        Some(Ok(Message::Text(text))) => return Some(text),
+                        Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+                        _ => return None,
+                    }
                 }
-            }
-        },
-    )
-    .await
-    {
+            },
+        ) => res,
+        _ = close.changed() => {
+            // Shutdown while still pre-registration: no registry entry or
+            // in-flight delegation exists to tear down — just tell the peer
+            // why its socket is closing. Only the process signal can latch
+            // before registration (the per-connection sender has no owner
+            // yet), but the frame is still picked by which signal fired.
+            let frame = match close.process_reason() {
+                Some(reason) => restart_close(reason),
+                None => policy_close(close.reason().unwrap_or(REASON_SHUTDOWN)),
+            };
+            send_final_frame(&mut sink, frame, final_frame_budget(&state, write_timeout)).await;
+            return;
+        }
+    } {
         Ok(Some(text)) => text,
         Ok(None) => {
             warn!(agent = %identity.name, "connection closed before registration");
@@ -289,11 +467,10 @@ async fn handle_connection(
                 timeout_secs = state.cfg.register_timeout_secs,
                 "no cp/register within the registration deadline — closing"
             );
-            let _ = send_bounded(
+            send_final_frame(
                 &mut sink,
                 policy_close(REASON_REGISTER_TIMEOUT),
-                write_timeout,
-                &mut shutdown_rx,
+                final_frame_budget(&state, write_timeout),
             )
             .await;
             return;
@@ -303,11 +480,10 @@ async fn handle_connection(
         Ok(ok) => ok,
         Err((id, err)) => {
             let resp = JsonRpcErrorResponse::new(id, err);
-            let _ = send_bounded(
+            send_final_frame(
                 &mut sink,
                 Message::Text(serde_json::to_string(&resp).expect("serializable").into()),
-                write_timeout,
-                &mut shutdown_rx,
+                final_frame_budget(&state, write_timeout),
             )
             .await;
             return;
@@ -367,11 +543,10 @@ async fn handle_connection(
                     ),
                 ),
             );
-            let _ = send_bounded(
+            send_final_frame(
                 &mut sink,
                 Message::Text(serde_json::to_string(&resp).expect("serializable").into()),
-                write_timeout,
-                &mut shutdown_rx,
+                final_frame_budget(&state, write_timeout),
             )
             .await;
             return;
@@ -413,21 +588,22 @@ async fn handle_connection(
         &mut sink,
         Message::Text(serde_json::to_string(&resp).expect("serializable").into()),
         write_timeout,
-        &mut shutdown_rx,
+        &mut close,
     )
     .await
     {
         // CP-initiated closes carry meaning even here: if the CP signalled
         // this connection while the ack was in flight, still tell the client
-        // why before tearing down.
-        if let WriteStop::Shutdown(Some(reason)) = stop {
-            let _ = send_bounded(
-                &mut sink,
-                policy_close(reason),
-                write_timeout,
-                &mut shutdown_rx,
-            )
-            .await;
+        // why before tearing down — a restart frame when the whole process
+        // is draining, a policy frame when this connection alone is ending.
+        if let WriteStop::Shutdown(_) = stop {
+            let frame = match close.process_reason() {
+                Some(reason) => Some(restart_close(reason)),
+                None => close.reason().map(policy_close),
+            };
+            if let Some(frame) = frame {
+                send_final_frame(&mut sink, frame, final_frame_budget(&state, write_timeout)).await;
+            }
         }
         // `_registered` runs teardown on the way out.
         return;
@@ -451,7 +627,7 @@ async fn handle_connection(
     // duration of its own arm body, and `break` acts on the loop below.
     macro_rules! write_or_break {
         ($msg:expr) => {
-            match send_bounded(&mut sink, $msg, write_timeout, &mut shutdown_rx).await {
+            match send_bounded(&mut sink, $msg, write_timeout, &mut close).await {
                 Ok(()) => {}
                 Err(WriteStop::Shutdown(reason)) => {
                     cp_close_reason = reason;
@@ -471,15 +647,15 @@ async fn handle_connection(
     }
     loop {
         tokio::select! {
-            // The CP dropped this registration (lease expiry) or must
-            // terminate the connection (terminal-frame backpressure): the
-            // socket must go too. Keeping it open would leave a
-            // connection whose every frame hits an absent registry entry and
-            // which can never re-register, since registration is
-            // first-frame-only. Closing lets the client reconnect,
-            // re-authenticate, and register again.
-            _ = shutdown_rx.changed() => {
-                cp_close_reason = *shutdown_rx.borrow_and_update();
+            // The CP dropped this registration (lease expiry), must
+            // terminate the connection (terminal-frame backpressure), or the
+            // process is shutting down: the socket must go too. Keeping it
+            // open would leave a connection whose every frame hits an absent
+            // registry entry and which can never re-register, since
+            // registration is first-frame-only. Closing lets the client
+            // reconnect, re-authenticate, and register again.
+            _ = close.changed() => {
+                cp_close_reason = close.reason();
                 break;
             }
             outbound = rx.recv() => {
@@ -507,7 +683,61 @@ async fn handle_connection(
         }
     }
 
-    if let Some(reason) = cp_close_reason {
+    // Process shutdown — SIGTERM/SIGHUP/SIGINT — is distinguished from a
+    // per-connection termination by which signal latched. On the process
+    // path the outbound queue is flushed FIRST: the synthesized terminals
+    // and cancels that `graceful_shutdown` queued must reach the wire ahead
+    // of the close frame. `rx.close()` refuses any further enqueue, so the
+    // loop ends on its own once the backlog is flushed.
+    //
+    // Every budget below is a remainder of ONE instant — the deadline latched
+    // when the CP began draining — not a fresh `shutdown_drain_secs` per
+    // connection and not a fresh one per write. That is what makes the
+    // documented bound true: `shutdown_drain_secs` covers the whole drain,
+    // the flush and the final close write included.
+    if let Some(reason) = close.process_reason() {
+        rx.close();
+        let deadline = state.shutdown_deadline().unwrap_or_else(Instant::now);
+        while let Some(text) = rx.recv().await {
+            let budget = deadline.saturating_duration_since(Instant::now());
+            if budget.is_zero() {
+                break;
+            }
+            if !matches!(
+                tokio::time::timeout(budget.min(write_timeout), sink.send(text.into())).await,
+                Ok(Ok(()))
+            ) {
+                return; // the peer is gone — teardown runs via the guard
+            }
+        }
+        info!(
+            agent = %format!("{}/{}", identity.namespace, identity.name),
+            handle,
+            reason,
+            "closing connection: control plane shutting down"
+        );
+        // Bounded like every other write — a peer that has stopped reading
+        // must not be able to hold teardown (and its quota slot) by refusing
+        // to accept the close frame — but by what is LEFT of the drain, not by
+        // a fresh timeout: a stalled peer cannot push the process's exit past
+        // the budget the operator configured. The write is NOT raced against
+        // the close watch: a second signal latching mid-write (a lease sweep
+        // landing mid-drain) must not eat the promised close frame.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            send_final_frame(
+                &mut sink,
+                restart_close(reason),
+                remaining.min(write_timeout),
+            )
+            .await;
+        } else {
+            warn!(
+                handle,
+                "drain deadline elapsed before this connection's close frame could be written"
+            );
+        }
+    } else if let Some(reason) = cp_close_reason {
         info!(
             agent = %format!("{}/{}", identity.namespace, identity.name),
             handle,
@@ -516,14 +746,10 @@ async fn handle_connection(
         );
         // Bounded like every other write: a peer that has stopped reading must
         // not be able to delay teardown (and its quota slot) by refusing to
-        // accept the close frame.
-        let _ = send_bounded(
-            &mut sink,
-            policy_close(reason),
-            write_timeout,
-            &mut shutdown_rx,
-        )
-        .await;
+        // accept the close frame. Not raced against the close watch either:
+        // the process signal may latch mid-write while this frame is still
+        // the only explanation the peer will get.
+        send_final_frame(&mut sink, policy_close(reason), write_timeout).await;
     }
 
     // Teardown runs here, when `_registered` drops — on this path and on an
@@ -861,9 +1087,23 @@ fn handle_frame(state: &Arc<AppState>, handle: u64, text: &str) -> Option<String
                         // already committed (entry removed, capacity
                         // released, terminal emitted), so the teardown finds
                         // nothing to fail and synthesizes nothing.
-                        state
-                            .registry
-                            .signal_shutdown(initiator_handle, REASON_BACKPRESSURE);
+                        //
+                        // Exception: during the drain the queue was closed on
+                        // purpose, not overflowed, and the connection is on its
+                        // way out with the shutdown close. Naming
+                        // backpressure there would tell a client its queue
+                        // overflowed when the real cause is a deploy.
+                        if state.shutting_down() {
+                            info!(
+                                initiator_handle,
+                                "delegation terminal undeliverable during shutdown — \
+                                 the connection is closing with the shutdown reason"
+                            );
+                        } else {
+                            state
+                                .registry
+                                .signal_shutdown(initiator_handle, REASON_BACKPRESSURE);
+                        }
                     }
                     if !delivered {
                         info!(
@@ -1005,6 +1245,68 @@ pub async fn run_sweeper(state: Arc<AppState>) {
         ) {
             let _ = inst.tx.try_send(frame);
         }
+    }
+}
+
+/// Graceful shutdown (SIGTERM/SIGHUP/SIGINT): resolve every in-flight
+/// delegation with synthesized terminal frames, latch the process-wide close
+/// signal, then wait — bounded by the SAME `shutdown_drain_secs` deadline the
+/// connection tasks are working against — for the connection tasks to flush
+/// their queues and exit.
+///
+/// Runs concurrently with the listener's own graceful shutdown, NOT after it:
+/// hyper's wait ends when the last in-flight HTTP request finishes, and a peer
+/// that opened a socket and then said nothing would pin that wait for as long
+/// as the orchestrator lets the process live — taking the drain down with it.
+/// The caller stops the sweeper once this returns; the sweeper deliberately
+/// outlives the drain so a mid-drain lease/deadline expiry still synthesizes
+/// normally.
+///
+/// Order is deliberate: terminals are synthesized BEFORE the close signal
+/// so they are already on each connection's outbound queue when it starts
+/// draining. Signalling first would let tasks close ahead of the frames
+/// they were about to deliver, and "synthesize where possible" would
+/// degrade to "almost never".
+pub async fn graceful_shutdown(state: &Arc<AppState>) {
+    info!("draining connections and resolving in-flight delegations");
+    let mut next = || state.next_rpc_id();
+    let mut undeliverable = 0usize;
+    for (inst, frame) in
+        state
+            .router
+            .fail_all(&state.registry, &state.events, REASON_SHUTDOWN, &mut next)
+    {
+        if inst.tx.try_send(frame).is_err() {
+            // The peer's bounded queue is already full (or was closed by a
+            // connection leaving the drain): the terminal cannot be delivered
+            // and the observer event is already emitted, so the two surfaces
+            // disagree — unavoidably, since a full queue is exactly a peer
+            // that stopped reading. Named at warn level because the drain is
+            // the last chance this delegation could ever be resolved for that
+            // initiator, and its only remaining outcome is deadline
+            // reconciliation on the client.
+            undeliverable += 1;
+            warn!(
+                agent = %inst.logical_id(),
+                handle = inst.handle,
+                "shutdown terminal could not be queued — the peer's outbound \
+                 queue refused it; the delegation will be reconciled by the \
+                 initiator's deadline"
+            );
+        }
+    }
+    // The deadline is latched with the close signal below, and covers
+    // everything after it.
+    let drain = Duration::from_secs(state.cfg.shutdown_drain_secs);
+    state.begin_shutdown(REASON_SHUTDOWN);
+    let outcome = tokio::time::timeout(drain, state.connections_drained()).await;
+    if outcome.is_err() {
+        warn!(
+            drain_secs = state.cfg.shutdown_drain_secs,
+            undeliverable, "shutdown drain budget elapsed — exiting with connections still open"
+        );
+    } else {
+        info!(undeliverable, "all connections drained");
     }
 }
 
@@ -1241,6 +1543,79 @@ mod tests {
         ack["result"]["admission"]
             .as_u64()
             .expect("token on the ack")
+    }
+
+    #[tokio::test]
+    async fn shutdown_survives_an_initiator_whose_queue_is_already_full() {
+        // The one outcome the drain cannot repair: an initiator whose bounded
+        // queue is full when the terminal is synthesized. The frame cannot be
+        // delivered — that is what "bounded" means — so the two surfaces
+        // disagree by construction: the observer event is emitted, the wire
+        // frame is refused. What must NOT happen is a panic, a delegation row
+        // left behind, a leaked serving reservation, or a drain that never
+        // ends. The refusal is logged at warn level, because the drain is the
+        // last chance that delegation had to be resolved for that initiator.
+        let state = state_with("");
+        let (h_i, mut rx_i) = register_test_instance(&state, "koudu", AgentType::Primary, 4);
+        let (h_w, mut rx_w) = register_test_instance(&state, "worker-1", AgentType::Worker, 1);
+        let (_h_o, mut rx_o) = register_test_instance(&state, "lobby", AgentType::Observer, 0);
+        delegate_through_handler(&state, h_i, "d-1", "worker-1");
+        rx_w.try_recv().expect("worker received the forward");
+        while rx_o.try_recv().is_ok() {}
+
+        // Nobody drains this queue — exactly the situation a peer that stopped
+        // reading creates, and the only way to make `try_send` refuse.
+        let filler = "x".repeat(64 * 1024);
+        let mut enqueued = 0;
+        while state
+            .registry
+            .get(h_i)
+            .unwrap()
+            .tx
+            .try_send(filler.clone())
+            .is_ok()
+        {
+            enqueued += 1;
+            assert!(enqueued < 1000, "the bounded queue must refuse eventually");
+        }
+        assert!(enqueued > 0, "the first frame must fit");
+
+        graceful_shutdown(&state).await;
+
+        assert_eq!(
+            state.router.inflight_count(),
+            0,
+            "the delegation must still be ended"
+        );
+        assert_eq!(
+            state.registry.get(h_w).unwrap().active_sessions,
+            0,
+            "the serving reservation must still be released"
+        );
+        assert!(
+            state.shutting_down(),
+            "the CP must stay latched as draining afterwards"
+        );
+        let mut terminal_queued = false;
+        while let Ok(frame) = rx_i.try_recv() {
+            if frame.contains("cp/delegate_result") {
+                terminal_queued = true;
+            }
+        }
+        assert!(
+            !terminal_queued,
+            "a full queue cannot take the terminal — the documented exception"
+        );
+        let events: Vec<String> = std::iter::from_fn(|| rx_o.try_recv().ok()).collect();
+        assert!(
+            events.iter().any(|e| e.contains("delegation_completed")),
+            "the observer-side terminal is still emitted: that is why the two \
+             surfaces disagree, and why the refusal must be logged: {events:?}"
+        );
+        assert!(
+            rx_w.try_recv().unwrap().contains("cp/cancel"),
+            "the serving runtime's queue was healthy, so its cancel must land"
+        );
     }
 
     #[test]

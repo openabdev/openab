@@ -54,7 +54,11 @@ const MAX_STORE_SIZE: usize = 20 * 1024 * 1024; // 20 MB (matches AUDIO_MAX_DOWN
 /// Rejects files exceeding MAX_STORE_SIZE as a defense-in-depth measure.
 pub async fn store_media(bytes: &[u8]) -> Option<String> {
     if bytes.len() > MAX_STORE_SIZE {
-        error!(size = bytes.len(), max = MAX_STORE_SIZE, "store_media rejected: exceeds size limit");
+        error!(
+            size = bytes.len(),
+            max = MAX_STORE_SIZE,
+            "store_media rejected: exceeds size limit"
+        );
         return None;
     }
     let dir = media_dir().await;

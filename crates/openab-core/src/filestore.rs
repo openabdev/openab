@@ -92,11 +92,7 @@ impl Filestore {
     ///
     /// The object key is `{prefix}{uuid}_{filename}`. On success returns the
     /// presigned URL as a String. On failure logs the error and returns Err.
-    pub async fn upload_and_presign(
-        &self,
-        filename: &str,
-        data: &[u8],
-    ) -> anyhow::Result<String> {
+    pub async fn upload_and_presign(&self, filename: &str, data: &[u8]) -> anyhow::Result<String> {
         // Sanitize filename: strip path separators, traversal sequences,
         // double quotes (breaks Content-Disposition header parsing), and
         // non-ASCII chars. Limit length to prevent excessively long S3 keys.
@@ -107,13 +103,12 @@ impl Filestore {
             .filter(|c| c.is_ascii_graphic() || *c == ' ')
             .take(200)
             .collect();
-        let safe_name = if safe_name.is_empty() { "unnamed" } else { &safe_name };
-        let key = format!(
-            "{}{}_{}",
-            self.prefix,
-            uuid::Uuid::new_v4(),
-            safe_name
-        );
+        let safe_name = if safe_name.is_empty() {
+            "unnamed"
+        } else {
+            &safe_name
+        };
+        let key = format!("{}{}_{}", self.prefix, uuid::Uuid::new_v4(), safe_name);
 
         // Upload the object (3-minute timeout to prevent indefinite hangs)
         const UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
@@ -188,7 +183,7 @@ impl Filestore {
         } else {
             &safe_name
         };
-        let key = format!("{}{}_{}",self.prefix, uuid::Uuid::new_v4(), safe_name);
+        let key = format!("{}{}_{}", self.prefix, uuid::Uuid::new_v4(), safe_name);
 
         // Pre-check reported size
         if reported_size > self.max_file_size {
@@ -260,25 +255,26 @@ impl Filestore {
                     .send()
                     .await
                 {
-                    Ok(resp) => {
-                        match resp.e_tag {
-                            Some(tag) => {
-                                parts.push(
-                                    CompletedPart::builder()
-                                        .part_number(part_number)
-                                        .e_tag(tag)
-                                        .build(),
-                                );
-                                part_number += 1;
-                            }
-                            None => {
-                                upload_error = Some(anyhow::anyhow!("upload_part {part_number} returned no ETag"));
-                                break;
-                            }
+                    Ok(resp) => match resp.e_tag {
+                        Some(tag) => {
+                            parts.push(
+                                CompletedPart::builder()
+                                    .part_number(part_number)
+                                    .e_tag(tag)
+                                    .build(),
+                            );
+                            part_number += 1;
                         }
-                    }
+                        None => {
+                            upload_error = Some(anyhow::anyhow!(
+                                "upload_part {part_number} returned no ETag"
+                            ));
+                            break;
+                        }
+                    },
                     Err(e) => {
-                        upload_error = Some(anyhow::anyhow!("upload_part {part_number} failed: {e}"));
+                        upload_error =
+                            Some(anyhow::anyhow!("upload_part {part_number} failed: {e}"));
                         break;
                     }
                 }
@@ -294,27 +290,31 @@ impl Filestore {
                 .key(&key)
                 .upload_id(&upload_id)
                 .part_number(part_number)
-                .body(aws_sdk_s3::primitives::ByteStream::from(std::mem::take(&mut buffer)))
+                .body(aws_sdk_s3::primitives::ByteStream::from(std::mem::take(
+                    &mut buffer,
+                )))
                 .send()
                 .await
             {
-                Ok(resp) => {
-                    match resp.e_tag {
-                        Some(tag) => {
-                            parts.push(
-                                CompletedPart::builder()
-                                    .part_number(part_number)
-                                    .e_tag(tag)
-                                    .build(),
-                            );
-                        }
-                        None => {
-                            upload_error = Some(anyhow::anyhow!("upload_part {part_number} (final) returned no ETag"));
-                        }
+                Ok(resp) => match resp.e_tag {
+                    Some(tag) => {
+                        parts.push(
+                            CompletedPart::builder()
+                                .part_number(part_number)
+                                .e_tag(tag)
+                                .build(),
+                        );
                     }
-                }
+                    None => {
+                        upload_error = Some(anyhow::anyhow!(
+                            "upload_part {part_number} (final) returned no ETag"
+                        ));
+                    }
+                },
                 Err(e) => {
-                    upload_error = Some(anyhow::anyhow!("upload_part {part_number} (final) failed: {e}"));
+                    upload_error = Some(anyhow::anyhow!(
+                        "upload_part {part_number} (final) failed: {e}"
+                    ));
                 }
             }
         }
@@ -361,7 +361,9 @@ impl Filestore {
                 .upload_id(&upload_id)
                 .send()
                 .await;
-            return Err(anyhow::anyhow!("stream produced no data — file may be empty or download failed"));
+            return Err(anyhow::anyhow!(
+                "stream produced no data — file may be empty or download failed"
+            ));
         }
 
         // If buffer has remaining data but no parts yet (file < 16 MB), upload as single part
@@ -383,7 +385,8 @@ impl Filestore {
                         Some(tag) => tag,
                         None => {
                             error!(bucket = %self.bucket, key = %key, "upload single part returned no ETag, aborting");
-                            let _ = self.client
+                            let _ = self
+                                .client
                                 .abort_multipart_upload()
                                 .bucket(&self.bucket)
                                 .key(&key)
@@ -393,16 +396,12 @@ impl Filestore {
                             return Err(anyhow::anyhow!("upload single part returned no ETag"));
                         }
                     };
-                    parts.push(
-                        CompletedPart::builder()
-                            .part_number(1)
-                            .e_tag(e_tag)
-                            .build(),
-                    );
+                    parts.push(CompletedPart::builder().part_number(1).e_tag(e_tag).build());
                 }
                 Err(e) => {
                     error!(bucket = %self.bucket, key = %key, error = %e, "upload single part failed, aborting");
-                    let _ = self.client
+                    let _ = self
+                        .client
                         .abort_multipart_upload()
                         .bucket(&self.bucket)
                         .key(&key)
@@ -419,7 +418,8 @@ impl Filestore {
             .set_parts(Some(parts))
             .build();
 
-        if let Err(e) = self.client
+        if let Err(e) = self
+            .client
             .complete_multipart_upload()
             .bucket(&self.bucket)
             .key(&key)
@@ -430,7 +430,8 @@ impl Filestore {
         {
             error!(bucket = %self.bucket, key = %key, error = %e, "complete_multipart_upload failed, aborting");
             // Abort the multipart upload to clean up orphaned parts
-            let _ = self.client
+            let _ = self
+                .client
                 .abort_multipart_upload()
                 .bucket(&self.bucket)
                 .key(&key)
@@ -480,11 +481,20 @@ impl Filestore {
 
 /// Format the hint block returned to the agent when a large file is uploaded
 /// to the filestore instead of being inlined.
-pub fn format_filestore_hint(filename: &str, size_bytes: u64, presigned_url: &str, ttl_secs: u64) -> String {
+pub fn format_filestore_hint(
+    filename: &str,
+    size_bytes: u64,
+    presigned_url: &str,
+    ttl_secs: u64,
+) -> String {
     let size_kb = size_bytes / 1024;
     let ttl_minutes = ttl_secs / 60;
     // Sanitize filename for prompt safety — strip control characters
-    let safe_filename: String = filename.chars().filter(|c| !c.is_control()).take(200).collect();
+    let safe_filename: String = filename
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect();
     format!(
         "[File: {safe_filename}]\n\
          This file ({size_kb} KB) exceeds the 512 KB inline limit. \
@@ -550,7 +560,9 @@ secret_access_key = "SECRET"
         assert!(hint.contains("[File: big-log.txt]"));
         assert!(hint.contains("1024 KB"));
         assert!(hint.contains("exceeds the 512 KB inline limit"));
-        assert!(hint.contains("https://bucket.s3.amazonaws.com/incoming/uuid_big-log.txt?X-Amz-..."));
+        assert!(
+            hint.contains("https://bucket.s3.amazonaws.com/incoming/uuid_big-log.txt?X-Amz-...")
+        );
         assert!(hint.contains("expires in 60 minutes"));
     }
 

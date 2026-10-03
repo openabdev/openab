@@ -60,6 +60,19 @@ write_timeout_secs = 30
 # max_frame_bytes so one maximum-size frame always fits.
 max_outbound_queue_bytes = 16777216
 
+# Grace period for live connections after SIGTERM/SIGHUP/SIGINT, seconds.
+# `docker stop` and k8s/ECS send SIGTERM first and SIGKILL after their own
+# grace period, so keep this comfortably below it. On the signal the CP
+# resolves every in-flight delegation (initiators get a synthesized
+# target_disconnected terminal, serving runtimes a cp/cancel), then each
+# connection flushes its queued outbound frames and closes with code 1012 —
+# and this budget is the ceiling for all of it, close write included, so a
+# peer that stops reading cannot push the exit past it; once the drain is done
+# the CP allows the HTTP listener one further second for its own bookkeeping.
+# Must be greater than 0: a zero budget would emit the observer-side terminal
+# events and then exit before any of the frames reached a wire.
+shutdown_drain_secs = 5
+
 # Process-wide ceiling on simultaneously in-flight delegations, enforced at
 # admission (before any capacity is reserved) with SATURATED. Per-target
 # max_delegated_sessions is advertised by the runtime and bounds one target's

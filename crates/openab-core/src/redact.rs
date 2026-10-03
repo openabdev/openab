@@ -24,9 +24,14 @@
 /// identifier in a log at all.
 pub fn redact_session_ids(s: &str) -> String {
     s.split(':')
-        .map(|seg| match seg.strip_prefix("acp_").or_else(|| seg.strip_prefix("sess_")) {
-            Some(uuid) if !uuid.is_empty() => hash_tag(uuid),
-            _ => seg.to_string(),
+        .map(|seg| {
+            match seg
+                .strip_prefix("acp_")
+                .or_else(|| seg.strip_prefix("sess_"))
+            {
+                Some(uuid) if !uuid.is_empty() => hash_tag(uuid),
+                _ => seg.to_string(),
+            }
         })
         .collect::<Vec<_>>()
         .join(":")
@@ -53,7 +58,10 @@ mod tests {
     fn both_encodings_hash_alike_and_everything_else_passes_through() {
         let u = "00000000-0000-0000-0000-000000000000";
         let tag = redact_session_ids(&format!("acp_{u}"));
-        assert!(tag.starts_with('#') && tag.len() == 9, "expected #<8hex>, got {tag}");
+        assert!(
+            tag.starts_with('#') && tag.len() == 9,
+            "expected #<8hex>, got {tag}"
+        );
         assert_eq!(
             redact_session_ids(&format!("sess_{u}")),
             tag,
@@ -65,10 +73,22 @@ mod tests {
             format!("acp:{tag}"),
             "a <platform>:<id> pool key must redact the id half and keep the platform greppable"
         );
-        assert_eq!(redact_session_ids("1234567890"), "1234567890", "public ids stay greppable");
-        assert_eq!(redact_session_ids("-"), "-", "the no-session sentinel is not a session");
+        assert_eq!(
+            redact_session_ids("1234567890"),
+            "1234567890",
+            "public ids stay greppable"
+        );
+        assert_eq!(
+            redact_session_ids("-"),
+            "-",
+            "the no-session sentinel is not a session"
+        );
         assert_eq!(redact_session_ids(""), "", "empty in, empty out");
-        assert_eq!(redact_session_ids("acp_"), "acp_", "a bare prefix carries no uuid to hide");
+        assert_eq!(
+            redact_session_ids("acp_"),
+            "acp_",
+            "a bare prefix carries no uuid to hide"
+        );
         assert_eq!(
             redact_session_ids("discord:1234567890"),
             "discord:1234567890",

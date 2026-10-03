@@ -1,4 +1,7 @@
-use crate::media::{format_bytes, resize_and_compress, MediaKind, AUDIO_MAX_DOWNLOAD, FILE_MAX_DOWNLOAD, IMAGE_MAX_DOWNLOAD};
+use crate::media::{
+    format_bytes, resize_and_compress, MediaKind, AUDIO_MAX_DOWNLOAD, FILE_MAX_DOWNLOAD,
+    IMAGE_MAX_DOWNLOAD,
+};
 use crate::schema::*;
 use crate::store;
 use axum::extract::State;
@@ -106,12 +109,19 @@ pub async fn webhook(
     // Priority: CF-Connecting-IP (edge proxy, non-spoofable) > X-Real-IP > X-Forwarded-For
     // NOTE: XFF leftmost entry is client-supplied and spoofable. Phase 2 must implement
     // trusted proxy configuration for accurate IP extraction when enforcement is enabled.
-    let source_ip = headers.get("cf-connecting-ip")
+    let source_ip = headers
+        .get("cf-connecting-ip")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim().to_string())
-        .or_else(|| headers.get("x-real-ip").and_then(|v| v.to_str().ok()).map(|s| s.trim().to_string()))
         .or_else(|| {
-            headers.get("x-forwarded-for")
+            headers
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.trim().to_string())
+        })
+        .or_else(|| {
+            headers
+                .get("x-forwarded-for")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.split(',').next())
                 .map(|s| s.trim().to_string())
@@ -159,19 +169,25 @@ pub async fn webhook(
             let client = &state.client;
             if is_photo {
                 if let Some(largest) = msg.photo.iter().max_by_key(|p| p.width * p.height) {
-                    let att = download_telegram_media(client, token, &largest.file_id, MediaKind::Image).await;
+                    let att =
+                        download_telegram_media(client, token, &largest.file_id, MediaKind::Image)
+                            .await;
                     attachments.push(att);
                 }
             } else if let Some(doc) = msg.document {
                 let file_name = doc.file_name.unwrap_or_else(|| "unknown.txt".to_string());
                 let mime_type = doc.mime_type.unwrap_or_else(|| "text/plain".to_string());
-                let att = download_telegram_document(client, token, &doc.file_id, &file_name, &mime_type).await;
+                let att =
+                    download_telegram_document(client, token, &doc.file_id, &file_name, &mime_type)
+                        .await;
                 attachments.push(att);
             } else if let Some(voice) = msg.voice {
-                let att = download_telegram_media(client, token, &voice.file_id, MediaKind::Audio).await;
+                let att =
+                    download_telegram_media(client, token, &voice.file_id, MediaKind::Audio).await;
                 attachments.push(att);
             } else if let Some(audio) = msg.audio {
-                let att = download_telegram_media(client, token, &audio.file_id, MediaKind::Audio).await;
+                let att =
+                    download_telegram_media(client, token, &audio.file_id, MediaKind::Audio).await;
                 attachments.push(att);
             }
         }
@@ -277,7 +293,8 @@ fn check_telegram_subnet(ip_str: &str) -> bool {
         std::net::IpAddr::V4(v4) => {
             let octets = v4.octets();
             // 149.154.160.0/20 → 149.154.160.0 - 149.154.175.255
-            let in_range1 = octets[0] == 149 && octets[1] == 154 && (160..=175).contains(&octets[2]);
+            let in_range1 =
+                octets[0] == 149 && octets[1] == 154 && (160..=175).contains(&octets[2]);
             // 91.108.4.0/22 → 91.108.4.0 - 91.108.7.255
             let in_range2 = octets[0] == 91 && octets[1] == 108 && (4..=7).contains(&octets[2]);
             in_range1 || in_range2
@@ -338,7 +355,11 @@ fn is_complex_markdown(text: &str) -> bool {
 /// Compute a stable draft_id from channel + thread to avoid collisions in forum topics.
 fn compute_draft_id(chat_id: &str, thread_id: &Option<String>) -> i64 {
     let chan: i64 = chat_id.parse::<i64>().unwrap_or(1).abs();
-    let tid: i64 = thread_id.as_deref().and_then(|t| t.parse::<i64>().ok()).unwrap_or(0).abs();
+    let tid: i64 = thread_id
+        .as_deref()
+        .and_then(|t| t.parse::<i64>().ok())
+        .unwrap_or(0)
+        .abs();
     (chan.wrapping_add(tid)) % 1_000_000 + 1
 }
 
@@ -360,12 +381,20 @@ async fn send_rich_message(
         "message_thread_id": thread_id,
         "rich_message": { "markdown": text },
     });
-    let resp = client.post(&url).json(&body).send().await.map_err(|e| e.to_string())?;
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
     let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
     if json["ok"].as_bool() == Some(true) {
         Ok(json)
     } else {
-        Err(json["description"].as_str().unwrap_or("unknown error").to_string())
+        Err(json["description"]
+            .as_str()
+            .unwrap_or("unknown error")
+            .to_string())
     }
 }
 
@@ -391,12 +420,20 @@ async fn send_rich_message_draft(
         "draft_id": draft_id,
         "rich_message": if text.contains("<tg-") { serde_json::json!({ "html": text }) } else { serde_json::json!({ "markdown": text }) },
     });
-    let resp = client.post(&url).json(&body).send().await.map_err(|e| e.to_string())?;
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
     let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
     if json["ok"].as_bool() == Some(true) {
         Ok(())
     } else {
-        Err(json["description"].as_str().unwrap_or("unknown error").to_string())
+        Err(json["description"]
+            .as_str()
+            .unwrap_or("unknown error")
+            .to_string())
     }
 }
 
@@ -482,7 +519,15 @@ pub async fn handle_reply(
                 };
                 // Combine channel + thread to avoid draft_id collision in forum topics
                 let draft_id = compute_draft_id(&reply.channel.id, &reply.channel.thread_id);
-                let _ = send_rich_message_draft(client, bot_token, &reply.channel.id, &reply.channel.thread_id, draft_id, text).await;
+                let _ = send_rich_message_draft(
+                    client,
+                    bot_token,
+                    &reply.channel.id,
+                    &reply.channel.thread_id,
+                    draft_id,
+                    text,
+                )
+                .await;
             }
             // else: rich_messages=false with dummy ref — silently drop (no real msg to edit)
             return;
@@ -592,7 +637,15 @@ pub async fn handle_reply(
         } else {
             text.to_string()
         };
-        match send_rich_message(client, bot_token, &reply.channel.id, &reply.channel.thread_id, &rich_text).await {
+        match send_rich_message(
+            client,
+            bot_token,
+            &reply.channel.id,
+            &reply.channel.thread_id,
+            &rich_text,
+        )
+        .await
+        {
             Ok(_) => return,
             Err(e) => warn!("sendRichMessage failed ({e}), falling back to sendMessage"),
         }
@@ -680,25 +733,48 @@ async fn download_telegram_media(
     let fallback_filename = format!("{}.{}", file_id, ext);
 
     let get_file_url = format!("{TELEGRAM_API_BASE}/bot{}/getFile", bot_token);
-    let resp = match client.get(&get_file_url).query(&[("file_id", file_id)]).send().await {
+    let resp = match client
+        .get(&get_file_url)
+        .query(&[("file_id", file_id)])
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             warn!(file_id, error = %e, kind = ?kind, "Telegram getFile request failed");
-            return Attachment::rejected(att_type, fallback_filename, default_mime, 0, "download failed: network error");
+            return Attachment::rejected(
+                att_type,
+                fallback_filename,
+                default_mime,
+                0,
+                "download failed: network error",
+            );
         }
     };
     let body: serde_json::Value = match resp.json().await {
         Ok(v) => v,
         Err(e) => {
             warn!(file_id, error = %e, kind = ?kind, "Telegram getFile JSON parse failed");
-            return Attachment::rejected(att_type, fallback_filename, default_mime, 0, "download failed: invalid API response");
+            return Attachment::rejected(
+                att_type,
+                fallback_filename,
+                default_mime,
+                0,
+                "download failed: invalid API response",
+            );
         }
     };
     let file_path = match body["result"]["file_path"].as_str() {
         Some(p) => p,
         None => {
             warn!(file_id, kind = ?kind, "Telegram getFile response missing file_path");
-            return Attachment::rejected(att_type, fallback_filename, default_mime, 0, "download failed: invalid API response");
+            return Attachment::rejected(
+                att_type,
+                fallback_filename,
+                default_mime,
+                0,
+                "download failed: invalid API response",
+            );
         }
     };
 
@@ -707,7 +783,13 @@ async fn download_telegram_media(
         Ok(r) => r,
         Err(e) => {
             warn!(file_id, error = %e, kind = ?kind, "Telegram media download request failed");
-            return Attachment::rejected(att_type, fallback_filename, default_mime, 0, "download failed: network error");
+            return Attachment::rejected(
+                att_type,
+                fallback_filename,
+                default_mime,
+                0,
+                "download failed: network error",
+            );
         }
     };
 
@@ -732,7 +814,11 @@ async fn download_telegram_media(
                     fallback_filename,
                     default_mime,
                     size,
-                    format!("size exceeded: {} exceeds {}", format_bytes(size), format_bytes(max_size)),
+                    format!(
+                        "size exceeded: {} exceeds {}",
+                        format_bytes(size),
+                        format_bytes(max_size)
+                    ),
                 );
             }
         }
@@ -749,7 +835,13 @@ async fn download_telegram_media(
         Ok(b) => b,
         Err(e) => {
             warn!(file_id, error = %e, kind = ?kind, "Telegram media body read failed");
-            return Attachment::rejected(att_type, fallback_filename, default_mime, 0, "download failed: body read error");
+            return Attachment::rejected(
+                att_type,
+                fallback_filename,
+                default_mime,
+                0,
+                "download failed: body read error",
+            );
         }
     };
     if bytes.len() as u64 > max_size {
@@ -759,7 +851,11 @@ async fn download_telegram_media(
             fallback_filename,
             default_mime,
             bytes.len() as u64,
-            format!("size exceeded: {} exceeds {}", format_bytes(bytes.len() as u64), format_bytes(max_size)),
+            format!(
+                "size exceeded: {} exceeds {}",
+                format_bytes(bytes.len() as u64),
+                format_bytes(max_size)
+            ),
         );
     }
 
@@ -768,7 +864,13 @@ async fn download_telegram_media(
             Ok((c, m)) => (c, m),
             Err(e) => {
                 error!(err = %e, "Telegram image processing failed");
-                return Attachment::rejected(att_type, fallback_filename, default_mime, bytes.len() as u64, "processing failed: image encoding error");
+                return Attachment::rejected(
+                    att_type,
+                    fallback_filename,
+                    default_mime,
+                    bytes.len() as u64,
+                    "processing failed: image encoding error",
+                );
             }
         },
         MediaKind::Audio => (bytes.to_vec(), content_type),
@@ -779,17 +881,27 @@ async fn download_telegram_media(
         Some(p) => p,
         None => {
             warn!(file_id, kind = ?kind, "Telegram media store failed");
-            return Attachment::rejected(att_type, fallback_filename, default_mime, data_bytes.len() as u64, "processing failed: storage error");
+            return Attachment::rejected(
+                att_type,
+                fallback_filename,
+                default_mime,
+                data_bytes.len() as u64,
+                "processing failed: storage error",
+            );
         }
     };
     info!(file_id, size = data_bytes.len(), kind = ?kind, "Telegram media stored");
 
     Attachment {
         attachment_type: att_type.into(),
-        filename: format!("{}.{}", file_id, match kind {
-            MediaKind::Image => "jpg",
-            MediaKind::Audio => crate::media::audio_extension(&mime),
-        }),
+        filename: format!(
+            "{}.{}",
+            file_id,
+            match kind {
+                MediaKind::Image => "jpg",
+                MediaKind::Audio => crate::media::audio_extension(&mime),
+            }
+        ),
         mime_type: mime,
         data: String::new(), // No base64 — using file path
         size: data_bytes.len() as u64,
@@ -819,25 +931,51 @@ async fn download_telegram_document(
     }
 
     let get_file_url = format!("{TELEGRAM_API_BASE}/bot{}/getFile", bot_token);
-    let resp = match client.get(&get_file_url).query(&[("file_id", file_id)]).send().await {
+    let resp = match client
+        .get(&get_file_url)
+        .query(&[("file_id", file_id)])
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             warn!(file_id, error = %e, "Telegram document getFile request failed");
-            return Attachment::rejected("text_file", file_name.to_string(), mime_type, 0, "download failed: network error");
+            return Attachment::rejected(
+                "text_file",
+                file_name.to_string(),
+                mime_type,
+                0,
+                "download failed: network error",
+            );
         }
     };
     let body: serde_json::Value = match resp.json().await {
         Ok(v) => v,
         Err(e) => {
             warn!(file_id, error = %e, "Telegram document getFile JSON parse failed");
-            return Attachment::rejected("text_file", file_name.to_string(), mime_type, 0, "download failed: invalid API response");
+            return Attachment::rejected(
+                "text_file",
+                file_name.to_string(),
+                mime_type,
+                0,
+                "download failed: invalid API response",
+            );
         }
     };
     let file_path = match body["result"]["file_path"].as_str() {
         Some(p) => p,
         None => {
-            warn!(file_id, "Telegram document getFile response missing file_path");
-            return Attachment::rejected("text_file", file_name.to_string(), mime_type, 0, "download failed: invalid API response");
+            warn!(
+                file_id,
+                "Telegram document getFile response missing file_path"
+            );
+            return Attachment::rejected(
+                "text_file",
+                file_name.to_string(),
+                mime_type,
+                0,
+                "download failed: invalid API response",
+            );
         }
     };
 
@@ -846,12 +984,22 @@ async fn download_telegram_document(
         Ok(r) => r,
         Err(e) => {
             warn!(file_id, err = %e, "Telegram document network error");
-            return Attachment::rejected("text_file", file_name.to_string(), mime_type, 0, "download failed: network error");
+            return Attachment::rejected(
+                "text_file",
+                file_name.to_string(),
+                mime_type,
+                0,
+                "download failed: network error",
+            );
         }
     };
     if !resp.status().is_success() {
         let status = resp.status();
-        warn!(file_id, status = status.as_u16(), "Telegram document HTTP error");
+        warn!(
+            file_id,
+            status = status.as_u16(),
+            "Telegram document HTTP error"
+        );
         return Attachment::rejected(
             "text_file",
             file_name.to_string(),
@@ -864,13 +1012,20 @@ async fn download_telegram_document(
     if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
         if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
             if size > FILE_MAX_DOWNLOAD {
-                warn!(file_id, size, "Telegram document Content-Length exceeds limit");
+                warn!(
+                    file_id,
+                    size, "Telegram document Content-Length exceeds limit"
+                );
                 return Attachment::rejected(
                     "text_file",
                     file_name.to_string(),
                     mime_type,
                     size,
-                    format!("size exceeded: {} exceeds {}", format_bytes(size), format_bytes(FILE_MAX_DOWNLOAD)),
+                    format!(
+                        "size exceeded: {} exceeds {}",
+                        format_bytes(size),
+                        format_bytes(FILE_MAX_DOWNLOAD)
+                    ),
                 );
             }
         }
@@ -880,23 +1035,40 @@ async fn download_telegram_document(
         Ok(b) => b,
         Err(e) => {
             warn!(file_id, error = %e, "Telegram document body read failed");
-            return Attachment::rejected("text_file", file_name.to_string(), mime_type, 0, "download failed: body read error");
+            return Attachment::rejected(
+                "text_file",
+                file_name.to_string(),
+                mime_type,
+                0,
+                "download failed: body read error",
+            );
         }
     };
     if bytes.len() as u64 > FILE_MAX_DOWNLOAD {
-        warn!(file_id, size = bytes.len(), "Telegram document exceeds limit");
+        warn!(
+            file_id,
+            size = bytes.len(),
+            "Telegram document exceeds limit"
+        );
         return Attachment::rejected(
             "text_file",
             file_name.to_string(),
             mime_type,
             bytes.len() as u64,
-            format!("size exceeded: {} exceeds {}", format_bytes(bytes.len() as u64), format_bytes(FILE_MAX_DOWNLOAD)),
+            format!(
+                "size exceeded: {} exceeds {}",
+                format_bytes(bytes.len() as u64),
+                format_bytes(FILE_MAX_DOWNLOAD)
+            ),
         );
     }
 
     // Validate UTF-8 — reject binary files
     if String::from_utf8(bytes.to_vec()).is_err() {
-        warn!(file_id, file_name, "Telegram document is not valid UTF-8, skipping");
+        warn!(
+            file_id,
+            file_name, "Telegram document is not valid UTF-8, skipping"
+        );
         return Attachment::rejected(
             "text_file",
             file_name.to_string(),
@@ -910,10 +1082,21 @@ async fn download_telegram_document(
         Some(p) => p,
         None => {
             warn!(file_id, file_name, "Telegram document store failed");
-            return Attachment::rejected("text_file", file_name.to_string(), mime_type, bytes.len() as u64, "processing failed: storage error");
+            return Attachment::rejected(
+                "text_file",
+                file_name.to_string(),
+                mime_type,
+                bytes.len() as u64,
+                "processing failed: storage error",
+            );
         }
     };
-    info!(file_id, file_name, size = bytes.len(), "Telegram document stored");
+    info!(
+        file_id,
+        file_name,
+        size = bytes.len(),
+        "Telegram document stored"
+    );
 
     Attachment {
         attachment_type: "text_file".into(),
@@ -941,17 +1124,29 @@ mod tests {
             "application/pdf",
         )
         .await;
-        assert!(att.status.is_some(), "non-text extension must have status set");
+        assert!(
+            att.status.is_some(),
+            "non-text extension must have status set"
+        );
         let reason = att.status.unwrap();
         assert!(reason.contains("unsupported format"), "got: {reason}");
-        assert!(reason.contains("pdf"), "expected file extension in reason, got: {reason}");
+        assert!(
+            reason.contains("pdf"),
+            "expected file extension in reason, got: {reason}"
+        );
     }
 
     #[test]
     fn test_is_markdown_parse_error() {
-        assert!(is_markdown_parse_error("Bad Request: can't find end of italic entity at byte offset 37"));
-        assert!(is_markdown_parse_error("Bad Request: can't parse entities: Can't find end of bold entity"));
-        assert!(is_markdown_parse_error("can't parse entities in message text"));
+        assert!(is_markdown_parse_error(
+            "Bad Request: can't find end of italic entity at byte offset 37"
+        ));
+        assert!(is_markdown_parse_error(
+            "Bad Request: can't parse entities: Can't find end of bold entity"
+        ));
+        assert!(is_markdown_parse_error(
+            "can't parse entities in message text"
+        ));
         assert!(!is_markdown_parse_error("Unauthorized"));
         assert!(!is_markdown_parse_error("Bad Request: chat not found"));
     }
@@ -982,8 +1177,12 @@ mod tests {
     fn test_is_complex_markdown() {
         // Tables
         assert!(is_complex_markdown("| Col1 | Col2 |\n|---|---|\n| a | b |"));
-        assert!(is_complex_markdown("| Col1 | Col2 |\n| :--- | ---: |\n| a | b |"));
-        assert!(is_complex_markdown("| A | B |\n| :---: | :---: |\n| x | y |"));
+        assert!(is_complex_markdown(
+            "| Col1 | Col2 |\n| :--- | ---: |\n| a | b |"
+        ));
+        assert!(is_complex_markdown(
+            "| A | B |\n| :---: | :---: |\n| x | y |"
+        ));
         // Code blocks — intentionally NOT complex (preserves syntax highlighting on legacy path)
         assert!(!is_complex_markdown("```rust\nfn main() {}\n```"));
         assert!(!is_complex_markdown("~~~\ncode\n~~~"));

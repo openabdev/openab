@@ -251,10 +251,12 @@ fn should_create_cron_thread(job: &CronJobConfig) -> bool {
 }
 
 fn cron_sender_thread_id(channel: &ChannelRef) -> Option<String> {
-    channel
-        .thread_id
-        .clone()
-        .or_else(|| channel.parent_id.as_ref().map(|_| channel.channel_id.clone()))
+    channel.thread_id.clone().or_else(|| {
+        channel
+            .parent_id
+            .as_ref()
+            .map(|_| channel.channel_id.clone())
+    })
 }
 
 /// Validate all cronjob configs (fail-fast on bad cron expressions or timezones).
@@ -647,8 +649,7 @@ async fn fire_cronjob(
                 DisableOnSuccessResult::NotAchieved(reason) => {
                     info!(
                         id = job.id.as_deref().unwrap_or(""),
-                        reason,
-                        "disable_on_success not achieved, firing cronjob normally"
+                        reason, "disable_on_success not achieved, firing cronjob normally"
                     );
                 }
             }
@@ -725,7 +726,7 @@ async fn fire_cronjob(
         thread_id: cron_sender_thread_id(&reply_channel),
         is_bot: true,
         timestamp: Some(Utc::now().to_rfc3339()),
-        message_id: None, // cron jobs don't originate from a message
+        message_id: None,  // cron jobs don't originate from a message
         receiver_id: None, // cron jobs are self-triggered, no external receiver
     };
     let sender_json = match serde_json::to_string(&sender) {
@@ -1250,7 +1251,7 @@ message = "hello"
 "#;
         let cfg: UsercronFile = toml::from_str(toml_str).unwrap();
         let job = &cfg.jobs[0];
-        assert_eq!(job.enabled, true);
+        assert!(job.enabled);
         assert_eq!(job.platform, "discord");
         assert_eq!(job.sender_name, "openab-cron");
         assert_eq!(job.timezone, "UTC");
@@ -1272,7 +1273,7 @@ channel = "123"
 message = "hello"
 "#;
         let cfg: UsercronFile = toml::from_str(toml_str).unwrap();
-        assert_eq!(cfg.jobs[0].enabled, false);
+        assert!(!cfg.jobs[0].enabled);
     }
 
     #[test]
@@ -1630,7 +1631,10 @@ message = "a"
             origin_event_id: None,
         };
 
-        assert_eq!(cron_sender_thread_id(&channel).as_deref(), Some("thread-456"));
+        assert_eq!(
+            cron_sender_thread_id(&channel).as_deref(),
+            Some("thread-456")
+        );
     }
 
     // --- validate_cronjobs tests ---

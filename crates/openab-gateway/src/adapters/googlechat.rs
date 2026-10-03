@@ -34,8 +34,7 @@ const CHAT_API_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// End-to-end budget for one outbound Google Chat reply. Core waits 35 seconds
 /// for an acknowledged gateway reply; finishing within 30 seconds leaves room
 /// for response serialization and WebSocket/broadcast scheduling.
-const GOOGLE_CHAT_DELIVERY_DEADLINE: std::time::Duration =
-    std::time::Duration::from_secs(30);
+const GOOGLE_CHAT_DELIVERY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 /// Cap on text file attachments per message (matches Discord/Slack).
 const TEXT_FILE_COUNT_CAP: usize = 5;
 /// Cap on aggregate text file bytes per message (matches Discord/Slack 1 MB).
@@ -300,9 +299,9 @@ fn normalize_adc_target_service_account(value: Option<String>) -> Result<Option<
     let (account, domain) = email.split_once('@').ok_or_else(|| {
         "adc_target_service_account must be a service-account email, not an ID".to_string()
     })?;
-    let project = domain.strip_suffix(SUFFIX).ok_or_else(|| {
-        format!("adc_target_service_account must end with {SUFFIX}")
-    })?;
+    let project = domain
+        .strip_suffix(SUFFIX)
+        .ok_or_else(|| format!("adc_target_service_account must end with {SUFFIX}"))?;
     let valid_label = |label: &str| {
         !label.is_empty()
             && label
@@ -393,11 +392,9 @@ impl GoogleChatParts {
             use_adc: std::env::var("GOOGLE_CHAT_USE_ADC")
                 .map(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
-            adc_target_service_account: std::env::var(
-                "GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT",
-            )
-            .ok()
-            .filter(|s| !s.trim().is_empty()),
+            adc_target_service_account: std::env::var("GOOGLE_CHAT_ADC_TARGET_SERVICE_ACCOUNT")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
         }
     }
 }
@@ -588,10 +585,7 @@ impl GoogleChatAdapter {
         };
 
         let formatted = markdown_to_gchat(text);
-        let url = format!(
-            "{}/{}?updateMask=text",
-            self.api_base, message_name
-        );
+        let url = format!("{}/{}?updateMask=text", self.api_base, message_name);
         let body = serde_json::json!({ "text": formatted });
 
         match self
@@ -658,7 +652,9 @@ impl GoogleChatAdapter {
 
         let token = tokio::time::timeout_at(deadline, self.get_token())
             .await
-            .map_err(|_| "googlechat token resolution timed out before sending any chunk".to_string())?
+            .map_err(|_| {
+                "googlechat token resolution timed out before sending any chunk".to_string()
+            })?
             .ok_or_else(|| "no credentials configured".to_string())?;
         let chunks = split_text(&reply.content.text, GOOGLE_CHAT_MESSAGE_LIMIT);
         if chunks.is_empty() {
@@ -737,7 +733,8 @@ impl GoogleChatAdapter {
                     );
                     return;
                 }
-                self.edit_message(&reply.reply_to, &reply.content.text).await;
+                self.edit_message(&reply.reply_to, &reply.content.text)
+                    .await;
                 return;
             }
             _ => {}
@@ -763,10 +760,7 @@ pub async fn webhook(
 
     if let Some(ref adapter) = state.google_chat {
         if let Some(ref verifier) = adapter.jwt_verifier {
-            let auth_header = match headers
-                .get("authorization")
-                .and_then(|v| v.to_str().ok())
-            {
+            let auth_header = match headers.get("authorization").and_then(|v| v.to_str().ok()) {
                 Some(h) => h,
                 None => {
                     warn!("googlechat webhook: missing authorization header");
@@ -843,12 +837,7 @@ pub async fn webhook(
 
     let thread_id = msg.thread.as_ref().map(|t| t.name.clone());
 
-    let message_id = msg
-        .name
-        .rsplit('/')
-        .next()
-        .unwrap_or(&msg.name)
-        .to_string();
+    let message_id = msg.name.rsplit('/').next().unwrap_or(&msg.name).to_string();
 
     // No attachments → emit event synchronously and respond 200
     if media_refs.is_empty() {
@@ -1106,7 +1095,9 @@ impl GoogleChatTokenCache {
     }
 
     async fn refresh(&self, client: &reqwest::Client) -> Result<(String, u64), String> {
-        let jwt = self.build_jwt().map_err(|e| format!("JWT build error: {e}"))?;
+        let jwt = self
+            .build_jwt()
+            .map_err(|e| format!("JWT build error: {e}"))?;
         let resp = client
             .post("https://oauth2.googleapis.com/token")
             .timeout(TOKEN_REQUEST_TIMEOUT)
@@ -1163,8 +1154,7 @@ impl GoogleChatTokenCache {
         let key = jsonwebtoken::EncodingKey::from_rsa_pem(self.private_key.as_bytes())
             .map_err(|e| format!("RSA key parse error: {e}"))?;
         let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
-        jsonwebtoken::encode(&header, &claims, &key)
-            .map_err(|e| format!("JWT encode error: {e}"))
+        jsonwebtoken::encode(&header, &claims, &key).map_err(|e| format!("JWT encode error: {e}"))
     }
 }
 
@@ -1366,9 +1356,7 @@ impl MetadataTokenSource {
                     if elapsed < ttl {
                         *self.refresh_retry_after.write().await = Some(
                             Instant::now()
-                                + std::time::Duration::from_secs(
-                                    ADC_REFRESH_RETRY_COOLDOWN_SECS,
-                                ),
+                                + std::time::Duration::from_secs(ADC_REFRESH_RETRY_COOLDOWN_SECS),
                         );
                         warn!(
                             "googlechat ADC refresh failed ({e}); serving cached token \
@@ -1827,9 +1815,9 @@ fn split_text(text: &str, limit: usize) -> Vec<&str> {
 
 /// Whitelist of text-like file extensions for `download_googlechat_file`.
 const TEXT_EXTS: &[&str] = &[
-    "txt", "csv", "log", "md", "json", "jsonl", "yaml", "yml", "toml", "xml",
-    "rs", "py", "js", "ts", "jsx", "tsx", "go", "java", "c", "cpp", "h", "hpp",
-    "rb", "sh", "bash", "sql", "html", "css", "ini", "cfg", "conf",
+    "txt", "csv", "log", "md", "json", "jsonl", "yaml", "yml", "toml", "xml", "rs", "py", "js",
+    "ts", "jsx", "tsx", "go", "java", "c", "cpp", "h", "hpp", "rb", "sh", "bash", "sql", "html",
+    "css", "ini", "cfg", "conf",
 ];
 
 /// Parse Google Chat attachment array into media references for async download.
@@ -1931,7 +1919,13 @@ pub async fn download_googlechat_image(
     content_name: &str,
 ) -> crate::schema::Attachment {
     let url = media_url(api_base, resource_name);
-    let resp = match client.get(&url).bearer_auth(token).timeout(MEDIA_REQUEST_TIMEOUT).send().await {
+    let resp = match client
+        .get(&url)
+        .bearer_auth(token)
+        .timeout(MEDIA_REQUEST_TIMEOUT)
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             warn!(content_name, error = %e, "googlechat image download failed");
@@ -1958,13 +1952,20 @@ pub async fn download_googlechat_image(
     if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
         if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
             if size > IMAGE_MAX_DOWNLOAD {
-                warn!(content_name, size, "googlechat image Content-Length exceeds 10MB limit");
+                warn!(
+                    content_name,
+                    size, "googlechat image Content-Length exceeds 10MB limit"
+                );
                 return crate::schema::Attachment::rejected(
                     "image",
                     content_name.to_string(),
                     "image/jpeg",
                     size,
-                    format!("size exceeded: {} exceeds {}", format_bytes(size), format_bytes(IMAGE_MAX_DOWNLOAD)),
+                    format!(
+                        "size exceeded: {} exceeds {}",
+                        format_bytes(size),
+                        format_bytes(IMAGE_MAX_DOWNLOAD)
+                    ),
                 );
             }
         }
@@ -1983,13 +1984,21 @@ pub async fn download_googlechat_image(
         }
     };
     if bytes.len() as u64 > IMAGE_MAX_DOWNLOAD {
-        warn!(content_name, size = bytes.len(), "googlechat image exceeds 10MB limit");
+        warn!(
+            content_name,
+            size = bytes.len(),
+            "googlechat image exceeds 10MB limit"
+        );
         return crate::schema::Attachment::rejected(
             "image",
             content_name.to_string(),
             "image/jpeg",
             bytes.len() as u64,
-            format!("size exceeded: {} exceeds {}", format_bytes(bytes.len() as u64), format_bytes(IMAGE_MAX_DOWNLOAD)),
+            format!(
+                "size exceeded: {} exceeds {}",
+                format_bytes(bytes.len() as u64),
+                format_bytes(IMAGE_MAX_DOWNLOAD)
+            ),
         );
     }
     let (compressed, mime) = match resize_and_compress(&bytes) {
@@ -2052,7 +2061,13 @@ pub async fn download_googlechat_file(
     }
     let max_size = FILE_MAX_DOWNLOAD.min(remaining_budget);
     let url = media_url(api_base, resource_name);
-    let resp = match client.get(&url).bearer_auth(token).timeout(MEDIA_REQUEST_TIMEOUT).send().await {
+    let resp = match client
+        .get(&url)
+        .bearer_auth(token)
+        .timeout(MEDIA_REQUEST_TIMEOUT)
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             warn!(content_name, error = %e, "googlechat file download failed");
@@ -2079,13 +2094,22 @@ pub async fn download_googlechat_file(
     if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
         if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
             if size > max_size {
-                warn!(content_name, size, limit = max_size, "googlechat file Content-Length exceeds limit");
+                warn!(
+                    content_name,
+                    size,
+                    limit = max_size,
+                    "googlechat file Content-Length exceeds limit"
+                );
                 return crate::schema::Attachment::rejected(
                     "text_file",
                     content_name.to_string(),
                     "text/plain",
                     size,
-                    format!("size exceeded: {} exceeds {}", format_bytes(size), format_bytes(max_size)),
+                    format!(
+                        "size exceeded: {} exceeds {}",
+                        format_bytes(size),
+                        format_bytes(max_size)
+                    ),
                 );
             }
         }
@@ -2104,13 +2128,22 @@ pub async fn download_googlechat_file(
         }
     };
     if bytes.len() as u64 > max_size {
-        warn!(content_name, size = bytes.len(), limit = max_size, "googlechat file exceeds size limit");
+        warn!(
+            content_name,
+            size = bytes.len(),
+            limit = max_size,
+            "googlechat file exceeds size limit"
+        );
         return crate::schema::Attachment::rejected(
             "text_file",
             content_name.to_string(),
             "text/plain",
             bytes.len() as u64,
-            format!("size exceeded: {} exceeds {}", format_bytes(bytes.len() as u64), format_bytes(max_size)),
+            format!(
+                "size exceeded: {} exceeds {}",
+                format_bytes(bytes.len() as u64),
+                format_bytes(max_size)
+            ),
         );
     }
     let path = match crate::store::store_media(&bytes).await {
@@ -2148,7 +2181,13 @@ pub async fn download_googlechat_audio(
     content_type: &str,
 ) -> crate::schema::Attachment {
     let url = media_url(api_base, resource_name);
-    let resp = match client.get(&url).bearer_auth(token).timeout(MEDIA_REQUEST_TIMEOUT).send().await {
+    let resp = match client
+        .get(&url)
+        .bearer_auth(token)
+        .timeout(MEDIA_REQUEST_TIMEOUT)
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             warn!(content_name, error = %e, "googlechat audio download failed");
@@ -2175,13 +2214,20 @@ pub async fn download_googlechat_audio(
     if let Some(cl) = resp.headers().get(reqwest::header::CONTENT_LENGTH) {
         if let Ok(size) = cl.to_str().unwrap_or("0").parse::<u64>() {
             if size > AUDIO_MAX_DOWNLOAD {
-                warn!(content_name, size, "googlechat audio Content-Length exceeds 25MB limit");
+                warn!(
+                    content_name,
+                    size, "googlechat audio Content-Length exceeds 25MB limit"
+                );
                 return crate::schema::Attachment::rejected(
                     "audio",
                     content_name.to_string(),
                     "audio/ogg",
                     size,
-                    format!("size exceeded: {} exceeds {}", format_bytes(size), format_bytes(AUDIO_MAX_DOWNLOAD)),
+                    format!(
+                        "size exceeded: {} exceeds {}",
+                        format_bytes(size),
+                        format_bytes(AUDIO_MAX_DOWNLOAD)
+                    ),
                 );
             }
         }
@@ -2200,13 +2246,21 @@ pub async fn download_googlechat_audio(
         }
     };
     if bytes.len() as u64 > AUDIO_MAX_DOWNLOAD {
-        warn!(content_name, size = bytes.len(), "googlechat audio exceeds 25MB limit");
+        warn!(
+            content_name,
+            size = bytes.len(),
+            "googlechat audio exceeds 25MB limit"
+        );
         return crate::schema::Attachment::rejected(
             "audio",
             content_name.to_string(),
             "audio/ogg",
             bytes.len() as u64,
-            format!("size exceeded: {} exceeds {}", format_bytes(bytes.len() as u64), format_bytes(AUDIO_MAX_DOWNLOAD)),
+            format!(
+                "size exceeded: {} exceeds {}",
+                format_bytes(bytes.len() as u64),
+                format_bytes(AUDIO_MAX_DOWNLOAD)
+            ),
         );
     }
     let path = match crate::store::store_media(&bytes).await {
@@ -2311,7 +2365,10 @@ mod tests {
         let msg = payload.message.as_ref().unwrap();
         assert_eq!(msg.argument_text.as_deref(), Some("hi"));
         assert_eq!(msg.thread.as_ref().unwrap().name, "spaces/SP/threads/t1");
-        assert_eq!(payload.space.as_ref().unwrap().space_type.as_deref(), Some("ROOM"));
+        assert_eq!(
+            payload.space.as_ref().unwrap().space_type.as_deref(),
+            Some("ROOM")
+        );
     }
 
     #[test]
@@ -2546,10 +2603,7 @@ mod tests {
             server.uri(),
         );
 
-        let token = src
-            .get_token()
-            .await
-            .expect("should mint a chat.bot token");
+        let token = src.get_token().await.expect("should mint a chat.bot token");
         assert_eq!(token, "chat-bot-tok");
     }
 
@@ -2578,11 +2632,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let src = MetadataTokenSource::with_bases(
-            same_sa.into(),
-            server.uri(),
-            server.uri(),
-        );
+        let src = MetadataTokenSource::with_bases(same_sa.into(), server.uri(), server.uri());
         let err = src
             .get_token()
             .await
@@ -2636,12 +2686,10 @@ mod tests {
         // Start both production policy helpers from a builder carrying the
         // same explicit proxy. Metadata must clear it; IAM must retain it.
         let metadata_client = MetadataTokenSource::build_metadata_client(
-            reqwest::Client::builder()
-                .proxy(reqwest::Proxy::all(iam_proxy.uri()).unwrap()),
+            reqwest::Client::builder().proxy(reqwest::Proxy::all(iam_proxy.uri()).unwrap()),
         );
         let iam_client = MetadataTokenSource::build_iam_client(
-            reqwest::Client::builder()
-                .proxy(reqwest::Proxy::all(iam_proxy.uri()).unwrap()),
+            reqwest::Client::builder().proxy(reqwest::Proxy::all(iam_proxy.uri()).unwrap()),
         );
         let src = MetadataTokenSource::with_bases_and_clients(
             "chat-bot@project.iam.gserviceaccount.com".into(),
@@ -2821,7 +2869,10 @@ mod tests {
             adc_target_service_account: Some("chat-bot@project.iam.gserviceaccount.com".into()),
             ..Default::default()
         });
-        assert!(adapter.token_cache.is_none(), "unreadable key file → no cache");
+        assert!(
+            adapter.token_cache.is_none(),
+            "unreadable key file → no cache"
+        );
         assert!(
             adapter.metadata_source.is_some(),
             "use_adc=true → ADC source installed when the key file could not be read"
@@ -2880,7 +2931,10 @@ mod tests {
             "api_not_enabled"
         );
         // Anything else stays unclassified rather than guessing.
-        assert_eq!(classify_generate_access_token_error(500, "boom"), "unclassified");
+        assert_eq!(
+            classify_generate_access_token_error(500, "boom"),
+            "unclassified"
+        );
     }
 
     #[test]
@@ -2990,9 +3044,13 @@ mod tests {
         assert!(!is_google_chat_message_name("spaces/"));
         assert!(!is_google_chat_message_name("spaces/SP"));
         assert!(!is_google_chat_message_name("spaces/SP/messages/"));
-        assert!(!is_google_chat_message_name("spaces/SP/messages/msg1/extra"));
+        assert!(!is_google_chat_message_name(
+            "spaces/SP/messages/msg1/extra"
+        ));
         assert!(!is_google_chat_message_name("spaces/SP/messages/msg1?x=1"));
-        assert!(!is_google_chat_message_name("spaces/SP/messages/msg1#fragment"));
+        assert!(!is_google_chat_message_name(
+            "spaces/SP/messages/msg1#fragment"
+        ));
         assert!(!is_google_chat_message_name("spaces/SP/messages/msg%2F1"));
     }
 
@@ -3093,7 +3151,10 @@ mod tests {
             server.uri(),
             server.uri(),
         );
-        let err = src.get_token().await.expect_err("blank token must be rejected");
+        let err = src
+            .get_token()
+            .await
+            .expect_err("blank token must be rejected");
         assert!(
             err.contains("missing or empty accessToken"),
             "unexpected error: {err}"
@@ -3402,15 +3463,16 @@ mod tests {
 
     #[tokio::test]
     async fn handle_reply_sends_gateway_response_success() {
-        use wiremock::{Mock, MockServer, ResponseTemplate};
         use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path_regex("/spaces/.*/messages"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"name": "spaces/TEST/messages/msg_abc"}),
-            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"name": "spaces/TEST/messages/msg_abc"})),
+            )
             .mount(&mock_server)
             .await;
 
@@ -3448,8 +3510,8 @@ mod tests {
 
     #[tokio::test]
     async fn handle_reply_sends_failure_response_on_api_error() {
-        use wiremock::{Mock, MockServer, ResponseTemplate};
         use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -3489,13 +3551,17 @@ mod tests {
         assert!(!resp.success);
         assert!(resp.message_id.is_none());
         let err = resp.error.expect("error should be set on send failure");
-        assert!(err.contains("500"), "error should include status code, got: {}", err);
+        assert!(
+            err.contains("500"),
+            "error should include status code, got: {}",
+            err
+        );
     }
 
     #[tokio::test]
     async fn handle_reply_empty_message_short_circuits() {
-        use wiremock::{Mock, MockServer, ResponseTemplate};
         use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
         // Mount a mock that would fail the test if called
@@ -3531,7 +3597,10 @@ mod tests {
         adapter.handle_reply(&reply, &event_tx).await;
 
         let received = event_rx.try_recv();
-        assert!(received.is_ok(), "expected failure GatewayResponse for empty message");
+        assert!(
+            received.is_ok(),
+            "expected failure GatewayResponse for empty message"
+        );
         let resp: GatewayResponse = serde_json::from_str(&received.unwrap()).unwrap();
         assert_eq!(resp.request_id, "req_empty");
         assert!(!resp.success);
@@ -3540,8 +3609,8 @@ mod tests {
 
     #[tokio::test]
     async fn handle_reply_multi_chunk_failure_includes_error() {
-        use wiremock::{Mock, MockServer, ResponseTemplate};
         use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -3620,15 +3689,16 @@ mod tests {
 
     #[tokio::test]
     async fn handle_reply_edit_message_does_not_send_response() {
-        use wiremock::{Mock, MockServer, ResponseTemplate};
         use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
         Mock::given(method("PATCH"))
             .and(path_regex("/spaces/.*/messages/.*"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"name": "spaces/SP/messages/msg1"}),
-            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"name": "spaces/SP/messages/msg1"})),
+            )
             .expect(1)
             .mount(&mock_server)
             .await;
@@ -3663,15 +3733,16 @@ mod tests {
 
     #[tokio::test]
     async fn handle_reply_multi_chunk_sends_gateway_response() {
-        use wiremock::{Mock, MockServer, ResponseTemplate};
         use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path_regex("/spaces/.*/messages"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"name": "spaces/TEST/messages/first_chunk"}),
-            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"name": "spaces/TEST/messages/first_chunk"})),
+            )
             .mount(&mock_server)
             .await;
 
@@ -3705,7 +3776,10 @@ mod tests {
         let resp: GatewayResponse = serde_json::from_str(&received.unwrap()).unwrap();
         assert_eq!(resp.request_id, "req_multi");
         assert!(resp.success);
-        assert_eq!(resp.message_id, Some("spaces/TEST/messages/first_chunk".into()));
+        assert_eq!(
+            resp.message_id,
+            Some("spaces/TEST/messages/first_chunk".into())
+        );
     }
 
     #[tokio::test]
@@ -3714,16 +3788,17 @@ mod tests {
         // Result contract reports no overall message receipt, but the error
         // retains explicit partial-delivery context so operators know one chunk
         // already reached the space and should not blindly retry the whole turn.
-        use wiremock::{Mock, MockServer, ResponseTemplate};
         use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
         // First request: 200 OK with message name
         Mock::given(method("POST"))
             .and(path_regex("/spaces/.*/messages"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"name": "spaces/TEST/messages/first_chunk"}),
-            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"name": "spaces/TEST/messages/first_chunk"})),
+            )
             .up_to_n_times(1)
             .mount(&mock_server)
             .await;
@@ -3764,7 +3839,10 @@ mod tests {
         let resp: GatewayResponse = serde_json::from_str(&received.unwrap()).unwrap();
         assert_eq!(resp.request_id, "req_partial");
         assert!(!resp.success, "partial failure must report success=false");
-        assert!(resp.message_id.is_none(), "partial delivery is not an overall receipt");
+        assert!(
+            resp.message_id.is_none(),
+            "partial delivery is not an overall receipt"
+        );
         let err = resp.error.expect("partial failure should set error");
         assert!(err.contains("chunk 2/2"), "{err}");
         assert!(err.contains("after 1 successful chunk(s)"), "{err}");
@@ -3780,9 +3858,10 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path_regex("/spaces/.*/messages"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"name": "spaces/TEST/messages/first_chunk"}),
-            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"name": "spaces/TEST/messages/first_chunk"})),
+            )
             .up_to_n_times(1)
             .mount(&server)
             .await;
@@ -3791,9 +3870,7 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_delay(std::time::Duration::from_millis(250))
-                    .set_body_json(
-                        serde_json::json!({"name": "spaces/TEST/messages/late_chunk"}),
-                    ),
+                    .set_body_json(serde_json::json!({"name": "spaces/TEST/messages/late_chunk"})),
             )
             .mount(&server)
             .await;
@@ -3923,7 +4000,10 @@ mod tests {
 
     #[test]
     fn media_url_preserves_slashes_and_encodes_specials() {
-        let url = media_url("https://chat.googleapis.com/v1", "spaces/SP/messages/MSG/attachments/ATT");
+        let url = media_url(
+            "https://chat.googleapis.com/v1",
+            "spaces/SP/messages/MSG/attachments/ATT",
+        );
         assert_eq!(
             url,
             "https://chat.googleapis.com/v1/media/spaces/SP/messages/MSG/attachments/ATT?alt=media"
@@ -3937,8 +4017,8 @@ mod tests {
 
     #[tokio::test]
     async fn download_googlechat_image_resizes_and_returns_attachment() {
-        use wiremock::{Mock, MockServer, ResponseTemplate};
         use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         // Generate a small valid PNG
         let img = image::RgbImage::from_pixel(10, 10, image::Rgb([255, 0, 0]));
@@ -3989,22 +4069,23 @@ mod tests {
         )
         .await;
         let att = result;
-        assert!(att.status.is_some(), "non-text extension must have status set");
+        assert!(
+            att.status.is_some(),
+            "non-text extension must have status set"
+        );
         let reason = att.status.unwrap();
         assert!(reason.contains("unsupported format"), "got: {reason}");
     }
 
     #[tokio::test]
     async fn download_googlechat_file_text_extension_succeeds() {
-        use wiremock::{Mock, MockServer, ResponseTemplate};
         use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path_regex("/media/.*"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_bytes(b"hello world".to_vec()),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello world".to_vec()))
             .mount(&mock_server)
             .await;
 
@@ -4026,8 +4107,8 @@ mod tests {
 
     #[tokio::test]
     async fn download_googlechat_audio_returns_attachment() {
-        use wiremock::{Mock, MockServer, ResponseTemplate};
         use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
         let audio_bytes = vec![0u8; 1024];
@@ -4056,8 +4137,8 @@ mod tests {
 
     #[tokio::test]
     async fn download_googlechat_image_rejects_oversized_content_length() {
-        use wiremock::{Mock, MockServer, ResponseTemplate};
         use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))

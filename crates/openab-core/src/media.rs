@@ -98,10 +98,7 @@ fn hex_prefix(body: &[u8]) -> String {
 /// (`image/*`) because CDNs commonly serve any file type as `application/octet-stream`;
 /// rejecting that header would silently break real downloads. The magic-byte check
 /// examines the actual bytes regardless of what the server claims.
-fn validate_image_response(
-    content_type: Option<&str>,
-    body: &[u8],
-) -> Result<(), MediaFetchError> {
+fn validate_image_response(content_type: Option<&str>, body: &[u8]) -> Result<(), MediaFetchError> {
     // Reject explicitly-text responses early (e.g. Slack HTML login page at HTTP 200).
     // application/octet-stream and other generic types pass through to magic-byte check.
     if let Some(ct) = content_type {
@@ -344,7 +341,11 @@ pub async fn download_and_transcribe(
     };
 
     if bytes.len() as u64 > MAX_SIZE {
-        error!(filename, size = bytes.len(), "downloaded audio exceeds 25MB limit");
+        error!(
+            filename,
+            size = bytes.len(),
+            "downloaded audio exceeds 25MB limit"
+        );
         return None;
     }
 
@@ -574,15 +575,27 @@ async fn download_text_file_inner(
                 let stream = Box::pin(resp.bytes_stream());
                 let upload_result = tokio::time::timeout(
                     STREAM_TIMEOUT,
-                    fs.stream_upload_and_presign(filename, stream, content_length, Some("text/plain; charset=utf-8")),
+                    fs.stream_upload_and_presign(
+                        filename,
+                        stream,
+                        content_length,
+                        Some("text/plain; charset=utf-8"),
+                    ),
                 )
                 .await;
                 return match upload_result {
                     Ok(Ok((presigned_url, actual_bytes))) => {
                         let hint = crate::filestore::format_filestore_hint(
-                            filename, actual_bytes, &presigned_url, fs.presigned_ttl_secs(),
+                            filename,
+                            actual_bytes,
+                            &presigned_url,
+                            fs.presigned_ttl_secs(),
                         );
-                        tracing::info!(filename, size = actual_bytes, "text file streamed to filestore (inline fallback)");
+                        tracing::info!(
+                            filename,
+                            size = actual_bytes,
+                            "text file streamed to filestore (inline fallback)"
+                        );
                         Some((ContentBlock::Text { text: hint }, 0))
                     }
                     Ok(Err(e)) => {
@@ -596,7 +609,10 @@ async fn download_text_file_inner(
                         Some((ContentBlock::Text { text: hint }, 0))
                     }
                     Err(_) => {
-                        tracing::error!(filename, "filestore stream upload timed out (inline fallback)");
+                        tracing::error!(
+                            filename,
+                            "filestore stream upload timed out (inline fallback)"
+                        );
                         let size_kb = content_length / 1024;
                         let hint = format!(
                             "[File: {safe_filename}]\n\
@@ -739,7 +755,12 @@ async fn download_and_upload_to_filestore(
     // Cap file size to prevent abuse (configurable, default 250 MB, max 500 MB).
     let max_size = filestore.max_file_size();
     if size > max_size {
-        tracing::warn!(filename, size, max = max_size, "text file exceeds filestore size limit, skipping");
+        tracing::warn!(
+            filename,
+            size,
+            max = max_size,
+            "text file exceeds filestore size limit, skipping"
+        );
         return None;
     }
 
@@ -789,7 +810,12 @@ async fn download_and_upload_to_filestore(
 
     let upload_result = tokio::time::timeout(
         STREAM_TIMEOUT,
-        filestore.stream_upload_and_presign(filename, stream, size, Some("text/plain; charset=utf-8")),
+        filestore.stream_upload_and_presign(
+            filename,
+            stream,
+            size,
+            Some("text/plain; charset=utf-8"),
+        ),
     )
     .await;
 
@@ -801,7 +827,11 @@ async fn download_and_upload_to_filestore(
                 &presigned_url,
                 filestore.presigned_ttl_secs(),
             );
-            tracing::info!(filename, size = actual_bytes, "text file streamed to filestore");
+            tracing::info!(
+                filename,
+                size = actual_bytes,
+                "text file streamed to filestore"
+            );
             Some((ContentBlock::Text { text: hint }, 0))
         }
         Ok(Err(e)) => {
@@ -856,7 +886,12 @@ pub async fn download_and_upload_any_file(
 ) -> Option<(ContentBlock, u64)> {
     let max_size = filestore.max_file_size();
     if size > max_size {
-        tracing::warn!(filename, size, max = max_size, "file exceeds filestore size limit, skipping");
+        tracing::warn!(
+            filename,
+            size,
+            max = max_size,
+            "file exceeds filestore size limit, skipping"
+        );
         return None;
     }
 
@@ -881,7 +916,12 @@ pub async fn download_and_upload_any_file(
     // Content-Length pre-check
     if let Some(content_length) = resp.content_length() {
         if content_length > max_size {
-            tracing::warn!(filename, content_length, max = max_size, "Content-Length exceeds filestore limit");
+            tracing::warn!(
+                filename,
+                content_length,
+                max = max_size,
+                "Content-Length exceeds filestore limit"
+            );
             return None;
         }
     }
@@ -922,7 +962,12 @@ pub async fn download_and_upload_any_file(
                  Note: this URL expires in {} minutes.",
                 filestore.presigned_ttl_secs() / 60
             );
-            tracing::info!(filename, mime, size = actual_bytes, "file uploaded to filestore (any-file path)");
+            tracing::info!(
+                filename,
+                mime,
+                size = actual_bytes,
+                "file uploaded to filestore (any-file path)"
+            );
             Some((ContentBlock::Text { text: hint }, 0))
         }
         Ok(Err(e)) => {
@@ -984,7 +1029,11 @@ async fn upload_bytes_to_filestore(
                 &presigned_url,
                 filestore.presigned_ttl_secs(),
             );
-            tracing::info!(filename, size = actual_size, "text file uploaded to filestore");
+            tracing::info!(
+                filename,
+                size = actual_size,
+                "text file uploaded to filestore"
+            );
             // Return 0 inline bytes — the file is stored externally, not inlined
             // into the prompt. This prevents it from counting against the
             // caller's aggregate size cap.

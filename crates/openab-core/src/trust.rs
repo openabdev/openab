@@ -206,10 +206,10 @@ mod tests {
     fn cfg() -> TrustConfig {
         // L2 open, explicit allowed channel; L3 with one allowed user.
         TrustConfig::new(
-            None,                                  // allow_all_channels → true
+            None, // allow_all_channels → true
             ["chan-1".to_string()],
-            None,                                  // allow_dm → true
-            None,                                  // allow_all_users → false (deny)
+            None, // allow_dm → true
+            None, // allow_all_users → false (deny)
             ["user-1".to_string()],
         )
     }
@@ -225,7 +225,10 @@ mod tests {
 
     #[test]
     fn allowed_user_in_scope_channel_is_allowed() {
-        assert_eq!(cfg().decide("any-channel", false, "user-1"), Decision::Allow);
+        assert_eq!(
+            cfg().decide("any-channel", false, "user-1"),
+            Decision::Allow
+        );
     }
 
     #[test]
@@ -239,7 +242,10 @@ mod tests {
     #[test]
     fn untrusted_user_in_dm_denied_identity_not_scope() {
         // DM surface open by default → reaches L3 → identity deny (echo path).
-        assert_eq!(cfg().decide("dm-chan", true, "stranger"), Decision::DenyIdentity);
+        assert_eq!(
+            cfg().decide("dm-chan", true, "stranger"),
+            Decision::DenyIdentity
+        );
     }
 
     #[test]
@@ -266,13 +272,25 @@ mod tests {
 
     #[test]
     fn allow_all_users_opens_l3() {
-        let c = TrustConfig::new(None, std::iter::empty(), None, Some(true), std::iter::empty());
+        let c = TrustConfig::new(
+            None,
+            std::iter::empty(),
+            None,
+            Some(true),
+            std::iter::empty(),
+        );
         assert_eq!(c.decide("c", false, "anyone"), Decision::Allow);
     }
 
     #[test]
     fn dm_closed_denies_scope_even_for_allowed_user() {
-        let c = TrustConfig::new(None, std::iter::empty(), Some(false), None, ["user-1".to_string()]);
+        let c = TrustConfig::new(
+            None,
+            std::iter::empty(),
+            Some(false),
+            None,
+            ["user-1".to_string()],
+        );
         // allowed user, but DM surface disabled → DenyScope (no echo).
         assert_eq!(c.decide("dm", true, "user-1"), Decision::DenyScope);
         // same user in a channel (L2 open) → Allow.
@@ -291,7 +309,10 @@ mod tests {
     fn registry_returns_default_for_unknown_platform() {
         let reg = PlatformTrustConfigs::new();
         // unknown platform → default (L3 deny-all) → stranger denied identity.
-        assert_eq!(reg.decide("mars", "c", false, "stranger"), Decision::DenyIdentity);
+        assert_eq!(
+            reg.decide("mars", "c", false, "stranger"),
+            Decision::DenyIdentity
+        );
     }
 
     #[test]
@@ -302,15 +323,27 @@ mod tests {
             TrustConfig::new(None, std::iter::empty(), None, None, ["123".to_string()]),
         );
         assert_eq!(reg.decide("telegram", "c", false, "123"), Decision::Allow);
-        assert_eq!(reg.decide("telegram", "c", false, "999"), Decision::DenyIdentity);
+        assert_eq!(
+            reg.decide("telegram", "c", false, "999"),
+            Decision::DenyIdentity
+        );
         // unregistered platform still gets deny-all default.
-        assert_eq!(reg.decide("discord", "c", false, "123"), Decision::DenyIdentity);
+        assert_eq!(
+            reg.decide("discord", "c", false, "123"),
+            Decision::DenyIdentity
+        );
     }
 
     #[test]
     fn empty_sender_is_never_identity_allowed() {
         // Even with allow_all_users = true, an empty sender_id fails closed.
-        let open = TrustConfig::new(None, std::iter::empty(), None, Some(true), std::iter::empty());
+        let open = TrustConfig::new(
+            None,
+            std::iter::empty(),
+            None,
+            Some(true),
+            std::iter::empty(),
+        );
         assert!(!open.identity_allowed(""));
         assert_eq!(open.decide("c", false, ""), Decision::DenyIdentity);
         // non-empty still allowed under allow_all_users.
