@@ -47,7 +47,7 @@ impl OutboundBudget {
     /// treats it exactly like a full queue (the peer is disconnected).
     fn reserve(&self, n: usize) -> bool {
         self.reserved
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                 match cur.checked_add(n) {
                     Some(next) if next <= self.max => Some(next),
                     _ => None,
