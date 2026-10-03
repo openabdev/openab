@@ -718,10 +718,10 @@ async fn dispatch_batch(
                 let title_to_apply = pr.metadata.title.clone();
 
                 // If workspace resolution failed on a NEW session, rollback and abort.
-                // Reset FIRST to minimize TOCTOU window (擺渡 F1), then rename.
+                // Discard FIRST to minimize TOCTOU window (擺渡 F1), then rename.
                 if let Some(Err(e)) = ws_resolved {
                     target.discard_session(&session_key).await;
-                    // Apply title after reset so the thread is identifiable.
+                    // Apply title after the discard so the thread is identifiable.
                     if let Some(ref title) = title_to_apply {
                         if !title.is_empty() {
                             let _ = adapter.rename_thread(&dispatch_channel, title).await;

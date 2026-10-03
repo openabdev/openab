@@ -850,7 +850,7 @@ impl SessionPool {
     /// killed once the last Arc reference is dropped (after streaming finishes). The next
     /// message will trigger a fresh `get_or_create` with a new ACP session.
     pub async fn reset_session(&self, thread_id: &str) -> Result<()> {
-        if self.tear_down(thread_id, purge_for_reset).await? {
+        if self.tear_down(thread_id, "reset", purge_for_reset).await? {
             info!(thread_id = %crate::redact::redact_session_ids(thread_id), "session reset");
             Ok(())
         } else {
@@ -862,13 +862,20 @@ impl SessionPool {
     /// `dispatch_batch`. Unlike [`Self::reset_session`] it keeps the thread's workspace: on that
     /// path `get_or_create` got no override, so any stored workspace predates this turn.
     pub async fn discard_session(&self, thread_id: &str) -> Result<()> {
-        self.tear_down(thread_id, purge_session_entries).await?;
+        self.tear_down(thread_id, "discard", purge_session_entries)
+            .await?;
         Ok(())
     }
 
     /// Cancel any in-flight turn, drop the active connection, `purge` the rest, and persist.
-    /// Returns whether a connection was active.
-    async fn tear_down(&self, thread_id: &str, purge: fn(&mut PoolState, &str)) -> Result<bool> {
+    /// `op` names the caller in the log. Returns whether the thread had anything to tear down: a
+    /// connection, a resumable session id, or a workspace.
+    async fn tear_down(
+        &self,
+        thread_id: &str,
+        op: &'static str,
+        purge: fn(&mut PoolState, &str),
+    ) -> Result<bool> {
         // Send session/cancel via the lock-free stdin handle first.
         // This stops in-flight streaming even while with_connection() holds the
         // connection mutex, so the old process finishes promptly.
@@ -881,7 +888,7 @@ impl SessionPool {
                 "method": "session/cancel",
                 "params": {"sessionId": session_id}
             }))?;
-            tracing::info!(session_id = %crate::redact::redact_session_ids(&session_id), "reset: sending session/cancel");
+            tracing::info!(session_id = %crate::redact::redact_session_ids(&session_id), "{op}: sending session/cancel");
             use tokio::io::AsyncWriteExt;
             let mut w = stdin.lock().await;
             let _ = w.write_all(data.as_bytes()).await;
@@ -890,7 +897,13 @@ impl SessionPool {
         }
 
         let mut state = self.state.write().await;
-        let had_active = state.active.remove(thread_id).is_some();
+        // Read before `purge`: a thread with no connection can still hold a resumable session id
+        // or a workspace (all that is left after a hung eviction), and clearing those is a reset.
+        let had_state = state.active.contains_key(thread_id)
+            || state.suspended.contains_key(thread_id)
+            || state.persisted.contains_key(thread_id)
+            || state.session_workdirs.contains_key(thread_id);
+        state.active.remove(thread_id);
         // `purge` is `purge_session_entries` or a wrapper around it, never a second copy of the
         // list: the copies are what let reset and hung eviction drift, and the creating-gate rule
         // is precisely the kind of line that gets dropped from a duplicate without anyone noticing.
@@ -901,7 +914,7 @@ impl SessionPool {
         revoke_facade_token_for_key(&mut state, thread_id, self.session_registrar.as_ref());
         self.save_mapping(&state.persisted);
         self.save_meta(&state.session_workdirs);
-        Ok(had_active)
+        Ok(had_state)
     }
 
     pub async fn cleanup_idle(&self, ttl_secs: u64) {
@@ -1481,11 +1494,44 @@ mod tests {
         let pool =
             pool_with_workspaces(dir.path(), &[("thread", "/ws"), ("other", "/other")]).await;
 
-        let _ = pool.reset_session("thread").await;
+        // "thread" has only a workspace, as it does after a hung eviction. The reset clears it, so
+        // it must not come back as "no session": the `/reset` handlers turn that into
+        // "No active session to reset" on the very step `docs/workspaces.md` tells the user to take.
+        assert!(pool.reset_session("thread").await.is_ok());
 
         let expected = HashMap::from([("other".to_string(), "/other".to_string())]);
         assert_eq!(pool.state.read().await.session_workdirs, expected);
         assert_eq!(workspaces_on_disk(dir.path()), expected);
+    }
+
+    /// An idle-evicted thread has no connection either, only a resumable session id. `/reset`
+    /// clears that id, so it is a successful reset too.
+    #[tokio::test]
+    async fn reset_session_succeeds_for_a_thread_that_only_has_a_resumable_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool_with_workspaces(dir.path(), &[]).await;
+        {
+            let mut state = pool.state.write().await;
+            state
+                .suspended
+                .insert("suspended".to_string(), "session-1".to_string());
+            state
+                .persisted
+                .insert("persisted".to_string(), "session-2".to_string());
+        }
+
+        assert!(pool.reset_session("suspended").await.is_ok());
+        assert!(pool.reset_session("persisted").await.is_ok());
+    }
+
+    /// A thread the pool holds nothing for has nothing to reset, and the `/reset` handlers rely
+    /// on the error to say so.
+    #[tokio::test]
+    async fn reset_session_fails_for_a_thread_with_no_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool_with_workspaces(dir.path(), &[("other", "/other")]).await;
+
+        assert!(pool.reset_session("thread").await.is_err());
     }
 
     #[test]
