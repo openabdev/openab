@@ -46,8 +46,10 @@ struct PoolState {
     /// Serializes create/resume work per thread so rapid same-thread requests
     /// cannot race each other into duplicate `session/load` attempts.
     creating: HashMap<String, Arc<Mutex<()>>>,
-    /// Per-session working directory overrides (from control directives).
-    /// thread_key → canonical workspace path.
+    /// Per-thread `[[ws:...]]` workspace: thread_key → canonical workspace path.
+    /// It belongs to the thread, not to one ACP session: it survives suspend/resume and hung or
+    /// idle eviction (ADR control-directives §3.1), and outranks a new `[[ws:...]]` in
+    /// `get_or_create`. Only [`SessionPool::reset_session`] (`/reset`) forgets it.
     session_workdirs: HashMap<String, String>,
 }
 
@@ -164,11 +166,11 @@ async fn setup_facade_session(
 
 /// Remove every non-`active` pool entry for `key`, except its creating gate and its workspace.
 ///
-/// The single implementation for both hung eviction and [`SessionPool::reset_session`]; the latter
-/// removes `active` itself and then calls this through [`purge_for_reset`]. It used to be a second
-/// copy of the same list, which is how the two could drift — and the lines most likely to be lost
-/// from a copy are the ones below about the creating gate and the workspace, because they say
-/// *not* to remove something.
+/// The single implementation for hung eviction, [`SessionPool::discard_session`] and (through
+/// [`purge_for_reset`]) [`SessionPool::reset_session`]; the latter two remove `active` themselves.
+/// It used to be a second copy of the same list, which is how reset and eviction could drift — and
+/// the lines most likely to be lost from a copy are the ones below, because they say *not* to
+/// remove something.
 ///
 /// Hung eviction must NOT leave the session resumable: the old streaming task still holds an Arc
 /// clone of the connection, so the agent process may be alive and mid-turn. If the session id
@@ -185,16 +187,11 @@ fn purge_session_entries(state: &mut PoolState, key: &str) {
     // a concurrent get_or_create mint a fresh gate and run two creations for
     // the same key.
     //
-    // Do NOT remove `session_workdirs` either: the `[[ws:]]` workspace belongs to the thread, not
-    // to the evicted session, and must survive an eviction rebuild (ADR control-directives §3.1).
-    // Without it the replacement session starts in the default `working_dir`.
+    // Do NOT remove `session_workdirs` either: the workspace belongs to the thread (see the field
+    // doc). Without it the replacement session starts in the default `working_dir`.
 }
 
-/// [`purge_session_entries`], plus the thread's `[[ws:]]` workspace.
-///
-/// A reset is the user asking for a new session, and the only way to give a thread a different
-/// workspace: a stored workspace outranks a new `[[ws:]]` in `get_or_create`. Hung eviction keeps
-/// the workspace; reset is the one path that forgets it.
+/// [`purge_session_entries`], plus the thread's workspace: the `/reset` path.
 fn purge_for_reset(state: &mut PoolState, key: &str) {
     purge_session_entries(state, key);
     state.session_workdirs.remove(key);
@@ -296,6 +293,23 @@ impl SessionPool {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/tmp"))
             .join(".openab");
+        Self::new_in(
+            config,
+            max_sessions,
+            hung_threshold_secs,
+            default_config_options,
+            openab_dir,
+        )
+    }
+
+    /// [`Self::new`] with the `thread_map.json` / `session_meta.json` directory given explicitly.
+    fn new_in(
+        config: AgentConfig,
+        max_sessions: usize,
+        hung_threshold_secs: u64,
+        default_config_options: HashMap<String, String>,
+        openab_dir: PathBuf,
+    ) -> Self {
         let _ = std::fs::create_dir_all(&openab_dir);
         let mapping_path = openab_dir.join("thread_map.json");
         let meta_path = openab_dir.join("session_meta.json");
@@ -488,6 +502,13 @@ impl SessionPool {
         };
 
         let effective_workdir = if let Some(stored) = stored_workdir {
+            if working_dir_override.is_some_and(|wd| wd != stored) {
+                // A fresh session after an eviction rebuild: the thread already has a workspace.
+                warn!(
+                    thread_id = %crate::redact::redact_session_ids(thread_id),
+                    "ignoring [[ws:]] directive: the thread keeps its stored workspace until /reset"
+                );
+            }
             stored
         } else if let Some(wd) = working_dir_override {
             wd.to_string()
@@ -825,10 +846,29 @@ impl SessionPool {
     }
 
     /// Reset a session: cancel any in-flight operation, remove the active connection,
-    /// and clear all suspended state. The ACP process will be killed once the last
-    /// Arc reference is dropped (after streaming finishes). The next message will
-    /// trigger a fresh `get_or_create` with a new ACP session.
+    /// and clear all suspended state and the thread's workspace. The ACP process will be
+    /// killed once the last Arc reference is dropped (after streaming finishes). The next
+    /// message will trigger a fresh `get_or_create` with a new ACP session.
     pub async fn reset_session(&self, thread_id: &str) -> Result<()> {
+        if self.tear_down(thread_id, purge_for_reset).await? {
+            info!(thread_id = %crate::redact::redact_session_ids(thread_id), "session reset");
+            Ok(())
+        } else {
+            Err(anyhow!("no session for thread {}", crate::redact::redact_session_ids(thread_id)))
+        }
+    }
+
+    /// Tear down a session the current turn just created, for the directive rollback in
+    /// `dispatch_batch`. Unlike [`Self::reset_session`] it keeps the thread's workspace: on that
+    /// path `get_or_create` got no override, so any stored workspace predates this turn.
+    pub async fn discard_session(&self, thread_id: &str) -> Result<()> {
+        self.tear_down(thread_id, purge_session_entries).await?;
+        Ok(())
+    }
+
+    /// Cancel any in-flight turn, drop the active connection, `purge` the rest, and persist.
+    /// Returns whether a connection was active.
+    async fn tear_down(&self, thread_id: &str, purge: fn(&mut PoolState, &str)) -> Result<bool> {
         // Send session/cancel via the lock-free stdin handle first.
         // This stops in-flight streaming even while with_connection() holds the
         // connection mutex, so the old process finishes promptly.
@@ -851,24 +891,17 @@ impl SessionPool {
 
         let mut state = self.state.write().await;
         let had_active = state.active.remove(thread_id).is_some();
-        // Everything else a reset clears is what hung eviction clears, including the rule that the
-        // creating gate survives, plus the thread's workspace. Call the one implementation rather
-        // than keeping a second copy of the list: the copies are what let the two drift, and the
-        // gate rule is precisely the kind of line that gets dropped from a duplicate without anyone
-        // noticing.
-        purge_for_reset(&mut state, thread_id);
-        // Resetting a hung session drops the map's Arc but not the one the stuck task holds, so the
-        // guard cannot revoke — do it synchronously here too (F3).
+        // `purge` is `purge_session_entries` or a wrapper around it, never a second copy of the
+        // list: the copies are what let reset and hung eviction drift, and the creating-gate rule
+        // is precisely the kind of line that gets dropped from a duplicate without anyone noticing.
+        purge(&mut state, thread_id);
+        // Tearing down a hung session drops the map's Arc but not the one the stuck task holds, so
+        // the guard cannot revoke — do it synchronously here too (F3).
         #[cfg(feature = "acp-mcp")]
         revoke_facade_token_for_key(&mut state, thread_id, self.session_registrar.as_ref());
         self.save_mapping(&state.persisted);
         self.save_meta(&state.session_workdirs);
-        if had_active {
-            info!(thread_id = %crate::redact::redact_session_ids(thread_id), "session reset");
-            Ok(())
-        } else {
-            Err(anyhow!("no session for thread {}", crate::redact::redact_session_ids(thread_id)))
-        }
+        Ok(had_active)
     }
 
     pub async fn cleanup_idle(&self, ttl_secs: u64) {
@@ -975,8 +1008,8 @@ impl SessionPool {
                     state.persisted.insert(key.clone(), sid.clone());
                     state.suspended.insert(key, sid);
                 } else {
+                    // Not resumable, but the workspace stays with the thread.
                     state.persisted.remove(&key);
-                    state.session_workdirs.remove(&key);
                 }
             }
         }
@@ -1036,8 +1069,8 @@ impl SessionPool {
 #[cfg(test)]
 mod tests {
     use super::{
-        better_candidate, classify_hung, classify_idle, get_or_insert_gate, purge_for_reset,
-        purge_session_entries, remove_if_same_handle, PoolState,
+        better_candidate, classify_hung, classify_idle, get_or_insert_gate, purge_session_entries,
+        remove_if_same_handle, PoolState,
     };
     use crate::acp::connection::SessionActivity;
     use std::collections::HashMap;
@@ -1342,7 +1375,7 @@ mod tests {
     }
 
     #[test]
-    fn purge_session_entries_drops_all_entries_for_evicted_key_only() {
+    fn purge_session_entries_drops_resumable_state_for_evicted_key_only() {
         let mut state = PoolState {
             active: HashMap::new(),
             cancel_handles: HashMap::new(),
@@ -1373,6 +1406,12 @@ mod tests {
         assert!(!state.pgids.contains_key("hung"));
         assert!(!state.suspended.contains_key("hung"));
         assert!(!state.persisted.contains_key("hung"));
+        // The workspace belongs to the thread, not the evicted session: the replacement session
+        // must land back in it (#1556).
+        assert_eq!(
+            state.session_workdirs.get("hung").map(String::as_str),
+            Some("/tmp/ws")
+        );
         // The creating gate is concurrency control, not session state: it must
         // survive so an in-flight get_or_create holder stays serialized.
         assert!(state.creating.contains_key("hung"));
@@ -1389,56 +1428,64 @@ mod tests {
         assert!(state.activity.contains_key("other"));
     }
 
-    /// A `PoolState` holding only `[[ws:]]` workspaces, one per `(key, workdir)` pair.
-    fn pool_state_with_workdirs(workdirs: &[(&str, &str)]) -> PoolState {
-        PoolState {
-            active: HashMap::new(),
-            cancel_handles: HashMap::new(),
-            #[cfg(feature = "acp-mcp")]
-            facade_tokens: HashMap::new(),
-            activity: HashMap::new(),
-            pgids: HashMap::new(),
-            suspended: HashMap::new(),
-            persisted: HashMap::new(),
-            creating: HashMap::new(),
-            session_workdirs: workdirs
-                .iter()
-                .map(|(key, dir)| (key.to_string(), dir.to_string()))
-                .collect(),
-        }
+    /// A pool whose `thread_map.json` / `session_meta.json` live in `dir`, with these
+    /// `(thread, workspace)` pairs already stored and no session for any of them.
+    async fn pool_with_workspaces(
+        dir: &std::path::Path,
+        workspaces: &[(&str, &str)],
+    ) -> super::SessionPool {
+        let pool = super::SessionPool::new_in(
+            crate::config::AgentConfig::default(),
+            1,
+            60,
+            HashMap::new(),
+            dir.to_path_buf(),
+        );
+        pool.state.write().await.session_workdirs = workspaces
+            .iter()
+            .map(|(thread, ws)| (thread.to_string(), ws.to_string()))
+            .collect();
+        pool
     }
 
-    /// Hung eviction drops the session, not the thread's workspace. `get_or_create` resolves the
-    /// stored workspace ahead of the configured default, so the session that replaces an evicted
-    /// one only lands back in its `[[ws:]]` directory if the entry is still there. Dropping it sent
-    /// the replacement to the default `working_dir` whenever the next message carried no directive
-    /// (a cron fire, or any follow-up in the thread).
-    #[test]
-    fn hung_eviction_purge_keeps_the_workspace() {
-        let mut state = pool_state_with_workdirs(&[("hung", "/tmp/ws")]);
-
-        purge_session_entries(&mut state, "hung");
-
-        assert_eq!(
-            state.session_workdirs.get("hung").map(String::as_str),
-            Some("/tmp/ws")
-        );
+    fn workspaces_on_disk(dir: &std::path::Path) -> HashMap<String, String> {
+        serde_json::from_str(&std::fs::read_to_string(dir.join("session_meta.json")).unwrap())
+            .unwrap()
     }
 
-    /// A reset is how a thread gets a different workspace (directives only apply to a session's
-    /// first message, and a stored workspace outranks a new `[[ws:]]`), so it must forget the old
-    /// one — for the reset key only.
-    #[test]
-    fn reset_purge_forgets_the_workspace_of_the_reset_key_only() {
-        let mut state = pool_state_with_workdirs(&[("reset", "/tmp/ws"), ("other", "/tmp/other")]);
+    /// After a hung eviction the thread keeps its workspace but has no session, so the next
+    /// message builds a fresh one. If that message carries a `[[ws:...]]` that fails to resolve,
+    /// `dispatch_batch` rolls the fresh session back. The rollback must not take the thread's
+    /// workspace with it, or every later message lands in the default `working_dir` again.
+    #[tokio::test]
+    async fn discard_session_keeps_the_thread_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool =
+            pool_with_workspaces(dir.path(), &[("thread", "/ws"), ("other", "/other")]).await;
 
-        purge_for_reset(&mut state, "reset");
+        let _ = pool.discard_session("thread").await;
 
-        assert!(!state.session_workdirs.contains_key("reset"));
-        assert_eq!(
-            state.session_workdirs.get("other").map(String::as_str),
-            Some("/tmp/other")
-        );
+        let expected = HashMap::from([
+            ("thread".to_string(), "/ws".to_string()),
+            ("other".to_string(), "/other".to_string()),
+        ]);
+        assert_eq!(pool.state.read().await.session_workdirs, expected);
+        assert_eq!(workspaces_on_disk(dir.path()), expected);
+    }
+
+    /// `/reset` is how a thread gets a different workspace: a stored workspace outranks a new
+    /// `[[ws:...]]`, so reset must forget it — for the reset thread only.
+    #[tokio::test]
+    async fn reset_session_forgets_the_workspace_of_the_reset_thread_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool =
+            pool_with_workspaces(dir.path(), &[("thread", "/ws"), ("other", "/other")]).await;
+
+        let _ = pool.reset_session("thread").await;
+
+        let expected = HashMap::from([("other".to_string(), "/other".to_string())]);
+        assert_eq!(pool.state.read().await.session_workdirs, expected);
+        assert_eq!(workspaces_on_disk(dir.path()), expected);
     }
 
     #[test]

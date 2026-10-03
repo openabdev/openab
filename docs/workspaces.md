@@ -53,6 +53,7 @@ All workspace paths are validated before use:
 - Workspace is set **once** at session creation and is immutable
 - The workspace persists across session suspend/resume and eviction rebuilds
 - To change workspace, start a new session
+- After an eviction rebuild the thread keeps its workspace, so a new `[[ws:...]]` is ignored; run `/reset` first
 - If workspace resolution fails, no session is created (clean failure)
 
 ## Error Messages

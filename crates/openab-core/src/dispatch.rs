@@ -135,7 +135,8 @@ pub trait DispatchTarget: Send + Sync + 'static {
     async fn ensure_session(&self, session_key: &str, working_dir: Option<&str>) -> Result<bool>;
 
     /// Destroy the session for `session_key` (used to rollback on directive failure).
-    async fn reset_session(&self, session_key: &str);
+    /// Keeps the thread's stored workspace, which the rolled-back turn did not create.
+    async fn discard_session(&self, session_key: &str);
 
     /// Drive one ACP turn with the pre-packed `content_blocks`.
     #[allow(clippy::too_many_arguments)]
@@ -169,8 +170,8 @@ impl DispatchTarget for AdapterRouter {
         self.pool().get_or_create(session_key, working_dir).await
     }
 
-    async fn reset_session(&self, session_key: &str) {
-        let _ = self.pool().reset_session(session_key).await;
+    async fn discard_session(&self, session_key: &str) {
+        let _ = self.pool().discard_session(session_key).await;
     }
 
     async fn stream_prompt_blocks(
@@ -719,7 +720,7 @@ async fn dispatch_batch(
                 // If workspace resolution failed on a NEW session, rollback and abort.
                 // Reset FIRST to minimize TOCTOU window (擺渡 F1), then rename.
                 if let Some(Err(e)) = ws_resolved {
-                    target.reset_session(&session_key).await;
+                    target.discard_session(&session_key).await;
                     // Apply title after reset so the thread is identifiable.
                     if let Some(ref title) = title_to_apply {
                         if !title.is_empty() {
@@ -1421,7 +1422,7 @@ mod tests {
             Ok(true)
         }
 
-        async fn reset_session(&self, _session_key: &str) {}
+        async fn discard_session(&self, _session_key: &str) {}
 
         async fn stream_prompt_blocks(
             &self,
