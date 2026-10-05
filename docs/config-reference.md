@@ -818,7 +818,7 @@ timezone = "UTC"
 | `platform` | string | `"discord"` | Target platform (`"discord"` or `"slack"`). |
 | `sender_name` | string | `"openab-cron"` | Sender attribution shown in the prompt context. |
 | `timezone` | string | `"UTC"` | IANA timezone for schedule evaluation (e.g. `"America/New_York"`, `"Europe/Berlin"`). |
-| `thread_id` | string | — (unset) | Optional thread ID to post into an existing thread. Omit the field for a new thread per run; never set it to `""` (see [Thread Behavior](cronjob.md#thread-behavior)). |
+| `thread_id` | string | — (unset) | Optional thread ID to post into an existing thread. Omit the field for a new thread (one per run, unless a usercron `id` pins the job to its first thread); never set it to `""` (see [Thread Behavior](cronjob.md#thread-behavior)). |
 
 The external `cronjob.toml` uses `[[jobs]]` (same fields). See [Usercron docs](cronjob.md#usercron--hot-reload-with-cronjobtoml) for details.
 
@@ -828,7 +828,7 @@ These fields are valid only in the external usercron file, for example `$HOME/.o
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `id` | string | *required with `disable_on_success`* | Stable job ID used when the scheduler writes `enabled = false` or `thread_id` back to `cronjob.toml`. |
+| `id` | string | *required with `disable_on_success`* | Non-empty, unique job ID used when the scheduler writes `enabled = false` or `thread_id` back to `cronjob.toml`. An empty `id` counts as unset; with duplicate IDs, writeback updates only the first matching entry. |
 | `disable_on_success` | string | — | Command to run before sending the scheduled prompt. |
 | `disable_on_success_match` | string | *required with `disable_on_success`* | Marker that must appear in stdout or stderr, in addition to exit code `0`, before the job is considered complete. |
 | `disable_on_success_timeout_secs` | integer | `60` | Timeout for the completion check command. |

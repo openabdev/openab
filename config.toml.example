@@ -334,7 +334,7 @@ error_hold_ms = 2500
 # [[cron.jobs]]
 # enabled = true                               # optional, default: true
 # schedule = "0 9 * * 1-5"                    # weekdays at 9:00 AM
-# channel = "123456789"                        # target channel/thread ID
+# channel = "123456789012345678"               # target channel/thread ID
 # message = "summarize yesterday's merged PRs" # prompt for the agent
 # platform = "discord"                         # "discord" or "slack"
 # sender_name = "DailyOps"                     # attribution (default: "openab-cron")
