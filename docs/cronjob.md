@@ -321,6 +321,26 @@ usercron_enabled = true
 usercron_path = "cronjob.toml"
 ```
 
+## Security Considerations
+
+Cron jobs are system-initiated. When a job fires, the scheduler hands the prompt directly to the message router instead of going through a platform adapter, so a cron prompt is **not** subject to the inbound checks that apply to chat messages:
+
+- the platform trust gate (`allowed_users` / `allowed_channels`)
+- @mention requirements
+- bot-message filtering
+
+This is by design — scheduled jobs may target channels outside the human-facing allowlist (see the [Identity Trust-None ADR](adr/identity-trust-none.md)). The prompt runs with the same tool permissions as any other session (e.g. `--trust-all-tools`), and the message text is forwarded verbatim, so agent CLI commands such as `/clear` or `/model <id>` are executed as well.
+
+The practical consequence: **whoever can write the cron configuration can run unattended prompts as the agent.** For baseline `[[cron.jobs]]`, that is whoever controls `config.toml`. For usercron, it is whoever can write `cronjob.toml` — which, with [Agent-Managed Schedules](#agent-managed-schedules), includes the agent itself.
+
+If your agent reads untrusted content (web pages, RSS feeds, transcripts, messages from other users), a prompt injection that persuades the agent to append a `[[jobs]]` entry turns a one-off injection into a recurring one that looks like a legitimate schedule.
+
+Mitigations:
+
+- Leave `usercron_enabled = false` unless you need agent-managed schedules.
+- Review changes to `cronjob.toml` — for example, track it in git and diff it periodically, or watch it with a file monitor such as `inotifywait`.
+- Put long-lived schedules in baseline `[[cron.jobs]]`, stored where the agent cannot write (e.g. a read-only mount or a Kubernetes ConfigMap).
+
 ## Behaviors
 
 - **Minute-aligned**: The scheduler aligns to minute boundaries (`:00`), so `0 9 * * *` fires at exactly 09:00:00, not at whatever second the process started.
