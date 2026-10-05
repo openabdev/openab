@@ -293,7 +293,7 @@ Execution flow:
 
 1. The schedule matches.
 2. The scheduler runs `disable_on_success`.
-3. If the command exits `0` and output contains `disable_on_success_match`, OpenAB posts `✅ Goal achieved`, writes `enabled = false` back to `$HOME/.openab/cronjob.toml`, and skips the regular prompt.
+3. If the command exits `0` and output contains `disable_on_success_match`, OpenAB posts `✅ Goal achieved`, writes `enabled = false` back to the usercron file (`usercron_path`, `$HOME/.openab/cronjob.toml` by default), and skips the regular prompt.
 4. Otherwise, OpenAB sends the regular `message` and the agent continues working.
 
 `disable_on_success` is supported only in usercron `[[jobs]]`, not baseline `[[cron.jobs]]`. This keeps scheduler writeback limited to the user-managed cron file.
@@ -303,7 +303,7 @@ Execution flow:
 
 ### Re-enabling a Disabled Job
 
-Once a goal is achieved and the job is disabled, re-enable it by editing `$HOME/.openab/cronjob.toml`:
+Once a goal is achieved and the job is disabled, re-enable it by editing the usercron file (`$HOME/.openab/cronjob.toml` by default, or the resolved `usercron_path`):
 
 ```toml
 # Flip back to true to restart the job
@@ -330,36 +330,45 @@ Cron is how OpenAB gives an agent a degree of autonomy: it can act on a schedule
 
 ### Cron prompts skip inbound chat checks (by design)
 
-Cron jobs are system-initiated. When a job fires, the scheduler hands the prompt directly to the message router, bypassing the platform adapter's inbound event path (replies are still sent through the adapter). A cron prompt is therefore **not** subject to the inbound checks that apply to chat messages:
+Cron jobs are system-initiated. When a job fires, the scheduler hands the prompt directly to the message router, bypassing the platform adapter's inbound event path (replies are still sent through the adapter). A cron prompt therefore never enters the adapter's event handler, and none of the adapter's inbound filters apply to it. For example:
 
-- the platform trust gate (`allowed_users` / `allowed_channels`)
+- user, channel, and role allowlists (`allowed_users`, `allowed_channels`, and similar)
+- DM gating (`allow_dm`, where supported)
 - @mention requirements
 - bot-message filtering
 
-This is intentional: scheduled jobs have no external sender and may target channels outside the human-facing allowlist (see the [Identity Trust-None ADR](adr/identity-trust-none.md)). The prompt runs with the same tool permissions as any other session. OpenAB forwards the message text verbatim and does not interpret it; depending on the agent CLI, text such as `/clear` may be handled as a command (kiro-cli does).
+This is intentional: scheduled jobs have no external sender and may target channels outside the human-facing allowlist (see the [Identity Trust-None ADR](adr/identity-trust-none.md)). The prompt runs with the same tool permissions as any other session. OpenAB forwards the message text verbatim and does not interpret it; depending on the agent CLI, text such as `/clear` may be handled as a command (for example, kiro-cli does).
 
 ### What write access to `cronjob.toml` grants
 
 Baseline `[[cron.jobs]]` in `config.toml` can only send prompts. Usercron `[[jobs]]` in `cronjob.toml` can also run a shell command through [`disable_on_success`](#goal-driven-auto-disable), and with Agent-Managed Schedules the agent itself can write `cronjob.toml`.
 
-`disable_on_success` is executed by OpenAB itself (`sh -c` on Unix, `cmd /C` on Windows) on every schedule match (when `disable_on_success_match` is set), before the prompt is sent. It runs as the OpenAB process user, outside the agent's tool approval and any agent sandbox, and inherits OpenAB's filesystem, network access, credentials, and mounts. Run OpenAB with least privilege.
+`disable_on_success` is executed by OpenAB itself (`sh -c` on Unix, `cmd /C` on Windows) on every schedule match, before the prompt is sent. A usercron job that sets `disable_on_success` must also set a non-empty `id` and `disable_on_success_match`. If either is missing, the whole entry is dropped at load time with only a warning in the logs, and the job never fires. Jobs that do not set `disable_on_success` do not need `id` for this.
+
+The command runs as the OpenAB process user, outside the agent's tool approval and any agent sandbox. It inherits OpenAB's filesystem, network access, mounts, and full environment, which often includes platform bot tokens (for example `bot_token = "${DISCORD_BOT_TOKEN}"`) and other credentials. The agent's own process does not get these: OpenAB clears the environment when it starts the agent and passes through only a few baseline variables plus `[agent].env` and `inherit_env`. Run OpenAB under a dedicated account, and give its environment and mounts only the credentials OpenAB itself needs.
 
 How much this adds depends on your setup:
 
-- If the agent already has unrestricted shell access (for example `--trust-all-tools`, as in the [example above](#minimal-configtoml-example)), `disable_on_success` adds unattended persistence, not new privilege.
+- If the agent already has unrestricted shell access (for example `--trust-all-tools`, as in the [example above](#minimal-configtoml-example)), `disable_on_success` adds unattended persistence **and** access to OpenAB's environment, which the agent's shell does not have. For example, `disable_on_success = "env > /tmp/openab-env"` can expose a bot token to the agent.
 - If the agent's shell tool is restricted, or the agent runs sandboxed with less privilege than the OpenAB process, but it can still write `cronjob.toml`, then `disable_on_success` grants shell execution the agent would not otherwise have.
 
 > [!CAUTION]
-> If your agent reads untrusted content (web pages, RSS feeds, transcripts, messages from other users), a prompt injection that persuades it to add a `[[jobs]]` entry with `disable_on_success` gains recurring shell execution as the OpenAB process user, without agent tool approval, and the entry looks like a legitimate schedule.
+> If your agent reads untrusted content (web pages, RSS feeds, transcripts, messages from other users), a prompt injection that persuades it to add a `[[jobs]]` entry with `disable_on_success` gains recurring shell execution as the OpenAB process user, with OpenAB's credentials and without agent tool approval, and the entry looks like a legitimate schedule. With a bot token from that environment, the command can act as the bot in any channel the bot can reach, including channels that `allowed_users` / `allowed_channels` exclude. The inbound allowlist does not cover this path.
 
 ### Choosing the right scope
 
 Prompts and `disable_on_success` live in the same file, so write access cannot be split by field. Choose one of:
 
 - **Full autonomy**: enable usercron and let the agent manage `cronjob.toml`. Best for a personal agent whose inputs you trust.
-- **Operator-managed only**: leave `usercron_enabled = false` and put schedules in baseline `[[cron.jobs]]`, or keep usercron but make the file unwritable by the agent at the filesystem level (a read-only mount, a Kubernetes ConfigMap, or a file and containing directory owned by a different user than the agent runs as). Write access to the directory alone is enough to replace the file, and `usercron_path` may be absolute, so protect the file and directory it actually points to. Agent CLI path rules alone are not enough, because an agent with a shell tool can bypass them. A protected file also blocks scheduler writeback, so avoid `disable_on_success` (and `thread_id` persistence) there: an achieved goal cannot be written back as `enabled = false` and the job keeps firing.
+- **Operator-managed only**: leave `usercron_enabled = false` and put schedules in baseline `[[cron.jobs]]`, or keep usercron but make the file unwritable by the agent at the filesystem level. By default the agent runs as the same OS user as OpenAB, so anything the agent cannot write, OpenAB cannot write either, unless you run them as different users. Options:
+  - A read-only mount or a Kubernetes ConfigMap. OpenAB cannot write the file either.
+  - A file **and** containing directory owned by a different user than the agent runs as. Write access to the directory alone is enough to replace the file, so making only the file read-only protects nothing. If the directory is shared-writable (such as `/tmp`), also set the sticky bit.
 
-For an audit trail, commit changes to version control or persist file-monitor events (e.g. from `inotifywait`) to a location outside the agent's writable scope. This is detective, not preventive: changes are hot-reloaded and take effect within about a minute.
+  `usercron_path` may be absolute, so protect the file and directory it actually points to. Agent CLI path rules alone are not enough, because an agent with a shell tool can bypass them.
+
+  OpenAB rewrites the file through a temporary file in the same directory, so scheduler writeback fails whenever OpenAB itself cannot write the file's directory. In that case, do not use `disable_on_success`: an achieved goal cannot be written back as `enabled = false`, so the command keeps running and `✅ Goal achieved` is posted on every schedule match. Also avoid jobs that set `id` but leave `thread_id` unset: the new thread's ID cannot be saved, so a new thread is created on every run. Instead, set a real `thread_id`, or omit `id` if you want a new thread per run.
+
+For an audit trail, record changes somewhere the agent cannot write: push commits to a protected remote, or persist file-monitor events (e.g. from `inotifywait`) to an external or append-only store. A local git repository is not enough, because an agent with a shell tool can rewrite its history. This is detective, not preventive: changes are hot-reloaded and take effect within about a minute.
 
 ## Behaviors
 
