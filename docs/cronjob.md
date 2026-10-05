@@ -357,7 +357,7 @@ How much this adds depends on your setup:
 Prompts and `disable_on_success` live in the same file, so write access cannot be split by field. Choose one of:
 
 - **Full autonomy**: enable usercron and let the agent manage `cronjob.toml`. Best for a personal agent whose inputs you trust.
-- **Operator-managed only**: leave `usercron_enabled = false` and put schedules in baseline `[[cron.jobs]]`, or keep usercron but make the file unwritable by the agent at the filesystem level (a read-only mount, a different file owner, or a Kubernetes ConfigMap). `usercron_path` may be absolute, so protect the file it actually points to. Agent CLI path rules alone are not enough, because an agent with a shell tool can bypass them.
+- **Operator-managed only**: leave `usercron_enabled = false` and put schedules in baseline `[[cron.jobs]]`, or keep usercron but make the file unwritable by the agent at the filesystem level (a read-only mount, a Kubernetes ConfigMap, or a file and containing directory owned by a different user than the agent runs as). Write access to the directory alone is enough to replace the file, and `usercron_path` may be absolute, so protect the file and directory it actually points to. Agent CLI path rules alone are not enough, because an agent with a shell tool can bypass them. A protected file also blocks scheduler writeback, so avoid `disable_on_success` (and `thread_id` persistence) there: an achieved goal cannot be written back as `enabled = false` and the job keeps firing.
 
 For an audit trail, commit changes to version control or persist file-monitor events (e.g. from `inotifywait`) to a location outside the agent's writable scope. This is detective, not preventive: changes are hot-reloaded and take effect within about a minute.
 
