@@ -790,7 +790,7 @@ message = "summarize yesterday's merged PRs" # message sent to agent
 platform = "discord"                         # optional, default: "discord"
 sender_name = "DailyOps"                     # optional, default: "openab-cron"
 timezone = "America/New_York"                # optional, default: "UTC"
-# thread_id = "123456789012345678"           # optional, post to existing thread (omit for a new thread per run; never "")
+# thread_id = "234567890123456789"           # optional, post to existing thread (omit for a new thread per run; never "")
 
 [[cron.jobs]]
 schedule = "0 0 * * 0"

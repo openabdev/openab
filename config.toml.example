@@ -339,7 +339,7 @@ error_hold_ms = 2500
 # platform = "discord"                         # "discord" or "slack"
 # sender_name = "DailyOps"                     # attribution (default: "openab-cron")
 # timezone = "America/New_York"                # IANA timezone (default: "UTC")
-# thread_id = ""                               # optional: post to existing thread
+# thread_id = "234567890123456789"             # optional: post to existing thread (omit for a new thread; never "")
 
 # [[cron.jobs]]
 # schedule = "0 0 * * 0"
