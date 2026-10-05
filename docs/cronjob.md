@@ -362,7 +362,7 @@ Prompts and `disable_on_success` live in the same file, so write access cannot b
 - **Full autonomy**: enable usercron and let the agent manage `cronjob.toml`. Best for a personal agent whose inputs you trust.
 - **Operator-managed only**: leave `usercron_enabled = false` and put schedules in baseline `[[cron.jobs]]`, or keep usercron but make the file unwritable by the agent at the filesystem level. By default the agent runs as the same OS user as OpenAB, so anything the agent cannot write, OpenAB cannot write either, unless you run them as different users. Options:
   - A read-only mount or a Kubernetes ConfigMap. OpenAB cannot write the file either.
-  - A file **and** containing directory owned by a different user than the agent runs as. Write access to the directory alone is enough to replace the file, so making only the file read-only protects nothing. If the directory is shared-writable (such as `/tmp`), also set the sticky bit.
+  - A file **and** containing directory owned by a different user than the agent runs as. Write access to the directory alone is enough to replace the file, so making only the file read-only protects nothing. The containing directory must not be writable by the agent; do not use a shared-writable directory such as `/tmp`.
 
   `usercron_path` may be absolute, so protect the file and directory it actually points to. Agent CLI path rules alone are not enough, because an agent with a shell tool can bypass them.
 
