@@ -321,7 +321,11 @@ usercron_enabled = true
 usercron_path = "cronjob.toml"
 ```
 
-## Security Considerations
+## Autonomy and Permission Scope
+
+Cron is how OpenAB gives an agent a degree of autonomy: it can act on a schedule without a human in the loop, and with [Agent-Managed Schedules](#agent-managed-schedules) it can decide its own schedule. This section describes exactly what that capability covers, so you can decide how much of it to grant.
+
+### Cron prompts skip inbound chat checks (by design)
 
 Cron jobs are system-initiated. When a job fires, the scheduler hands the prompt directly to the message router instead of going through a platform adapter, so a cron prompt is **not** subject to the inbound checks that apply to chat messages:
 
@@ -329,17 +333,28 @@ Cron jobs are system-initiated. When a job fires, the scheduler hands the prompt
 - @mention requirements
 - bot-message filtering
 
-This is by design — scheduled jobs may target channels outside the human-facing allowlist (see the [Identity Trust-None ADR](adr/identity-trust-none.md)). The prompt runs with the same tool permissions as any other session (e.g. `--trust-all-tools`), and the message text is forwarded verbatim, so agent CLI commands such as `/clear` or `/model <id>` are executed as well.
+This is intentional: scheduled jobs have no external sender and may target channels outside the human-facing allowlist (see the [Identity Trust-None ADR](adr/identity-trust-none.md)). The prompt runs with the same tool permissions as any other session (e.g. `--trust-all-tools`), and the message text is forwarded verbatim, so agent CLI commands such as `/clear` are executed as well.
 
-The practical consequence: **whoever can write the cron configuration can run unattended prompts as the agent.** For baseline `[[cron.jobs]]`, that is whoever controls `config.toml`. For usercron, it is whoever can write `cronjob.toml` — which, with [Agent-Managed Schedules](#agent-managed-schedules), includes the agent itself.
+### What write access to the cron configuration grants
 
-If your agent reads untrusted content (web pages, RSS feeds, transcripts, messages from other users), a prompt injection that persuades the agent to append a `[[jobs]]` entry turns a one-off injection into a recurring one that looks like a legitimate schedule.
+Writing the cron configuration is equivalent to scheduling unattended work:
 
-Mitigations:
+| Config | Who can write it | What a job can do |
+|--------|------------------|-------------------|
+| Baseline `[[cron.jobs]]` in `config.toml` | Whoever controls `config.toml` | Send a recurring prompt to the agent |
+| Usercron `[[jobs]]` in `cronjob.toml` | Whoever can write `cronjob.toml`, including the agent itself with Agent-Managed Schedules | Send a recurring prompt to the agent, **and** run a shell command via [`disable_on_success`](#goal-driven-auto-disable) |
 
-- Leave `usercron_enabled = false` unless you need agent-managed schedules.
-- Review changes to `cronjob.toml` — for example, track it in git and diff it periodically, or watch it with a file monitor such as `inotifywait`.
-- Put long-lived schedules in baseline `[[cron.jobs]]`, stored where the agent cannot write (e.g. a read-only mount or a Kubernetes ConfigMap).
+`disable_on_success` is executed by OpenAB itself (`sh -c` on Unix, `cmd /C` on Windows) on every schedule match, before the prompt is sent. It does not go through the agent, so the agent CLI's tool-approval settings do not apply to it. An agent that can write `cronjob.toml` can therefore run shell commands on a schedule, even if its own shell tool is restricted.
+
+If your agent reads untrusted content (web pages, RSS feeds, transcripts, messages from other users), keep in mind that a prompt injection which persuades the agent to add a `[[jobs]]` entry becomes recurring and looks like a legitimate schedule.
+
+### Choosing the right scope
+
+- **Full autonomy**: enable usercron and let the agent manage `cronjob.toml`. Best for a personal agent whose inputs you trust.
+- **Agent-managed prompts, operator-managed commands**: keep usercron enabled, but restrict the agent's file-write tools from `$HOME/.openab/` (or require approval for that path) where your agent CLI supports path-scoped permissions. Add `disable_on_success` entries yourself.
+- **Operator-managed only**: leave `usercron_enabled = false` and put schedules in baseline `[[cron.jobs]]`, stored where the agent cannot write (e.g. a read-only mount or a Kubernetes ConfigMap).
+
+Whichever scope you choose, tracking `cronjob.toml` in git or watching it with a file monitor such as `inotifywait` gives you an audit trail. This is detective, not preventive: changes are hot-reloaded and take effect within about a minute.
 
 ## Behaviors
 
