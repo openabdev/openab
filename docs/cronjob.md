@@ -60,8 +60,8 @@ Where a job posts depends on `thread_id` and, for usercron jobs, `id`. This appl
 |---|---|---|
 | set | any (ignored) | Every run posts into that thread. No new thread and no `thread_id` writeback. |
 | omitted | omitted | Every run creates a new thread. Since sessions are keyed by thread, each run also starts a fresh agent session. |
-| omitted | set (usercron) | The first run creates a thread and the scheduler writes its ID back to `cronjob.toml` as `thread_id`. If that writeback succeeds, all later runs post into that same thread. If OpenAB cannot write the file, a new thread is created on every run (see [Choosing the right scope](#choosing-the-right-scope)). |
-| `""` | any | Invalid on every platform. An empty string is treated as a thread ID, not as unset. On Discord, for example, the send fails (`failed to send cron message ... cannot parse integer from empty string` in the logs) and nothing is posted. |
+| omitted | set (usercron) | The first run creates a thread and the scheduler writes its ID back to `cronjob.toml` as `thread_id`. If that writeback succeeds, later runs post into that same thread once the scheduler reloads the file (about a minute). If OpenAB cannot write the file, a new thread is created on every run (see [Choosing the right scope](#choosing-the-right-scope)). |
+| `""` | any | Known defect; do not use. An empty string is not treated as unset: it is passed through as a thread ID. On Discord the send fails (`failed to send cron message ... cannot parse integer from empty string` in the logs) and nothing is posted; other platforms may behave differently. A future release may treat `""` as unset. |
 
 `id` does not select a thread — it only tells the scheduler which entry to update. If you remove a written-back `thread_id` but keep `id`, the next run creates a new thread and pins the job to it again.
 
