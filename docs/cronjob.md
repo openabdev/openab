@@ -50,7 +50,7 @@ timezone = "America/New_York"                     # optional, default: "UTC"
 | `sender_name` | | `"openab-cron"` | Attribution shown in prompt context |
 | `timezone` | | `"UTC"` | IANA timezone (e.g. `"America/New_York"`, `"Europe/Berlin"`) |
 | `thread_id` | | — | Post into an existing thread instead of creating a new one. Omit the field entirely to create a new thread per run — do not set it to `""` (see [Thread Behavior](#thread-behavior)) |
-| `id` | | — | Usercron only. Stable job identifier, required for `disable_on_success`. Enables scheduler writeback, including persisting an auto-created `thread_id` (see [Thread Behavior](#thread-behavior)) |
+| `id` | | — | Usercron only; ignored in baseline `[[cron.jobs]]`. Stable job identifier, required for `disable_on_success`. Enables scheduler writeback, including persisting an auto-created `thread_id` (see [Thread Behavior](#thread-behavior)) |
 
 ### Thread Behavior
 
@@ -58,12 +58,12 @@ Where a job posts depends on `thread_id` and, for usercron jobs, `id`. This appl
 
 | `thread_id` | `id` | Behavior |
 |---|---|---|
-| set | any | Every run posts into that thread. No new thread, no writeback. |
+| set | any (ignored) | Every run posts into that thread. No new thread and no `thread_id` writeback. |
 | omitted | omitted | Every run creates a new thread. Since sessions are keyed by thread, each run also starts a fresh agent session. |
-| omitted | set (usercron) | The first run creates a thread and the scheduler writes its ID back to `cronjob.toml` as `thread_id`. All later runs post into that same thread. |
-| `""` | any | Invalid. An empty string is treated as a thread ID, not as unset. On Discord the send fails (`failed to send cron message ... cannot parse integer from empty string` in the logs) and nothing is posted. |
+| omitted | set (usercron) | The first run creates a thread and the scheduler writes its ID back to `cronjob.toml` as `thread_id`. If that writeback succeeds, all later runs post into that same thread. If OpenAB cannot write the file, a new thread is created on every run (see [Choosing the right scope](#choosing-the-right-scope)). |
+| `""` | any | Invalid on every platform. An empty string is treated as a thread ID, not as unset. On Discord, for example, the send fails (`failed to send cron message ... cannot parse integer from empty string` in the logs) and nothing is posted. |
 
-`id` does not select a thread — it only tells the scheduler which entry to update. If you remove a written-back `thread_id` but keep `id`, the next run creates a new thread and pins the job to it again. To get a new thread on every run, omit both fields.
+`id` does not select a thread — it only tells the scheduler which entry to update. If you remove a written-back `thread_id` but keep `id`, the next run creates a new thread and pins the job to it again.
 
 ## Cron Expression Format
 
