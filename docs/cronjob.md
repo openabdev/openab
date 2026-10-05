@@ -37,7 +37,7 @@ message = "summarize yesterday's merged PRs" # required: prompt for the agent
 platform = "discord"                         # optional, default: "discord"
 sender_name = "DailyOps"                     # optional, default: "openab-cron"
 timezone = "America/New_York"                     # optional, default: "UTC"
-# thread_id = "123456789012345678"           # optional: post to existing thread (omit to create a new thread per run)
+# thread_id = "234567890123456789"           # optional: post to existing thread (omit to create a new thread; never "")
 ```
 
 | Field | Required | Default | Description |
@@ -49,8 +49,8 @@ timezone = "America/New_York"                     # optional, default: "UTC"
 | `platform` | | `"discord"` | `"discord"`, `"slack"`, `"telegram"`, `"googlechat"`, or `"lineworks"` (non-default platforms require their feature) |
 | `sender_name` | | `"openab-cron"` | Attribution shown in prompt context |
 | `timezone` | | `"UTC"` | IANA timezone (e.g. `"America/New_York"`, `"Europe/Berlin"`) |
-| `thread_id` | | — | Post into an existing thread instead of creating a new one. Omit the field entirely to create a new thread per run — do not set it to `""` (see [Thread Behavior](#thread-behavior)) |
-| `id` | | — | Usercron only; ignored in baseline `[[cron.jobs]]`. Stable job identifier, required for `disable_on_success`. Enables scheduler writeback, including persisting an auto-created `thread_id` (see [Thread Behavior](#thread-behavior)) |
+| `thread_id` | | — | Post into an existing thread instead of creating a new one. Omit the field to create a new thread (a new one per run, unless a usercron `id` pins the job to its first thread); do not set it to `""` (see [Thread Behavior](#thread-behavior)) |
+| `id` | | — | Usercron only; ignored in baseline `[[cron.jobs]]`. Non-empty, unique job identifier, required for `disable_on_success`. Enables scheduler writeback, including persisting an auto-created `thread_id` (see [Thread Behavior](#thread-behavior)). An empty `id` counts as unset; with duplicate IDs, writeback updates only the first matching entry |
 
 ### Thread Behavior
 
@@ -404,3 +404,4 @@ See [Kubernetes CronJob Reference Architecture](cronjob_k8s_refarch.md) for the 
 | Usercron not reloading | File not saved / wrong path | Check logs for `usercron file changed, reloading` |
 | Usercron parse error | Invalid TOML syntax | Check logs for `failed to parse usercron file` |
 | Goal job does not auto-disable | Command did not exit `0` or output did not include `disable_on_success_match` | Run the command manually and confirm both conditions |
+| Nothing posted; logs show `failed to send cron message ... cannot parse integer from empty string` | `thread_id = ""` | Remove the `thread_id` line or set a real thread ID (see [Thread Behavior](#thread-behavior)) |
