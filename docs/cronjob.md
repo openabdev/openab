@@ -37,7 +37,7 @@ message = "summarize yesterday's merged PRs" # required: prompt for the agent
 platform = "discord"                         # optional, default: "discord"
 sender_name = "DailyOps"                     # optional, default: "openab-cron"
 timezone = "America/New_York"                     # optional, default: "UTC"
-thread_id = ""                               # optional: post to existing thread
+# thread_id = "123456789012345678"           # optional: post to existing thread (omit to create a new thread per run)
 ```
 
 | Field | Required | Default | Description |
@@ -49,7 +49,21 @@ thread_id = ""                               # optional: post to existing thread
 | `platform` | | `"discord"` | `"discord"`, `"slack"`, `"telegram"`, `"googlechat"`, or `"lineworks"` (non-default platforms require their feature) |
 | `sender_name` | | `"openab-cron"` | Attribution shown in prompt context |
 | `timezone` | | `"UTC"` | IANA timezone (e.g. `"America/New_York"`, `"Europe/Berlin"`) |
-| `thread_id` | | — | Post into an existing thread instead of the channel |
+| `thread_id` | | — | Post into an existing thread instead of creating a new one. Omit the field entirely to create a new thread per run — do not set it to `""` (see [Thread Behavior](#thread-behavior)) |
+| `id` | | — | Usercron only. Stable job identifier, required for `disable_on_success`. Enables scheduler writeback, including persisting an auto-created `thread_id` (see [Thread Behavior](#thread-behavior)) |
+
+### Thread Behavior
+
+Where a job posts depends on `thread_id` and, for usercron jobs, `id`. This applies to platforms with thread support; Google Chat and LINE WORKS differ (see [Platform Prerequisites](#platform-prerequisites)).
+
+| `thread_id` | `id` | Behavior |
+|---|---|---|
+| set | any | Every run posts into that thread. No new thread, no writeback. |
+| omitted | omitted | Every run creates a new thread. Since sessions are keyed by thread, each run also starts a fresh agent session. |
+| omitted | set (usercron) | The first run creates a thread and the scheduler writes its ID back to `cronjob.toml` as `thread_id`. All later runs post into that same thread. |
+| `""` | any | Invalid. An empty string is treated as a thread ID, not as unset. On Discord the send fails (`failed to send cron message ... cannot parse integer from empty string` in the logs) and nothing is posted. |
+
+`id` does not select a thread — it only tells the scheduler which entry to update. If you remove a written-back `thread_id` but keep `id`, the next run creates a new thread and pins the job to it again. To get a new thread on every run, omit both fields.
 
 ## Cron Expression Format
 
@@ -326,7 +340,7 @@ usercron_path = "cronjob.toml"
 - **Minute-aligned**: The scheduler aligns to minute boundaries (`:00`), so `0 9 * * *` fires at exactly 09:00:00, not at whatever second the process started.
 - **Overlap protection**: If a previous execution of the same job is still running, the next tick is skipped.
 - **Isolation**: Cron failures are logged but never block interactive chat traffic.
-- **Usercron persistence**: For usercron jobs, the scheduler may write `thread_id` and `enabled = false` back to `cronjob.toml`.
+- **Usercron persistence**: For usercron jobs with an `id`, the scheduler may write `thread_id` and `enabled = false` back to `cronjob.toml` (see [Thread Behavior](#thread-behavior)).
 - **Graceful shutdown**: In-flight cron tasks are waited on (up to 30 seconds) during shutdown.
 
 ## Sender Identity
