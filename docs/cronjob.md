@@ -37,7 +37,7 @@ message = "summarize yesterday's merged PRs" # required: prompt for the agent
 platform = "discord"                         # optional, default: "discord"
 sender_name = "DailyOps"                     # optional, default: "openab-cron"
 timezone = "America/New_York"                     # optional, default: "UTC"
-# thread_id = "234567890123456789"           # optional: post to existing thread (omit to create a new thread; never "")
+# thread_id = "234567890123456789"           # optional: post to existing thread (omit to create a new thread)
 ```
 
 | Field | Required | Default | Description |
@@ -49,7 +49,7 @@ timezone = "America/New_York"                     # optional, default: "UTC"
 | `platform` | | `"discord"` | `"discord"`, `"slack"`, `"telegram"`, `"googlechat"`, or `"lineworks"` (non-default platforms require their feature) |
 | `sender_name` | | `"openab-cron"` | Attribution shown in prompt context |
 | `timezone` | | `"UTC"` | IANA timezone (e.g. `"America/New_York"`, `"Europe/Berlin"`) |
-| `thread_id` | | — | Post into an existing thread instead of creating a new one. Omit the field to create a new thread (a new one per run, unless a usercron `id` pins the job to its first thread); do not set it to `""` (see [Thread Behavior](#thread-behavior)) |
+| `thread_id` | | — | Post into an existing thread instead of creating a new one. Omit the field to create a new thread per run, unless a usercron `id` pins the job to its first thread. See [Thread Behavior](#thread-behavior) |
 | `id` | | — | Usercron only; ignored in baseline `[[cron.jobs]]`. Non-empty, unique job identifier, required for `disable_on_success`. Enables scheduler writeback, including persisting an auto-created `thread_id` (see [Thread Behavior](#thread-behavior)). An empty `id` counts as unset; with duplicate IDs, writeback updates only the first matching entry |
 
 ### Thread Behavior
@@ -59,11 +59,18 @@ Where a job posts depends on `thread_id` and, for usercron jobs, `id`. This appl
 | `thread_id` | `id` | Behavior |
 |---|---|---|
 | set | any | Every run posts into that thread. No new thread and no `thread_id` writeback. |
-| omitted | omitted | Every run creates a new thread. Since sessions are keyed by thread, each run also starts a fresh agent session. |
-| omitted | set (usercron) | The first run that successfully creates a thread has the scheduler write its ID back to `cronjob.toml` as `thread_id`. If that writeback succeeds and records a real thread ID, later runs post into that same thread once the scheduler reloads the file (about a minute). If OpenAB cannot write the file, a new thread is created on every run (see "Choosing the right scope" under Autonomy and Permission Scope below). |
-| `""` | any | Known defect; do not use. An empty string is not treated as unset: it is passed through as a thread ID. On Discord the send fails (`failed to send cron message ... cannot parse integer from empty string` in the logs) and nothing is posted; other platforms may behave differently. A future release may treat `""` as unset. |
+| omitted or blank | omitted | Every run creates a new thread. Since sessions are keyed by thread, each run also starts a fresh agent session. |
+| omitted or blank | set (usercron) | The first run creates a thread and writes its ID back as `thread_id`; later runs post into that thread. |
+
+A blank value (`""` or whitespace) is treated the same as omitting the field, for both `thread_id` and `id`.
 
 `id` does not select a thread — it only tells the scheduler which entry to update. If you remove a written-back `thread_id` but keep `id`, the next run creates a new thread and pins the job to it again.
+
+Writeback edge cases for the `id` row:
+
+- The pinned thread takes effect once the scheduler reloads the file (next tick, normally within 60s).
+- If OpenAB cannot write `cronjob.toml` (see [Choosing the right scope](#choosing-the-right-scope)), nothing is pinned and every run creates a new thread. The logs show `failed to persist usercron thread_id`.
+- On gateway platforms (Telegram), if topic creation fails or times out (5s), the job posts to the chat itself and the **chat ID** is written back as `thread_id`. Later runs then target that ID as a topic. Remove the written-back `thread_id` line to retry topic creation.
 
 ## Cron Expression Format
 
@@ -453,4 +460,5 @@ See [Kubernetes CronJob Reference Architecture](cronjob_k8s_refarch.md) for the 
 | Usercron not reloading | File not saved / wrong path | Check logs for `usercron file changed, reloading` |
 | Usercron parse error | Invalid TOML syntax | Check logs for `failed to parse usercron file` |
 | Goal job does not auto-disable | Command did not exit `0` or output did not include `disable_on_success_match` | Run the command manually and confirm both conditions |
-| Nothing posted; logs show `failed to send cron message ... cannot parse integer from empty string` | `thread_id = ""` | Remove the `thread_id` line or set a real thread ID (see [Thread Behavior](#thread-behavior)) |
+| Usercron job with `id` creates a new thread on every run | `thread_id` writeback failed (e.g. agent or OpenAB cannot write the file) | Check logs for `failed to persist usercron thread_id`; see [Thread Behavior](#thread-behavior) |
+| Telegram job with `id`: written-back `thread_id` equals the chat ID | Topic creation failed or timed out on the first run, so the chat ID was persisted | Check logs for `create_topic failed` / `create_topic timeout`; remove the `thread_id` line |

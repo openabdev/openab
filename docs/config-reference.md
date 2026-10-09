@@ -790,7 +790,7 @@ message = "summarize yesterday's merged PRs" # message sent to agent
 platform = "discord"                         # optional, default: "discord"
 sender_name = "DailyOps"                     # optional, default: "openab-cron"
 timezone = "America/New_York"                # optional, default: "UTC"
-# thread_id = "234567890123456789"           # optional, post to existing thread (omit for a new thread per run; never "")
+# thread_id = "234567890123456789"           # optional, post to existing thread (omit for a new thread per run)
 
 [[cron.jobs]]
 schedule = "0 0 * * 0"
@@ -818,13 +818,13 @@ timezone = "UTC"
 | `platform` | string | `"discord"` | Target platform (`"discord"` or `"slack"`). |
 | `sender_name` | string | `"openab-cron"` | Sender attribution shown in the prompt context. |
 | `timezone` | string | `"UTC"` | IANA timezone for schedule evaluation (e.g. `"America/New_York"`, `"Europe/Berlin"`). |
-| `thread_id` | string | — (unset) | Optional thread ID to post into an existing thread. Omit the field for a new thread (one per run, unless a usercron `id` pins the job to its first thread); never set it to `""` (see [Thread Behavior](cronjob.md#thread-behavior)). |
+| `thread_id` | string | — (unset) | Optional thread ID to post into an existing thread. Omit the field for a new thread per run, unless a usercron `id` pins the job to its first thread. See [Thread Behavior](cronjob.md#thread-behavior). |
 
 The external `cronjob.toml` uses `[[jobs]]` (same fields). See [Usercron docs](cronjob.md#usercron--hot-reload-with-cronjobtoml) for details.
 
 ### Usercron-only `[[jobs]]` fields
 
-These fields are valid only in the external usercron file, for example `$HOME/.openab/cronjob.toml`. `disable_on_success` is rejected in baseline `[[cron.jobs]]`; the other fields, including `id`, are accepted there but ignored, because OpenAB only writes state back to the user-managed cron file.
+These fields only take effect in the external usercron file, for example `$HOME/.openab/cronjob.toml`. `disable_on_success` is rejected in baseline `[[cron.jobs]]`; the others, including `id`, are parsed but ignored there, because OpenAB only writes state back to the user-managed cron file.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
