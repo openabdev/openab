@@ -327,11 +327,23 @@ pub fn load_usercron_file(path: &Path, configured_platforms: &[&str]) -> Vec<Cro
             return vec![];
         }
     };
-    // Validate each entry individually — keep valid ones, skip bad ones
-    parsed.jobs.into_iter().enumerate().filter(|(i, job)| {
+    // Validate each entry individually — keep valid ones, skip bad ones.
+    // Writeback matches on the trimmed `id` (see `update_usercron_job`), so two
+    // entries whose ids differ only by surrounding whitespace would collide:
+    // the second job's `thread_id`/`enabled` writeback would land on the first
+    // entry. Skip later duplicates (after trimming) so each live id maps to one
+    // writeback target.
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    parsed.jobs.into_iter().enumerate().filter(move |(i, job)| {
         if let Err(e) = parse_cron_expr(&job.schedule) {
             warn!(index = i, schedule = %job.schedule, error = %e, "usercron: invalid cron expression, skipping");
             return false;
+        }
+        if let Some(id) = non_empty_opt(job.id.as_deref()) {
+            if !seen_ids.insert(id.to_owned()) {
+                warn!(index = i, id, "usercron: duplicate id after trimming, skipping");
+                return false;
+            }
         }
         if job.timezone.parse::<Tz>().is_err() {
             warn!(index = i, timezone = %job.timezone, "usercron: invalid timezone, skipping");
@@ -420,8 +432,10 @@ fn parse_job_list(
 /// Canonicalize optional identifiers so blank values behave like omitted ones.
 ///
 /// `thread_id = ""` would otherwise deserialize to `Some("")`, skip thread
-/// creation, and fail the send. Trimming `id` keeps writeback lookups
-/// consistent with `update_usercron_job`, which also compares trimmed values.
+/// creation, and fail the send. Both fields also have surrounding whitespace
+/// trimmed: a padded `thread_id` never matches a real platform thread ID, and
+/// trimming `id` keeps writeback lookups consistent with `update_usercron_job`,
+/// which also compares trimmed values.
 fn normalize_job_config(job: &CronJobConfig) -> CronJobConfig {
     let mut config = job.clone();
     config.thread_id = non_empty_opt(job.thread_id.as_deref()).map(str::to_owned);
@@ -1540,10 +1554,11 @@ message = "a"
     #[test]
     fn parse_job_list_normalizes_thread_id_on_baseline_and_usercron() {
         let usercron = Path::new("/tmp/cronjob.toml");
-        let cases: [(Option<&str>, Option<&str>); 4] = [
+        let cases: [(Option<&str>, Option<&str>); 5] = [
             (None, None),
             (Some(""), None),
             (Some("   "), None),
+            (Some(" 1556488188002959532 "), Some("1556488188002959532")),
             (Some("1556488188002959532"), Some("1556488188002959532")),
         ];
         for path in [None, Some(usercron)] {
@@ -1603,6 +1618,34 @@ message = "a"
             .unwrap();
         let job = doc["jobs"].as_array_of_tables().unwrap().get(0).unwrap();
         assert_eq!(job["thread_id"].as_str(), Some("thread-789"));
+    }
+
+    #[test]
+    fn load_usercron_file_skips_ids_that_collide_after_trimming() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cronjob.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[jobs]]
+id = "x"
+schedule = "* * * * *"
+channel = "123"
+message = "first"
+
+[[jobs]]
+id = " x "
+schedule = "* * * * *"
+channel = "123"
+message = "second"
+"#,
+        )
+        .unwrap();
+        // Both ids trim to "x" and would share one writeback target, so only the
+        // first survives; the padded duplicate is skipped.
+        let jobs = load_usercron_file(&path, &["discord"]);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].message, "first");
     }
 
     #[tokio::test]

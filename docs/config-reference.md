@@ -828,7 +828,7 @@ These fields only take effect in the external usercron file, for example `$HOME/
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `id` | string | *required with `disable_on_success`* | Non-empty, unique job ID used when the scheduler writes `enabled = false` or `thread_id` back to `cronjob.toml`. An empty `id` counts as unset; with duplicate IDs, writeback updates only the first matching entry. |
+| `id` | string | *required with `disable_on_success`* | Unique job ID that enables scheduler writeback of `enabled`/`thread_id` to `cronjob.toml`. See [Thread Behavior](cronjob.md#thread-behavior). |
 | `disable_on_success` | string | — | Command to run before sending the scheduled prompt. |
 | `disable_on_success_match` | string | *required with `disable_on_success`* | Marker that must appear in stdout or stderr, in addition to exit code `0`, before the job is considered complete. |
 | `disable_on_success_timeout_secs` | integer | `60` | Timeout for the completion check command. |
