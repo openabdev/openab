@@ -1756,7 +1756,7 @@ message = "second"
         let jobs = load_usercron_file(&path, configured);
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].message, "first");
-        assert_eq!(jobs[0].enabled, false);
+        assert!(!jobs[0].enabled);
     }
 
     #[tokio::test]
