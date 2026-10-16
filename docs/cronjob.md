@@ -66,18 +66,17 @@ A blank value (`""` or whitespace) is treated the same as omitting the field, fo
 
 `id` does not select a thread — it only tells the scheduler which entry to update. If you remove a written-back `thread_id` but keep `id`, the next run creates a new thread and pins the job to it again.
 
+> [!CAUTION]
+> **Breaking Change** — Duplicate usercron ids now skip. On earlier versions, two `[[jobs]]` entries with the same `id` both loaded and ran; as of this version only the first (in file order) runs and the rest are skipped at load. A job with an accidental copy-paste duplicate id stops firing after upgrading.
+> Before upgrading, check `cronjob.toml` for ids that are equal after trimming (including values that differ only by surrounding whitespace) and make them unique.
+
 Writeback edge cases for the `id` row:
 
-- A blank `id` counts as unset. Ids are compared after trimming, so any duplicates — including identical values and ids that differ only by surrounding whitespace — share one writeback target. The scheduler keeps the first entry in file order and skips the rest at load (`usercron: duplicate id (compared after trimming), skipping`). The first entry owns the id even when it is itself invalid or disabled, so a later entry with the same id still does not run.
-
-  > [!CAUTION]
-  > **Breaking Change** — Duplicate usercron ids now skip. On earlier versions, two `[[jobs]]` entries with the same `id` both loaded and ran; as of this version only the first (in file order) runs and the rest are skipped at load. A job with an accidental copy-paste duplicate id stops firing after upgrading.
-  > Before upgrading, check `cronjob.toml` for ids that are equal after trimming (including values that differ only by surrounding whitespace) and make them unique.
-
+- A blank `id` counts as unset. Ids are compared after trimming, so any duplicates — including identical values and ids that differ only by surrounding whitespace — share one writeback target. The scheduler keeps the first entry in file order and skips the rest at load (`usercron: duplicate id (compared after trimming), skipping`). The first entry owns the id even when it is itself invalid or disabled, so a later entry with the same id still does not run (see the Breaking Change note below).
 - The pinned thread takes effect once the scheduler reloads the file (next tick, normally within 60s).
 - Writeback re-resolves the first entry by trimmed `id` at write time, not against the snapshot the job was loaded from. `usercron_write_lock` serializes OpenAB's own writes but not external edits. Editing `cronjob.toml` while a job is in flight — inserting a same-id entry above it, reordering entries, or reusing an id for another job — can redirect the writeback to a different entry: `thread_id` pins the wrong entry (the job that ran keeps creating a new thread each run), or `enabled = false` disables an unrelated job. Avoid reusing or moving ids while jobs are running.
 - If OpenAB cannot write `cronjob.toml` (see [Choosing the right scope](#choosing-the-right-scope)), nothing is pinned and every run creates a new thread. The logs show `failed to persist usercron thread_id`. This also means `disable_on_success` cannot write `enabled = false` back, so the goal command keeps running on every match — avoid both patterns when the file is unwritable.
-- **Known limitation** — On gateway platforms (Telegram), if topic creation fails or times out (5s), the job posts to the chat itself and the **chat ID** is written back as `thread_id`. Because Telegram chat IDs and topic IDs are both numeric, a written-back value cannot be distinguished from a correct topic ID. Later runs then target that ID as a topic. Remove the written-back `thread_id` line to retry topic creation. This is a documented workaround, not the final behavior; the root-cause fix (gating the writeback on a thread actually being created) is a follow-up (tracking issue pending).
+- **Known limitation** — On gateway platforms (Telegram), if topic creation fails or times out (5s), the job posts to the chat itself and the **chat ID** is written back as `thread_id`. Because Telegram chat IDs and topic IDs are both numeric, a written-back value cannot be distinguished from a correct topic ID. Later runs then target that ID as a topic. Remove the written-back `thread_id` line to retry topic creation. This is a documented workaround, not the final behavior; the root-cause fix (gating the writeback on a thread actually being created) is a follow-up.
 
 ## Cron Expression Format
 
