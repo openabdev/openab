@@ -82,6 +82,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           VERSION: ${{ steps.version.outputs.version }}
+          STABLE: ${{ steps.version.outputs.stable }}
         run: |
           BRANCH="release/v${VERSION}"
           git config user.name "openab-app[bot]"
@@ -90,7 +91,36 @@ jobs:
           git add -A
           git commit -m "release: v${VERSION}"
           git push origin "$BRANCH"
+          # Generated body carries a Review Contract so review-contract.yml
+          # passes without a maintainer exemption label.
+          BODY_FILE="$(mktemp)"
+          cat > "$BODY_FILE" <<EOF
+          Merge this PR to tag \`v${VERSION}\` and trigger the build pipeline.
+
+          ## Review Contract
+
+          ### Goal
+
+          Set \`charts/openab/Chart.yaml\` (\`version\`, \`appVersion\`) to \`${VERSION}\` and \`Cargo.toml\` to \`${STABLE}\`, so that merging tags \`v${VERSION}\` and starts the release build.
+
+          ### Non-goals
+
+          No source, chart template, or workflow changes. The release notes are written separately on the GitHub release.
+
+          ### Accepted Residual Risks
+
+          This PR does not test the release contents. The pre-release images are validated after the build, before any stable promotion.
+
+          ### Acceptance Criteria
+
+          - [ ] The diff only changes version fields in \`charts/openab/Chart.yaml\` and \`Cargo.toml\`.
+          - [ ] CI checks pass.
+
+          ### Follow-ups
+
+          Verify the published images and update the GitHub release notes after the build completes.
+          EOF
           gh pr create \
             --title "release: v${VERSION}" \
-            --body "Merge this PR to tag \`v${VERSION}\` and trigger the build pipeline." \
+            --body-file "$BODY_FILE" \
             --base main --head "$BRANCH"
