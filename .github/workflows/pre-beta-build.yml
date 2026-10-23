@@ -21,10 +21,11 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      actions: read
     outputs:
       should_run: ${{ steps.check.outputs.should_run }}
     steps:
-      - name: Skip scheduled run when no recent commits
+      - name: Skip scheduled run when main is already built
         uses: actions/github-script@v7
         id: check
         with:
@@ -34,17 +35,43 @@ jobs:
               core.setOutput('should_run', 'true');
               return;
             }
-            // Scheduled run: build only if main got a commit in the last ~70min.
-            const since = new Date(Date.now() - 70 * 60 * 1000).toISOString();
-            const { data: commits } = await github.rest.repos.listCommits({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha: context.payload.repository?.default_branch || 'main',
-              since,
-              per_page: 1,
+            // Scheduled run: build unless the current main HEAD was already
+            // published by a full pre-beta build. Compare SHAs, not a time
+            // window. GitHub delivers the hourly schedule hours late, so a
+            // "commit in the last ~70min" window skipped most merges and left
+            // pre-beta-* stale (openab#1567).
+            const { owner, repo } = context.repo;
+            const branch = context.payload.repository?.default_branch || 'main';
+            const { data: head } = await github.rest.repos.getBranch({ owner, repo, branch });
+            const headSha = head.commit.sha;
+            const agentCount = process.env.ALL_AGENTS.split(',').length;
+
+            const { data: runs } = await github.rest.actions.listWorkflowRuns({
+              owner, repo,
+              workflow_id: 'pre-beta-build.yml',
+              branch,
+              status: 'success',
+              per_page: 100,
             });
-            const run = commits.length > 0;
-            core.info(`commits since ${since}: ${commits.length} -> should_run=${run}`);
+            let lastBuilt = null;
+            for (const run of runs.workflow_runs) {
+              if (run.id === context.runId) continue;
+              const jobs = await github.paginate(
+                github.rest.actions.listJobsForWorkflowRun,
+                { owner, repo, run_id: run.id, per_page: 100 },
+              );
+              // A full build tags every agent. Skipped-gate runs and partial
+              // manual builds (agents subset) do not count.
+              const tagged = jobs.filter(
+                (j) => j.name.startsWith('tag') && j.conclusion === 'success',
+              ).length;
+              if (tagged >= agentCount) {
+                lastBuilt = run.head_sha;
+                break;
+              }
+            }
+            const run = lastBuilt !== headSha;
+            core.info(`main HEAD ${headSha}, last full pre-beta build ${lastBuilt ?? 'none found'} -> should_run=${run}`);
             core.setOutput('should_run', run ? 'true' : 'false');
 
   matrix:
