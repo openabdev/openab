@@ -486,13 +486,26 @@ pub async fn serve_http(addr: &str) -> Result<()> {
 /// can drive the full HTTP path (including rmcp's injection of the request
 /// `Parts` into extensions, which the session-token resolution depends on)
 /// without binding a port.
+///
+/// **Stateless transport.** The facade never issues an `Mcp-Session-Id`: every
+/// POST is served on its own. Nothing here needs a protocol-level session —
+/// identity is the per-request `Authorization` bearer, the two tools are plain
+/// request/response, and the facade never pushes notifications or sends
+/// server→client requests. A stateful session only added a failure mode: rmcp's
+/// `LocalSessionManager` retires a session after 5 idle minutes (and all of
+/// them on restart), the client's next call gets `404 Session not found`, and
+/// Claude Code's recovery retries the call on a fresh session while its own
+/// background reconnect tears that connection down ~1s later — the retried
+/// call runs downstream (a write lands) but the agent is told
+/// `session expired`. No session, no 404, no recovery race. This also matches
+/// the MCP 2026-07-28 revision, which removes protocol-level sessions.
 pub(crate) fn build_router(
     manager: McpRuntimeManager,
     sources: Vec<Arc<dyn CapabilitySource>>,
     tokens: SessionTokens,
 ) -> axum::Router {
     use rmcp::transport::streamable_http_server::{
-        session::local::LocalSessionManager, StreamableHttpService,
+        session::never::NeverSessionManager, StreamableHttpServerConfig, StreamableHttpService,
     };
     let sources = Arc::new(sources);
     let service = StreamableHttpService::new(
@@ -503,8 +516,8 @@ pub(crate) fn build_router(
                 tokens: tokens.clone(),
             })
         },
-        LocalSessionManager::default().into(),
-        Default::default(),
+        NeverSessionManager::default().into(),
+        StreamableHttpServerConfig::default().with_stateful_mode(false),
     );
     axum::Router::new().nest_service("/mcp", service)
 }
@@ -668,55 +681,20 @@ mod tests {
             tokens,
         );
 
-        let post = |body: String, bearer: Option<String>, session: Option<String>| {
-            let mut b = axum::http::Request::builder()
-                .method("POST")
-                .uri("/mcp")
-                .header("content-type", "application/json")
-                .header("accept", "application/json, text/event-stream")
-                // tower::oneshot bypasses hyper, which normally supplies Host.
-                .header("host", "127.0.0.1");
-            if let Some(t) = bearer {
-                b = b.header("authorization", format!("Bearer {t}"));
-            }
-            if let Some(s) = session {
-                b = b.header("mcp-session-id", s);
-            }
-            b.body(axum::body::Body::from(body)).unwrap()
-        };
-        let init_body = serde_json::json!({
-            "jsonrpc": "2.0", "id": 0, "method": "initialize",
-            "params": { "protocolVersion": "2025-06-18", "capabilities": {},
-                        "clientInfo": { "name": "t", "version": "0" } }
-        })
-        .to_string();
         let search_body = serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": { "name": "search_capabilities", "arguments": {} }
         })
         .to_string();
 
-        // One MCP session per identity variant (initialize → session id → call).
+        // The facade is stateless: identity rides on each request's bearer, so
+        // a bare tools/call (no initialize, no session id) is the whole exchange.
         let run = |bearer: Option<String>| {
             let router = router.clone();
-            let init_body = init_body.clone();
             let search_body = search_body.clone();
             async move {
                 let resp = router
-                    .clone()
-                    .oneshot(post(init_body, bearer.clone(), None))
-                    .await
-                    .unwrap();
-                assert_eq!(resp.status(), 200, "initialize must succeed");
-                let sid = resp
-                    .headers()
-                    .get("mcp-session-id")
-                    .expect("session id header")
-                    .to_str()
-                    .unwrap()
-                    .to_string();
-                let resp = router
-                    .oneshot(post(search_body, bearer, Some(sid)))
+                    .oneshot(mcp_post(search_body, bearer.as_deref(), None))
                     .await
                     .unwrap();
                 assert_eq!(resp.status(), 200);
@@ -740,6 +718,90 @@ mod tests {
             !wrong.contains("echo_channel"),
             "unknown token must resolve to the anonymous view: {wrong}"
         );
+    }
+
+    /// A Streamable HTTP POST to the facade router, shaped like an MCP client's.
+    fn mcp_post(
+        body: String,
+        bearer: Option<&str>,
+        session: Option<&str>,
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut b = axum::http::Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            // tower::oneshot bypasses hyper, which normally supplies Host.
+            .header("host", "127.0.0.1");
+        if let Some(t) = bearer {
+            b = b.header("authorization", format!("Bearer {t}"));
+        }
+        if let Some(s) = session {
+            b = b.header("mcp-session-id", s);
+        }
+        b.body(axum::body::Body::from(body)).unwrap()
+    }
+
+    /// Regression for "session expired, but the write already landed": on the
+    /// stateful transport an idle-retired (or pre-restart) session id got
+    /// `404 Session not found`, which sent Claude Code into a recovery path that
+    /// re-ran the call downstream and then reported it as failed. Stateless:
+    /// initialize issues no session id, a stale session id is ignored instead
+    /// of 404'd, and GET (the standalone SSE stream, a session feature) is 405.
+    #[tokio::test]
+    async fn http_stateless_issues_no_session_and_never_404s_a_stale_one() {
+        use http_body_util::BodyExt as _;
+        use tower::ServiceExt as _;
+
+        let router = super::build_router(
+            McpRuntimeManager::from_config(McpConfig::default()),
+            Vec::new(),
+            super::SessionTokens::new(),
+        );
+
+        let init_body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 0, "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {},
+                        "clientInfo": { "name": "t", "version": "0" } }
+        })
+        .to_string();
+        let resp = router
+            .clone()
+            .oneshot(mcp_post(init_body, None, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "initialize must succeed");
+        assert!(
+            resp.headers().get("mcp-session-id").is_none(),
+            "the facade must not issue a session id"
+        );
+
+        let search_body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "search_capabilities", "arguments": {} }
+        })
+        .to_string();
+        let resp = router
+            .clone()
+            .oneshot(mcp_post(search_body, None, Some("retired-by-idle-or-restart")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "a stale session id must not be 404'd");
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            body.contains(r#""result""#) && body.contains("unavailable"),
+            "tools/call must be served a search result: {body}"
+        );
+
+        let get = axum::http::Request::builder()
+            .method("GET")
+            .uri("/mcp")
+            .header("accept", "text/event-stream")
+            .header("host", "127.0.0.1")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(router.oneshot(get).await.unwrap().status(), 405);
     }
 
     #[tokio::test]

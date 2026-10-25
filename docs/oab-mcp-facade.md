@@ -125,6 +125,24 @@ Claude Code:
 claude mcp add --transport http oab http://127.0.0.1:8848/mcp
 ```
 
+## Stateless transport
+
+The facade serves Streamable HTTP in **stateless** mode: it never issues an
+`Mcp-Session-Id`, every POST is handled on its own, and `GET`/`DELETE` on
+`/mcp` return `405`. Nothing it does needs a protocol-level session —
+identity is the per-request `Authorization` bearer, both tools are plain
+request/response, and it never pushes notifications or sends server→client
+requests.
+
+This removes a client-visible failure mode. With sessions, an idle-retired
+(5 minutes) or pre-restart session id got `404 Session not found`; Claude
+Code then retried the call on a fresh session while its own background
+reconnect closed that connection about a second later, so the retried call
+**ran downstream** (a write landed) yet the agent saw
+`MCP server "…" session expired`. Stateless, there is no session to expire.
+It also matches the MCP 2026-07-28 revision, which removes protocol-level
+sessions.
+
 ## Trust model
 
 Loopback-only, **no authentication layer** — the host/pod boundary is the
