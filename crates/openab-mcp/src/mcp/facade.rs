@@ -478,33 +478,28 @@ pub async fn serve_http(addr: &str) -> Result<()> {
     serve_http_with(addr, Vec::new(), SessionTokens::new()).await
 }
 
-/// [`serve_http`] plus in-process capability sources and the broker-shared
-/// session-token registry (see the `sources` module). The broker hands the
-/// same `tokens` handle to its session pool so per-agent-session mint/revoke
-/// is visible here per request.
 /// The facade's axum router — factored out of [`serve_http_with`] so tests
 /// can drive the full HTTP path (including rmcp's injection of the request
 /// `Parts` into extensions, which the session-token resolution depends on)
 /// without binding a port.
 ///
 /// **Stateless transport.** The facade never issues an `Mcp-Session-Id`: every
-/// POST is served on its own. Nothing here needs a protocol-level session —
-/// identity is the per-request `Authorization` bearer, the two tools are plain
+/// POST is served on its own, and a stale `Mcp-Session-Id` header is ignored
+/// rather than rejected. Nothing here needs a protocol-level session — identity
+/// is the per-request `Authorization` bearer, the two tools are plain
 /// request/response, and the facade never pushes notifications or sends
-/// server→client requests. A stateful session only added a failure mode: rmcp's
-/// `LocalSessionManager` retires a session after 5 idle minutes (and all of
-/// them on restart), the client's next call gets `404 Session not found`, and
-/// Claude Code's recovery retries the call on a fresh session while its own
-/// background reconnect tears that connection down ~1s later — the retried
-/// call runs downstream (a write lands) but the agent is told
-/// `session expired`. No session, no 404, no recovery race: a stale
-/// `Mcp-Session-Id` header is ignored rather than rejected. This also aligns
-/// with the MCP 2026-07-28 revision's removal of protocol-level sessions (the
-/// facade still speaks the 2025 `initialize` handshake).
+/// server→client requests. A stateful session only added state that can expire
+/// (after 5 idle minutes, and every session on restart) plus the client-side
+/// failure that expiry triggers — see `docs/oab-mcp-facade.md`, "Stateless
+/// transport". This also aligns with the MCP 2026-07-28 revision's removal of
+/// protocol-level sessions (the facade still speaks the 2025 `initialize`
+/// handshake).
 ///
 /// Constraint for future facade tools: they must not rely on server→client
 /// requests (sampling/elicitation/roots) or the standalone GET SSE stream —
-/// both need session routing. A tool that does means revisiting this choice.
+/// both need session routing — and a tool that needs client cancellation must
+/// wire `RequestContext.ct` (stateless mode drops `notifications/cancelled`).
+/// A tool that needs either means revisiting this choice.
 pub(crate) fn build_router(
     manager: McpRuntimeManager,
     sources: Vec<Arc<dyn CapabilitySource>>,
@@ -531,6 +526,10 @@ pub(crate) fn build_router(
     axum::Router::new().nest_service("/mcp", service)
 }
 
+/// [`serve_http`] plus in-process capability sources and the broker-shared
+/// session-token registry (see the `sources` module). The broker hands the
+/// same `tokens` handle to its session pool so per-agent-session mint/revoke
+/// is visible here per request.
 pub async fn serve_http_with(
     addr: &str,
     sources: Vec<Arc<dyn CapabilitySource>>,
@@ -795,6 +794,17 @@ mod tests {
             "initialize must return a result, not an error: {body}"
         );
 
+        let initialized = serde_json::json!({
+            "jsonrpc": "2.0", "method": "notifications/initialized"
+        })
+        .to_string();
+        let resp = router
+            .clone()
+            .oneshot(mcp_post(initialized, None, None))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 202, "a notification-only POST must be 202");
+
         let search_body = serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": { "name": "search_capabilities", "arguments": {} }
@@ -809,7 +819,10 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let body = String::from_utf8_lossy(&bytes);
         assert!(
-            body.contains(r#""result""#) && body.contains("unavailable"),
+            body.contains(r#""id":1"#)
+                && body.contains(r#""result""#)
+                && body.contains("unavailable")
+                && !body.contains(r#""isError":true"#),
             "tools/call must be served a search result: {body}"
         );
 

@@ -430,11 +430,11 @@ listen = "127.0.0.1:8848"   # loopback only; this is the default
 - **Security posture:** the listener refuses to bind any non-loopback
   address; the endpoint itself carries no authentication layer,
   so the host/pod boundary is the trust boundary for every capability that
-  does not require a session. Deployments that colocate untrusted processes
+  does not require an agent session. Deployments that colocate untrusted processes
   must not enable `[mcp]`. Session-bound sources are the exception: the
-  per-session bearer shipped in #1447, so the facade hides and refuses them
-  unless the request resolves to a session. A socket-permission scheme for
-  the remaining session-free capabilities is still a documented follow-up.
+  per-agent-session bearer shipped in #1447, so the facade hides and refuses them
+  unless the request resolves to an agent session. A socket-permission scheme for
+  the remaining agent-session-free capabilities is still a documented follow-up.
 - **Stateless transport:** the facade serves Streamable HTTP without
   protocol-level sessions (no `Mcp-Session-Id`; `GET`/`DELETE /mcp` → `405`);
   identity stays the per-request bearer above. The native Gmail adapter's HTTP

@@ -147,7 +147,9 @@ aligns with the MCP 2026-07-28 revision's removal of protocol-level sessions
 
 Constraint for future facade tools: they must not rely on server→client
 requests (sampling/elicitation/roots) or the standalone GET SSE stream — both
-need session routing. A tool that does means revisiting this choice.
+need session routing — and a tool that needs client cancellation must wire the
+request's cancellation token (stateless mode drops `notifications/cancelled`).
+A tool that needs either means revisiting this choice.
 
 ## Trust model
 
@@ -157,7 +159,7 @@ session the facade no longer issues (see Stateless transport).
 
 Loopback-only, **no authentication layer** — the host/pod boundary is the
 trust boundary. Any process on the host can invoke every capability that does **not** require an agent session.
-Session-bound sources are different: since the per-session bearer shipped, the facade filters
+Session-bound sources are different: since the per-agent-session bearer shipped, the facade filters
 them out unless the request's bearer resolves to an agent session, so a host process without that token can
 neither discover nor call them. Do not enable it on hosts that colocate
 untrusted processes. Least-privilege is enforced per provider with
