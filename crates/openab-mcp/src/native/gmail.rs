@@ -100,7 +100,8 @@ impl OauthApp {
     }
 }
 
-/// The native Gmail MCP server. One instance per `serve` process.
+/// The native Gmail MCP server. One instance per stdio `serve` process; over
+/// HTTP (`serve_http`), one per MCP session.
 pub struct GmailNative {
     http: reqwest::Client,
     store: McpCredentialStore,
@@ -702,11 +703,19 @@ impl ServerHandler for GmailNative {
     }
 }
 
-/// Serve the adapter over **loopback Streamable HTTP** at `/mcp`, mirroring
-/// the OAB MCP Facade's transport (ADR §6.2 trust model: loopback-only, no
+/// Serve the adapter over **loopback Streamable HTTP** at `/mcp`, with the
+/// same trust model as the OAB MCP Facade (ADR §6.2: loopback-only, no
 /// authentication layer — the host/pod boundary is the trust boundary; a
 /// non-loopback bind is refused at startup). Register in `mcp.json` as a
 /// `"type": "http"` entry pointing at `http://<addr>/mcp`.
+///
+/// Unlike the facade, this transport is still **stateful**: rmcp retires a
+/// session after 5 idle minutes (and all of them on restart), so clients can
+/// hit the same `404 Session not found` recovery race the facade's stateless
+/// transport removed. Going stateless here first needs the `reqwest::Client`
+/// and refresh lock shared outside the per-session factory
+/// (`GmailNative::new` builds fresh ones), or every request would lose
+/// connection pooling and the refresh lock would cover a single call.
 ///
 /// One handler is constructed per MCP session, all sharing the same
 /// credential store file; a cross-session refresh race is benign (each

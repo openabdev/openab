@@ -435,6 +435,11 @@ listen = "127.0.0.1:8848"   # loopback only; this is the default
   per-session bearer shipped in #1447, so the facade hides and refuses them
   unless the request resolves to a session. A socket-permission scheme for
   the remaining session-free capabilities is still a documented follow-up.
+- **Stateless transport:** the facade serves Streamable HTTP without
+  protocol-level sessions (no `Mcp-Session-Id`; `GET`/`DELETE /mcp` → `405`);
+  identity stays the per-request bearer above. The native Gmail adapter's HTTP
+  transport remains stateful pending unification. See
+  [`oab-mcp-facade.md`](../oab-mcp-facade.md#stateless-transport).
 - **Native `openab-agent`:** the dispatcher is invoked in-process via the
   existing `mcp` meta-tool. No HTTP hop is required because the facade
   contract and policy checks are implemented by the same dispatcher component

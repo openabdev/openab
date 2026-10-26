@@ -497,8 +497,14 @@ pub async fn serve_http(addr: &str) -> Result<()> {
 /// Claude Code's recovery retries the call on a fresh session while its own
 /// background reconnect tears that connection down ~1s later — the retried
 /// call runs downstream (a write lands) but the agent is told
-/// `session expired`. No session, no 404, no recovery race. This also matches
-/// the MCP 2026-07-28 revision, which removes protocol-level sessions.
+/// `session expired`. No session, no 404, no recovery race: a stale
+/// `Mcp-Session-Id` header is ignored rather than rejected. This also aligns
+/// with the MCP 2026-07-28 revision's removal of protocol-level sessions (the
+/// facade still speaks the 2025 `initialize` handshake).
+///
+/// Constraint for future facade tools: they must not rely on server→client
+/// requests (sampling/elicitation/roots) or the standalone GET SSE stream —
+/// both need session routing. A tool that does means revisiting this choice.
 pub(crate) fn build_router(
     manager: McpRuntimeManager,
     sources: Vec<Arc<dyn CapabilitySource>>,
@@ -516,6 +522,9 @@ pub(crate) fn build_router(
                 tokens: tokens.clone(),
             })
         },
+        // Deliberately redundant with `with_stateful_mode(false)`: if stateful
+        // mode is ever flipped back on, `initialize` fails loudly instead of
+        // silently re-enabling sessions.
         NeverSessionManager::default().into(),
         StreamableHttpServerConfig::default().with_stateful_mode(false),
     );
@@ -659,7 +668,7 @@ mod tests {
         assert_eq!(out["channel"], "");
     }
 
-    /// Full-HTTP-path proof of the session mechanism: a real request through
+    /// Full-HTTP-path proof of the session-token (bearer) mechanism: a real request through
     /// the router (rmcp StreamableHttpService) must surface the
     /// `Authorization` header to the handler via request extensions, and the
     /// same request without the header must fall back to the anonymous view.
@@ -747,7 +756,8 @@ mod tests {
     /// `404 Session not found`, which sent Claude Code into a recovery path that
     /// re-ran the call downstream and then reported it as failed. Stateless:
     /// initialize issues no session id, a stale session id is ignored instead
-    /// of 404'd, and GET (the standalone SSE stream, a session feature) is 405.
+    /// of 404'd, and GET (the standalone SSE stream) / DELETE (session
+    /// termination) — both session features — are 405 with `Allow: POST`.
     #[tokio::test]
     async fn http_stateless_issues_no_session_and_never_404s_a_stale_one() {
         use http_body_util::BodyExt as _;
@@ -775,6 +785,15 @@ mod tests {
             resp.headers().get("mcp-session-id").is_none(),
             "the facade must not issue a session id"
         );
+        // A JSON-RPC error also arrives as HTTP 200 over SSE, so check the body.
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(
+            body.contains(r#""result""#)
+                && body.contains("protocolVersion")
+                && !body.contains(r#""error""#),
+            "initialize must return a result, not an error: {body}"
+        );
 
         let search_body = serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -794,14 +813,23 @@ mod tests {
             "tools/call must be served a search result: {body}"
         );
 
-        let get = axum::http::Request::builder()
-            .method("GET")
-            .uri("/mcp")
-            .header("accept", "text/event-stream")
-            .header("host", "127.0.0.1")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        assert_eq!(router.oneshot(get).await.unwrap().status(), 405);
+        for method in ["GET", "DELETE"] {
+            let req = axum::http::Request::builder()
+                .method(method)
+                .uri("/mcp")
+                .header("accept", "text/event-stream")
+                .header("host", "127.0.0.1")
+                .header("mcp-session-id", "retired-by-idle-or-restart")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = router.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), 405, "{method} /mcp must be 405");
+            assert_eq!(
+                resp.headers().get("allow").and_then(|v| v.to_str().ok()),
+                Some("POST"),
+                "{method} /mcp must advertise Allow: POST"
+            );
+        }
     }
 
     #[tokio::test]

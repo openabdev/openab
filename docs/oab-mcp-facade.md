@@ -140,15 +140,25 @@ Code then retried the call on a fresh session while its own background
 reconnect closed that connection about a second later, so the retried call
 **ran downstream** (a write landed) yet the agent saw
 `MCP server "…" session expired`. Stateless, there is no session to expire.
-It also matches the MCP 2026-07-28 revision, which removes protocol-level
-sessions.
+A stale `Mcp-Session-Id` header is ignored rather than rejected, so clients
+still holding one after an idle gap or a restart keep working. This also
+aligns with the MCP 2026-07-28 revision's removal of protocol-level sessions
+(the facade still speaks the 2025 `initialize` handshake).
+
+Constraint for future facade tools: they must not rely on server→client
+requests (sampling/elicitation/roots) or the standalone GET SSE stream — both
+need session routing. A tool that does means revisiting this choice.
 
 ## Trust model
 
+"Session" below means the **agent session** behind the per-request
+`Authorization` bearer — application-level, unrelated to the MCP protocol
+session the facade no longer issues (see Stateless transport).
+
 Loopback-only, **no authentication layer** — the host/pod boundary is the
-trust boundary. Any process on the host can invoke every capability that does **not** require a session.
+trust boundary. Any process on the host can invoke every capability that does **not** require an agent session.
 Session-bound sources are different: since the per-session bearer shipped, the facade filters
-them out unless the request resolves to a session, so a host process without that token can
+them out unless the request's bearer resolves to an agent session, so a host process without that token can
 neither discover nor call them. Do not enable it on hosts that colocate
 untrusted processes. Least-privilege is enforced per provider with
 `tool_filter` include/exclude lists in `mcp.json`; excluded tools are
