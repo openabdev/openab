@@ -497,9 +497,10 @@ pub async fn serve_http(addr: &str) -> Result<()> {
 ///
 /// Constraint for future facade tools: they must not rely on server→client
 /// requests (sampling/elicitation/roots) or the standalone GET SSE stream —
-/// both need session routing — and a tool that needs client cancellation must
-/// wire `RequestContext.ct` (stateless mode drops `notifications/cancelled`).
-/// A tool that needs either means revisiting this choice.
+/// both need session routing. Client cancellation is not available either:
+/// stateless mode drops `notifications/cancelled`, so `RequestContext.ct`
+/// never fires on a client cancel. A tool that needs any of these means
+/// revisiting this choice.
 pub(crate) fn build_router(
     manager: McpRuntimeManager,
     sources: Vec<Arc<dyn CapabilitySource>>,
@@ -754,13 +755,24 @@ mod tests {
     /// stateful transport an idle-retired (or pre-restart) session id got
     /// `404 Session not found`, which sent Claude Code into a recovery path that
     /// re-ran the call downstream and then reported it as failed. Stateless:
-    /// initialize issues no session id, a stale session id is ignored instead
-    /// of 404'd, and GET (the standalone SSE stream) / DELETE (session
+    /// initialize returns a result and issues no session id, a notification-only
+    /// POST is 202, a `tools/call` carrying a stale session id is served (not
+    /// 404'd), and GET (the standalone SSE stream) / DELETE (session
     /// termination) — both session features — are 405 with `Allow: POST`.
     #[tokio::test]
     async fn http_stateless_issues_no_session_and_never_404s_a_stale_one() {
         use http_body_util::BodyExt as _;
         use tower::ServiceExt as _;
+
+        // Bounded so a regression that leaves the SSE stream open fails
+        // instead of hanging the test.
+        async fn sse_body(resp: axum::response::Response) -> axum::body::Bytes {
+            tokio::time::timeout(std::time::Duration::from_secs(10), resp.into_body().collect())
+                .await
+                .expect("SSE response body must end")
+                .unwrap()
+                .to_bytes()
+        }
 
         let router = super::build_router(
             McpRuntimeManager::from_config(McpConfig::default()),
@@ -785,7 +797,7 @@ mod tests {
             "the facade must not issue a session id"
         );
         // A JSON-RPC error also arrives as HTTP 200 over SSE, so check the body.
-        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let bytes = sse_body(resp).await;
         let body = String::from_utf8_lossy(&bytes);
         assert!(
             body.contains(r#""result""#)
@@ -816,13 +828,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), 200, "a stale session id must not be 404'd");
-        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let bytes = sse_body(resp).await;
         let body = String::from_utf8_lossy(&bytes);
         assert!(
             body.contains(r#""id":1"#)
                 && body.contains(r#""result""#)
                 && body.contains("unavailable")
-                && !body.contains(r#""isError":true"#),
+                && body.contains(r#""isError":false"#),
             "tools/call must be served a search result: {body}"
         );
 

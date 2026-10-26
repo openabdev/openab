@@ -147,9 +147,10 @@ aligns with the MCP 2026-07-28 revision's removal of protocol-level sessions
 
 Constraint for future facade tools: they must not rely on server→client
 requests (sampling/elicitation/roots) or the standalone GET SSE stream — both
-need session routing — and a tool that needs client cancellation must wire the
-request's cancellation token (stateless mode drops `notifications/cancelled`).
-A tool that needs either means revisiting this choice.
+need session routing. Client cancellation is not available either: stateless
+mode drops `notifications/cancelled`, so a tool's request cancellation token
+never fires on a client cancel. A tool that needs any of these means
+revisiting this choice.
 
 ## Trust model
 
