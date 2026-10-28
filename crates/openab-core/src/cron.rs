@@ -960,7 +960,18 @@ fn update_usercron_job(
 /// (`tempfile::Builder`), so a file or symlink planted next to `path` can't
 /// redirect or capture the write. The original file's permissions are kept,
 /// because the new file would otherwise be created with mode 0600. If any step
-/// fails, the temp file is removed when it is dropped.
+/// fails, the temp file is removed when it is dropped. After the rename the
+/// parent directory is fsynced (best-effort, unix only) so the rename is
+/// durable. If `path` is itself a symlink, the link is replaced by a regular
+/// file and its target is left untouched.
+///
+/// Non-goals:
+/// - No locking: concurrent `update_usercron_job` calls are still
+///   last-writer-wins (read-modify-write race), unchanged from before.
+/// - Only the mode is copied; owner, group, ACLs, and xattrs are not.
+/// - This is defense-in-depth. `docs/cronjob.md` already requires that the
+///   usercron directory is not writable by the agent, and a writer of that
+///   directory can replace `cronjob.toml` directly.
 fn write_atomic(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     use std::io::Write;
 
@@ -984,6 +995,12 @@ fn write_atomic(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     }
     tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|e| e.error)?;
+    // fsync the parent dir so the rename itself is durable (best-effort,
+    // matching openab-mcp's auth.rs).
+    #[cfg(unix)]
+    if let Ok(dir_handle) = std::fs::File::open(dir) {
+        let _ = dir_handle.sync_all();
+    }
     Ok(())
 }
 
@@ -1612,6 +1629,29 @@ message = "m"
             .collect();
         names.sort();
         assert_eq!(names, vec!["cronjob.toml", "cronjob.toml.tmp"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_update_usercron_job_symlinked_destination_is_replaced_and_target_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real.toml");
+        std::fs::write(&target, WRITEBACK_FIXTURE).unwrap();
+        let path = dir.path().join("cronjob.toml");
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        update_usercron_job(&path, "goal", Some(false), None).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), WRITEBACK_FIXTURE);
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_file());
+        let doc = std::fs::read_to_string(&path)
+            .unwrap()
+            .parse::<DocumentMut>()
+            .unwrap();
+        assert_eq!(doc["jobs"][0]["enabled"].as_bool(), Some(false));
     }
 
     #[cfg(unix)]
