@@ -303,7 +303,7 @@ Add `OpenAB PR Review` as a required status check in branch protection rules. Th
 - Up to 5-min latency before review starts (GitHub cron is best-effort, may lag further under load)
 - If OpenAB agent is down, status stays "pending" until stale timeout re-triggers (30 min)
 - Webhook messages lack user identity — OpenAB must allow webhook-originated messages
-- Fork PRs: `OAB_REVIEW_ACTION_WEBHOOK` and `OAB_REVIEW_ACTION_BOT_UID` secrets are not available to workflows triggered by fork PRs (GitHub security policy). The webhook step will fail, and since fork PRs receive a read-only `GITHUB_TOKEN`, the error fallback **cannot** write commit statuses either — the workflow will fail silently with no status update. Fork PRs can still be reviewed manually via Discord @mention. Note: the `safe-to-review` label does **not** grant secrets access to fork PRs — it only bypasses the `author_association` gate for same-repo PRs.
+- Fork PRs: `pull_request` runs triggered by a fork get no secrets and a read-only `GITHUB_TOKEN` (GitHub security policy), so the workflow skips the event-driven path for fork PRs instead of failing. The scheduled poller and the maintainer `/review` command run in the base repository with secrets and a write token, so fork PRs are still reviewed, only with the cron delay. Note: the `safe-to-review` label does **not** grant secrets to fork-triggered runs — it only bypasses the poller's `author_association` gate.
 
 **Mitigations:**
 - Filter: skip draft PRs and untrusted authors — only `OWNER`, `MEMBER`, `COLLABORATOR`, and `CONTRIBUTOR` (returning contributor with merged PR) trigger automatic review. First-time contributors and unknown authors are skipped; maintainers can add `safe-to-review` label or manually @mention the agent.
@@ -349,7 +349,7 @@ When the auto-fix loop completes (LGTM or cap reached), the agent removes the `a
 
 **Constraints:**
 - Only effective on same-repo branches (agent needs push access)
-- Fork PRs: automation does not trigger (no secrets available); review manually via Discord @mention
+- Fork PRs: review still runs via the scheduled poller or `/review`, but auto-fix cannot push to the fork branch
 - Agent must implement iteration cap to prevent infinite push→review loops
 
 ### Circuit Breaker (workflow hard cap: 30)
