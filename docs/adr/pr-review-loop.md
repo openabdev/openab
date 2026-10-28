@@ -303,7 +303,7 @@ Add `OpenAB PR Review` as a required status check in branch protection rules. Th
 - Up to 5-min latency before review starts (GitHub cron is best-effort, may lag further under load)
 - If OpenAB agent is down, status stays "pending" until stale timeout re-triggers (30 min)
 - Webhook messages lack user identity — OpenAB must allow webhook-originated messages
-- Fork PRs: `pull_request` runs triggered by a fork get no secrets and a read-only `GITHUB_TOKEN` (GitHub security policy), so the workflow skips the event-driven path for fork PRs instead of failing. The scheduled poller and the maintainer `/review` command run in the base repository with secrets and a write token, so fork PRs are still reviewed, only with the cron delay. Note: the `safe-to-review` label does **not** grant secrets to fork-triggered runs — it only bypasses the poller's `author_association` gate.
+- Fork PRs: `pull_request` runs triggered by a fork get no secrets and a read-only `GITHUB_TOKEN` (GitHub security policy), so the workflow skips the event-driven path for fork PRs instead of failing. The scheduled poller and the maintainer `/review` command run in the base repository with secrets and a write token, so fork PRs from trusted authors (or labeled `safe-to-review`) are still reviewed by the poller on its next run. A maintainer can also comment `/review` for an immediate review; this checks only the commenter's association, so it bypasses the PR-author gate by design (the maintainer is asserting the diff is safe). Note: the `safe-to-review` label does **not** grant secrets to fork-triggered runs — it only bypasses the poller's `author_association` gate.
 
 **Mitigations:**
 - Filter: skip draft PRs and untrusted authors — only `OWNER`, `MEMBER`, `COLLABORATOR`, and `CONTRIBUTOR` (returning contributor with merged PR) trigger automatic review. First-time contributors and unknown authors are skipped; maintainers can add `safe-to-review` label or manually @mention the agent.
@@ -331,11 +331,9 @@ The workflow uses GitHub's `author_association` field to gate automatic reviews.
 
 ### Label Override: `safe-to-review`
 
-Maintainers can add the `safe-to-review` label to any PR to bypass the `author_association` check. This triggers the workflow via the `labeled` event, allowing untrusted contributors' PRs to be reviewed automatically after a maintainer has visually confirmed the PR is safe.
+Maintainers can add the `safe-to-review` label to any PR to bypass the poller's `author_association` check. The workflow has no `labeled` trigger: the next scheduled poll picks the PR up, allowing untrusted contributors' PRs to be reviewed automatically after a maintainer has visually confirmed the PR is safe. A maintainer `/review` comment triggers an immediate review instead of waiting for the poll.
 
-**Important:** This label only enables automatic review for **same-repo PRs**. Fork PRs lack access to repository secrets regardless of labels — adding `safe-to-review` to a fork PR will not trigger automation. Fork PRs must be reviewed manually via Discord @mention.
-
-**Note:** The `labeled` event is filtered — only `safe-to-review` and `auto-fix` labels trigger the workflow. Other labels (e.g. `documentation`, `bug`) are ignored to avoid unnecessary review runs.
+**Important:** This works for **same-repo and fork PRs**. The label does not give fork-triggered `pull_request` runs any secrets (those runs are skipped), but the poller runs in the base repository with secrets, so a labeled fork PR is reviewed on the next poll.
 
 ### Auto-Fix Mode: `auto-fix`
 
@@ -349,7 +347,7 @@ When the auto-fix loop completes (LGTM or cap reached), the agent removes the `a
 
 **Constraints:**
 - Only effective on same-repo branches (agent needs push access)
-- Fork PRs: review still runs via the scheduled poller or `/review`, but auto-fix cannot push to the fork branch
+- Fork PRs: review still runs via the scheduled poller or `/review`, but auto-fix is not supported for fork branches (pushes fail unless the contributor allows edits by maintainers)
 - Agent must implement iteration cap to prevent infinite push→review loops
 
 ### Circuit Breaker (workflow hard cap: 30)
