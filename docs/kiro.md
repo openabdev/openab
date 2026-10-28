@@ -141,6 +141,40 @@ sequenceDiagram
 
 This makes the entire Kiro deployment **zero-touch** — fully automated with no login step required.
 
+#### Known issue: MCP and web tools disabled with `KIRO_API_KEY`
+
+> **Temporary note.** Remove this section once the upstream bug is fixed and a fixed Kiro CLI version has been tested.
+
+An upstream Kiro bug ([kirodotdev/Kiro#11777](https://github.com/kirodotdev/Kiro/issues/11777), reproduced on Kiro CLI 2.33.1) can leave an API-key-authenticated agent where chat works but MCP servers and web tools are unavailable. A successful `kiro-cli whoami` or a normal chat reply does not prove that MCP loaded. Typical symptoms in the Kiro logs:
+
+```text
+GetProfile failed on all endpoints for API key
+Failed to get governance config from API — MCP disabled, web tools disabled
+```
+
+ACP may also emit `_kiro.dev/mcp/governance_disabled` with `apiFailure: true`.
+
+**Workaround (tested): GitHub OAuth login instead of the API key**
+
+1. Inside the persistent agent home, as the agent user, log in without the API key in the environment and select **Use with GitHub** in the menu:
+
+   ```bash
+   env -u KIRO_API_KEY kiro-cli login --use-device-flow
+   ```
+
+2. Confirm the login method (not just the email):
+
+   ```bash
+   env -u KIRO_API_KEY kiro-cli whoami   # expect "Logged in with GitHub"
+   ```
+
+3. Stop passing `KIRO_API_KEY` to the agent subprocess: remove it from `[agent].env` (and from `inherit_env` or any wrapper that re-adds it). Unsetting it only in the login shell is not enough if OpenAB injects it again when spawning Kiro. If `config.toml` is generated, fix the generator too.
+4. Make sure `~/.kiro/` and `~/.local/share/kiro-cli/` are persisted (see [Persisted Paths](#persisted-paths-pvc)).
+5. Restart OpenAB and start a fresh session so no API-key-authenticated Kiro process is reused.
+6. Verify that MCP servers initialize and that a real read-only tool call succeeds.
+
+When reporting this issue, include the image tag or digest and `kiro-cli --version`. Floating `nightly` tags follow the latest upstream CLI, so behavior can change without any OpenAB config change. See [#1576](https://github.com/openabdev/openab/issues/1576).
+
 ### Alternative: OAuth Device Flow (Legacy)
 
 If you cannot use an API key, Kiro CLI falls back to the OAuth device code flow. The PVC persists tokens across pod restarts.

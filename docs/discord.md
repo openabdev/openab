@@ -105,7 +105,7 @@ Controls whether the bot requires @mention in threads.
 |---|---|
 | `"involved"` | Respond in threads the bot owns or has participated in without @mention. Main channel always requires @mention. |
 | `"mentions"` | Always require @mention, even in the bot's own threads. |
-| `"multibot-mentions"` (default) | Same as `involved` in single-bot threads. In threads where other bots have also posted, requires @mention — prevents all bots from responding to every message. |
+| `"multibot-mentions"` (default) | Same as `involved` in single-bot threads. In threads where other bots have also posted, requires @mention — prevents all bots from responding to every message. This applies to the thread owner too: once another bot has posted in the thread, the owner also needs an @mention. |
 
 #### Comparison
 
@@ -161,10 +161,11 @@ When `allow_user_messages = "multibot-mentions"` is set alongside `allowed_role_
 | Action | Result |
 |--------|--------|
 | `@Role review this` in a channel | All bots trigger (role mention = explicit mention) |
-| Follow-up in the thread without @mention | Only the thread owner responds (multibot gate kicks in) |
+| Follow-up in the thread without @mention | No bot responds once more than one bot has posted in the thread, including the thread owner (multibot gate kicks in) |
+| `@Bot follow up` in the thread | Only the mentioned bot responds |
 | `@Role follow up` in the thread | All bots respond again |
 
-This gives the best of both worlds: one role mention to summon all bots, but subsequent messages in the thread don't cause all bots to pile on.
+This gives the best of both worlds: one role mention to summon all bots, but subsequent messages in the thread don't cause all bots to pile on. In a multi-bot thread, address each follow-up with an @mention of the bot (or role) you want to answer.
 
 ---
 
