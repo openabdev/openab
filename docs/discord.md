@@ -107,6 +107,8 @@ Controls whether the bot requires @mention in threads.
 | `"mentions"` | Always require @mention, even in the bot's own threads. |
 | `"multibot-mentions"` (default) | Same as `involved` in single-bot threads. In threads where other bots have also posted, requires @mention — prevents all bots from responding to every message. This applies to the thread owner too: once another bot has posted in the thread, the owner also needs an @mention. |
 
+> **Note:** The thread-owner rule in `"multibot-mentions"` describes current behavior. It is tracked in [#1566](https://github.com/openabdev/openab/issues/1566), which calls it a bug, so it may change.
+
 #### Comparison
 
 | Scenario | `involved` | `mentions` | `multibot-mentions` |
@@ -166,6 +168,8 @@ When `allow_user_messages = "multibot-mentions"` is set alongside `allowed_role_
 | `@Role follow up` in the thread | All bots respond again |
 
 This gives the best of both worlds: one role mention to summon all bots, but subsequent messages in the thread don't cause all bots to pile on. In a multi-bot thread, address each follow-up with an @mention of the bot (or role) you want to answer.
+
+> **Note:** The owner-needs-@mention behavior above describes current behavior. It is tracked in [#1566](https://github.com/openabdev/openab/issues/1566), which calls it a bug, so it may change.
 
 ---
 

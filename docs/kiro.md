@@ -170,7 +170,7 @@ ACP may also emit `_kiro.dev/mcp/governance_disabled` with `apiFailure: true`.
    env -u KIRO_API_KEY kiro-cli whoami   # expect "Logged in with GitHub"
    ```
 
-3. Stop passing `KIRO_API_KEY` to the agent subprocess: remove it from `[agent].env` (and from `inherit_env` or any wrapper that re-adds it). Unsetting it only in the login shell is not enough if OpenAB injects it again when spawning Kiro. If `config.toml` is generated, fix the generator too. For Helm installs, also remove the `KIRO_API_KEY` entry from `agents.<name>.secretEnv`, because the chart adds those keys to `inherit_env`.
+3. Stop passing `KIRO_API_KEY` to the agent subprocess: remove it from `[agent].env` (and from `inherit_env` or any wrapper that re-adds it). Unsetting it only in the login shell is not enough if OpenAB injects it again when spawning Kiro. If `config.toml` is generated, fix the generator too. For Helm installs, also remove the `KIRO_API_KEY` entry from `agents.<name>.secretEnv`, so the key is no longer injected into the container environment. The agent subprocess only receives it if `inherit_env` lists it, so make sure `inherit_env` does not list `KIRO_API_KEY`.
 4. Make sure `~/.kiro/` and `~/.local/share/kiro-cli/` are persisted (see [Persisted Paths](#persisted-paths-pvc)).
 5. Restart OpenAB and start a fresh session so no API-key-authenticated Kiro process is reused.
 6. Verify that MCP servers initialize and that a real read-only tool call succeeds.
