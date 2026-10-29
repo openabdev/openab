@@ -55,6 +55,8 @@ To override a single agent's image instead of the global tag:
 
 Kiro CLI supports API key authentication via the `KIRO_API_KEY` environment variable. This is the **recommended** approach — it requires no manual OAuth login and is fully managed by AWS Secrets Manager.
 
+If MCP servers or web tools are disabled with this setup, see [Known issue: MCP and web tools disabled with `KIRO_API_KEY`](#known-issue-mcp-and-web-tools-disabled-with-kiro_api_key).
+
 #### Setup Steps
 
 1. **Enable API Keys in AWS Console** — Go to your AWS Console and search for "Kiro". Enable the API Keys feature. This option is only available through the AWS Console.
@@ -168,7 +170,7 @@ ACP may also emit `_kiro.dev/mcp/governance_disabled` with `apiFailure: true`.
    env -u KIRO_API_KEY kiro-cli whoami   # expect "Logged in with GitHub"
    ```
 
-3. Stop passing `KIRO_API_KEY` to the agent subprocess: remove it from `[agent].env` (and from `inherit_env` or any wrapper that re-adds it). Unsetting it only in the login shell is not enough if OpenAB injects it again when spawning Kiro. If `config.toml` is generated, fix the generator too.
+3. Stop passing `KIRO_API_KEY` to the agent subprocess: remove it from `[agent].env` (and from `inherit_env` or any wrapper that re-adds it). Unsetting it only in the login shell is not enough if OpenAB injects it again when spawning Kiro. If `config.toml` is generated, fix the generator too. For Helm installs, also remove the `KIRO_API_KEY` entry from `agents.<name>.secretEnv`, because the chart adds those keys to `inherit_env`.
 4. Make sure `~/.kiro/` and `~/.local/share/kiro-cli/` are persisted (see [Persisted Paths](#persisted-paths-pvc)).
 5. Restart OpenAB and start a fresh session so no API-key-authenticated Kiro process is reused.
 6. Verify that MCP servers initialize and that a real read-only tool call succeeds.
