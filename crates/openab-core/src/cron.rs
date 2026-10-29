@@ -958,8 +958,9 @@ fn update_usercron_job(
 ///
 /// The temp file gets a random name and is created with `O_EXCL`
 /// (`tempfile::Builder`), so a file or symlink planted next to `path` can't
-/// redirect or capture the write. The original file's permissions are kept,
-/// because the new file would otherwise be created with mode 0600. If any step
+/// redirect or capture the write. `path` must already exist: its permissions
+/// are copied to the new file, which would otherwise be created with mode
+/// 0600, and a failure to read them is returned as an error. If any step
 /// fails, the temp file is removed when it is dropped. After the rename the
 /// parent directory is fsynced (best-effort, unix only) so the rename is
 /// durable. If `path` is itself a symlink, the link is replaced by a regular
@@ -973,6 +974,7 @@ fn update_usercron_job(
 ///   usercron directory is not writable by the agent, and a writer of that
 ///   directory can replace `cronjob.toml` directly.
 fn write_atomic(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+    use anyhow::Context as _;
     use std::io::Write;
 
     let dir = match path.parent() {
@@ -990,9 +992,12 @@ fn write_atomic(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
         .suffix(".tmp")
         .tempfile_in(dir)?;
     tmp.write_all(contents)?;
-    if let Ok(meta) = std::fs::metadata(path) {
-        tmp.as_file().set_permissions(meta.permissions())?;
-    }
+    // `path` must already exist (the caller just read it). Propagate any
+    // metadata error instead of silently persisting with tempfile's 0600 mode.
+    let perms = std::fs::metadata(path)
+        .with_context(|| format!("failed to stat {}", path.display()))?
+        .permissions();
+    tmp.as_file().set_permissions(perms)?;
     tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|e| e.error)?;
     // fsync the parent dir so the rename itself is durable (best-effort,
@@ -1668,6 +1673,18 @@ message = "m"
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o640);
+    }
+
+    #[test]
+    fn test_write_atomic_errors_when_destination_missing_and_leaves_no_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cronjob.toml");
+
+        let err = write_atomic(&path, b"x").unwrap_err();
+
+        assert!(err.to_string().contains("failed to stat"), "{err:#}");
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]
