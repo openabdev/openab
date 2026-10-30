@@ -636,16 +636,27 @@ default_max_delegated_sessions_cap = 3",
         assert_eq!(explicit.max_inflight_delegations, 32);
         assert_eq!(explicit.default_max_delegated_sessions_cap, 3);
 
-        for bad in [
-            "max_inflight_delegations = 0",
-            "default_max_delegated_sessions_cap = 0",
+        for (bad, why) in [
+            ("max_inflight_delegations = 0", "max_inflight_delegations"),
+            (
+                "default_max_delegated_sessions_cap = 0",
+                "default_max_delegated_sessions_cap",
+            ),
             // Equal to max_frame_bytes is not enough: one maximum-size frame
             // must fit, or the connection is unusable.
-            "max_outbound_queue_bytes = 1048576",
-            "max_outbound_queue_bytes = 4096\nmax_frame_bytes = 8192",
+            (
+                "max_outbound_queue_bytes = 1048576",
+                "must exceed max_frame_bytes",
+            ),
+            // Strictly below max_frame_bytes.
+            (
+                "max_outbound_queue_bytes = 1048576\nmax_frame_bytes = 2097152",
+                "must exceed max_frame_bytes",
+            ),
         ] {
             let cfg: CpConfig = toml::from_str(bad).unwrap();
-            assert!(cfg.validate().is_err(), "{bad} must be rejected");
+            let err = cfg.validate().expect_err(bad).to_string();
+            assert!(err.contains(why), "{bad}: unexpected error {err:?}");
         }
     }
 
