@@ -307,14 +307,6 @@ impl CpConfig {
         if self.write_timeout_secs == 0 {
             bail!("write_timeout_secs must be greater than 0");
         }
-        if self.max_frame_bytes < crate::proto::MIN_RUNTIME_FRAME_BYTES {
-            bail!(
-                "max_frame_bytes ({}) is below the bundled runtime minimum ({}) — \
-                 raise it or use a protocol-compatible client with a smaller negotiated ceiling",
-                self.max_frame_bytes,
-                crate::proto::MIN_RUNTIME_FRAME_BYTES
-            );
-        }
         // A budget that cannot hold one maximum-size frame would refuse every
         // enqueue and disconnect every peer the moment a large frame is routed
         // to it.
@@ -623,21 +615,6 @@ lease_expiry_secs = 30
     }
 
     #[test]
-    fn frame_limit_cannot_undercut_the_bundled_runtime_contract() {
-        let cfg: CpConfig = toml::from_str("max_frame_bytes = 1048575").unwrap();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert_eq!(
-            err,
-            concat!(
-                "max_frame_bytes (1048575) is below the bundled runtime minimum (1048576) — ",
-                "raise it or use a protocol-compatible client with a smaller negotiated ceiling"
-            )
-        );
-        let cfg: CpConfig = toml::from_str("max_frame_bytes = 1048576").unwrap();
-        cfg.validate().unwrap();
-    }
-
-    #[test]
     fn resource_bounds_default_and_are_validated() {
         // The byte budget, the global in-flight ceiling, and the default
         // session clamp all default to safe values, and every degenerate
@@ -671,8 +648,7 @@ default_max_delegated_sessions_cap = 3",
                 "max_outbound_queue_bytes = 1048576",
                 "must exceed max_frame_bytes",
             ),
-            // Strictly below, with a frame ceiling above the runtime floor so
-            // the queue rule (not the floor) is what rejects it.
+            // Strictly below max_frame_bytes.
             (
                 "max_outbound_queue_bytes = 1048576\nmax_frame_bytes = 2097152",
                 "must exceed max_frame_bytes",
