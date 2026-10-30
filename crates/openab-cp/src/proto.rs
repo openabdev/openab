@@ -37,13 +37,6 @@ use serde_json::Value;
 /// Wire protocol version. Carried in `cp/register`; the CP rejects
 /// registrations with a version it does not support.
 pub const PROTOCOL_VERSION: u32 = 1;
-/// Minimum frame ceiling the runtime client (landing in the follow-up PR)
-/// will require. The server may configure a larger value, but a smaller one
-/// would let an otherwise valid runtime result disconnect the whole worker
-/// connection. Not enforced yet: CP config validation starts rejecting
-/// smaller `max_frame_bytes` values in the same follow-up PR, together with
-/// the client that relies on it. The protocol has no frame-size negotiation.
-pub const MIN_RUNTIME_FRAME_BYTES: usize = 1024 * 1024;
 
 // --- JSON-RPC envelopes ---
 

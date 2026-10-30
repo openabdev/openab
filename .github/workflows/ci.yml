@@ -96,24 +96,43 @@ jobs:
       # `--workspace` always enables openab-cp's default `server` feature, so nothing above ever
       # builds the proto-only configuration that runtime clients depend on. Build, lint and test
       # it on its own, then fail if a server dependency leaks into its normal dependency graph.
-      # `-e normal` leaves out the test-only `tokio-tungstenite` dev-dependency. The pattern is
-      # the `server` feature's optional deps (crates/openab-cp/Cargo.toml) plus axum's hyper/tower.
+      # `-e normal` leaves out the test-only `tokio-tungstenite` dev-dependency. The denylist is
+      # read from the optional dependencies in crates/openab-cp/Cargo.toml (every dep that the
+      # `server` feature turns on), so it cannot drift from the manifest. Any failure stops the step.
       - name: openab-cp (proto only, no default features)
         run: |
           set -euo pipefail
           cargo clippy -p openab-cp --no-default-features --all-targets -- -D warnings
           cargo test -p openab-cp --no-default-features
+          server_deps=$(python3 -c '
+          import tomllib
+          with open("crates/openab-cp/Cargo.toml", "rb") as f:
+              manifest = tomllib.load(f)
+          for name, spec in manifest.get("dependencies", {}).items():
+              if isinstance(spec, dict) and spec.get("optional"):
+                  print(name)
+          ')
+          if [ -z "$server_deps" ]; then
+            echo "::error::Cargo.toml lists no optional server dependencies; the leak check would be empty"
+            exit 1
+          fi
           tree=$(cargo tree -p openab-cp --no-default-features -e normal --prefix none)
-          if ! printf '%s\n' "$tree" | grep -q '^openab-cp '; then
+          if [ -z "$tree" ]; then
+            echo "::error::cargo tree printed nothing; the leak check cannot run"
+            exit 1
+          fi
+          if ! grep -q '^openab-cp ' <<< "$tree"; then
             echo "::error::cargo tree did not list openab-cp; the leak check cannot run"
             exit 1
           fi
-          leaked=$(printf '%s\n' "$tree" \
-            | grep -E '^(tokio|axum|futures-util|toml|tracing|tracing-subscriber|anyhow|parking_lot|clap|subtle|hyper|tower) ' \
-            || true)
+          leaked=""
+          while read -r dep; do
+            if grep -q "^${dep} " <<< "$tree"; then
+              leaked="$leaked $dep"
+            fi
+          done <<< "$server_deps"
           if [ -n "$leaked" ]; then
-            echo "::error::openab-cp proto-only build pulls in server dependencies:"
-            echo "$leaked"
+            echo "::error::openab-cp proto-only build pulls in server dependencies:$leaked"
             exit 1
           fi
 
