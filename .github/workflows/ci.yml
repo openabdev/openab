@@ -93,6 +93,22 @@ jobs:
         run: cargo test --features acp
       - name: cargo build (unified)
         run: cargo build --features unified
+      # `--workspace` always enables openab-cp's default `server` feature, so nothing above ever
+      # builds the proto-only configuration that runtime clients depend on. Build, lint and test
+      # it on its own, then fail if a server dependency leaks into its normal dependency graph.
+      # `-e normal` leaves out the test-only `tokio-tungstenite` dev-dependency.
+      - name: openab-cp (proto only, no default features)
+        run: |
+          set -euo pipefail
+          cargo clippy -p openab-cp --no-default-features --all-targets -- -D warnings
+          cargo test -p openab-cp --no-default-features
+          leaked=$(cargo tree -p openab-cp --no-default-features -e normal --prefix none \
+            | grep -E '^(tokio|axum|hyper|tower|tracing|clap|toml) ' || true)
+          if [ -n "$leaked" ]; then
+            echo "::error::openab-cp proto-only build pulls in server dependencies:"
+            echo "$leaked"
+            exit 1
+          fi
 
   operator:
     needs: changes
