@@ -21,7 +21,7 @@
 //!
 //! Cargo unifies features per build, so this only keeps the server out of a
 //! build that does not also enable `server` somewhere else (a
-//! `cargo build --workspace` does, through the `openab-cp` binary). 
+//! `cargo build --workspace` does, through the `openab-cp` binary).
 //! Build the runtime package on its own to get the server-free graph.
 
 #[cfg(feature = "server")]
