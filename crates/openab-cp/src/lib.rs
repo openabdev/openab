@@ -18,6 +18,11 @@
 //! linking an HTTP server it never binds. Anything a runtime client needs
 //! belongs in `proto`; anything that only the hub does must stay behind the
 //! feature.
+//!
+//! Cargo unifies features per build, so this only keeps the server out of a
+//! build that does not also enable `server` somewhere else (a
+//! `cargo build --workspace` does, through the `openab-cp` binary). 
+//! Build the runtime package on its own to get the server-free graph.
 
 #[cfg(feature = "server")]
 pub mod config;

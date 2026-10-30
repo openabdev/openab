@@ -13,6 +13,13 @@ description = "OpenAB Agent Control Plane — registry, router, and policy for d
 # this crate with `default-features = false` purely for these types, and must
 # not inherit axum/tokio/hyper through that edge (the runtime image would
 # otherwise grow a whole HTTP server it never binds).
+#
+# Caveat: Cargo unifies features per build. If anything else in the same build
+# enables `server` (for example `cargo build --workspace`, which also builds
+# the `openab-cp` binary), the runtime is compiled against the server deps
+# too. The guarantee holds when the runtime package is built on its own.
+# `tokio-tungstenite` under [dev-dependencies] is test-only and never reaches
+# downstream crates.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
