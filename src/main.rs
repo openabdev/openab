@@ -210,7 +210,10 @@ async fn run_agent_command(socket: Option<PathBuf>, action: AgentAction) -> anyh
         default_socket_path, LocalClient, LocalRequest, LocalResponse, LocalTarget,
     };
 
-    let client = LocalClient::new(socket.unwrap_or(default_socket_path()?));
+    let client = LocalClient::new(match socket {
+        Some(path) => path,
+        None => default_socket_path()?,
+    });
     // A spawn is the one action bounded as a whole operation; the others are a
     // single request/response.
     if let AgentAction::Spawn {
@@ -242,8 +245,9 @@ async fn run_agent_command(socket: Option<PathBuf>, action: AgentAction) -> anyh
             deadline_secs,
             parent,
         };
-        // Same full-operation wrapper the MCP facade uses: admission + optional
-        // await under one `deadline_secs + 5` bound.
+        // Full-operation wrapper: admission + optional await under one
+        // `deadline_secs + 5` bound. The MCP facade does not call it at this
+        // commit; the CLI is the only caller.
         let client_ref = &client;
         let response =
             spawn_within_bound(deadline_secs, async_mode, spawn, move |req| async move {
@@ -272,9 +276,10 @@ async fn run_agent_command(socket: Option<PathBuf>, action: AgentAction) -> anyh
 }
 
 /// Accepted `deadline_secs` window for `openab agent spawn`, enforced
-/// client-side before any frame leaves the host. Matches the MCP tool schema
-/// (`minimum: 1, maximum: 1800`) and the local API server's own bound, so all
-/// three surfaces agree on the same 1-second..=30-minute window.
+/// client-side before any frame leaves the host. Matches the bound the local
+/// API server enforces (`minimum: 1, maximum: 1800`), so the CLI and the server
+/// agree on the same 1-second..=30-minute window. No MCP tool schema consumes
+/// these constants at this commit.
 const MIN_DEADLINE_SECS: u64 = 1;
 const MAX_DEADLINE_SECS: u64 = 1800;
 
@@ -306,9 +311,10 @@ fn parse_agent_labels(
 
 use openab_core::control_plane::{LocalRequest, LocalResponse};
 
-/// The one delegation-id generator shared by the MCP facade and the
-/// `openab agent` CLI. A single generator keeps CLI- and MCP-initiated
-/// delegations indistinguishable on the wire (no `d-cli-` vs `d-` fork) while
+/// The delegation-id generator for the `openab agent` CLI. The MCP facade is
+/// not wired to it at this commit. Using one generator for every initiating
+/// surface keeps the ids indistinguishable on the wire (no `d-cli-` vs `d-`
+/// fork) while
 /// still being process-unique: `pid` separates concurrent processes, the
 /// monotonic `seq` separates ids minted inside one process, and the nanosecond
 /// clock separates process restarts that reuse a pid.
@@ -322,8 +328,9 @@ fn new_delegation_id() -> String {
     format!("d-{}-{nanos:032x}-{seq:016x}", std::process::id())
 }
 
-/// Run one full spawn operation under a single `deadline_secs + 5` timeout,
-/// shared verbatim by the MCP facade and the `openab agent spawn` CLI.
+/// Run one full spawn operation under a single `deadline_secs + 5` timeout.
+/// The `openab agent spawn` CLI is the only caller at this commit; the MCP
+/// facade is not wired to it yet.
 ///
 /// "Full operation" is the crux the two surfaces previously diverged on: it is
 /// the admission round-trip *and*, unless `async_mode`, the blocking await of
@@ -408,9 +415,9 @@ fn has_unified_platform(cfg: &config::Config) -> bool {
 /// - `[mcp]` alone stays exactly what it was: the facade in the foreground.
 ///
 /// `type = "primary"` alone (without `[mcp]`) deliberately does NOT unlock a
-/// headless boot. A primary is the *initiating* side of a delegation; its
-/// prompts come from a chat platform, so an adapter-less primary has no way to
-/// be given work and is a misconfiguration worth failing on.
+/// headless boot. The primary's initiating surface is the local socket and the
+/// `openab agent` CLI. The headless boot serves that socket only through the
+/// `[mcp]` path above, so a primary with no adapter and no `[mcp]` is refused.
 #[derive(Debug, PartialEq, Eq)]
 enum HeadlessMode {
     FullRuntime,
@@ -469,10 +476,14 @@ fn supervise_local_api(
 async fn wait_for_control_plane_exit(
     task: &mut Option<SupervisedControlPlaneTask>,
 ) -> anyhow::Error {
-    let Some(task) = task.as_mut() else {
+    let Some(supervised) = task.as_mut() else {
         return std::future::pending::<anyhow::Error>().await;
     };
-    match (&mut task.completion).await {
+    let outcome = (&mut supervised.completion).await;
+    // The receiver is spent once it has yielded. Drop the supervision here so
+    // the shutdown path skips it instead of polling it again, which panics.
+    *task = None;
+    match outcome {
         Ok(Ok(())) => anyhow::anyhow!("control-plane client exited unexpectedly"),
         Ok(Err(error)) => anyhow::anyhow!("control-plane client task failed: {error}"),
         Err(_) => anyhow::anyhow!("control-plane client supervisor stopped unexpectedly"),
@@ -480,10 +491,13 @@ async fn wait_for_control_plane_exit(
 }
 
 async fn wait_for_local_api_exit(task: &mut Option<SupervisedLocalApiTask>) -> anyhow::Error {
-    let Some(task) = task.as_mut() else {
+    let Some(supervised) = task.as_mut() else {
         return std::future::pending::<anyhow::Error>().await;
     };
-    match (&mut task.completion).await {
+    let outcome = (&mut supervised.completion).await;
+    // Same as the control-plane wait: the spent receiver must not reach shutdown.
+    *task = None;
+    match outcome {
         Ok(Ok(Ok(()))) => anyhow::anyhow!("control-plane local API exited unexpectedly"),
         Ok(Ok(Err(error))) => anyhow::anyhow!("control-plane local API failed: {error:#}"),
         Ok(Err(error)) => anyhow::anyhow!("control-plane local API task failed: {error}"),
@@ -774,7 +788,7 @@ async fn main() -> anyhow::Result<()> {
             }
             HeadlessMode::None => {
                 anyhow::bail!(
-                    "no adapter configured — add [discord], [slack], [telegram], [line], [lineworks], [feishu], [wecom], [googlechat], [teams], or [gateway] to config (or [mcp] for facade-only mode, or [control_plane] with type = \"worker\" for control-plane worker mode), or set the corresponding platform environment variables"
+                    "no adapter configured — add [discord], [slack], [telegram], [line], [lineworks], [feishu], [wecom], [googlechat], [teams], or [gateway] to config (or [mcp] for facade-only mode, or [control_plane] with type = \"worker\" for control-plane worker mode; a control-plane primary with no adapter also needs [mcp]), or set the corresponding platform environment variables"
                 );
             }
         }
@@ -2692,6 +2706,25 @@ agent_id = "1000002"
         .await
         .expect("the completed local API task is observed");
         assert!(error.to_string().contains("exited unexpectedly"));
+    }
+
+    #[tokio::test]
+    async fn a_supervised_exit_is_not_awaited_again_at_shutdown() {
+        // Shutdown skips a task whose option is None. Reaching the await a
+        // second time would panic: tokio's oneshot receiver panics once spent.
+        let mut cp = Some(supervise_control_plane(tokio::spawn(async {})));
+        let _ = wait_for_control_plane_exit(&mut cp).await;
+        assert!(
+            cp.is_none(),
+            "the spent control-plane supervision must be dropped"
+        );
+
+        let mut local = Some(supervise_local_api(tokio::spawn(async { Ok(()) })));
+        let _ = wait_for_local_api_exit(&mut local).await;
+        assert!(
+            local.is_none(),
+            "the spent local-API supervision must be dropped"
+        );
     }
 
     #[test]

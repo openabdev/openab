@@ -600,10 +600,12 @@ impl ControlPlaneClient {
         sink: &mut WsSink,
         shutdown: &mut watch::Receiver<bool>,
     ) -> Result<(), WriteEnd> {
-        // A primary must be registered as such to initiate; a worker-only
-        // runtime rejects spawn/cancel/list locally so a misconfigured caller
-        // gets a clear answer instead of a CP policy denial round-trip. Await
-        // is allowed for either role (it only reads local tracking).
+        // A primary must be registered as such to initiate. A worker-only runtime
+        // rejects spawn and cancel locally, so a misconfigured caller gets a clear
+        // answer instead of a CP policy denial round-trip. list_agents is forwarded
+        // for either role; whether the CP accepts a worker's list_agents is not
+        // verified here. Await is allowed for either role (it only reads local
+        // tracking).
         match command {
             ClientCommand::Spawn { request, reply } => {
                 if self.cfg.agent_type != CpAgentType::Primary {
