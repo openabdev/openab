@@ -2522,6 +2522,7 @@ dependencies = [
  "http 1.4.2",
  "image",
  "libc",
+ "openab-cp",
  "pulldown-cmark",
  "rand 0.8.6",
  "regex",
