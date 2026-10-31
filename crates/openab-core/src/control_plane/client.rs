@@ -39,6 +39,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::{ControlPlaneConfig, CpAgentType};
 use crate::control_plane::executor::{cap_text, DelegationExecutor, PromptRunner};
+use crate::control_plane::primary::{ClientCommand, PrimaryState};
 
 /// Backoff ceiling, matching the gateway adapter.
 const MAX_BACKOFF_SECS: u64 = 30;
@@ -76,6 +77,35 @@ type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsSink = futures_util::stream::SplitSink<Ws, Message>;
 type WsStream = futures_util::stream::SplitStream<Ws>;
 
+/// A cloneable handle for submitting primary-side commands to a running
+/// [`ControlPlaneClient`]. Obtained via [`ControlPlaneClient::handle`], it is
+/// the initiating surface for local callers (the UDS server, an MCP tool, a
+/// CLI): the client's serve loop is the single socket owner, so a command
+/// carries a `oneshot` reply and is answered from inside that loop.
+#[derive(Clone)]
+pub struct ControlPlaneHandle {
+    tx: tokio::sync::mpsc::Sender<ClientCommand>,
+}
+
+impl ControlPlaneHandle {
+    /// Submit a command to the serve loop, returning `NotConnected` if the
+    /// loop is not currently running (channel closed).
+    pub async fn submit(
+        &self,
+        command: ClientCommand,
+    ) -> Result<(), crate::control_plane::primary::CommandError> {
+        self.tx
+            .send(command)
+            .await
+            .map_err(|_| crate::control_plane::primary::CommandError::NotConnected)
+    }
+}
+
+/// How many primary-side commands may be queued to the serve loop before a
+/// submitter awaits. Bounded so a wedged loop applies backpressure rather than
+/// growing an unbounded queue.
+const COMMAND_QUEUE_DEPTH: usize = 64;
+
 /// Runtime client for the OpenAB Agent Control Plane.
 pub struct ControlPlaneClient {
     cfg: ControlPlaneConfig,
@@ -84,6 +114,13 @@ pub struct ControlPlaneClient {
     executor: Arc<DelegationExecutor>,
     /// Monotonic JSON-RPC request id for frames this client originates.
     next_id: std::sync::atomic::AtomicU64,
+    /// Sender kept so [`ControlPlaneClient::handle`] can hand out clones for
+    /// the process lifetime, independent of connection state.
+    command_tx: tokio::sync::mpsc::Sender<ClientCommand>,
+    /// Receiver, taken once by [`ControlPlaneClient::run`]. Behind a mutex so
+    /// `run` (which takes `Arc<Self>`) can move it into the loop; a second
+    /// `run` finds it gone and serves without a command channel.
+    command_rx: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<ClientCommand>>>,
 }
 
 impl ControlPlaneClient {
@@ -103,11 +140,23 @@ impl ControlPlaneClient {
             cfg.max_delegated_sessions,
             prompt_hard_timeout,
         ));
+        let (command_tx, command_rx) = tokio::sync::mpsc::channel(COMMAND_QUEUE_DEPTH);
         Self {
             cfg,
             instance_id,
             executor,
             next_id: std::sync::atomic::AtomicU64::new(1),
+            command_tx,
+            command_rx: std::sync::Mutex::new(Some(command_rx)),
+        }
+    }
+
+    /// A cloneable command handle. Valid for the process lifetime regardless of
+    /// connection state: submitting while disconnected succeeds at the channel
+    /// but the command is answered `NotConnected`/`Disconnected` by the loop.
+    pub fn handle(&self) -> ControlPlaneHandle {
+        ControlPlaneHandle {
+            tx: self.command_tx.clone(),
         }
     }
 
@@ -122,6 +171,17 @@ impl ControlPlaneClient {
 
     /// Connect, register, serve — forever, until `shutdown` flips.
     pub async fn run(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
+        // Take the command receiver once for the process lifetime. A second
+        // `run` (there should never be one) serves without a command channel.
+        let mut command_rx = self.command_rx.lock().unwrap().take();
+        // Primary-side correlation and tracking is PROCESS-lifetime, not
+        // per-connection: one instance is created here and passed through every
+        // connect/serve. A reconnect fails/removes pending and live delegations
+        // (`fail_all_live`) but PRESERVES terminal history, so a caller that
+        // recorded a completed delegation before a blip can still read it after
+        // reconnect. Recreating it per connection would silently discard that
+        // history and orphan any awaiter that spanned the gap.
+        let mut primary = PrimaryState::new();
         let mut backoff = 1u64;
         loop {
             if *shutdown.borrow() {
@@ -138,7 +198,9 @@ impl ControlPlaneClient {
             // connect_and_serve owns shutdown for each phase: connect/register
             // race it directly, then the serve loop alone performs
             // cancel/drain/abort. No outer arm may drop serve mid-cleanup.
-            let served = self.connect_and_serve(&mut shutdown).await;
+            let served = self
+                .connect_and_serve(&mut shutdown, &mut command_rx, &mut primary)
+                .await;
             match served {
                 Ok(Outcome::Shutdown) => {
                     info!("control-plane client shutting down");
@@ -166,11 +228,27 @@ impl ControlPlaneClient {
                 retry_delay_ms = retry_delay.as_millis(),
                 "control-plane reconnect delay selected"
             );
-            tokio::select! {
-                _ = tokio::time::sleep(retry_delay) => {}
-                _ = shutdown.changed() => {
-                    info!("control-plane client shutting down");
-                    return;
+            // While disconnected, reject any submitted command promptly rather
+            // than letting it sit in the buffer until the next session. The
+            // channel stays open (the handle is process-lifetime), so this only
+            // answers what is queued; new submissions during the sleep are
+            // answered too. A closed channel is replaced with `None` so
+            // `recv_command` becomes a pending future and the sleep proceeds.
+            let sleep = tokio::time::sleep(retry_delay);
+            tokio::pin!(sleep);
+            loop {
+                tokio::select! {
+                    _ = &mut sleep => break,
+                    _ = shutdown.changed() => {
+                        info!("control-plane client shutting down");
+                        return;
+                    }
+                    maybe = recv_command(&mut command_rx) => {
+                        match maybe {
+                            Some(command) => reject_command(command),
+                            None => { command_rx = None; }
+                        }
+                    }
                 }
             }
             backoff = next_backoff(backoff);
@@ -180,6 +258,8 @@ impl ControlPlaneClient {
     async fn connect_and_serve(
         &self,
         shutdown: &mut watch::Receiver<bool>,
+        command_rx: &mut Option<tokio::sync::mpsc::Receiver<ClientCommand>>,
+        primary: &mut PrimaryState,
     ) -> anyhow::Result<Outcome> {
         let ws = tokio::select! {
             result = self.connect_with_timeout() => result?,
@@ -204,7 +284,8 @@ impl ControlPlaneClient {
             max_delegated_sessions = ack.effective_max_delegated_sessions,
             "registered with control plane"
         );
-        self.serve(sink, stream, &ack, shutdown).await
+        self.serve(sink, stream, &ack, shutdown, command_rx, primary)
+            .await
     }
 
     async fn connect_with_timeout(&self) -> anyhow::Result<Ws> {
@@ -314,6 +395,8 @@ impl ControlPlaneClient {
         mut stream: WsStream,
         ack: &RegisterAck,
         shutdown: &mut watch::Receiver<bool>,
+        command_rx: &mut Option<tokio::sync::mpsc::Receiver<ClientCommand>>,
+        primary: &mut PrimaryState,
     ) -> anyhow::Result<Outcome> {
         let mut heartbeat = tokio::time::interval(Duration::from_secs(
             // A zero interval would spin; the CP's own default is 15s.
@@ -329,6 +412,13 @@ impl ControlPlaneClient {
             (ack.effective_max_delegated_sessions as usize).max(1),
         );
         let mut serving: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+        // Primary-side correlation and tracking for delegations THIS runtime
+        // initiates is owned by `run` and threaded through every connection, so
+        // it lives for the process, not the socket. It still lives inside the
+        // single socket owner — no lock guards it and every transition is
+        // serialized against frame writes — but terminal history and awaiters
+        // survive a reconnect. The `&mut` borrow makes that single-owner
+        // discipline explicit.
 
         let outcome = loop {
             tokio::select! {
@@ -347,6 +437,23 @@ impl ControlPlaneClient {
                         break Outcome::Disconnected;
                     }
                 }
+                // A primary-side command: the local initiating surface (UDS
+                // server, MCP tool, CLI) asked to spawn/cancel/await/list. The
+                // serve loop is the single socket owner, so it — not the
+                // caller — writes the frame and parks the reply.
+                maybe_command = recv_command(command_rx) => {
+                    match maybe_command {
+                        Some(command) => {
+                            if self.handle_command(command, primary, &mut sink).await.is_err() {
+                                break Outcome::Disconnected;
+                            }
+                        }
+                        // The command channel closed (no handles left). Stop
+                        // selecting on it by replacing it with `None`, which
+                        // `recv_command` treats as a pending future.
+                        None => { *command_rx = None; }
+                    }
+                }
                 // A finished delegation reports itself. Emitted by the runtime
                 // when the turn ends, never by the model: this is the only
                 // frame that closes the initiator's wait.
@@ -360,7 +467,7 @@ impl ControlPlaneClient {
                     let Some(msg) = inbound else { break Outcome::Disconnected };
                     match msg {
                         Ok(Message::Text(text)) => {
-                            match self.handle_frame(&text) {
+                            match self.classify_inbound(&text, primary) {
                                 FrameAction::Serve { ack, forward } => {
                                     let executor = Arc::clone(&self.executor);
                                     let tx = result_tx.clone();
@@ -422,6 +529,11 @@ impl ControlPlaneClient {
             );
         }
         self.executor.cancel_all();
+        // Primary-side mirror: every delegation THIS runtime initiated and was
+        // still awaiting can no longer complete over a dead socket, and every
+        // parked command reply would otherwise hang forever. Answer them all
+        // `Disconnected` so a caller's `await` returns instead of leaking.
+        primary.fail_all_live();
         let drained = tokio::time::timeout(DRAIN_TIMEOUT, async {
             for handle in &mut serving {
                 let _ = handle.await;
@@ -437,6 +549,159 @@ impl ControlPlaneClient {
         let _ = sink.send(Message::Close(None)).await;
         let _ = sink.close().await;
         Ok(outcome)
+    }
+
+    /// Turn one primary-side command into an outbound frame, parking its reply
+    /// in `primary` for later correlation. `Await` needs no frame — it only
+    /// registers interest in a terminal that arrives over the socket. Returns
+    /// `Err` only when the socket write fails, which ends the session.
+    async fn handle_command(
+        &self,
+        command: ClientCommand,
+        primary: &mut PrimaryState,
+        sink: &mut WsSink,
+    ) -> anyhow::Result<()> {
+        // A primary must be registered as such to initiate; a worker-only
+        // runtime rejects spawn/cancel/list locally so a misconfigured caller
+        // gets a clear answer instead of a CP policy denial round-trip. Await
+        // is allowed for either role (it only reads local tracking).
+        match command {
+            ClientCommand::Spawn { request, reply } => {
+                if self.cfg.agent_type != CpAgentType::Primary {
+                    let _ = reply.send(Err(primary_only_error()));
+                    return Ok(());
+                }
+                let emission = primary.begin_spawn(self.next_id(), request, reply);
+                let frame = JsonRpcRequest::new(
+                    emission.rpc_id,
+                    methods::DELEGATE,
+                    Some(serde_json::to_value(&emission.params)?),
+                );
+                // A Spawn whose complete serialized frame exceeds the transport
+                // ceiling must NOT tear down the connection: an oversized prompt
+                // is a caller-side fault, not a socket fault. Detect it before
+                // writing, remove/fail the parked pending request with
+                // InvalidRequest, and return Ok so the serve loop keeps running.
+                if !frame_within_limit(&frame)? {
+                    let bytes = serialized_len(&frame)?;
+                    warn!(
+                        rpc_id = emission.rpc_id,
+                        frame_bytes = bytes,
+                        limit = MAX_FRAME_BYTES,
+                        "cp/delegate frame exceeds the transport limit; failing the spawn without disconnecting"
+                    );
+                    primary.fail_pending_invalid_request(
+                        emission.rpc_id,
+                        format!(
+                            "delegate frame ({bytes} bytes) exceeds the transport limit \
+                             ({MAX_FRAME_BYTES} bytes); reduce the prompt"
+                        ),
+                    );
+                    return Ok(());
+                }
+                send(sink, &frame).await?;
+            }
+            ClientCommand::Cancel {
+                handle,
+                reason,
+                reply,
+            } => {
+                if self.cfg.agent_type != CpAgentType::Primary {
+                    let _ = reply.send(Err(primary_only_error()));
+                    return Ok(());
+                }
+                let rpc_id = self.next_id();
+                if let Some(params) = primary.begin_cancel(rpc_id, &handle, reason, reply) {
+                    let frame = JsonRpcRequest::new(
+                        rpc_id,
+                        methods::CANCEL,
+                        Some(serde_json::to_value(&params)?),
+                    );
+                    send(sink, &frame).await?;
+                }
+                // begin_cancel already answered the caller if the handle was
+                // unknown; no frame in that case.
+            }
+            ClientCommand::ListAgents { reply } => {
+                let rpc_id = self.next_id();
+                primary.begin_list_agents(rpc_id, reply);
+                let frame =
+                    JsonRpcRequest::new(rpc_id, methods::LIST_AGENTS, Some(serde_json::json!({})));
+                send(sink, &frame).await?;
+            }
+            ClientCommand::Await { handle, reply } => {
+                primary.begin_await(&handle, reply);
+            }
+            ClientCommand::Check { handle, reply } => {
+                primary.check(&handle, reply);
+            }
+        }
+        Ok(())
+    }
+
+    /// Classify one inbound frame, routing primary-side concerns (JSON-RPC
+    /// responses to our own requests, and the initiator-bound
+    /// `cp/delegate_result`) into `primary`, and everything else to the
+    /// worker-side [`Self::handle_frame`].
+    fn classify_inbound(&self, text: &str, primary: &mut PrimaryState) -> FrameAction {
+        let msg: JsonRpcMessage = match serde_json::from_str(text) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "malformed frame from the control plane");
+                return FrameAction::Ignore;
+            }
+        };
+        // A frame with no method is a response to one of our own requests.
+        // Route it to the primary-side correlator first; if it does not own
+        // the id (e.g. a heartbeat/delegate_result ack), fall back to the
+        // worker-side "absorb and log errors" behavior.
+        if msg.method.is_none() {
+            let Some(id) = msg.id else {
+                if let Some(err) = msg.error {
+                    warn!(code = err.code, message = %err.message, "control plane returned an error with no id");
+                }
+                return FrameAction::Ignore;
+            };
+            if primary.on_reply(id, msg.result, msg.error.clone()) {
+                return FrameAction::Ignore;
+            }
+            // Not a primary request: it is a response to a heartbeat or a
+            // delegate_result the worker side sent. Errors are worth a line.
+            if let Some(err) = msg.error {
+                warn!(code = err.code, message = %err.message, "control plane returned an error");
+            }
+            return FrameAction::Ignore;
+        }
+        // A `cp/delegate_result` REQUEST is the CP delivering a terminal to us
+        // as the initiator. Route it to primary and ack it as ours.
+        if msg.method.as_deref() == Some(methods::DELEGATE_RESULT) {
+            let id = match msg.require_request_envelope() {
+                Ok(id) => id,
+                Err(err) => {
+                    warn!(code = err.code, message = %err.message, "invalid cp/delegate_result envelope");
+                    return error_reply(msg.id.unwrap_or(0), err);
+                }
+            };
+            let params: Option<DelegateResultParams> =
+                msg.params.and_then(|p| serde_json::from_value(p).ok());
+            match params {
+                Some(params) => {
+                    // Ack regardless of whether we track it: an untracked
+                    // (id, admission) is a stale/foreign frame the CP cannot
+                    // act on, and a JSON-RPC error would be misread as our
+                    // failure rather than a routing miss.
+                    let _known = primary.on_delegate_result(&params);
+                    ok_reply(id)
+                }
+                None => error_reply(
+                    id,
+                    ErrorObject::new(codes::INVALID_PARAMS, "invalid cp/delegate_result params"),
+                ),
+            }
+        } else {
+            // Worker-side frames (cp/delegate, cp/cancel, unknown methods).
+            self.handle_frame(text)
+        }
     }
 
     /// Classify one inbound frame. Never spawns and never writes: the serve
@@ -608,6 +873,66 @@ async fn send(sink: &mut WsSink, frame: &JsonRpcRequest) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Serialized byte length of an outbound frame. Pure and testable — the same
+/// measurement [`send`] and the oversized-Spawn guard use, so the check and the
+/// wire agree by construction.
+fn serialized_len(frame: &JsonRpcRequest) -> anyhow::Result<usize> {
+    Ok(serde_json::to_string(frame)?.len())
+}
+
+/// Whether an outbound frame fits the transport ceiling. `Ok(false)` means the
+/// caller must fail the request WITHOUT writing (an oversized cp/delegate is a
+/// caller-side fault, not a socket fault, so it must not disconnect).
+fn frame_within_limit(frame: &JsonRpcRequest) -> anyhow::Result<bool> {
+    Ok(serialized_len(frame)? <= MAX_FRAME_BYTES)
+}
+
+/// Receive from an optional command channel. When the channel is `None` (never
+/// created, or closed and cleared), this future is `pending` forever so the
+/// serve loop's `select!` simply never wakes on this arm.
+async fn recv_command(
+    rx: &mut Option<tokio::sync::mpsc::Receiver<ClientCommand>>,
+) -> Option<ClientCommand> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Answer a command that arrived while the client is not connected.
+fn reject_command(command: ClientCommand) {
+    use crate::control_plane::primary::CommandError;
+    match command {
+        ClientCommand::Spawn { reply, .. } => {
+            let _ = reply.send(Err(CommandError::NotConnected));
+        }
+        ClientCommand::Cancel { reply, .. } => {
+            let _ = reply.send(Err(CommandError::NotConnected));
+        }
+        ClientCommand::ListAgents { reply } => {
+            let _ = reply.send(Err(CommandError::NotConnected));
+        }
+        ClientCommand::Await { reply, .. } => {
+            // Awaiting only reads local tracking, but a disconnected client
+            // holds none: there is nothing to wait on.
+            let _ = reply.send(Err(CommandError::NotConnected));
+        }
+        ClientCommand::Check { reply, .. } => {
+            // Same rationale as Await: no tracking survives a disconnect.
+            let _ = reply.send(Err(CommandError::NotConnected));
+        }
+    }
+}
+
+/// Error answered to a spawn/cancel/list command on a runtime not registered
+/// as `primary`.
+fn primary_only_error() -> crate::control_plane::primary::CommandError {
+    crate::control_plane::primary::CommandError::Internal(
+        "this runtime is not registered as a control-plane primary and cannot initiate delegations"
+            .into(),
+    )
+}
+
 fn validate_register_ack(result: serde_json::Value) -> anyhow::Result<RegisterAck> {
     let ack: RegisterAck = serde_json::from_value(result)?;
     anyhow::ensure!(
@@ -660,6 +985,25 @@ enum Outcome {
     Shutdown,
     /// The socket ended (close, error, or EOF); reconnect and re-register.
     Disconnected,
+}
+
+/// Test-only helpers for constructing a [`ControlPlaneHandle`] and its
+/// receiver without a full client + socket, so sibling modules (the local IPC
+/// server) can exercise their own plumbing.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// A handle plus the receiver end of its command channel. The receiver is
+    /// returned so the caller can drop it (making the handle answer
+    /// `NotConnected`) or drain commands in a stub loop.
+    pub(crate) fn handle_and_rx() -> (
+        ControlPlaneHandle,
+        tokio::sync::mpsc::Receiver<ClientCommand>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::channel(COMMAND_QUEUE_DEPTH);
+        (ControlPlaneHandle { tx }, rx)
+    }
 }
 
 #[cfg(test)]
@@ -973,5 +1317,62 @@ max_delegated_sessions = 3
             .await
             .expect("shutdown is checked before dialling");
         drop(tx);
+    }
+
+    #[test]
+    fn frame_within_limit_flags_an_oversized_delegate_frame() {
+        // A small frame fits; a frame whose serialized form exceeds the
+        // transport ceiling does not. This is the same measurement the
+        // oversized-Spawn guard uses before deciding to fail-without-writing.
+        let small = JsonRpcRequest::new(
+            1,
+            methods::DELEGATE,
+            Some(serde_json::json!({"prompt": "hi"})),
+        );
+        assert!(frame_within_limit(&small).unwrap());
+        assert!(serialized_len(&small).unwrap() <= MAX_FRAME_BYTES);
+
+        let huge = JsonRpcRequest::new(
+            2,
+            methods::DELEGATE,
+            Some(serde_json::json!({ "prompt": "x".repeat(MAX_FRAME_BYTES + 1024) })),
+        );
+        assert!(
+            !frame_within_limit(&huge).unwrap(),
+            "a frame larger than the ceiling must be flagged"
+        );
+        assert!(serialized_len(&huge).unwrap() > MAX_FRAME_BYTES);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_spawn_fails_the_caller_and_does_not_disconnect() {
+        // Mirror the serve-loop path without a socket: begin_spawn parks the
+        // request, the frame is measured oversized, and the parked pending is
+        // failed with InvalidRequest — nothing tracked, no disconnect signal.
+        use crate::control_plane::primary::{
+            CommandError, PrimaryState, SpawnRequest, SpawnTarget,
+        };
+        let mut primary = PrimaryState::new();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let request = SpawnRequest {
+            delegation_id: "d-huge".into(),
+            target: SpawnTarget::by_name("worker-1"),
+            prompt: "x".repeat(MAX_FRAME_BYTES + 4096),
+            deadline: chrono::Utc::now() + chrono::Duration::seconds(60),
+            parent: None,
+        };
+        let emission = primary.begin_spawn(1, request, tx);
+        let frame = JsonRpcRequest::new(
+            emission.rpc_id,
+            methods::DELEGATE,
+            Some(serde_json::to_value(&emission.params).unwrap()),
+        );
+        // The guard's decision: too large.
+        assert!(!frame_within_limit(&frame).unwrap());
+        // The guard's action: fail the parked pending, track nothing.
+        assert!(primary.fail_pending_invalid_request(emission.rpc_id, "too large".into()));
+        assert_eq!(primary.tracked_len(), 0);
+        let outcome = rx.await.unwrap();
+        assert!(matches!(outcome, Err(CommandError::InvalidRequest(_))));
     }
 }

@@ -17,10 +17,20 @@
 
 pub mod client;
 pub mod executor;
+pub mod local;
+pub mod primary;
 
-pub use client::ControlPlaneClient;
+pub use client::{ControlPlaneClient, ControlPlaneHandle};
 pub use executor::{
     delegation_session_key, DelegationExecutor, PromptOutcome, PromptRunner, RouterPromptRunner,
+};
+pub use local::{
+    default_socket_path, serve_local, LocalAgent, LocalClient, LocalRequest, LocalResponse,
+    LocalTarget,
+};
+pub use primary::{
+    ClientCommand, CommandError, DelegationHandle, DelegationLifecycle, DelegationOutcome,
+    DelegationSnapshot, DelegationStatusWire, SpawnAck, SpawnRequest, SpawnTarget,
 };
 
 use crate::config::CpAgentType;
