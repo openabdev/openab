@@ -1013,3 +1013,54 @@ async fn phase0_worker_identity_cannot_initiate() {
         "a refused initiation leaves no in-flight entry"
     );
 }
+
+/// Phase 0 criterion 5, runtime side: a worker runtime refuses `spawn` on its
+/// own client, so the request never reaches the CP and no CP policy denial is
+/// needed.
+#[tokio::test]
+async fn a_worker_runtime_refuses_spawn_locally() {
+    use openab_core::control_plane::{ClientCommand, CommandError, SpawnRequest, SpawnTarget};
+
+    let (state, url) = spawn_cp(cp_config("")).await;
+    let (worker_shutdown, worker_task, worker) = spawn_worker(
+        &url,
+        ScriptedRunner::new(Script::Answer),
+        Duration::from_secs(60),
+    );
+    wait_for("the worker to register", || {
+        !worker_instances(&state).is_empty()
+    })
+    .await;
+
+    let (spawn_tx, spawn_rx) = tokio::sync::oneshot::channel();
+    worker
+        .handle()
+        .submit(ClientCommand::Spawn {
+            request: SpawnRequest {
+                delegation_id: "d-worker-spawn".into(),
+                target: SpawnTarget::by_name("worker-1"),
+                prompt: "should be refused locally".into(),
+                deadline: chrono::Utc::now() + chrono::Duration::seconds(60),
+                parent: None,
+            },
+            reply: spawn_tx,
+        })
+        .await
+        .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), spawn_rx)
+        .await
+        .expect("the refusal is answered locally")
+        .unwrap();
+    assert!(
+        matches!(&result, Err(CommandError::Internal(message)) if message.contains("not registered as a control-plane primary")),
+        "a worker must refuse spawn with the primary-only error"
+    );
+    assert_eq!(
+        state.router.inflight_count(),
+        0,
+        "the local refusal sends nothing to the CP"
+    );
+
+    let _ = worker_shutdown.send(true);
+    let _ = worker_task.await;
+}
