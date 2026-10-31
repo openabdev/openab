@@ -27,7 +27,7 @@ FROM node:${NODE22_VERSION}-trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps ripgrep tini bubblewrap unzip && rm -rf /var/lib/apt/lists/*
 
 # Pre-install codex-acp and codex CLI globally
-ARG CODEX_ACP_VERSION=2.0.0
+ARG CODEX_ACP_VERSION=2.5.0
 ARG CODEX_VERSION=0.159.0
 RUN npm install -g @agentclientprotocol/codex-acp@${CODEX_ACP_VERSION} @openai/codex@${CODEX_VERSION} --fetch-retries=3
 

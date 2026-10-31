@@ -207,7 +207,7 @@ jobs:
           assert_line 'ARG KIRO_CLI_VERSION=2.25.0' Dockerfile Dockerfile.package Dockerfile.unified
           assert_line 'ARG KIRO_SHA256_AMD64=3e924de9697717b99891bb5f7d2a4bd9c768b8bfa1c498b35b3d242948512984' Dockerfile Dockerfile.package Dockerfile.unified
           assert_line 'ARG KIRO_SHA256_ARM64=cc8a2df90cd354b569b81ed4653db4796c86a69866568b4eb7fa7906afc95309' Dockerfile Dockerfile.package Dockerfile.unified
-          assert_line 'ARG CODEX_ACP_VERSION=2.0.0' Dockerfile.codex Dockerfile.package Dockerfile.unified
+          assert_line 'ARG CODEX_ACP_VERSION=2.5.0' Dockerfile.codex Dockerfile.package Dockerfile.unified
           assert_line 'ARG CODEX_VERSION=0.159.0' Dockerfile.codex Dockerfile.package Dockerfile.unified
           assert_line 'ARG COPILOT_VERSION=1.0.89' Dockerfile.copilot Dockerfile.package Dockerfile.unified
           assert_line 'ARG DEVIN_VERSION=3000.11.3' Dockerfile.devin Dockerfile.package Dockerfile.unified
