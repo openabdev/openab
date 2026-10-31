@@ -79,6 +79,11 @@ const REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
 /// reconnect path instead of wedging the process.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Bound on the whole best-effort close handshake (Close frame plus flush) at
+/// the end of a session. Short on purpose: the session is already over, and a
+/// dead peer must not delay reconnect or process exit.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
+
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// Write half. Split from the read half because the serve loop must be able to
 /// write from a handler while the read future is still alive — one `select!`
@@ -228,6 +233,10 @@ impl ControlPlaneClient {
                     );
                 }
                 Err(e) => {
+                    // Same stability clock as a clean close: one transient
+                    // failure after a long healthy session must not inherit an
+                    // escalated backoff from an earlier flap.
+                    backoff = backoff_after_session(backoff, session_started.elapsed());
                     error!(error = %format!("{e:#}"), backoff_secs = backoff, "control-plane connection failed");
                 }
             }
@@ -237,14 +246,23 @@ impl ControlPlaneClient {
                 retry_delay_ms = retry_delay.as_millis(),
                 "control-plane reconnect delay selected"
             );
-            // While disconnected, reject any submitted command promptly rather
+            // While disconnected, answer any submitted command promptly rather
             // than letting it sit in the buffer until the next session. The
             // channel stays open (the handle is process-lifetime), so this only
             // answers what is queued; new submissions during the sleep are
-            // answered too. A closed channel is replaced with `None` so
-            // `recv_command` becomes a pending future and the sleep proceeds.
+            // answered too. Commands that need the socket are rejected
+            // `NotConnected`; Await/Check read the preserved terminal history in
+            // `primary`, so a delegation that completed before the blip is
+            // still readable during backoff. A closed channel is replaced with
+            // `None` so `recv_command` becomes a pending future and the sleep
+            // proceeds.
             let sleep = tokio::time::sleep(retry_delay);
             tokio::pin!(sleep);
+            // Idempotent: the serve-loop teardown normally did this already,
+            // but an early `Err` out of `connect_and_serve` skips it. After
+            // this call `primary` holds terminal history only, so Await below
+            // answers immediately and never parks a reply no socket can serve.
+            primary.fail_all_live();
             loop {
                 tokio::select! {
                     _ = &mut sleep => break,
@@ -254,7 +272,7 @@ impl ControlPlaneClient {
                     }
                     maybe = recv_command(&mut command_rx) => {
                         match maybe {
-                            Some(command) => reject_command(command),
+                            Some(command) => answer_while_disconnected(command, &mut primary),
                             None => { command_rx = None; }
                         }
                     }
@@ -286,6 +304,9 @@ impl ControlPlaneClient {
         };
         self.executor
             .set_effective_max(ack.effective_max_delegated_sessions);
+        if let Some(warning) = register_ack_budget_warning(&ack) {
+            warn!(instance = %self.instance_id, "{warning}");
+        }
         info!(
             instance = %self.instance_id,
             heartbeat_secs = ack.heartbeat_interval_secs,
@@ -581,10 +602,14 @@ impl ControlPlaneClient {
                 handle.abort();
             }
         }
-        // Best-effort close handshake, bounded: a peer that stopped reading
-        // must not hold up reconnect or process shutdown.
-        let _ = write_bounded(&mut sink, Message::Close(None)).await;
-        let _ = tokio::time::timeout(WRITE_TIMEOUT, sink.close()).await;
+        // Best-effort close handshake under ONE short bound: a peer that
+        // stopped reading must not hold up reconnect or process shutdown. Using
+        // WRITE_TIMEOUT for each of the two steps could cost ~60s here.
+        let _ = tokio::time::timeout(CLOSE_TIMEOUT, async {
+            let _ = sink.send(Message::Close(None)).await;
+            let _ = sink.close().await;
+        })
+        .await;
         Ok(outcome)
     }
 
@@ -603,9 +628,9 @@ impl ControlPlaneClient {
         // A primary must be registered as such to initiate. A worker-only runtime
         // rejects spawn and cancel locally, so a misconfigured caller gets a clear
         // answer instead of a CP policy denial round-trip. list_agents is forwarded
-        // for either role; whether the CP accepts a worker's list_agents is not
-        // verified here. Await is allowed for either role (it only reads local
-        // tracking).
+        // for either role: the CP serves it to every registered type (pinned by
+        // `a_worker_runtime_refuses_spawn_locally`). Await is allowed for either
+        // role (it only reads local tracking).
         match command {
             ClientCommand::Spawn { request, reply } => {
                 if self.cfg.agent_type != CpAgentType::Primary {
@@ -731,7 +756,13 @@ impl ControlPlaneClient {
                 }
             };
             let params: Option<DelegateResultParams> =
-                msg.params.and_then(|p| serde_json::from_value(p).ok());
+                msg.params.and_then(|p| match serde_json::from_value(p) {
+                    Ok(params) => Some(params),
+                    Err(e) => {
+                        warn!(error = %e, rpc_id = id, "invalid cp/delegate_result params");
+                        None
+                    }
+                });
             match params {
                 Some(params) => {
                     // Ack regardless of whether we track it: an untracked
@@ -1036,7 +1067,15 @@ async fn recv_command(
 }
 
 /// Answer a command that arrived while the client is not connected.
-fn reject_command(command: ClientCommand) {
+///
+/// Spawn, Cancel and ListAgents need the socket and are rejected
+/// `NotConnected` (retryable). Await and Check only read local tracking, and
+/// that tracking is process-lifetime: `fail_all_live` runs before backoff, so
+/// every live delegation has already failed and what remains is terminal history.
+/// Answering from it lets a caller read a result that landed before the blip
+/// instead of getting a spurious `NotConnected`. An unknown or already-failed
+/// handle gets `UnknownDelegation`, exactly as while connected.
+fn answer_while_disconnected(command: ClientCommand, primary: &mut PrimaryState) {
     use crate::control_plane::primary::CommandError;
     match command {
         ClientCommand::Spawn { reply, .. } => {
@@ -1048,14 +1087,13 @@ fn reject_command(command: ClientCommand) {
         ClientCommand::ListAgents { reply } => {
             let _ = reply.send(Err(CommandError::NotConnected));
         }
-        ClientCommand::Await { reply, .. } => {
-            // Awaiting only reads local tracking, but a disconnected client
-            // holds none: there is nothing to wait on.
-            let _ = reply.send(Err(CommandError::NotConnected));
+        ClientCommand::Await { handle, reply } => {
+            // Only terminal entries survive teardown, so this answers
+            // immediately; it never parks an awaiter that no socket can serve.
+            primary.begin_await(&handle, reply);
         }
-        ClientCommand::Check { reply, .. } => {
-            // Same rationale as Await: no tracking survives a disconnect.
-            let _ = reply.send(Err(CommandError::NotConnected));
+        ClientCommand::Check { handle, reply } => {
+            primary.check(&handle, reply);
         }
     }
 }
@@ -1078,6 +1116,18 @@ fn validate_register_ack(result: serde_json::Value) -> anyhow::Result<RegisterAc
         PROTOCOL_VERSION
     );
     Ok(ack)
+}
+
+/// A diagnostic for a register ack whose concurrency budget is zero. The
+/// runtime refuses `max_delegated_sessions = 0` at config load and the CP
+/// clamps to at least 1, so a zero here means a misconfigured or draining hub.
+/// It is accepted (a drain is legitimate), but every `cp/delegate` will then be
+/// refused, so it must not be silent.
+fn register_ack_budget_warning(ack: &RegisterAck) -> Option<&'static str> {
+    (ack.effective_max_delegated_sessions == 0).then_some(
+        "control plane granted an effective_max_delegated_sessions of 0; \
+         this runtime will refuse every delegation until it re-registers",
+    )
 }
 
 fn jittered_backoff(base_secs: u64) -> Duration {
@@ -1259,6 +1309,66 @@ max_delegated_sessions = 3
             .unwrap_err()
             .to_string()
             .contains("requires"));
+    }
+
+    #[test]
+    fn a_zero_budget_register_ack_is_accepted_but_warned() {
+        let ack = |max: u32| -> RegisterAck {
+            validate_register_ack(serde_json::json!({
+                "protocol_version": PROTOCOL_VERSION,
+                "heartbeat_interval_secs": 15,
+                "lease_expiry_secs": 45,
+                "effective_max_delegated_sessions": max
+            }))
+            .expect("a zero budget is a legitimate drain, not a protocol error")
+        };
+        let warning = register_ack_budget_warning(&ack(0)).expect("zero budget must not be silent");
+        assert!(warning.contains("effective_max_delegated_sessions of 0"));
+        assert!(register_ack_budget_warning(&ack(1)).is_none());
+    }
+
+    #[test]
+    fn while_disconnected_await_and_check_read_local_tracking() {
+        use crate::control_plane::primary::{CommandError, DelegationHandle};
+        let mut primary = PrimaryState::new();
+        let handle = DelegationHandle::new("d-gone", 1);
+
+        // Await/Check consult `primary`: an untracked handle is
+        // UnknownDelegation, not the socket-level NotConnected.
+        let (atx, mut arx) = tokio::sync::oneshot::channel();
+        answer_while_disconnected(
+            ClientCommand::Await {
+                handle: handle.clone(),
+                reply: atx,
+            },
+            &mut primary,
+        );
+        assert_eq!(arx.try_recv().unwrap(), Err(CommandError::UnknownDelegation));
+        let (ctx, mut crx) = tokio::sync::oneshot::channel();
+        answer_while_disconnected(
+            ClientCommand::Check {
+                handle: handle.clone(),
+                reply: ctx,
+            },
+            &mut primary,
+        );
+        assert_eq!(crx.try_recv().unwrap(), Err(CommandError::UnknownDelegation));
+        assert_eq!(primary.awaiters_len(), 0, "nothing is parked while disconnected");
+
+        // Commands that need the socket stay NotConnected (retryable).
+        let (ltx, mut lrx) = tokio::sync::oneshot::channel();
+        answer_while_disconnected(ClientCommand::ListAgents { reply: ltx }, &mut primary);
+        assert!(matches!(lrx.try_recv().unwrap(), Err(CommandError::NotConnected)));
+        let (xtx, mut xrx) = tokio::sync::oneshot::channel();
+        answer_while_disconnected(
+            ClientCommand::Cancel {
+                handle,
+                reason: "r".into(),
+                reply: xtx,
+            },
+            &mut primary,
+        );
+        assert_eq!(xrx.try_recv().unwrap(), Err(CommandError::NotConnected));
     }
 
     #[test]
