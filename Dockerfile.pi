@@ -28,7 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 
 # Install pi-acp adapter and Pi coding agent CLI.
 # The Pi coding agent npm package was renamed from @mariozechner/pi-coding-agent to @earendil-works/pi-coding-agent.
-ARG PI_ACP_VERSION=0.0.31
+ARG PI_ACP_VERSION=0.0.34
 ARG PI_CODING_AGENT_VERSION=0.79.9
 RUN npm install -g pi-acp@${PI_ACP_VERSION} @earendil-works/pi-coding-agent@${PI_CODING_AGENT_VERSION} --retry 3
 
