@@ -35,7 +35,7 @@ FROM node:${NODE22_VERSION}-trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps ripgrep tini unzip && rm -rf /var/lib/apt/lists/*
 
 # Install MiMo-Code
-ARG MIMOCODE_VERSION=0.1.15
+ARG MIMOCODE_VERSION=0.1.16
 RUN npm install -g @mimo-ai/cli@${MIMOCODE_VERSION} --retry 3
 
 # Install gh CLI

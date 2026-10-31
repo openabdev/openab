@@ -156,7 +156,7 @@ CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
 # =============================================================================
 FROM base-node AS codex
 ARG CODEX_ACP_VERSION=2.0.0
-ARG CODEX_VERSION=0.159.0
+ARG CODEX_VERSION=0.166.0
 RUN npm install -g @agentclientprotocol/codex-acp@${CODEX_ACP_VERSION} @openai/codex@${CODEX_VERSION} --fetch-retries=3
 ENV HOME=/home/node
 WORKDIR /home/node
@@ -183,7 +183,7 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
       > /etc/apt/sources.list.d/github-cli.list && \
     apt-get update && apt-get install -y --no-install-recommends gh && \
     rm -rf /var/lib/apt/lists/*
-ARG KIMI_CODE_VERSION=2.1.1
+ARG KIMI_CODE_VERSION=2.4.1
 RUN npm install -g @moonshot-ai/kimi-code@${KIMI_CODE_VERSION} --retry 3
 ENV HOME=/home/node
 WORKDIR /home/node
@@ -201,7 +201,7 @@ CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
 # Target: copilot
 # =============================================================================
 FROM base-node AS copilot
-ARG COPILOT_VERSION=1.0.89
+ARG COPILOT_VERSION=1.0.105
 RUN npm install -g @github/copilot@${COPILOT_VERSION} --retry 3
 ENV HOME=/home/node
 WORKDIR /home/node
@@ -244,7 +244,7 @@ CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
 # Target: gemini
 # =============================================================================
 FROM base-node AS gemini
-ARG GEMINI_CLI_VERSION=0.61.0
+ARG GEMINI_CLI_VERSION=0.66.0
 RUN npm install -g @google/gemini-cli@${GEMINI_CLI_VERSION} --retry 3
 ENV HOME=/home/node
 WORKDIR /home/node
@@ -293,7 +293,7 @@ CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
 # Target: mimocode
 # =============================================================================
 FROM base-node AS mimocode
-ARG MIMOCODE_VERSION=0.1.15
+ARG MIMOCODE_VERSION=0.1.16
 RUN npm install -g @mimo-ai/cli@${MIMOCODE_VERSION} --retry 3
 ENV HOME=/home/node
 WORKDIR /home/node
@@ -311,7 +311,7 @@ CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
 # Target: opencode
 # =============================================================================
 FROM base-node AS opencode
-ARG OPENCODE_VERSION=1.18.33
+ARG OPENCODE_VERSION=1.19.5
 RUN npm install -g opencode-ai@${OPENCODE_VERSION} --retry 3
 ENV HOME=/home/node
 WORKDIR /home/node
@@ -394,7 +394,7 @@ CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
 # Target: pi
 # =============================================================================
 FROM base-node AS pi
-ARG PI_ACP_VERSION=0.0.31
+ARG PI_ACP_VERSION=0.0.34
 ARG PI_CODING_AGENT_VERSION=0.79.9
 RUN npm install -g pi-acp@${PI_ACP_VERSION} @earendil-works/pi-coding-agent@${PI_CODING_AGENT_VERSION} --retry 3
 ENV HOME=/home/node
