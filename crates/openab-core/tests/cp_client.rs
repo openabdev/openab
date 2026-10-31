@@ -219,6 +219,30 @@ async fn connect_initiator(url: &str) -> Ws {
     ws
 }
 
+/// Raw connection that registers as `agent_type` under `key` and `name`.
+/// Lets a test send frames a real runtime would never send.
+async fn connect_raw(url: &str, key: &str, name: &str, agent_type: &str) -> Ws {
+    let mut req = url.into_client_request().unwrap();
+    req.headers_mut()
+        .insert("authorization", format!("Bearer {key}").parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    let register = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "cp/register",
+        "params": {
+            "protocol_version": 1,
+            "namespace": "prod",
+            "name": name,
+            "type": agent_type,
+            "instance_id": format!("i-raw-{name}")
+        }
+    })
+    .to_string();
+    ws.send(Message::Text(register)).await.unwrap();
+    let ack = next_json(&mut ws).await;
+    assert_eq!(ack["result"]["protocol_version"], 1, "raw ack: {ack}");
+    ws
+}
+
 async fn next_json(ws: &mut Ws) -> serde_json::Value {
     loop {
         match tokio::time::timeout(Duration::from_secs(10), ws.next())
@@ -852,4 +876,140 @@ async fn oversized_inprocess_spawn_is_rejected_without_disconnect() {
     let _ = worker_shutdown.send(true);
     let _ = primary_task.await;
     let _ = worker_task.await;
+}
+
+/// Phase 0 criterion 3: two parallel spawns land on different workers.
+///
+/// Both workers advertise `max_delegated_sessions = 1` and carry the same
+/// label, so a spawn selected by label has two candidates. The first spawn
+/// fills its worker, so the second must pick the other one. If the first
+/// spawn's capacity were not counted before the second selection, both would
+/// land on the same worker.
+#[tokio::test]
+async fn phase0_parallel_spawns_land_on_different_workers() {
+    let raw = format!(
+        r#"
+[[agents]]
+key = "{PRIMARY_KEY}"
+namespace = "prod"
+name = "koudu"
+type = "primary"
+
+[[agents]]
+key = "{WORKER_KEY}"
+namespace = "prod"
+name = "worker-1"
+type = "worker"
+
+[[agents]]
+key = "k-worker-2"
+namespace = "prod"
+name = "worker-2"
+type = "worker"
+"#
+    );
+    let cfg: CpConfig = toml::from_str(&raw).expect("two-worker config parses");
+    cfg.validate().expect("two-worker config validates");
+    let (state, url) = spawn_cp(cfg).await;
+
+    let one_slot = |key: &str, name: &str| ControlPlaneConfig {
+        auth_key: key.to_string(),
+        name: name.into(),
+        max_delegated_sessions: 1,
+        ..worker_cfg(&url)
+    };
+    let runner_1 = ScriptedRunner::new(Script::Hang);
+    let runner_2 = ScriptedRunner::new(Script::Hang);
+    let (tx_1, rx_1) = tokio::sync::watch::channel(false);
+    let (tx_2, rx_2) = tokio::sync::watch::channel(false);
+    let worker_1 = Arc::new(ControlPlaneClient::new(
+        one_slot(WORKER_KEY, "worker-1"),
+        runner_1.clone(),
+        Duration::from_secs(600),
+    ));
+    let worker_2 = Arc::new(ControlPlaneClient::new(
+        one_slot("k-worker-2", "worker-2"),
+        runner_2.clone(),
+        Duration::from_secs(600),
+    ));
+    let task_1 = tokio::spawn(Arc::clone(&worker_1).run(rx_1));
+    let task_2 = tokio::spawn(Arc::clone(&worker_2).run(rx_2));
+    wait_for("both workers to register", || {
+        state.registry.list("prod").len() >= 2
+    })
+    .await;
+
+    // Two spawns, both written before either reply is read.
+    let mut initiator = connect_initiator(&url).await;
+    for (id, delegation_id) in [(2u64, "d-par-1"), (3u64, "d-par-2")] {
+        let frame = serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "cp/delegate",
+            "params": {
+                "delegation_id": delegation_id,
+                "target": {"labels": {"backend": "kiro"}},
+                "prompt": "sleep 30; hostname",
+                "deadline": (chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339()
+            }
+        })
+        .to_string();
+        initiator.send(Message::Text(frame)).await.unwrap();
+    }
+
+    let ack_1 = next_json(&mut initiator).await;
+    let ack_2 = next_json(&mut initiator).await;
+    assert_eq!(ack_1["id"], 2, "first ack: {ack_1}");
+    assert_eq!(ack_2["id"], 3, "second ack: {ack_2}");
+    let landed_1 = ack_1["result"]["assigned_to"].as_str().unwrap().to_string();
+    let landed_2 = ack_2["result"]["assigned_to"].as_str().unwrap().to_string();
+    assert_ne!(
+        landed_1, landed_2,
+        "two parallel spawns must not share a worker"
+    );
+    let mut landed = vec![landed_1, landed_2];
+    landed.sort();
+    assert_eq!(landed, vec!["prod/worker-1", "prod/worker-2"]);
+
+    // Each worker's runner saw exactly one of the two prompts.
+    wait_for("each worker to start its one delegation", || {
+        runner_1.started() == 1 && runner_2.started() == 1
+    })
+    .await;
+
+    let _ = tx_1.send(true);
+    let _ = tx_2.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), task_1).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), task_2).await;
+}
+
+/// Phase 0 criterion 5: a worker identity cannot initiate. The CP refuses a
+/// `cp/delegate` from a worker with `POLICY_DENIED` (-32003) and admits nothing.
+#[tokio::test]
+async fn phase0_worker_identity_cannot_initiate() {
+    let (state, url) = spawn_cp(cp_config("")).await;
+    // A registered worker, so the refusal is about who is asking and not about
+    // a missing target. The target is the worker itself.
+    let mut worker = connect_raw(&url, WORKER_KEY, "worker-1", "worker").await;
+    wait_for("the worker to register", || {
+        !worker_instances(&state).is_empty()
+    })
+    .await;
+
+    delegate(
+        &mut worker,
+        2,
+        "d-worker-initiates",
+        "should be refused",
+        60,
+    )
+    .await;
+    let reply = next_json(&mut worker).await;
+    assert_eq!(reply["id"], 2, "the refusal answers the request: {reply}");
+    assert!(reply.get("error").is_some(), "no admission: {reply}");
+    assert_eq!(reply["error"]["code"], -32003, "POLICY_DENIED: {reply}");
+
+    assert_eq!(
+        state.router.inflight_count(),
+        0,
+        "a refused initiation leaves no in-flight entry"
+    );
 }
