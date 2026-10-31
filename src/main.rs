@@ -314,10 +314,9 @@ use openab_core::control_plane::{LocalRequest, LocalResponse};
 /// The delegation-id generator for the `openab agent` CLI. The MCP facade is
 /// not wired to it at this commit. Using one generator for every initiating
 /// surface keeps the ids indistinguishable on the wire (no `d-cli-` vs `d-`
-/// fork) while
-/// still being process-unique: `pid` separates concurrent processes, the
-/// monotonic `seq` separates ids minted inside one process, and the nanosecond
-/// clock separates process restarts that reuse a pid.
+/// fork) while still being process-unique: `pid` separates concurrent
+/// processes, the monotonic `seq` separates ids minted inside one process, and
+/// the nanosecond clock separates process restarts that reuse a pid.
 fn new_delegation_id() -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2735,8 +2734,9 @@ agent_id = "1000002"
 
     #[test]
     fn a_control_plane_primary_alone_does_not_unlock_a_headless_boot() {
-        // A primary initiates delegations; its prompts come from a chat
-        // platform, so an adapter-less primary has no way to be given work.
+        // A primary's initiating surface is the local socket and the `openab
+        // agent` CLI. The headless boot serves that socket only with `[mcp]`
+        // (or a chat adapter), so a primary with neither is refused.
         let cfg = config::parse_config_str(&cp_section("primary"), "test").unwrap();
         assert_eq!(headless_run_mode(&cfg), HeadlessMode::None);
     }
