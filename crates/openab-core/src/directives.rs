@@ -295,7 +295,7 @@ mod tests {
         fs::write(&file_path, "").unwrap();
 
         let aliases = HashMap::new();
-        let result = resolve_workspace(&format!("{}", file_path.display()), &aliases, tmp.path());
+        let result = resolve_workspace(&file_path.display().to_string(), &aliases, tmp.path());
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not a directory"));
     }

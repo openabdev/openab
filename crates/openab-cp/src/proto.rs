@@ -37,6 +37,13 @@ use serde_json::Value;
 /// Wire protocol version. Carried in `cp/register`; the CP rejects
 /// registrations with a version it does not support.
 pub const PROTOCOL_VERSION: u32 = 1;
+/// Minimum frame ceiling supported by the bundled runtime client. The server
+/// may configure a larger value, but a smaller one would let an otherwise
+/// valid runtime result disconnect the whole worker connection. The server
+/// does not enforce this floor: `max_frame_bytes` is not checked against it,
+/// so a hub configured below 1 MiB must keep this in mind. The default config
+/// is above the floor.
+pub const MIN_RUNTIME_FRAME_BYTES: usize = 1024 * 1024;
 
 // --- JSON-RPC envelopes ---
 
