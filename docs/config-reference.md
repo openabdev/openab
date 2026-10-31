@@ -831,6 +831,11 @@ a primary's initiating surface is the owner-only local socket and `openab agent`
 
 ### Operational notes
 
+- **Delegated prompts run with the worker's normal tool permissions.** A
+  `cp/delegate` from any primary the CP lets reach this worker enters the
+  worker's ordinary agent turn. The worker does not narrow tools per delegation,
+  so a delegated prompt can use any tool the configured `[agent]` can use. Give a
+  worker's key only to primaries you trust with that access.
 - **Local agent API.** `$OPENAB_AGENT_SOCKET` overrides the default
   `$HOME/.openab/run/agent.sock`. The runtime creates an owner-only directory
   (`0700`) and socket (`0600`). The transport is a **Unix-domain socket and is
