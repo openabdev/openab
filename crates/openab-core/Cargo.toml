@@ -64,6 +64,13 @@ libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+# The control-plane client integration test drives the REAL CP server
+# in-process (ephemeral loopback port), so the test build — and only the test
+# build — needs the `server` feature.
+openab-cp = { path = "../openab-cp", features = ["server"] }
+# ... and `axum::serve` to actually bind it. Test-only: the runtime is a
+# WebSocket *client* of the CP and links no HTTP server.
+axum = "0.8"
 
 [features]
 default = ["discord", "slack", "secrets-aws", "agentcore", "config-s3"]
