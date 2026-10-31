@@ -158,6 +158,7 @@ mod unix_impl {
     use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use rand::RngCore;
     use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -267,11 +268,18 @@ mod unix_impl {
         // Owner-only on the socket node itself, not merely via the directory.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
             .map_err(|e| anyhow::anyhow!("securing local socket {path:?}: {e}"))?;
+        // Remember WHICH node we bound so shutdown never unlinks a successor
+        // that took the pathname after us (F6).
+        let ours = node_identity(&path);
         info!(socket = %path.display(), "control-plane local IPC server listening");
 
         // One registry for the whole server: tokens minted on any connection
         // resolve on any other.
         let registry: SharedRegistry = Arc::new(Mutex::new(HandleRegistry::default()));
+        // Every connection handler is tracked here so (a) their number is
+        // bounded by MAX_LOCAL_CONNECTIONS and (b) shutdown aborts them
+        // instead of leaving detached tasks blocked on replies (F3).
+        let mut handlers: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
         loop {
             tokio::select! {
@@ -279,12 +287,22 @@ mod unix_impl {
                     info!("control-plane local IPC server shutting down");
                     break;
                 }
+                // Reap finished handlers so the set's length is the live count.
+                Some(_) = handlers.join_next(), if !handlers.is_empty() => {}
                 accepted = listener.accept() => {
                     match accepted {
                         Ok((stream, _addr)) => {
+                            if handlers.len() >= MAX_LOCAL_CONNECTIONS {
+                                warn!(
+                                    limit = MAX_LOCAL_CONNECTIONS,
+                                    "local IPC connection limit reached; refusing a new connection"
+                                );
+                                handlers.spawn(refuse_conn(stream));
+                                continue;
+                            }
                             let cp = cp.clone();
                             let registry = Arc::clone(&registry);
-                            tokio::spawn(async move {
+                            handlers.spawn(async move {
                                 if let Err(e) = handle_conn(stream, cp, registry).await {
                                     debug!(error = %format!("{e:#}"), "local IPC connection ended with error");
                                 }
@@ -297,9 +315,37 @@ mod unix_impl {
                 }
             }
         }
-        // Best-effort cleanup so the next boot does not trip over the node.
-        let _ = std::fs::remove_file(&path);
+        // Handlers still parked on a CP reply have no route to an answer once
+        // the runtime is leaving; end them now rather than at process exit.
+        handlers.abort_all();
+        while handlers.join_next().await.is_some() {}
+        // Best-effort cleanup so the next boot does not trip over the node —
+        // but only if the path still names OUR node.
+        remove_if_same_node(&path, ours);
         Ok(())
+    }
+
+    /// Ceiling on concurrently served local connections. Each handler is one
+    /// task that may be parked on a CP reply for up to the request bound
+    /// below; without a cap a local caller (or a stuck script) could pin an
+    /// unbounded number of them.
+    const MAX_LOCAL_CONNECTIONS: usize = 64;
+
+    /// Answer a connection refused at the cap with one error line so a CLI
+    /// gets a diagnostic instead of a bare EOF, then close it.
+    async fn refuse_conn(stream: UnixStream) {
+        let (_read_half, mut write_half) = stream.into_split();
+        let response = LocalResponse::error(format!(
+            "too many concurrent local connections (limit {MAX_LOCAL_CONNECTIONS}); retry shortly"
+        ));
+        if let Ok(mut encoded) = serde_json::to_string(&response) {
+            encoded.push('\n');
+            let _ = tokio::time::timeout(LOCAL_IO_TIMEOUT, async {
+                write_half.write_all(encoded.as_bytes()).await?;
+                write_half.flush().await
+            })
+            .await;
+        }
     }
 
     /// Prepare the socket's parent directory.
@@ -406,6 +452,14 @@ mod unix_impl {
     /// node owned by someone else is refused rather than unlinked, so a hostile
     /// or accidental entry planted at the socket path can never trick the
     /// runtime into deleting an unrelated file.
+    ///
+    /// Ownership alone does not make a node stale: a second runtime under the
+    /// same uid (several bots on one host sharing `$HOME`) would otherwise
+    /// unlink its sibling's LIVE socket and bind over it (F6). So the node is
+    /// probed with a connect: a listener that answers is live and the bind is
+    /// refused with a pointer at `OPENAB_AGENT_SOCKET`; `ECONNREFUSED` is the
+    /// kernel telling us nobody is listening, which is the only state that is
+    /// unlinked.
     fn remove_stale_socket(path: &Path) -> anyhow::Result<()> {
         let meta = match std::fs::symlink_metadata(path) {
             Ok(m) => m,
@@ -432,8 +486,65 @@ mod unix_impl {
                 meta.uid()
             ));
         }
+        match std::os::unix::net::UnixStream::connect(path) {
+            Ok(_probe) => {
+                return Err(anyhow::anyhow!(
+                    "another runtime is already serving {path:?}; refusing to replace a live \
+                     socket — run one runtime per socket path, or point OPENAB_AGENT_SOCKET at \
+                     a distinct path for this instance"
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                // Nobody is listening: the classic leftover from an unclean exit.
+            }
+            Err(e) => {
+                // Anything else (permission, backlog full, ...) is not evidence
+                // of staleness, so do not unlink on it.
+                return Err(anyhow::anyhow!(
+                    "cannot tell whether socket {path:?} is live ({e}); refusing to remove it"
+                ));
+            }
+        }
         std::fs::remove_file(path)
             .map_err(|e| anyhow::anyhow!("removing stale socket {path:?}: {e}"))
+    }
+
+    /// Identity of the node this server bound: enough to tell OUR socket from a
+    /// successor that later took the same pathname.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct NodeIdentity {
+        dev: u64,
+        ino: u64,
+    }
+
+    fn node_identity(path: &Path) -> Option<NodeIdentity> {
+        let meta = std::fs::symlink_metadata(path).ok()?;
+        if !meta.file_type().is_socket() {
+            return None;
+        }
+        Some(NodeIdentity {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
+    }
+
+    /// Unlink `path` only if it is still the node THIS server created. An older
+    /// runtime shutting down after a successor bound the same pathname must
+    /// not remove the successor's socket (F6); with the liveness probe above
+    /// that succession is refused, but the check keeps cleanup correct even if
+    /// the path was replaced by other means.
+    fn remove_if_same_node(path: &Path, ours: Option<NodeIdentity>) {
+        let Some(ours) = ours else {
+            return;
+        };
+        if node_identity(path) == Some(ours) {
+            let _ = std::fs::remove_file(path);
+        } else {
+            debug!(
+                socket = %path.display(),
+                "socket path no longer names the node this server bound; leaving it in place"
+            );
+        }
     }
 
     /// Maximum length, in bytes, of a single newline-delimited protocol line
@@ -514,6 +625,11 @@ mod unix_impl {
     /// One client connection: read request lines, answer each with one
     /// response line. A malformed line is answered with an `Error` rather than
     /// dropping the connection, so a CLI gets a diagnostic.
+    ///
+    /// Every wait is bounded (F3): the read for the next request line by
+    /// [`LOCAL_IDLE_TIMEOUT`], the response write by [`LOCAL_IO_TIMEOUT`], and
+    /// each CP round trip inside [`dispatch`] by its own bound — so a handler
+    /// task always ends, whatever the peer or the CP does.
     async fn handle_conn(
         stream: UnixStream,
         cp: ControlPlaneHandle,
@@ -521,7 +637,21 @@ mod unix_impl {
     ) -> anyhow::Result<()> {
         let (read_half, mut write_half) = stream.into_split();
         let mut reader = BufReader::new(read_half);
-        while let Some(line) = read_line_bounded(&mut reader).await? {
+        loop {
+            let line = match tokio::time::timeout(
+                LOCAL_IDLE_TIMEOUT,
+                read_line_bounded(&mut reader),
+            )
+            .await
+            {
+                Ok(Ok(Some(line))) => line,
+                Ok(Ok(None)) => return Ok(()),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => anyhow::bail!(
+                    "local IPC connection idle for {}s; closing",
+                    LOCAL_IDLE_TIMEOUT.as_secs()
+                ),
+            };
             if line.trim().is_empty() {
                 continue;
             }
@@ -531,10 +661,54 @@ mod unix_impl {
             };
             let mut encoded = serde_json::to_string(&response)?;
             encoded.push('\n');
-            write_half.write_all(encoded.as_bytes()).await?;
-            write_half.flush().await?;
+            tokio::time::timeout(LOCAL_IO_TIMEOUT, async {
+                write_half.write_all(encoded.as_bytes()).await?;
+                write_half.flush().await
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("local IPC response write stalled; closing"))??;
         }
-        Ok(())
+    }
+
+    /// How long a connection may sit between requests before it is closed. A
+    /// CLI or MCP call opens, asks, reads, and closes; an idle connection is a
+    /// client that forgot, and it must not pin a handler slot indefinitely.
+    const LOCAL_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+    /// Bound on writing one response line to a local peer.
+    const LOCAL_IO_TIMEOUT: Duration = Duration::from_secs(10);
+    /// Bound on a CP round trip for spawn/check/cancel/list. Mirrors the
+    /// primary state's own [`PENDING_REQUEST_TTL`] plus slack for the reply to
+    /// travel the command channel, so the state-side timeout normally fires
+    /// first and this is the backstop.
+    const LOCAL_REPLY_TIMEOUT: Duration =
+        Duration::from_secs(crate::control_plane::primary::PENDING_REQUEST_TTL.as_secs() + 15);
+    /// Bound on an `Await`: the longest deadline a caller may request plus the
+    /// grace the primary state gives a late terminal, plus slack. The state
+    /// normally answers `Timeout` before this; the constant guarantees the
+    /// handler task is finite regardless.
+    const LOCAL_AWAIT_TIMEOUT: Duration = Duration::from_secs(MAX_DEADLINE_SECS + 120);
+
+    /// Wait for a parked reply, bounded. `None` means the bound elapsed: the
+    /// receiver is dropped here, which the primary state observes as
+    /// "caller gone" on its next prune and removes the parked entry without
+    /// sending anything.
+    async fn wait_reply<T>(
+        rx: tokio::sync::oneshot::Receiver<T>,
+        bound: Duration,
+    ) -> Option<Result<T, ()>> {
+        match tokio::time::timeout(bound, rx).await {
+            Ok(Ok(v)) => Some(Ok(v)),
+            Ok(Err(_recv)) => Some(Err(())),
+            Err(_elapsed) => None,
+        }
+    }
+
+    fn reply_timed_out() -> LocalResponse {
+        LocalResponse::error(CommandError::Timeout.to_string())
+    }
+
+    fn reply_dropped() -> LocalResponse {
+        LocalResponse::error("control-plane client dropped the reply")
     }
 
     /// Minimum accepted `deadline_secs`. Zero (or a negative-by-underflow
@@ -597,8 +771,8 @@ mod unix_impl {
                 {
                     return LocalResponse::error(CommandError::NotConnected.to_string());
                 }
-                match rx.await {
-                    Ok(Ok(ack)) => {
+                match wait_reply(rx, LOCAL_REPLY_TIMEOUT).await {
+                    Some(Ok(Ok(ack))) => {
                         // Mint an opaque token for the handle only now that the
                         // spawn succeeded, and report the CP-assigned peer.
                         let token = registry.lock().unwrap().insert(ack.handle);
@@ -607,8 +781,9 @@ mod unix_impl {
                             assigned_to: ack.assigned_to,
                         }
                     }
-                    Ok(Err(e)) => LocalResponse::error(e.to_string()),
-                    Err(_) => LocalResponse::error("control-plane client dropped the reply"),
+                    Some(Ok(Err(e))) => LocalResponse::error(e.to_string()),
+                    Some(Err(())) => reply_dropped(),
+                    None => reply_timed_out(),
                 }
             }
             LocalRequest::Await { handle } => {
@@ -623,14 +798,15 @@ mod unix_impl {
                 {
                     return LocalResponse::error(CommandError::NotConnected.to_string());
                 }
-                match rx.await {
-                    Ok(Ok(outcome)) => LocalResponse::Terminal {
+                match wait_reply(rx, LOCAL_AWAIT_TIMEOUT).await {
+                    Some(Ok(Ok(outcome))) => LocalResponse::Terminal {
                         status: outcome.status.into(),
                         result: outcome.result,
                         error: outcome.error,
                     },
-                    Ok(Err(e)) => LocalResponse::error(e.to_string()),
-                    Err(_) => LocalResponse::error("control-plane client dropped the reply"),
+                    Some(Ok(Err(e))) => LocalResponse::error(e.to_string()),
+                    Some(Err(())) => reply_dropped(),
+                    None => reply_timed_out(),
                 }
             }
             LocalRequest::Check { handle } => {
@@ -645,18 +821,21 @@ mod unix_impl {
                 {
                     return LocalResponse::error(CommandError::NotConnected.to_string());
                 }
-                match rx.await {
-                    Ok(Ok(DelegationSnapshot::Pending)) => LocalResponse::Pending,
-                    Ok(Ok(DelegationSnapshot::Running { assigned_to })) => {
+                match wait_reply(rx, LOCAL_REPLY_TIMEOUT).await {
+                    Some(Ok(Ok(DelegationSnapshot::Pending))) => LocalResponse::Pending,
+                    Some(Ok(Ok(DelegationSnapshot::Running { assigned_to }))) => {
                         LocalResponse::Running { assigned_to }
                     }
-                    Ok(Ok(DelegationSnapshot::Terminal(outcome))) => LocalResponse::Terminal {
-                        status: outcome.status.into(),
-                        result: outcome.result,
-                        error: outcome.error,
-                    },
-                    Ok(Err(e)) => LocalResponse::error(e.to_string()),
-                    Err(_) => LocalResponse::error("control-plane client dropped the reply"),
+                    Some(Ok(Ok(DelegationSnapshot::Terminal(outcome)))) => {
+                        LocalResponse::Terminal {
+                            status: outcome.status.into(),
+                            result: outcome.result,
+                            error: outcome.error,
+                        }
+                    }
+                    Some(Ok(Err(e))) => LocalResponse::error(e.to_string()),
+                    Some(Err(())) => reply_dropped(),
+                    None => reply_timed_out(),
                 }
             }
             LocalRequest::Cancel { handle, reason } => {
@@ -675,10 +854,11 @@ mod unix_impl {
                 {
                     return LocalResponse::error(CommandError::NotConnected.to_string());
                 }
-                match rx.await {
-                    Ok(Ok(())) => LocalResponse::Cancelled,
-                    Ok(Err(e)) => LocalResponse::error(e.to_string()),
-                    Err(_) => LocalResponse::error("control-plane client dropped the reply"),
+                match wait_reply(rx, LOCAL_REPLY_TIMEOUT).await {
+                    Some(Ok(Ok(()))) => LocalResponse::Cancelled,
+                    Some(Ok(Err(e))) => LocalResponse::error(e.to_string()),
+                    Some(Err(())) => reply_dropped(),
+                    None => reply_timed_out(),
                 }
             }
             LocalRequest::ListAgents => {
@@ -690,8 +870,8 @@ mod unix_impl {
                 {
                     return LocalResponse::error(CommandError::NotConnected.to_string());
                 }
-                match rx.await {
-                    Ok(Ok(agents)) => LocalResponse::Agents {
+                match wait_reply(rx, LOCAL_REPLY_TIMEOUT).await {
+                    Some(Ok(Ok(agents))) => LocalResponse::Agents {
                         agents: agents
                             .into_iter()
                             .map(|a| LocalAgent {
@@ -704,8 +884,9 @@ mod unix_impl {
                             })
                             .collect(),
                     },
-                    Ok(Err(e)) => LocalResponse::error(e.to_string()),
-                    Err(_) => LocalResponse::error("control-plane client dropped the reply"),
+                    Some(Ok(Err(e))) => LocalResponse::error(e.to_string()),
+                    Some(Err(())) => reply_dropped(),
+                    None => reply_timed_out(),
                 }
             }
         }
@@ -1286,6 +1467,140 @@ mod unix_impl {
             let root = tempfile::tempdir().unwrap();
             let sock = root.path().join("agent.sock");
             remove_stale_socket(&sock).expect("absent path is a clean no-op");
+        }
+
+        // -- F6: liveness and succession --
+
+        /// Two runtimes under one uid, same default path: the second must NOT
+        /// unlink the first's live socket. Ownership is not staleness; a
+        /// connect probe that succeeds is.
+        #[tokio::test]
+        async fn a_live_same_uid_socket_is_refused_not_unlinked() {
+            let root = tempfile::tempdir().unwrap();
+            let sock = root.path().join("agent.sock");
+            let _live = UnixListener::bind(&sock).unwrap();
+            let err = remove_stale_socket(&sock).expect_err("a live listener must be refused");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("already serving"), "got {msg}");
+            assert!(
+                msg.contains("OPENAB_AGENT_SOCKET"),
+                "the error should point at the override: {msg}"
+            );
+            assert!(
+                std::fs::symlink_metadata(&sock).is_ok(),
+                "the live socket node must still be there"
+            );
+        }
+
+        /// The full boot path refuses to start over a live sibling.
+        #[tokio::test]
+        async fn serve_local_refuses_to_replace_a_live_listener() {
+            let root = tempfile::tempdir().unwrap();
+            let sock = root.path().join("nested").join("agent.sock");
+            // The first runtime's boot: creates the 0700 dir and binds.
+            prepare_socket_dir(&sock).unwrap();
+            let _live = UnixListener::bind(&sock).unwrap();
+            let (cp, task) = stub_cp();
+            let (_tx, rx) = watch::channel(false);
+            let err = serve_local(sock.clone(), cp, rx)
+                .await
+                .expect_err("second runtime must not bind over the first");
+            assert!(format!("{err:#}").contains("already serving"));
+            assert!(std::fs::symlink_metadata(&sock).is_ok());
+            task.abort();
+        }
+
+        /// An older runtime's shutdown cleanup must not remove a successor's
+        /// node that took the same pathname. The identity recorded at bind
+        /// time is what cleanup compares against.
+        #[tokio::test]
+        async fn cleanup_leaves_a_successors_node_alone() {
+            let root = tempfile::tempdir().unwrap();
+            let sock = root.path().join("agent.sock");
+
+            // Predecessor binds and remembers its node.
+            let predecessor = UnixListener::bind(&sock).unwrap();
+            let ours = node_identity(&sock);
+            assert!(ours.is_some());
+            drop(predecessor);
+            std::fs::remove_file(&sock).unwrap();
+
+            // Successor takes the pathname (a different inode).
+            let _successor = UnixListener::bind(&sock).unwrap();
+            let theirs = node_identity(&sock);
+            assert_ne!(ours, theirs, "a fresh bind is a fresh node");
+
+            // Predecessor's cleanup runs late: must be a no-op.
+            remove_if_same_node(&sock, ours);
+            assert!(
+                std::fs::symlink_metadata(&sock).is_ok(),
+                "the successor's socket must survive the predecessor's cleanup"
+            );
+
+            // The successor's own cleanup does remove it.
+            remove_if_same_node(&sock, theirs);
+            assert!(std::fs::symlink_metadata(&sock).is_err());
+        }
+
+        // -- F3: bounded handlers --
+
+        /// Connections past the cap are answered with one error line and
+        /// closed, rather than each pinning a handler task; the cap is the
+        /// number of LIVE handlers, so a slot frees when a connection ends.
+        #[tokio::test]
+        async fn connections_past_the_cap_are_refused_with_a_diagnostic() {
+            let root = tempfile::tempdir().unwrap();
+            let sock = root.path().join("nested").join("agent.sock");
+            let (cp, task) = stub_cp();
+            let (tx, rx) = watch::channel(false);
+            let server_path = sock.clone();
+            let server = tokio::spawn(async move { serve_local(server_path, cp, rx).await });
+            for _ in 0..100 {
+                if sock.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            // Fill every slot with an idle connection (never sends a line).
+            let mut held = Vec::new();
+            for _ in 0..MAX_LOCAL_CONNECTIONS {
+                held.push(UnixStream::connect(&sock).await.unwrap());
+            }
+            // Let the accept loop register them all.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            // The next one is refused with a diagnostic line.
+            let refused = UnixStream::connect(&sock).await.unwrap();
+            let mut reader = BufReader::new(refused);
+            let mut line = String::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                reader.read_line(&mut line),
+            )
+            .await
+            .expect("a refused connection must be answered promptly")
+            .unwrap();
+            let resp: LocalResponse = serde_json::from_str(line.trim()).unwrap();
+            let LocalResponse::Error { message } = resp else {
+                panic!("expected an error line, got {line}");
+            };
+            assert!(message.contains("too many concurrent"), "got {message}");
+
+            // Free one slot; the next connection is served normally.
+            held.pop();
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let client = LocalClient::new(sock.clone());
+            let resp = client.request(&LocalRequest::ListAgents).await.unwrap();
+            assert!(matches!(resp, LocalResponse::Agents { .. }), "got {resp:?}");
+
+            let _ = tx.send(true);
+            let _ = server.await;
+            task.abort();
+            assert!(
+                std::fs::symlink_metadata(&sock).is_err(),
+                "our own node is removed on shutdown"
+            );
         }
 
         /// A line longer than the cap, with no newline, is rejected — and the

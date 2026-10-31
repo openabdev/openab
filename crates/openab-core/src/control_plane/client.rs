@@ -70,6 +70,15 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// acks must land in backoff, not hang the client until shutdown.
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bound on ONE WebSocket write. The serve loop is the single sink owner and
+/// awaits every write inline, so an unbounded `sink.send` under socket
+/// backpressure would freeze heartbeats, inbound handling, completions,
+/// command traffic and graceful shutdown together (F4). The CP server bounds
+/// its writer with `write_timeout_secs` (default 30s); the runtime mirrors
+/// that so a stalled peer is classified as disconnected and recovered by the
+/// reconnect path instead of wedging the process.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
 type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// Write half. Split from the read half because the serve loop must be able to
 /// write from a handler while the read future is still alive — one `select!`
@@ -343,7 +352,9 @@ impl ControlPlaneClient {
         };
         let frame =
             JsonRpcRequest::new(id, methods::REGISTER, Some(serde_json::to_value(&params)?));
-        send(sink, &frame).await?;
+        // Bounded but not shutdown-raced: the caller's connect/register select
+        // already races the whole registration against shutdown.
+        write_bounded(sink, Message::Text(frame_text(&frame)?)).await?;
 
         // Anything other than the ack to this id is a protocol violation at
         // this point: registration is the first frame in both directions.
@@ -424,6 +435,10 @@ impl ControlPlaneClient {
             tokio::select! {
                 _ = shutdown.changed() => break Outcome::Shutdown,
                 _ = heartbeat.tick() => {
+                    // Age out parked requests/awaiters a withholding CP would
+                    // otherwise let accumulate (F3). Piggybacks on the tick so
+                    // the bound holds with no local caller involved.
+                    primary.prune(std::time::Instant::now(), chrono::Utc::now());
                     let params = HeartbeatParams {
                         instance_id: self.instance_id.clone(),
                         active_delegated_sessions: self.executor.active(),
@@ -433,8 +448,8 @@ impl ControlPlaneClient {
                         methods::HEARTBEAT,
                         Some(serde_json::to_value(&params)?),
                     );
-                    if send(&mut sink, &frame).await.is_err() {
-                        break Outcome::Disconnected;
+                    if let Err(end) = send(&mut sink, &frame, shutdown).await {
+                        break end.into();
                     }
                 }
                 // A primary-side command: the local initiating surface (UDS
@@ -444,8 +459,8 @@ impl ControlPlaneClient {
                 maybe_command = recv_command(command_rx) => {
                     match maybe_command {
                         Some(command) => {
-                            if self.handle_command(command, primary, &mut sink).await.is_err() {
-                                break Outcome::Disconnected;
+                            if let Err(end) = self.handle_command(command, primary, &mut sink, shutdown).await {
+                                break end.into();
                             }
                         }
                         // The command channel closed (no handles left). Stop
@@ -459,8 +474,8 @@ impl ControlPlaneClient {
                 // frame that closes the initiator's wait.
                 Some(result) = result_rx.recv() => {
                     let frame = delegate_result_request(self.next_id(), result)?;
-                    if send(&mut sink, &frame).await.is_err() {
-                        break Outcome::Disconnected;
+                    if let Err(end) = send(&mut sink, &frame, shutdown).await {
+                        break end.into();
                     }
                 }
                 inbound = stream.next() => {
@@ -469,33 +484,53 @@ impl ControlPlaneClient {
                         Ok(Message::Text(text)) => {
                             match self.classify_inbound(&text, primary) {
                                 FrameAction::Serve { ack, forward } => {
-                                    let executor = Arc::clone(&self.executor);
-                                    let tx = result_tx.clone();
-                                    serving.push(tokio::spawn(async move {
-                                        let result = executor.serve(forward).await;
-                                        // A closed channel means the connection
-                                        // that would carry this result is gone;
-                                        // the CP fails it as target_disconnected.
-                                        let _ = tx.send(result).await;
-                                    }));
+                                    // Admit HERE, on the loop's own task, before
+                                    // anything yields (F1). A `cp/cancel` that is
+                                    // the very next frame then finds the
+                                    // reservation instead of racing a spawned
+                                    // task that has not been polled yet.
+                                    let admitted = self.executor.admit_delegation(forward);
                                     // Prune finished tasks so a long-lived
                                     // connection does not accumulate handles.
                                     serving.retain(|h| !h.is_finished());
-                                    if sink.send(Message::Text(ack)).await.is_err() {
-                                        break Outcome::Disconnected;
+                                    let refused = match admitted {
+                                        Ok(admitted) => {
+                                            let tx = result_tx.clone();
+                                            serving.push(tokio::spawn(async move {
+                                                let result = admitted.run().await;
+                                                // A closed channel means the connection
+                                                // that would carry this result is gone;
+                                                // the CP fails it as target_disconnected.
+                                                let _ = tx.send(result).await;
+                                            }));
+                                            None
+                                        }
+                                        Err(refused) => Some(refused),
+                                    };
+                                    if let Err(end) = write_or_shutdown(&mut sink, Message::Text(ack), shutdown).await {
+                                        break end.into();
+                                    }
+                                    // A refusal is answered inline, after the ack,
+                                    // so the initiator is not left waiting on its
+                                    // deadline for a runtime that never started.
+                                    if let Some(refused) = refused {
+                                        let frame = delegate_result_request(self.next_id(), refused)?;
+                                        if let Err(end) = send(&mut sink, &frame, shutdown).await {
+                                            break end.into();
+                                        }
                                     }
                                 }
                                 FrameAction::Reply(reply) => {
-                                    if sink.send(Message::Text(reply)).await.is_err() {
-                                        break Outcome::Disconnected;
+                                    if let Err(end) = write_or_shutdown(&mut sink, Message::Text(reply), shutdown).await {
+                                        break end.into();
                                     }
                                 }
                                 FrameAction::Ignore => {}
                             }
                         }
                         Ok(Message::Ping(p)) => {
-                            if sink.send(Message::Pong(p)).await.is_err() {
-                                break Outcome::Disconnected;
+                            if let Err(end) = write_or_shutdown(&mut sink, Message::Pong(p), shutdown).await {
+                                break end.into();
                             }
                         }
                         Ok(Message::Close(_)) => {
@@ -546,21 +581,25 @@ impl ControlPlaneClient {
                 handle.abort();
             }
         }
-        let _ = sink.send(Message::Close(None)).await;
-        let _ = sink.close().await;
+        // Best-effort close handshake, bounded: a peer that stopped reading
+        // must not hold up reconnect or process shutdown.
+        let _ = write_bounded(&mut sink, Message::Close(None)).await;
+        let _ = tokio::time::timeout(WRITE_TIMEOUT, sink.close()).await;
         Ok(outcome)
     }
 
     /// Turn one primary-side command into an outbound frame, parking its reply
     /// in `primary` for later correlation. `Await` needs no frame — it only
     /// registers interest in a terminal that arrives over the socket. Returns
-    /// `Err` only when the socket write fails, which ends the session.
+    /// `Err` only when the socket write fails, stalls, or shutdown interrupts
+    /// it, each of which ends the session.
     async fn handle_command(
         &self,
         command: ClientCommand,
         primary: &mut PrimaryState,
         sink: &mut WsSink,
-    ) -> anyhow::Result<()> {
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> Result<(), WriteEnd> {
         // A primary must be registered as such to initiate; a worker-only
         // runtime rejects spawn/cancel/list locally so a misconfigured caller
         // gets a clear answer instead of a CP policy denial round-trip. Await
@@ -571,19 +610,27 @@ impl ControlPlaneClient {
                     let _ = reply.send(Err(primary_only_error()));
                     return Ok(());
                 }
-                let emission = primary.begin_spawn(self.next_id(), request, reply);
+                // `None`: the pending cap is reached and the caller was already
+                // answered `Overloaded`; nothing to send.
+                let Some(emission) = primary.begin_spawn(self.next_id(), request, reply) else {
+                    return Ok(());
+                };
                 let frame = JsonRpcRequest::new(
                     emission.rpc_id,
                     methods::DELEGATE,
-                    Some(serde_json::to_value(&emission.params)?),
+                    Some(encode(&emission.params)?),
                 );
                 // A Spawn whose complete serialized frame exceeds the transport
                 // ceiling must NOT tear down the connection: an oversized prompt
                 // is a caller-side fault, not a socket fault. Detect it before
                 // writing, remove/fail the parked pending request with
                 // InvalidRequest, and return Ok so the serve loop keeps running.
-                if !frame_within_limit(&frame)? {
-                    let bytes = serialized_len(&frame)?;
+                let fits = frame_within_limit(&frame).map_err(|e| {
+                    error!(error = %e, "failed to measure a cp/delegate frame");
+                    WriteEnd::Disconnected
+                })?;
+                if !fits {
+                    let bytes = serialized_len(&frame).unwrap_or(usize::MAX);
                     warn!(
                         rpc_id = emission.rpc_id,
                         frame_bytes = bytes,
@@ -599,7 +646,7 @@ impl ControlPlaneClient {
                     );
                     return Ok(());
                 }
-                send(sink, &frame).await?;
+                send(sink, &frame, shutdown).await?;
             }
             ClientCommand::Cancel {
                 handle,
@@ -612,22 +659,21 @@ impl ControlPlaneClient {
                 }
                 let rpc_id = self.next_id();
                 if let Some(params) = primary.begin_cancel(rpc_id, &handle, reason, reply) {
-                    let frame = JsonRpcRequest::new(
-                        rpc_id,
-                        methods::CANCEL,
-                        Some(serde_json::to_value(&params)?),
-                    );
-                    send(sink, &frame).await?;
+                    let frame =
+                        JsonRpcRequest::new(rpc_id, methods::CANCEL, Some(encode(&params)?));
+                    send(sink, &frame, shutdown).await?;
                 }
                 // begin_cancel already answered the caller if the handle was
                 // unknown; no frame in that case.
             }
             ClientCommand::ListAgents { reply } => {
                 let rpc_id = self.next_id();
-                primary.begin_list_agents(rpc_id, reply);
+                if !primary.begin_list_agents(rpc_id, reply) {
+                    return Ok(());
+                }
                 let frame =
                     JsonRpcRequest::new(rpc_id, methods::LIST_AGENTS, Some(serde_json::json!({})));
-                send(sink, &frame).await?;
+                send(sink, &frame, shutdown).await?;
             }
             ClientCommand::Await { handle, reply } => {
                 primary.begin_await(&handle, reply);
@@ -860,7 +906,10 @@ fn delegate_result_request(
     Ok(frame)
 }
 
-async fn send(sink: &mut WsSink, frame: &JsonRpcRequest) -> anyhow::Result<()> {
+/// Serialize an outbound frame and enforce the transport ceiling. The size
+/// check is the same measurement [`serialized_len`] and the oversized-Spawn
+/// guard use, so the check and the wire agree by construction.
+fn frame_text(frame: &JsonRpcRequest) -> anyhow::Result<String> {
     let text = serde_json::to_string(frame)?;
     if text.len() > MAX_FRAME_BYTES {
         anyhow::bail!(
@@ -869,8 +918,93 @@ async fn send(sink: &mut WsSink, frame: &JsonRpcRequest) -> anyhow::Result<()> {
             MAX_FRAME_BYTES
         );
     }
-    sink.send(Message::Text(text)).await?;
-    Ok(())
+    Ok(text)
+}
+
+/// One bounded WebSocket write. Generic over the sink so the stall path can be
+/// exercised with a sink that never becomes ready.
+async fn write_bounded<S>(sink: &mut S, msg: Message) -> anyhow::Result<()>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    match tokio::time::timeout(WRITE_TIMEOUT, sink.send(msg)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(anyhow::anyhow!("control-plane socket write failed: {e}")),
+        Err(_) => Err(anyhow::anyhow!(
+            "control-plane socket write stalled for {}s; treating the connection as lost",
+            WRITE_TIMEOUT.as_secs()
+        )),
+    }
+}
+
+/// Why a serve-loop write did not complete. Both end the session; they differ
+/// in what the loop reports (and therefore whether it reconnects).
+#[derive(Debug, PartialEq, Eq)]
+enum WriteEnd {
+    /// Shutdown was requested while the write was pending.
+    Shutdown,
+    /// The write failed or exceeded [`WRITE_TIMEOUT`].
+    Disconnected,
+}
+
+impl From<WriteEnd> for Outcome {
+    fn from(end: WriteEnd) -> Self {
+        match end {
+            WriteEnd::Shutdown => Outcome::Shutdown,
+            WriteEnd::Disconnected => Outcome::Disconnected,
+        }
+    }
+}
+
+/// Bounded write raced against shutdown: the serve loop's single-owner sink
+/// must never make graceful shutdown wait on a stalled peer.
+async fn write_or_shutdown<S>(
+    sink: &mut S,
+    msg: Message,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<(), WriteEnd>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    tokio::select! {
+        biased;
+        _ = shutdown.changed() => Err(WriteEnd::Shutdown),
+        res = write_bounded(sink, msg) => res.map_err(|e| {
+            warn!(error = %e, "control-plane write ended the session");
+            WriteEnd::Disconnected
+        }),
+    }
+}
+
+/// Serve-loop frame write: size-checked, bounded, shutdown-racing. An
+/// oversized frame is a programming error at this layer (payloads are capped
+/// upstream), so it ends the session like a socket fault would.
+async fn send<S>(
+    sink: &mut S,
+    frame: &JsonRpcRequest,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<(), WriteEnd>
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    let text = frame_text(frame).map_err(|e| {
+        error!(error = %e, "refusing to write an oversized control-plane frame");
+        WriteEnd::Disconnected
+    })?;
+    write_or_shutdown(sink, Message::Text(text), shutdown).await
+}
+
+/// Encode command params for the wire. Serializing our own wire structs cannot
+/// realistically fail; if it does, the session ends rather than the frame
+/// silently not being sent.
+fn encode<T: serde::Serialize>(params: &T) -> Result<serde_json::Value, WriteEnd> {
+    serde_json::to_value(params).map_err(|e| {
+        error!(error = %e, "failed to encode a control-plane frame");
+        WriteEnd::Disconnected
+    })
 }
 
 /// Serialized byte length of an outbound frame. Pure and testable — the same
@@ -980,6 +1114,7 @@ fn error_reply(id: u64, error: ErrorObject) -> FrameAction {
 }
 
 /// Why a connection's serve loop ended.
+#[derive(Debug, PartialEq, Eq)]
 enum Outcome {
     /// The process is shutting down; do not reconnect.
     Shutdown,
@@ -1012,6 +1147,7 @@ mod tests {
     use crate::config::CpAgentType;
     use crate::control_plane::executor::PromptOutcome;
     use async_trait::async_trait;
+    use openab_cp::proto::DelegationStatus;
 
     struct NoopRunner;
 
@@ -1361,7 +1497,9 @@ max_delegated_sessions = 3
             deadline: chrono::Utc::now() + chrono::Duration::seconds(60),
             parent: None,
         };
-        let emission = primary.begin_spawn(1, request, tx);
+        let emission = primary
+            .begin_spawn(1, request, tx)
+            .expect("under the pending cap");
         let frame = JsonRpcRequest::new(
             emission.rpc_id,
             methods::DELEGATE,
@@ -1374,5 +1512,168 @@ max_delegated_sessions = 3
         assert_eq!(primary.tracked_len(), 0);
         let outcome = rx.await.unwrap();
         assert!(matches!(outcome, Err(CommandError::InvalidRequest(_))));
+    }
+
+    // ---- F1: cancel-before-admission -------------------------------------
+
+    /// A runner that records whether it was ever started. If the F1 race were
+    /// still open — admission on the spawned task's first poll — a cancel
+    /// classified before that poll would be acked as unknown and the runner
+    /// would then start anyway.
+    struct RecordingRunner {
+        started: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl PromptRunner for RecordingRunner {
+        async fn run(
+            &self,
+            _session_key: &str,
+            _forward: &DelegateForward,
+        ) -> anyhow::Result<PromptOutcome> {
+            self.started
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(PromptOutcome::default())
+        }
+        async fn cancel(&self, _session_key: &str) {}
+        async fn discard(&self, _session_key: &str) {}
+    }
+
+    #[tokio::test]
+    async fn a_cancel_handled_before_the_serving_task_is_polled_never_starts_the_runner() {
+        // Reproduce the serve loop's ordering exactly: classify `cp/delegate`
+        // (which now admits synchronously), classify `cp/cancel` as the very
+        // next frame, and only THEN let the serving future run. `handle_frame`
+        // is the loop's classifier; `admit_delegation` + `Admitted::run` is
+        // what the `Serve` arm does around the spawn.
+        let runner = Arc::new(RecordingRunner {
+            started: std::sync::atomic::AtomicBool::new(false),
+        });
+        let c = ControlPlaneClient::new(cfg(), Arc::clone(&runner) as _, Duration::from_secs(60));
+        let delegate = serde_json::json!({"jsonrpc":"2.0","id":9,"method":"cp/delegate","params":{
+            "delegation_id":"d-race","admission":7,"prompt":"hi",
+            "deadline":(chrono::Utc::now()+chrono::Duration::seconds(60)).to_rfc3339(),
+            "from":"prod/koudu","chain":["prod/koudu"]}})
+        .to_string();
+        let FrameAction::Serve { forward, .. } = c.handle_frame(&delegate) else {
+            panic!("expected a served delegation");
+        };
+        // The loop admits before it yields.
+        let admitted = c
+            .executor
+            .admit_delegation(forward)
+            .expect("capacity 3, nothing in flight");
+        assert_eq!(c.executor.active(), 1, "the slot is reserved immediately");
+
+        // Next frame: the cancel. It must find the reservation.
+        let cancel = serde_json::json!({
+            "jsonrpc": "2.0", "id": 10, "method": "cp/cancel",
+            "params": {"delegation_id": "d-race", "admission": 7, "reason": "initiator gave up"}
+        })
+        .to_string();
+        let FrameAction::Reply(reply) = c.handle_frame(&cancel) else {
+            panic!("expected a cancel ack");
+        };
+        assert!(reply.contains("\"ok\":true"));
+
+        // Only now does the serving future get its first poll.
+        let result = admitted.run().await;
+        assert_eq!(result.status, DelegationStatus::Cancelled);
+        assert!(
+            !runner.started.load(std::sync::atomic::Ordering::SeqCst),
+            "a cancelled delegation must never reach the prompt runner"
+        );
+        assert_eq!(c.executor.active(), 0, "the slot is released after the run");
+    }
+
+    #[tokio::test]
+    async fn an_admitted_delegation_dropped_without_running_releases_its_slot() {
+        let c = client();
+        let forward = DelegateForward {
+            delegation_id: "d-drop".into(),
+            admission: 1,
+            prompt: "hi".into(),
+            deadline: chrono::Utc::now() + chrono::Duration::seconds(60),
+            from: "prod/koudu".into(),
+            chain: vec!["prod/koudu".into()],
+        };
+        let admitted = c.executor.admit_delegation(forward).unwrap();
+        assert_eq!(c.executor.active(), 1);
+        drop(admitted);
+        assert_eq!(
+            c.executor.active(),
+            0,
+            "an ack write failure after admission must not leak the slot"
+        );
+    }
+
+    // ---- F4: bounded writes ---------------------------------------------
+
+    /// A sink that is never ready: the shape of a peer that stopped reading
+    /// while the kernel buffers are full.
+    struct StalledSink;
+
+    impl futures_util::Sink<Message> for StalledSink {
+        type Error = std::io::Error;
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+        fn start_send(self: std::pin::Pin<&mut Self>, _item: Message) -> Result<(), Self::Error> {
+            unreachable!("never ready")
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_write_is_classified_as_disconnected_after_the_write_timeout() {
+        let (_tx, mut shutdown) = watch::channel(false);
+        let frame = JsonRpcRequest::new(1, methods::HEARTBEAT, Some(serde_json::json!({})));
+        let mut sink = StalledSink;
+        let writing = tokio::spawn(async move { send(&mut sink, &frame, &mut shutdown).await });
+        tokio::task::yield_now().await;
+        // Just short of the bound: still pending.
+        tokio::time::advance(WRITE_TIMEOUT - Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !writing.is_finished(),
+            "the write is still within its bound"
+        );
+        tokio::time::advance(Duration::from_millis(2)).await;
+        let end = writing.await.unwrap();
+        assert_eq!(end, Err(WriteEnd::Disconnected));
+        assert_eq!(Outcome::from(WriteEnd::Disconnected), Outcome::Disconnected);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_wins_over_a_stalled_write() {
+        let (tx, mut shutdown) = watch::channel(false);
+        let mut sink = StalledSink;
+        let writing = tokio::spawn(async move {
+            write_or_shutdown(&mut sink, Message::Pong(vec![]), &mut shutdown).await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(!writing.is_finished());
+        tx.send(true).unwrap();
+        let end = tokio::time::timeout(Duration::from_secs(1), writing)
+            .await
+            .expect("shutdown must not wait on the stalled peer")
+            .unwrap();
+        assert_eq!(end, Err(WriteEnd::Shutdown));
+        assert_eq!(Outcome::from(WriteEnd::Shutdown), Outcome::Shutdown);
     }
 }
