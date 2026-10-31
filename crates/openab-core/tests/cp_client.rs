@@ -1104,6 +1104,331 @@ async fn a_worker_runtime_refuses_spawn_locally() {
         "the local refusal sends nothing to the CP"
     );
 
+    // list_agents is NOT refused locally: it is forwarded for either role, and
+    // the CP serves it to a worker. Pin that so a policy change on either side
+    // shows up here.
+    let (list_tx, list_rx) = tokio::sync::oneshot::channel();
+    worker
+        .handle()
+        .submit(ClientCommand::ListAgents { reply: list_tx })
+        .await
+        .unwrap();
+    let agents = tokio::time::timeout(Duration::from_secs(5), list_rx)
+        .await
+        .expect("the roster is answered")
+        .unwrap()
+        .expect("the CP serves cp/list_agents to a worker");
+    assert!(
+        agents.iter().any(|a| a.name == "worker-1"),
+        "the roster includes the calling worker"
+    );
+
     let _ = worker_shutdown.send(true);
     let _ = worker_task.await;
+}
+
+// ---------------------------------------------------------------------------
+// Failure paths
+// ---------------------------------------------------------------------------
+
+/// A scripted stand-in for the CP, for failure modes the real server never
+/// produces on demand. Counts accepted TCP connections; `script` drives each
+/// upgraded socket.
+async fn spawn_fake_cp<F, Fut>(script: F) -> (String, Arc<AtomicUsize>)
+where
+    F: Fn(WebSocketStream<TcpStream>) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/cp", listener.local_addr().unwrap());
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&attempts);
+    let script = Arc::new(script);
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::Relaxed);
+            let script = Arc::clone(&script);
+            tokio::spawn(async move {
+                if let Ok(ws) = tokio_tungstenite::accept_async(tcp).await {
+                    (*script)(ws).await;
+                }
+            });
+        }
+    });
+    (url, attempts)
+}
+
+/// Read the client's `cp/register` frame and return its JSON-RPC id.
+async fn read_register(ws: &mut WebSocketStream<TcpStream>) -> Option<serde_json::Value> {
+    while let Some(Ok(msg)) = ws.next().await {
+        if let Message::Text(text) = msg {
+            let req: serde_json::Value = serde_json::from_str(&text).ok()?;
+            if req["method"] == "cp/register" {
+                return Some(req["id"].clone());
+            }
+        }
+    }
+    None
+}
+
+/// A CP that rejects `cp/register` (unknown key, wrong identity) must put the
+/// client into its jittered exponential backoff, not a reconnect spin. With a
+/// 1s base the attempts land at ~0s, 0.5-1s and 1.5-3s, and the fourth no
+/// earlier than 3.5s, so a 3.2s window sees two or three attempts.
+#[tokio::test]
+async fn a_rejected_registration_backs_off_instead_of_spinning() {
+    let (url, attempts) = spawn_fake_cp(|mut ws| async move {
+        if let Some(id) = read_register(&mut ws).await {
+            let reply = serde_json::json!({
+                "jsonrpc": "2.0", "id": id,
+                "error": {"code": -32001, "message": "unknown agent key"}
+            });
+            let _ = ws.send(Message::Text(reply.to_string())).await;
+        }
+        // Hold the socket until the client drops it.
+        while let Some(Ok(_)) = ws.next().await {}
+    })
+    .await;
+
+    let (shutdown, handle, _client) = spawn_worker(
+        &url,
+        ScriptedRunner::new(Script::Answer),
+        Duration::from_secs(60),
+    );
+    tokio::time::sleep(Duration::from_millis(3200)).await;
+    let seen = attempts.load(Ordering::Relaxed);
+    assert!(
+        (2..=3).contains(&seen),
+        "a rejected registration must retry with backoff (saw {seen} attempts in 3.2s)"
+    );
+
+    let _ = shutdown.send(true);
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("shutdown is honoured during backoff")
+        .unwrap();
+}
+
+/// An unknown method gets METHOD_NOT_FOUND, and a frame that is not JSON is
+/// ignored. Neither may end the session: both later requests are answered on
+/// the SAME connection, and the client never reconnects.
+#[tokio::test]
+async fn unknown_methods_and_malformed_frames_do_not_end_the_session() {
+    let (replies_tx, mut replies_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+    let replies_tx = Arc::new(replies_tx);
+    let (url, attempts) = spawn_fake_cp(move |mut ws| {
+        let replies_tx = Arc::clone(&replies_tx);
+        async move {
+            let Some(id) = read_register(&mut ws).await else {
+                return;
+            };
+            let ack = serde_json::json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": {
+                    "protocol_version": 1,
+                    "heartbeat_interval_secs": 15,
+                    "lease_expiry_secs": 45,
+                    "effective_max_delegated_sessions": 2
+                }
+            });
+            ws.send(Message::Text(ack.to_string())).await.unwrap();
+            for frame in [
+                "{this is not json".to_string(),
+                serde_json::json!({"jsonrpc": "2.0", "id": 901, "method": "cp/bogus"}).to_string(),
+                "\u{0}\u{1}garbage".to_string(),
+                serde_json::json!({"jsonrpc": "2.0", "id": 902, "method": "cp/also_bogus"})
+                    .to_string(),
+            ] {
+                ws.send(Message::Text(frame)).await.unwrap();
+            }
+            while let Some(Ok(msg)) = ws.next().await {
+                if let Message::Text(text) = msg {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                        let _ = replies_tx.send(v);
+                    }
+                }
+            }
+        }
+    })
+    .await;
+
+    let (shutdown, handle, _client) = spawn_worker(
+        &url,
+        ScriptedRunner::new(Script::Answer),
+        Duration::from_secs(60),
+    );
+
+    let mut answered = std::collections::BTreeMap::new();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while answered.len() < 2 && Instant::now() < deadline {
+        let Ok(Some(v)) = tokio::time::timeout(Duration::from_secs(10), replies_rx.recv()).await
+        else {
+            break;
+        };
+        if let Some(id) = v["id"].as_u64().filter(|id| *id == 901 || *id == 902) {
+            answered.insert(id, v);
+        }
+    }
+    for id in [901, 902] {
+        let reply = answered
+            .get(&id)
+            .unwrap_or_else(|| panic!("request {id} was never answered"));
+        assert_eq!(reply["error"]["code"], -32601, "METHOD_NOT_FOUND: {reply}");
+    }
+    // Give a wrongly-ended session time to reconnect before checking.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        attempts.load(Ordering::Relaxed),
+        1,
+        "the session survived; the client never reconnected"
+    );
+
+    let _ = shutdown.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+}
+
+/// Terminal history is process-lifetime: a delegation that completed before a
+/// connection loss can still be awaited and checked while the client is in
+/// reconnect backoff. Socket-bound commands are still rejected NotConnected.
+#[tokio::test]
+async fn a_completed_delegation_is_readable_during_reconnect_backoff() {
+    use openab_core::control_plane::{
+        ClientCommand, CommandError, DelegationSnapshot, DelegationStatusWire, SpawnRequest,
+        SpawnTarget,
+    };
+
+    // The real CP, with its serve task kept so it can be stopped: once the
+    // listener is gone every reconnect is refused, which pins the client in
+    // its backoff loop.
+    let state = Arc::new(AppState::new(cp_config("")));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/cp", listener.local_addr().unwrap());
+    let router = app(state.clone());
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    let (worker_shutdown, worker_task, _worker) = spawn_worker(
+        &url,
+        ScriptedRunner::new(Script::Answer),
+        Duration::from_secs(60),
+    );
+    let mut cfg = worker_cfg(&url);
+    cfg.auth_key = PRIMARY_KEY.to_string();
+    cfg.name = "koudu".into();
+    cfg.agent_type = CpAgentType::Primary;
+    let (primary_shutdown, primary_rx) = tokio::sync::watch::channel(false);
+    let primary = Arc::new(ControlPlaneClient::new(
+        cfg,
+        ScriptedRunner::new(Script::Answer),
+        Duration::from_secs(60),
+    ));
+    let cp = primary.handle();
+    let primary_task = tokio::spawn(primary.run(primary_rx));
+    wait_for("both runtimes to register", || {
+        state.registry.list("prod").len() >= 2
+    })
+    .await;
+
+    // Spawn and await while connected.
+    let (spawn_tx, spawn_rx) = tokio::sync::oneshot::channel();
+    cp.submit(ClientCommand::Spawn {
+        request: SpawnRequest {
+            delegation_id: "d-across-blip".into(),
+            target: SpawnTarget::by_name("worker-1"),
+            prompt: "finish before the blip".into(),
+            deadline: chrono::Utc::now() + chrono::Duration::seconds(60),
+            parent: None,
+        },
+        reply: spawn_tx,
+    })
+    .await
+    .unwrap();
+    let ack = tokio::time::timeout(Duration::from_secs(10), spawn_rx)
+        .await
+        .expect("spawn is acked")
+        .unwrap()
+        .expect("spawn succeeds");
+    let (await_tx, await_rx) = tokio::sync::oneshot::channel();
+    cp.submit(ClientCommand::Await {
+        handle: ack.handle.clone(),
+        reply: await_tx,
+    })
+    .await
+    .unwrap();
+    let before = tokio::time::timeout(Duration::from_secs(10), await_rx)
+        .await
+        .expect("terminal arrives")
+        .unwrap()
+        .expect("the delegation completed");
+    assert_eq!(
+        DelegationStatusWire::from(before.status.clone()),
+        DelegationStatusWire::Completed
+    );
+
+    // Lose the connection and keep it lost: stop accepting, then drop every
+    // registration so the CP closes the live sockets.
+    server.abort();
+    let _ = server.await;
+    sweep_leases(&state, Duration::ZERO);
+    assert!(state.registry.list("prod").is_empty());
+    // Let the primary notice the close and enter backoff.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let (await_tx, await_rx) = tokio::sync::oneshot::channel();
+    cp.submit(ClientCommand::Await {
+        handle: ack.handle.clone(),
+        reply: await_tx,
+    })
+    .await
+    .unwrap();
+    let during = tokio::time::timeout(Duration::from_secs(5), await_rx)
+        .await
+        .expect("await is answered during backoff")
+        .unwrap();
+    assert_eq!(
+        during,
+        Ok(before.clone()),
+        "the preserved terminal is readable while disconnected"
+    );
+
+    let (check_tx, check_rx) = tokio::sync::oneshot::channel();
+    cp.submit(ClientCommand::Check {
+        handle: ack.handle.clone(),
+        reply: check_tx,
+    })
+    .await
+    .unwrap();
+    let snapshot = tokio::time::timeout(Duration::from_secs(5), check_rx)
+        .await
+        .expect("check is answered during backoff")
+        .unwrap();
+    assert_eq!(snapshot, Ok(DelegationSnapshot::Terminal(before)));
+
+    let (spawn_tx, spawn_rx) = tokio::sync::oneshot::channel();
+    cp.submit(ClientCommand::Spawn {
+        request: SpawnRequest {
+            delegation_id: "d-while-down".into(),
+            target: SpawnTarget::by_name("worker-1"),
+            prompt: "no socket".into(),
+            deadline: chrono::Utc::now() + chrono::Duration::seconds(60),
+            parent: None,
+        },
+        reply: spawn_tx,
+    })
+    .await
+    .unwrap();
+    let refused = tokio::time::timeout(Duration::from_secs(5), spawn_rx)
+        .await
+        .expect("spawn is answered during backoff")
+        .unwrap();
+    assert!(
+        matches!(refused, Err(CommandError::NotConnected)),
+        "a socket-bound command is still NotConnected"
+    );
+
+    let _ = primary_shutdown.send(true);
+    let _ = worker_shutdown.send(true);
+    let _ = tokio::time::timeout(Duration::from_secs(5), primary_task).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), worker_task).await;
 }
