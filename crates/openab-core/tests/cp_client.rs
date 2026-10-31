@@ -630,6 +630,49 @@ async fn shutdown_drains_an_inflight_delegation_before_exit() {
     .await;
 }
 
+/// Phase 0 criterion 4: stopping one worker fails its in-flight delegation as
+/// `target_disconnected` at the initiator. The worker drops its own result on
+/// the way out, so the CP's disconnect synthesis is what the initiator hears.
+/// The lease defaults to 30s and the delegation deadline here is 300s; the
+/// initiator must hear the failure within 10s, which rules out both.
+#[tokio::test]
+async fn a_stopped_worker_fails_its_inflight_delegation_as_target_disconnected() {
+    let (state, url) = spawn_cp(cp_config("")).await;
+    let runner = ScriptedRunner::new(Script::Hang);
+    let (shutdown, handle, _client) =
+        spawn_worker(&url, Arc::clone(&runner), Duration::from_secs(60));
+    wait_for("the worker to register", || {
+        !worker_instances(&state).is_empty()
+    })
+    .await;
+
+    let mut initiator = connect_initiator(&url).await;
+    delegate(
+        &mut initiator,
+        9,
+        "d-worker-stopped",
+        "hang until stopped",
+        300,
+    )
+    .await;
+    assert_eq!(next_json(&mut initiator).await["id"], 9, "delegate ack");
+    wait_for("the delegated turn to start", || runner.started() == 1).await;
+
+    let _ = shutdown.send(true);
+    let failure = tokio::time::timeout(
+        Duration::from_secs(10),
+        next_request(&mut initiator, "cp/delegate_result"),
+    )
+    .await
+    .expect("the initiator hears the failure within 10s, well inside the lease");
+    assert_eq!(failure["params"]["delegation_id"], "d-worker-stopped");
+    assert_eq!(
+        failure["params"]["status"], "target_disconnected",
+        "the stopped worker fails its delegation: {failure}"
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(7), handle).await;
+}
+
 /// The PR4 local API against two real runtime clients and the real CP server:
 /// primary UDS -> primary client -> CP -> worker client -> scripted agent -> result.
 #[tokio::test]
