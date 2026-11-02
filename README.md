@@ -6,7 +6,7 @@ English | [繁體中文](README.zh-TW.md)
 
 ![OpenAB banner](images/banner.jpg)
 
-A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**, and any [Agent Client Protocol](https://github.com/anthropics/agent-protocol)-compatible coding CLI (Kiro CLI, Claude Code, Codex, Gemini, OpenCode, MiMo-Code, Kimi Code, Copilot CLI, Grok Build, Devin, Antigravity, Pi, etc.) over stdio JSON-RPC — delivering the next-generation development experience. **Telegram, LINE, Feishu/Lark, Google Chat, WeCom, and Microsoft Teams** are available through gateway adapters, either compiled into the unified binary or deployed as the standalone [Custom Gateway](crates/openab-gateway/).
+A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**, and any [Agent Client Protocol](https://github.com/anthropics/agent-protocol)-compatible coding CLI (Kiro CLI, Claude Code, Codex, Gemini, OpenCode, Command Code, MiMo-Code, Kimi Code, Copilot CLI, Grok Build, Devin, Antigravity, Pi, etc.) over stdio JSON-RPC — delivering the next-generation development experience. **Telegram, LINE, Feishu/Lark, Google Chat, WeCom, and Microsoft Teams** are available through gateway adapters, either compiled into the unified binary or deployed as the standalone [Custom Gateway](crates/openab-gateway/).
 
 🪼 **Join our community!** Come say hi on Discord — we'd love to have you: **[🪼 OpenAB — Official](https://openab.dev/discord)** 🎉
 
@@ -22,7 +22,7 @@ A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**,
 │ User         │              │        │ WebSocket            │ gemini --acp            │
 ├──────────────┤              │        │ (standalone)         │ copilot --acp           │
 │ LINE         │◄webhook/API─►┤        │ or in-process        │ cursor-agent acp        │
-│ User         │              │        │ (unified)            │                         │
+│ User         │              │        │ (unified)            │ command-code acp        │
 ├──────────────┤              │ ┌──────┴───────────┐          │ opencode acp            │
 │ Feishu/Lark  │◄─WS/webhook─►┼►│ gateway adapters │          │ mimo acp                │
 │ User         │              │ │ standalone or    │          │ kimi acp                │
@@ -54,7 +54,7 @@ webhook platforms and `WS/webhook` for Feishu/Lark.
 
 - **Multi-platform** — supports Discord and Slack, run one or both simultaneously
 - **Gateway adapters** — extend to Telegram, LINE, Feishu/Lark, Google Chat, WeCom, and Microsoft Teams through the standalone [gateway](crates/openab-gateway/) or an opt-in unified build
-- **Pluggable agent backend** — swap between Kiro CLI, Claude Code, Codex, Gemini, OpenCode, MiMo-Code, Kimi Code, Copilot CLI, Grok Build, Devin, Antigravity, Pi via config
+- **Pluggable agent backend** — swap between Kiro CLI, Claude Code, Codex, Gemini, OpenCode, Command Code, MiMo-Code, Kimi Code, Copilot CLI, Grok Build, Devin, Antigravity, Pi via config
 - **@mention trigger** — mention the bot in an allowed channel to start a conversation
 - **Thread-based multi-turn** — auto-creates threads; no @mention needed for follow-ups
 - **Multi-agent collaboration** — bot-to-bot messaging for coordinated workflows ([docs/multi-agent.md](docs/multi-agent.md))
