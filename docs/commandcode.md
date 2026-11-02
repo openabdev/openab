@@ -56,12 +56,20 @@ or the entire home directory. The OpenAB image runs as `node`, with
 
 ## Docker
 
+Build the standalone image:
+
+```bash
+docker build -f Dockerfile.commandcode -t openab-commandcode .
+```
+
+Or use the unified Dockerfile target:
+
 ```bash
 docker build --target commandcode -f Dockerfile.unified -t openab-commandcode .
 ```
 
 The `commandcode` target is also available in `Dockerfile.package` for packaging
-prebuilt binaries. Both pin `COMMAND_CODE_VERSION`. They set:
+prebuilt binaries. All three Dockerfiles pin `COMMAND_CODE_VERSION`. They set:
 
 ```text
 OPENAB_AGENT_COMMAND=command-code acp

@@ -1,0 +1,55 @@
+# Standalone Command Code image.
+# Usage: docker build -f Dockerfile.commandcode -t openab-commandcode .
+# A prebuilt OpenAB builder may be selected with --build-arg BUILDER_IMAGE=...
+ARG BUILDER_IMAGE=local_builder
+ARG NODE22_VERSION=22.23.4
+
+# Keep the Rust builder digest in sync with Dockerfile.unified.
+FROM rust:1-bookworm@sha256:5e2214abe154fe26e39f64488952e5c991eeed1d6d6da7cc8381ae83927f0cfc AS local_builder
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates/openab-core/Cargo.toml crates/openab-core/Cargo.toml
+COPY crates/openab-gateway/Cargo.toml crates/openab-gateway/Cargo.toml
+COPY crates/openab-mcp/Cargo.toml crates/openab-mcp/Cargo.toml
+COPY crates/openab-cp/Cargo.toml crates/openab-cp/Cargo.toml
+RUN mkdir -p src crates/openab-core/src crates/openab-gateway/src crates/openab-mcp/src crates/openab-cp/src \
+    && echo 'fn main() {}' > src/main.rs \
+    && echo '' > crates/openab-core/src/lib.rs \
+    && echo '' > crates/openab-gateway/src/lib.rs \
+    && echo '' > crates/openab-mcp/src/lib.rs \
+    && echo '' > crates/openab-cp/src/lib.rs \
+    && cargo build --release --features unified \
+    && rm -rf src crates/openab-core/src crates/openab-gateway/src crates/openab-mcp/src crates/openab-cp/src
+COPY crates/ crates/
+COPY src/ src/
+RUN touch src/main.rs crates/openab-core/src/lib.rs crates/openab-gateway/src/lib.rs crates/openab-mcp/src/lib.rs crates/openab-cp/src/lib.rs \
+    && cargo build --release --features unified
+
+FROM ${BUILDER_IMAGE} AS builder
+RUN test -x /build/target/release/openab
+
+FROM node:${NODE22_VERSION}-trixie-slim AS base-node
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl procps ripgrep tini bubblewrap socat unzip git \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && apt-get install -y --no-install-recommends gh && \
+    rm -rf /var/lib/apt/lists/*
+
+FROM base-node AS commandcode
+ARG COMMAND_CODE_VERSION=1.88.2
+RUN npm install -g command-code@${COMMAND_CODE_VERSION} --retry 3
+ENV HOME=/home/node
+WORKDIR /home/node
+COPY --from=builder --chown=node:node /build/target/release/openab /usr/local/bin/openab
+RUN mkdir -p /home/node/.commandcode && chown -R node:node /home/node
+USER node
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+  CMD pgrep -x openab || exit 1
+ENV OPENAB_AGENT_COMMAND="command-code acp"
+ENV OPENAB_AGENT_AUTH_COMMAND="command-code login"
+ENTRYPOINT ["tini", "--"]
+CMD ["openab", "run", "-c", "/etc/openab/config.toml"]

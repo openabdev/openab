@@ -87,6 +87,7 @@ for f in Dockerfile.unified Dockerfile.package; do
   repo_expect "$f" kimi NODE24_VERSION
   for t in kiro cursor grok devin antigravity native agentcore; do repo_expect "$f" "$t" ''; done
 done
+repo_expect Dockerfile.commandcode '' NODE22_VERSION
 echo "ok   repository targets"
 
 [ "$failures" -eq 0 ] || { echo "$failures test(s) failed"; exit 1; }

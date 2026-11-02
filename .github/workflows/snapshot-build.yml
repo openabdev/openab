@@ -92,10 +92,6 @@ jobs:
           if [ "$VARIANT" = "default" ]; then
             echo "file=Dockerfile" >> "$GITHUB_OUTPUT"
             echo "suffix=" >> "$GITHUB_OUTPUT"
-          elif [ "$VARIANT" = "commandcode" ]; then
-            echo "file=Dockerfile.unified" >> "$GITHUB_OUTPUT"
-            echo "target=commandcode" >> "$GITHUB_OUTPUT"
-            echo "suffix=-commandcode" >> "$GITHUB_OUTPUT"
           else
             echo "file=Dockerfile.${VARIANT}" >> "$GITHUB_OUTPUT"
             echo "suffix=-${VARIANT}" >> "$GITHUB_OUTPUT"
@@ -107,7 +103,6 @@ jobs:
         with:
           context: .
           file: ${{ steps.df.outputs.file }}
-          target: ${{ steps.df.outputs.target }}
           platforms: ${{ matrix.platform.os }}
           outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}${{ steps.df.outputs.suffix }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=snapshot-${{ matrix.variant }}-${{ matrix.platform.os }}

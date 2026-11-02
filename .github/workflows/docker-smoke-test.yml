@@ -13,6 +13,8 @@ on:
       - 'Cargo.*'
       - '.github/scripts/node_base_arg.sh'
       - '.github/scripts/test_node_base_arg.sh'
+      - '.github/scripts/commandcode_acp_smoke.mjs'
+      - '.github/workflows/docker-smoke-test.yml'
 
 concurrency:
   group: smoke-test-${{ github.event.pull_request.number }}
@@ -29,6 +31,7 @@ jobs:
           - { dockerfile: Dockerfile, suffix: "-unified", agent: "kiro-cli", agent_args: "acp --trust-all-tools", build_args: "--build-arg BUILD_MODE=unified" }
           - { dockerfile: Dockerfile.claude, suffix: "-claude", agent: "claude-agent-acp", agent_args: "", build_args: "" }
           - { dockerfile: Dockerfile.codex, suffix: "-codex", agent: "codex-acp", agent_args: "", build_args: "" }
+          - { dockerfile: Dockerfile.commandcode, suffix: "-commandcode", agent: "command-code", agent_args: "acp", build_args: "" }
           - { dockerfile: Dockerfile.gemini, suffix: "-gemini", agent: "gemini", agent_args: "--acp", build_args: "" }
           - { dockerfile: Dockerfile.copilot, suffix: "-copilot", agent: "copilot", agent_args: "--acp", build_args: "" }
           - { dockerfile: Dockerfile.opencode, suffix: "-opencode", agent: "opencode", agent_args: "acp", build_args: "" }
@@ -97,6 +100,23 @@ jobs:
           docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' openab-test-codex \
             | grep -Fx 'OPENAB_AGENT_COMMAND=codex-acp'
 
+      - name: Verify Command Code version and defaults
+        if: matrix.variant.suffix == '-commandcode'
+        run: |
+          EXPECTED=$(awk -F= '$1 == "ARG COMMAND_CODE_VERSION" {print $2; exit}' Dockerfile.commandcode)
+          test -n "$EXPECTED"
+          docker run --rm --entrypoint command-code openab-test-commandcode --version | grep -Fx "$EXPECTED"
+          docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' openab-test-commandcode \
+            | grep -Fx 'OPENAB_AGENT_COMMAND=command-code acp'
+          docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' openab-test-commandcode \
+            | grep -Fx 'OPENAB_AGENT_AUTH_COMMAND=command-code login'
+
+      - name: Verify Command Code ACP handshake
+        if: matrix.variant.suffix == '-commandcode'
+        run: |
+          docker run --rm -i --entrypoint node openab-test-commandcode \
+            --input-type=module < .github/scripts/commandcode_acp_smoke.mjs
+
       - name: Verify bumped runtime versions
         if: matrix.variant.suffix == '' || matrix.variant.suffix == '-unified' || matrix.variant.suffix == '-copilot' || matrix.variant.suffix == '-devin' || matrix.variant.suffix == '-antigravity'
         shell: bash
@@ -132,7 +152,7 @@ jobs:
 
       - name: Verify agent responds
         run: |
-          if [ "${{ matrix.variant.suffix }}" = "-codex" ]; then
+          if [ "${{ matrix.variant.suffix }}" = "-codex" ] || [ "${{ matrix.variant.suffix }}" = "-commandcode" ]; then
             INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"ci-test","version":"0.0.1"}}}'
           else
             INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientCapabilities":{},"clientInfo":{"name":"ci-test","version":"0.0.1"}}}'
@@ -150,8 +170,8 @@ jobs:
           if [ -n "$RESPONSE" ] && echo "$RESPONSE" | jq -e '.result.agentInfo.name' > /dev/null 2>&1; then
             AGENT_NAME=$(echo "$RESPONSE" | jq -r '.result.agentInfo.name')
             echo "✅ ACP handshake ok — agent=$AGENT_NAME"
-          elif [ "${{ matrix.variant.suffix }}" = "-codex" ]; then
-            echo "❌ Codex ACP handshake failed"
+          elif [ "${{ matrix.variant.suffix }}" = "-codex" ] || [ "${{ matrix.variant.suffix }}" = "-commandcode" ]; then
+            echo "❌ ACP handshake failed for ${{ matrix.variant.suffix }}"
             exit 1
           else
             echo "⚠️ ACP handshake returned no response — falling back to CLI check"
@@ -210,6 +230,7 @@ jobs:
           assert_line 'ARG CODEX_ACP_VERSION=2.0.0' Dockerfile.codex Dockerfile.package Dockerfile.unified
           assert_line 'ARG CODEX_VERSION=0.166.0' Dockerfile.codex Dockerfile.package Dockerfile.unified
           assert_line 'ARG COPILOT_VERSION=1.0.105' Dockerfile.copilot Dockerfile.package Dockerfile.unified
+          assert_line 'ARG COMMAND_CODE_VERSION=1.88.2' Dockerfile.commandcode Dockerfile.package Dockerfile.unified
           assert_line 'ARG DEVIN_VERSION=3000.11.3' Dockerfile.devin Dockerfile.package Dockerfile.unified
           assert_line 'ARG DEVIN_SHA256_AMD64=83b3b113c01bf2a3e9e100db08d77e6b086806a7754f091e20831bdfe215157e' Dockerfile.devin Dockerfile.package Dockerfile.unified
           assert_line 'ARG DEVIN_SHA256_ARM64=21a2d7a8dea67987067cde7eb3fe7193a48daa8f8c3d50d414c603c4a2b67f15' Dockerfile.devin Dockerfile.package Dockerfile.unified
