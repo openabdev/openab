@@ -89,6 +89,7 @@ pub fn generate_config(
                 "claude" => ("claude-agent-acp", vec![]),
                 "codex" => ("codex-acp", vec![]),
                 "gemini" => ("gemini", vec!["--acp".into()]),
+                "commandcode" => ("command-code", vec!["acp".into()]),
                 other => (other, vec![]),
             };
             AgentConfigToml {

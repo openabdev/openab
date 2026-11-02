@@ -399,6 +399,15 @@ command = "opencode"
 args = ["acp"]
 working_dir = "/home/node"
 
+# Command Code (https://commandcode.ai/docs/acp)
+[agent]
+command = "command-code"
+args = ["acp"]
+working_dir = "/home/node"
+# Auth: command-code login, or explicitly forward a key:
+# env = { COMMAND_CODE_API_KEY = "${COMMAND_CODE_API_KEY}" }
+# See docs/commandcode.md.
+
 # Kimi Code CLI
 [agent]
 command = "kimi"

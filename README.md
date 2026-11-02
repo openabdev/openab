@@ -185,6 +185,7 @@ The bot creates a thread. After that, just type in the thread — no @mention ne
 | Codex | `codex-acp` | [@agentclientprotocol/codex-acp](https://github.com/agentclientprotocol/codex-acp) | [docs/codex.md](docs/codex.md) |
 | Gemini | `gemini --acp` | Native | [docs/gemini.md](docs/gemini.md) |
 | OpenCode | `opencode acp` | Native | [docs/opencode.md](docs/opencode.md) |
+| Command Code | `command-code acp` | Native | [docs/commandcode.md](docs/commandcode.md) |
 | MiMo-Code | `mimo acp` | Native | [docs/mimocode.md](docs/mimocode.md) |
 | Kimi Code | `kimi acp` | Native | [docs/kimi.md](docs/kimi.md) |
 | Copilot CLI ⚠️ | `copilot --acp --stdio` | Native | [docs/copilot.md](docs/copilot.md) |

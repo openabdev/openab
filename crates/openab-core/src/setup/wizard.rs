@@ -371,6 +371,18 @@ fn section_channels(client: &DiscordClient) -> anyhow::Result<Vec<String>> {
 // Section 3: Agent Configuration
 // ---------------------------------------------------------------------------
 
+fn resolve_agent_working_dir(agent: &str, working_dir: &str, is_local: bool) -> io::Result<String> {
+    // Command Code requires an absolute ACP cwd. Resolve only local paths:
+    // Docker paths must not acquire the setup host's Windows drive prefix.
+    if agent == "commandcode" && is_local {
+        Ok(std::path::absolute(working_dir)?
+            .to_string_lossy()
+            .into_owned())
+    } else {
+        Ok(working_dir.to_string())
+    }
+}
+
 fn section_agent() -> (String, String, bool) {
     println!();
     cprintln!(C.bold, "--- Step 3: Agent Configuration ---");
@@ -383,12 +395,13 @@ fn section_agent() -> (String, String, bool) {
         "kiro:    npm install -g @koryhutchison/kiro-cli",
         "codex:   npm install -g @openai/codex @agentclientprotocol/codex-acp",
         "gemini:  npm install -g @google/gemini-cli",
+        "commandcode: npm install -g command-code (Node.js 22+)",
         "",
         "Make sure the agent is in your PATH before continuing.",
     ]);
     println!();
 
-    let choices = ["claude", "kiro", "codex", "gemini"];
+    let choices = ["claude", "kiro", "codex", "gemini", "commandcode"];
     let idx = prompt_choice("  Select agent:", &choices);
     let agent = choices[idx];
 
@@ -530,6 +543,12 @@ fn print_next_steps(agent: &str, output_path: &Path, is_local: bool) {
                     "  2. Authenticate via Google OAuth, or set GEMINI_API_KEY in config.toml"
                 );
             }
+            "commandcode" => {
+                cprintln!(C.cyan, "  1. Install Command Code (Node.js 22+):");
+                println!("       npm install -g command-code");
+                cprintln!(C.cyan, "  2. Authenticate:");
+                println!("       command-code login");
+            }
             _ => {}
         }
 
@@ -543,11 +562,16 @@ fn print_next_steps(agent: &str, output_path: &Path, is_local: bool) {
         );
         println!();
         cprintln!(C.cyan, "  1. Deploy with Helm (or your preferred method):");
-        println!("       helm install openab openab/openab \\");
-        println!(
-            "         --set agents.{}.discord.botToken=\"$BOT_TOKEN\"",
-            agent
-        );
+        if agent == "commandcode" {
+            println!("       Prepare values.yaml using docs/commandcode.md");
+            println!("       helm install openab openab/openab -f values.yaml");
+        } else {
+            println!("       helm install openab openab/openab \\");
+            println!(
+                "         --set agents.{}.discord.botToken=\"$BOT_TOKEN\"",
+                agent
+            );
+        }
         println!();
         cprintln!(
             C.cyan,
@@ -565,6 +589,10 @@ fn print_next_steps(agent: &str, output_path: &Path, is_local: bool) {
             ),
             "gemini" => {
                 println!("       Set GEMINI_API_KEY via secret, or exec into the pod for OAuth")
+            }
+            "commandcode" => {
+                println!("       Set COMMAND_CODE_API_KEY via secret and agent.inherit_env");
+                println!("       See docs/commandcode.md for a complete Helm example");
             }
             _ => {}
         }
@@ -643,6 +671,7 @@ pub fn run_setup(output_path: Option<PathBuf>) -> anyhow::Result<()> {
 
     // Step 3: Agent
     let (agent, working_dir, is_local) = section_agent();
+    let working_dir = resolve_agent_working_dir(&agent, &working_dir, is_local)?;
 
     // Step 4: Pool
     let (max_sessions, ttl_hours) = section_pool();
@@ -664,4 +693,29 @@ pub fn run_setup(output_path: Option<PathBuf>) -> anyhow::Result<()> {
     print_next_steps(&agent, &output_path, is_local);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commandcode_local_setup_resolves_directory_for_acp() {
+        let dir = resolve_agent_working_dir("commandcode", ".", true).unwrap();
+        let raw = generate_config("tok", "commandcode", vec!["123".into()], &dir, 10, 24);
+        let config = crate::config::parse_config_str(&raw, "setup").unwrap();
+        assert_eq!(config.agent.command, "command-code");
+        assert_eq!(config.agent.args, ["acp"]);
+        assert!(Path::new(&config.agent.working_dir).is_absolute());
+        assert_eq!(
+            std::fs::canonicalize(&config.agent.working_dir).unwrap(),
+            std::env::current_dir().unwrap().canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn commandcode_container_setup_preserves_linux_path() {
+        let dir = resolve_agent_working_dir("commandcode", "/home/node", false).unwrap();
+        assert_eq!(dir, "/home/node");
+    }
 }

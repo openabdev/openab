@@ -19,6 +19,7 @@ on:
           - antigravity
           - claude
           - codex
+          - commandcode
           - copilot
           - cursor
           - devin

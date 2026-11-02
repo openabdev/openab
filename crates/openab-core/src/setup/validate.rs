@@ -24,7 +24,7 @@ pub fn validate_bot_token(token: &str) -> anyhow::Result<()> {
 /// Validate agent command
 #[cfg(test)]
 pub fn validate_agent_command(cmd: &str) -> anyhow::Result<()> {
-    let valid = ["kiro", "claude", "codex", "gemini"];
+    let valid = ["kiro", "claude", "codex", "gemini", "commandcode"];
     if !valid.contains(&cmd) {
         anyhow::bail!("Agent must be one of: {}", valid.join(", "));
     }
@@ -63,7 +63,7 @@ mod tests {
 
     #[test]
     fn validate_agent_command_known_and_unknown() {
-        for agent in &["kiro", "claude", "codex", "gemini"] {
+        for agent in &["kiro", "claude", "codex", "gemini", "commandcode"] {
             assert!(validate_agent_command(agent).is_ok());
         }
         assert!(validate_agent_command("invalid").is_err());

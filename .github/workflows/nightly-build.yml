@@ -50,7 +50,7 @@ env:
   # OPENAB_AGENT_COMMAND=openab-agent but does not ship that binary (a
   # pre-existing bug across all lanes — see follow-up issue), so a nightly-pi
   # tag would publish a runtime-broken image. Re-add once the pi target is fixed.
-  ALL_VARIANTS: 'kiro,claude,codex,copilot,cursor,devin,gemini,grok,kimi,mimocode,opencode,antigravity'
+  ALL_VARIANTS: 'kiro,claude,codex,commandcode,copilot,cursor,devin,gemini,grok,kimi,mimocode,opencode,antigravity'
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -251,6 +251,10 @@ jobs:
               REPORT="codex-acp $ACP + codex $CODE"
               BUILD_ARGS="CODEX_ACP_VERSION=$ACP
           CODEX_VERSION=$CODE" ;;
+            commandcode)
+              V=$(curl -fsSL --retry 3 https://registry.npmjs.org/command-code/latest | jq -r .version)
+              check_ver "$V"; REPORT="command-code $V"
+              BUILD_ARGS="COMMAND_CODE_VERSION=$V" ;;
             copilot)
               V=$(curl -fsSL --retry 3 https://registry.npmjs.org/@github/copilot/latest | jq -r .version)
               check_ver "$V"; REPORT="copilot $V"

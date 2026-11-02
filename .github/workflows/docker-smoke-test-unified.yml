@@ -11,6 +11,8 @@ on:
       - 'openab-agent/**'
       - 'agy-acp/**'
       - '.github/scripts/node_base_arg.sh'
+      - '.github/scripts/commandcode_acp_smoke.mjs'
+      - '.github/workflows/docker-smoke-test-unified.yml'
 
 concurrency:
   group: smoke-test-unified-${{ github.event.pull_request.number }}
@@ -52,6 +54,7 @@ jobs:
           - { name: kiro, agent: "kiro-cli" }
           - { name: claude, agent: "claude-agent-acp" }
           - { name: codex, agent: "codex-acp" }
+          - { name: commandcode, agent: "command-code" }
           - { name: copilot, agent: "copilot" }
           - { name: cursor, agent: "cursor-agent" }
           - { name: devin, agent: "devin" }
@@ -138,6 +141,24 @@ jobs:
           echo "$RESPONSE" | jq -e \
             '.result.agentInfo.name == "@agentclientprotocol/codex-acp"' \
             >/dev/null
+
+      - name: Verify Command Code runtime version and defaults
+        if: matrix.target.name == 'commandcode'
+        run: |
+          EXPECTED=$(awk -F= '$1 == "ARG COMMAND_CODE_VERSION" {print $2; exit}' Dockerfile.unified)
+          test -n "$EXPECTED"
+          docker run --rm --entrypoint command-code openab-unified-commandcode:test --version \
+            | grep -Fx "$EXPECTED"
+          docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' openab-unified-commandcode:test \
+            | grep -Fx 'OPENAB_AGENT_COMMAND=command-code acp'
+          docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' openab-unified-commandcode:test \
+            | grep -Fx 'OPENAB_AGENT_AUTH_COMMAND=command-code login'
+
+      - name: Verify Command Code ACP handshake
+        if: matrix.target.name == 'commandcode'
+        run: |
+          docker run --rm -i --entrypoint node openab-unified-commandcode:test \
+            --input-type=module < .github/scripts/commandcode_acp_smoke.mjs
 
       - name: Verify Kimi runtime version
         if: matrix.target.name == 'kimi'

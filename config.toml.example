@@ -229,6 +229,15 @@ working_dir = "/home/agent"
 # # Run `opencode auth login` once before starting openab.
 
 # [agent]
+# command = "command-code"
+# args = ["acp"]
+# working_dir = "/home/node"
+# # Command Code: npm install -g command-code (Node.js 22+).
+# # Auth: command-code login, or explicitly pass an API key:
+# # env = { COMMAND_CODE_API_KEY = "${COMMAND_CODE_API_KEY}" }
+# # See docs/commandcode.md for authentication and persistence.
+
+# [agent]
 # command = "devin"
 # args = ["acp"]
 # working_dir = "/home/agent"

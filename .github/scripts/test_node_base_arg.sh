@@ -83,7 +83,7 @@ repo_expect() { # repo_expect <dockerfile> <target> <want_stdout>
   fi
 }
 for f in Dockerfile.unified Dockerfile.package; do
-  for t in claude codex copilot gemini mimocode opencode pi; do repo_expect "$f" "$t" NODE22_VERSION; done
+  for t in claude codex commandcode copilot gemini mimocode opencode pi; do repo_expect "$f" "$t" NODE22_VERSION; done
   repo_expect "$f" kimi NODE24_VERSION
   for t in kiro cursor grok devin antigravity native agentcore; do repo_expect "$f" "$t" ''; done
 done
