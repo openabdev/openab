@@ -363,7 +363,9 @@ pub async fn list_schedules(aws_config: &aws_config::SdkConfig) -> Result<()> {
 
     if all_schedules.is_empty() {
         println!("No schedules found in group '{group_name}'.");
-        println!("  Use 'oabctl schedule create <alias> <size> --expr <expression>' to create one.");
+        println!(
+            "  Use 'oabctl schedule create <alias> <size> --expr <expression>' to create one."
+        );
         return Ok(());
     }
 

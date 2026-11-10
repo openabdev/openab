@@ -89,7 +89,9 @@ fn split_ecs_json_key_suffix(value: &str) -> Result<(&str, Option<&str>)> {
         return Ok((value, None));
     };
     let base = &value[..after_name_start + name_end];
-    let fields: Vec<&str> = value[after_name_start + name_end + 1..].split(':').collect();
+    let fields: Vec<&str> = value[after_name_start + name_end + 1..]
+        .split(':')
+        .collect();
     let (json_key, version_stage, version_id) = match fields.as_slice() {
         [k] => (*k, "", ""),
         [k, s] => (*k, *s, ""),
@@ -168,7 +170,10 @@ mod tests {
             "arn:aws:secretsmanager:us-east-1:123456789012:secret:example/telegram/bot-AbCdEf:TELEGRAM_BOT_TOKEN::",
         )
         .unwrap();
-        assert_eq!(base, "arn:aws:secretsmanager:us-east-1:123456789012:secret:example/telegram/bot-AbCdEf");
+        assert_eq!(
+            base,
+            "arn:aws:secretsmanager:us-east-1:123456789012:secret:example/telegram/bot-AbCdEf"
+        );
         assert_eq!(key, Some("TELEGRAM_BOT_TOKEN"));
     }
 
@@ -178,7 +183,10 @@ mod tests {
             "arn:aws:secretsmanager:us-east-1:123456789012:secret:example/telegram/bot-AbCdEf",
         )
         .unwrap();
-        assert_eq!(base, "arn:aws:secretsmanager:us-east-1:123456789012:secret:example/telegram/bot-AbCdEf");
+        assert_eq!(
+            base,
+            "arn:aws:secretsmanager:us-east-1:123456789012:secret:example/telegram/bot-AbCdEf"
+        );
         assert_eq!(key, None);
     }
 
@@ -195,9 +203,14 @@ mod tests {
         // optional fields empty (`::`) must not be misparsed as
         // json-key="mysecret" — "mysecret" here is part of the secret
         // name/base ARN, not a suffix field.
-        let (base, key) =
-            split_ecs_json_key_suffix("arn:aws:secretsmanager:us-east-1:123456789012:secret:mysecret::").unwrap();
-        assert_eq!(base, "arn:aws:secretsmanager:us-east-1:123456789012:secret:mysecret");
+        let (base, key) = split_ecs_json_key_suffix(
+            "arn:aws:secretsmanager:us-east-1:123456789012:secret:mysecret::",
+        )
+        .unwrap();
+        assert_eq!(
+            base,
+            "arn:aws:secretsmanager:us-east-1:123456789012:secret:mysecret"
+        );
         assert_eq!(key, None);
     }
 
@@ -242,7 +255,9 @@ mod tests {
 
     #[test]
     fn parse_aws_sm_uri_rejects_missing_hash() {
-        assert!(parse_aws_sm_uri("aws-sm://example/telegram/bot").unwrap().is_err());
+        assert!(parse_aws_sm_uri("aws-sm://example/telegram/bot")
+            .unwrap()
+            .is_err());
     }
 
     #[test]
@@ -253,7 +268,9 @@ mod tests {
 
     #[test]
     fn parse_aws_sm_uri_returns_none_for_other_schemes() {
-        assert!(parse_aws_sm_uri("arn:aws:secretsmanager:us-east-1:123:secret:oab/x-AbCdEf").is_none());
+        assert!(
+            parse_aws_sm_uri("arn:aws:secretsmanager:us-east-1:123:secret:oab/x-AbCdEf").is_none()
+        );
         assert!(parse_aws_sm_uri("plain-secret-name").is_none());
     }
 }

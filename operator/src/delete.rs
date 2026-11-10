@@ -237,15 +237,8 @@ async fn run_with_bucket(
         };
         for object in response.contents() {
             if let Some(key) = object.key() {
-                if let Err(error) = s3
-                    .delete_object()
-                    .bucket(bucket)
-                    .key(key)
-                    .send()
-                    .await
-                {
-                    cleanup_failures
-                        .push(format!("failed to delete s3://{bucket}/{key}: {error}"));
+                if let Err(error) = s3.delete_object().bucket(bucket).key(key).send().await {
+                    cleanup_failures.push(format!("failed to delete s3://{bucket}/{key}: {error}"));
                 }
             }
         }
