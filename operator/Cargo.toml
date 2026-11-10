@@ -30,7 +30,7 @@ aws-sdk-cloudwatchlogs = "1"
 aws-sdk-secretsmanager = "1"
 aws-sdk-apigatewayv2 = "1"
 aws-sdk-servicediscovery = "1"
-ecsctl = { git = "https://github.com/oablab/ecsctl.git", rev = "90a6cd1" }
+ecsctl = { git = "https://github.com/oablab/ecsctl.git", rev = "81f00d8f65dbbdae596bae6895fac7bdd803eb6a" }
 clap = { version = "4.5", features = ["derive"] }
 chrono = "0.4"
 serde = { version = "1.0", features = ["derive"] }
@@ -42,3 +42,7 @@ anyhow = "1.0"
 dirs = "6"
 rpassword = "7"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+[dev-dependencies]
+aws-smithy-mocks = "0.2"
+aws-sdk-ecs = { version = "1.53", features = ["test-util"] }

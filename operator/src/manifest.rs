@@ -75,7 +75,10 @@ pub struct AgentOverride {
 impl OABFleetManifest {
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.api_version != "oab.dev/v2" {
-            anyhow::bail!("unsupported apiVersion: {} (expected oab.dev/v2)", self.api_version);
+            anyhow::bail!(
+                "unsupported apiVersion: {} (expected oab.dev/v2)",
+                self.api_version
+            );
         }
         if self.kind != "OABFleet" {
             anyhow::bail!("unsupported kind: {}", self.kind);
@@ -99,42 +102,58 @@ impl OABFleetManifest {
 
     /// Expand fleet into individual OABService manifests
     pub fn expand(&self) -> Vec<OABServiceManifest> {
-        self.spec.agents.iter().map(|agent| {
-            let resources = agent.resources.clone()
-                .or(self.spec.template.resources.clone())
-                .unwrap_or(Resources { cpu: "256".into(), memory: "512".into() });
-            let base_secrets = agent.secrets.clone()
-                .unwrap_or_else(|| self.spec.template.secrets.clone());
-            // Interpolate ${name} in secret values
-            let secrets = base_secrets.into_iter().map(|(k, v)| {
-                (k, v.replace("${name}", &agent.name))
-            }).collect();
+        self.spec
+            .agents
+            .iter()
+            .map(|agent| {
+                let resources = agent
+                    .resources
+                    .clone()
+                    .or(self.spec.template.resources.clone())
+                    .unwrap_or(Resources {
+                        cpu: "256".into(),
+                        memory: "512".into(),
+                    });
+                let base_secrets = agent
+                    .secrets
+                    .clone()
+                    .unwrap_or_else(|| self.spec.template.secrets.clone());
+                // Interpolate ${name} in secret values
+                let secrets = base_secrets
+                    .into_iter()
+                    .map(|(k, v)| (k, v.replace("${name}", &agent.name)))
+                    .collect();
 
-            OABServiceManifest {
-                api_version: self.api_version.clone(),
-                kind: "OABService".to_string(),
-                metadata: Metadata {
-                    name: agent.name.clone(),
-                    namespace: self.metadata.namespace.clone(),
-                    generation: 0,
-                },
-                spec: Spec {
-                    image: agent.image.clone()
-                        .unwrap_or_else(|| self.spec.template.image.clone()),
-                    resources,
-                    config_from: agent.config_from.replace("${name}", &agent.name),
-                    bootstrap_from: agent.bootstrap_from.clone()
-                        .or(self.spec.template.bootstrap_from.clone())
-                        .map(|s| s.replace("${name}", &agent.name)),
-                    secrets,
-                    runtime: self.spec.template.runtime.clone(),
-                    ingress: agent
-                        .ingress
-                        .clone()
-                        .or_else(|| self.spec.template.ingress.clone()),
-                },
-            }
-        }).collect()
+                OABServiceManifest {
+                    api_version: self.api_version.clone(),
+                    kind: "OABService".to_string(),
+                    metadata: Metadata {
+                        name: agent.name.clone(),
+                        namespace: self.metadata.namespace.clone(),
+                        generation: 0,
+                    },
+                    spec: Spec {
+                        image: agent
+                            .image
+                            .clone()
+                            .unwrap_or_else(|| self.spec.template.image.clone()),
+                        resources,
+                        config_from: agent.config_from.replace("${name}", &agent.name),
+                        bootstrap_from: agent
+                            .bootstrap_from
+                            .clone()
+                            .or(self.spec.template.bootstrap_from.clone())
+                            .map(|s| s.replace("${name}", &agent.name)),
+                        secrets,
+                        runtime: self.spec.template.runtime.clone(),
+                        ingress: agent
+                            .ingress
+                            .clone()
+                            .or_else(|| self.spec.template.ingress.clone()),
+                    },
+                }
+            })
+            .collect()
     }
 }
 
@@ -292,7 +311,10 @@ const VALID_ECS_CPU: &[&str] = &["256", "512", "1024", "2048", "4096"];
 impl OABServiceManifest {
     pub fn validate(&self) -> anyhow::Result<()> {
         if self.api_version != "oab.dev/v2" {
-            anyhow::bail!("unsupported apiVersion: {} (expected oab.dev/v2)", self.api_version);
+            anyhow::bail!(
+                "unsupported apiVersion: {} (expected oab.dev/v2)",
+                self.api_version
+            );
         }
         if self.kind != "OABService" {
             anyhow::bail!("unsupported kind: {}", self.kind);
@@ -544,7 +566,8 @@ spec:
       securityGroups: ["sg-1"]
 "#;
         let m = parse(yaml);
-        m.validate().expect("should be valid with default architecture");
+        m.validate()
+            .expect("should be valid with default architecture");
         match &m.spec.runtime {
             Runtime::Ecs(ecs) => assert_eq!(ecs.architecture, "X86_64"),
             _ => panic!("expected ECS runtime"),
@@ -575,7 +598,9 @@ spec:
 "#;
         let m = parse(yaml);
         let err = m.validate().unwrap_err();
-        assert!(err.to_string().contains("runtime.architecture must be one of"));
+        assert!(err
+            .to_string()
+            .contains("runtime.architecture must be one of"));
     }
 
     #[test]
@@ -602,7 +627,9 @@ spec:
 "#;
         let m = parse(yaml);
         let err = m.validate().unwrap_err();
-        assert!(err.to_string().contains("runtime.architecture must be one of"));
+        assert!(err
+            .to_string()
+            .contains("runtime.architecture must be one of"));
     }
 
     #[test]
@@ -639,7 +666,11 @@ spec:
         assert_eq!(expanded.len(), 2);
 
         let from_template = &expanded[0];
-        let ing = from_template.spec.ingress.as_ref().expect("template ingress");
+        let ing = from_template
+            .spec
+            .ingress
+            .as_ref()
+            .expect("template ingress");
         assert_eq!(ing.paths, vec!["/webhook/telegram"]);
         assert_eq!(ing.cloud_map_namespace, "oab");
 
