@@ -8,8 +8,8 @@
 
 # Pinned so the shipped Node.js version is explicit; bump it on Node security
 # releases. Nightly passes just the major (22 / 24) to float to the latest.
-ARG NODE22_VERSION=22.23.4
-ARG NODE24_VERSION=24.22.1
+ARG NODE22_VERSION=22.23.5
+ARG NODE24_VERSION=24.22.3
 
 # =============================================================================
 # Stage: bins — pre-built binaries passed in via build context

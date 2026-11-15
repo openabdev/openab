@@ -1,6 +1,6 @@
 # Pinned so the shipped Node.js version is explicit; bump it on Node security
 # releases. Passing just the major (e.g. NODE24_VERSION=24) floats to the latest.
-ARG NODE24_VERSION=24.22.1
+ARG NODE24_VERSION=24.22.3
 
 # --- Build stage ---
 FROM rust:1-bookworm AS builder
