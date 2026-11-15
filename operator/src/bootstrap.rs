@@ -70,7 +70,12 @@ pub struct ImportOptions {
     pub task_role: Option<String>,
 }
 
-pub async fn run(config: &aws_config::SdkConfig, delete: bool, status: bool, imports: ImportOptions) -> Result<()> {
+pub async fn run(
+    config: &aws_config::SdkConfig,
+    delete: bool,
+    status: bool,
+    imports: ImportOptions,
+) -> Result<()> {
     if status {
         return show_status(config).await;
     }
@@ -84,7 +89,10 @@ async fn get_account_and_region(config: &aws_config::SdkConfig) -> Result<(Strin
     let sts = StsClient::new(config);
     let identity = sts.get_caller_identity().send().await?;
     let account = identity.account().context("no account ID")?.to_string();
-    let region = config.region().map(|r| r.to_string()).unwrap_or_else(|| "us-east-1".to_string());
+    let region = config
+        .region()
+        .map(|r| r.to_string())
+        .unwrap_or_else(|| "us-east-1".to_string());
     Ok((account, region))
 }
 
@@ -139,44 +147,107 @@ async fn create(config: &aws_config::SdkConfig, imports: ImportOptions) -> Resul
 
     let bucket_exists = s3.head_bucket().bucket(&bucket).send().await.is_ok();
     let cluster_name = imports.cluster.as_deref().unwrap_or(CLUSTER_NAME);
-    let cluster_exists = ecs.describe_clusters().clusters(cluster_name).send().await
-        .map(|r| r.clusters().first().is_some_and(|c| c.status() == Some("ACTIVE")))
+    let cluster_exists = ecs
+        .describe_clusters()
+        .clusters(cluster_name)
+        .send()
+        .await
+        .map(|r| {
+            r.clusters()
+                .first()
+                .is_some_and(|c| c.status() == Some("ACTIVE"))
+        })
         .unwrap_or(false);
     let exec_role_exists = imports.execution_role.is_some()
-        || iam.get_role().role_name(EXECUTION_ROLE).send().await.is_ok();
-    let task_role_exists = imports.task_role.is_some()
-        || iam.get_role().role_name(TASK_ROLE).send().await.is_ok();
+        || iam
+            .get_role()
+            .role_name(EXECUTION_ROLE)
+            .send()
+            .await
+            .is_ok();
+    let task_role_exists =
+        imports.task_role.is_some() || iam.get_role().role_name(TASK_ROLE).send().await.is_ok();
 
     let vpc_id_for_check = if let Some(ref v) = imports.vpc {
         v.clone()
     } else {
         ec2.describe_vpcs()
-            .filters(aws_sdk_ec2::types::Filter::builder().name("isDefault").values("true").build())
-            .send().await.ok()
-            .and_then(|r| r.vpcs().first().and_then(|v| v.vpc_id()).map(|s| s.to_string()))
+            .filters(
+                aws_sdk_ec2::types::Filter::builder()
+                    .name("isDefault")
+                    .values("true")
+                    .build(),
+            )
+            .send()
+            .await
+            .ok()
+            .and_then(|r| {
+                r.vpcs()
+                    .first()
+                    .and_then(|v| v.vpc_id())
+                    .map(|s| s.to_string())
+            })
             .unwrap_or_default()
     };
     let sg_exists = imports.security_group.is_some()
-        || ec2.describe_security_groups()
-            .filters(aws_sdk_ec2::types::Filter::builder().name("group-name").values(SG_NAME).build())
-            .filters(aws_sdk_ec2::types::Filter::builder().name("vpc-id").values(&vpc_id_for_check).build())
-            .send().await
+        || ec2
+            .describe_security_groups()
+            .filters(
+                aws_sdk_ec2::types::Filter::builder()
+                    .name("group-name")
+                    .values(SG_NAME)
+                    .build(),
+            )
+            .filters(
+                aws_sdk_ec2::types::Filter::builder()
+                    .name("vpc-id")
+                    .values(&vpc_id_for_check)
+                    .build(),
+            )
+            .send()
+            .await
             .map(|r| !r.security_groups().is_empty())
             .unwrap_or(false);
-    let log_group_exists = logs.describe_log_groups()
+    let log_group_exists = logs
+        .describe_log_groups()
         .log_group_name_prefix(LOG_GROUP)
-        .send().await
-        .map(|r| r.log_groups().iter().any(|g| g.log_group_name() == Some(LOG_GROUP)))
+        .send()
+        .await
+        .map(|r| {
+            r.log_groups()
+                .iter()
+                .any(|g| g.log_group_name() == Some(LOG_GROUP))
+        })
         .unwrap_or(false);
 
     // ─── DISPLAY PLAN ─────────────────────────────────────────────────────
     eprintln!("  Resource                 Action");
     eprintln!("  ─────────────────────────────────────────");
     plan_line("S3 Bucket", &bucket, bucket_exists, true);
-    plan_line("ECS Cluster", cluster_name, cluster_exists, imports.cluster.is_none());
-    plan_line("IAM Execution Role", imports.execution_role.as_deref().unwrap_or(EXECUTION_ROLE), exec_role_exists, imports.execution_role.is_none());
-    plan_line("IAM Task Role", imports.task_role.as_deref().unwrap_or(TASK_ROLE), task_role_exists, imports.task_role.is_none());
-    plan_line("Security Group", imports.security_group.as_deref().unwrap_or(SG_NAME), sg_exists, imports.security_group.is_none());
+    plan_line(
+        "ECS Cluster",
+        cluster_name,
+        cluster_exists,
+        imports.cluster.is_none(),
+    );
+    plan_line(
+        "IAM Execution Role",
+        imports.execution_role.as_deref().unwrap_or(EXECUTION_ROLE),
+        exec_role_exists,
+        imports.execution_role.is_none(),
+    );
+    plan_line(
+        "IAM Task Role",
+        imports.task_role.as_deref().unwrap_or(TASK_ROLE),
+        task_role_exists,
+        imports.task_role.is_none(),
+    );
+    plan_line(
+        "Security Group",
+        imports.security_group.as_deref().unwrap_or(SG_NAME),
+        sg_exists,
+        imports.security_group.is_none(),
+    );
     plan_line("CloudWatch Log Group", LOG_GROUP, log_group_exists, true);
     eprintln!();
 
@@ -216,7 +287,9 @@ async fn create(config: &aws_config::SdkConfig, imports: ImportOptions) -> Resul
                     .restrict_public_buckets(true)
                     .build(),
             )
-            .send().await.ok();
+            .send()
+            .await
+            .ok();
         eprintln!("  ✓ Created S3 bucket: {bucket} (public access blocked)");
         managed.bucket = true;
     }
@@ -224,7 +297,9 @@ async fn create(config: &aws_config::SdkConfig, imports: ImportOptions) -> Resul
     // 2. ECS Cluster — save state incrementally after this point
     let (cluster_arn, cluster_managed) = if let Some(ref name) = imports.cluster {
         let resp = ecs.describe_clusters().clusters(name).send().await?;
-        let arn = resp.clusters().first()
+        let arn = resp
+            .clusters()
+            .first()
             .and_then(|c| c.cluster_arn())
             .context(format!("cluster '{}' not found", name))?
             .to_string();
@@ -232,13 +307,22 @@ async fn create(config: &aws_config::SdkConfig, imports: ImportOptions) -> Resul
         (arn, false)
     } else {
         match ecs.describe_clusters().clusters(CLUSTER_NAME).send().await {
-            Ok(resp) if resp.clusters().first().is_some_and(|c| c.status() == Some("ACTIVE")) => {
-                let arn = resp.clusters()[0].cluster_arn().unwrap_or_default().to_string();
+            Ok(resp)
+                if resp
+                    .clusters()
+                    .first()
+                    .is_some_and(|c| c.status() == Some("ACTIVE")) =>
+            {
+                let arn = resp.clusters()[0]
+                    .cluster_arn()
+                    .unwrap_or_default()
+                    .to_string();
                 eprintln!("  ✓ ECS cluster already exists: {CLUSTER_NAME}");
                 (arn, true)
             }
             _ => {
-                let resp = ecs.create_cluster()
+                let resp = ecs
+                    .create_cluster()
                     .cluster_name(CLUSTER_NAME)
                     .capacity_providers("FARGATE")
                     .capacity_providers("FARGATE_SPOT")
@@ -251,7 +335,11 @@ async fn create(config: &aws_config::SdkConfig, imports: ImportOptions) -> Resul
                     .send()
                     .await
                     .context("failed to create ECS cluster")?;
-                let arn = resp.cluster().and_then(|c| c.cluster_arn()).unwrap_or_default().to_string();
+                let arn = resp
+                    .cluster()
+                    .and_then(|c| c.cluster_arn())
+                    .unwrap_or_default()
+                    .to_string();
                 eprintln!("  ✓ Created ECS cluster: {CLUSTER_NAME}");
                 (arn, true)
             }
@@ -268,7 +356,9 @@ async fn create(config: &aws_config::SdkConfig, imports: ImportOptions) -> Resul
         iam.attach_role_policy()
             .role_name(EXECUTION_ROLE)
             .policy_arn("arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy")
-            .send().await.ok();
+            .send()
+            .await
+            .ok();
         eprintln!("  ✓ IAM execution role: {EXECUTION_ROLE}");
         managed.execution_role = true;
         arn
@@ -330,7 +420,9 @@ async fn create(config: &aws_config::SdkConfig, imports: ImportOptions) -> Resul
             .role_name(TASK_ROLE)
             .policy_name("oab-s3-artifacts")
             .policy_document(&artifacts_policy)
-            .send().await.ok();
+            .send()
+            .await
+            .ok();
         // Secrets Manager access (agent reads its own secrets at runtime)
         iam.put_role_policy()
             .role_name(TASK_ROLE)
@@ -347,32 +439,58 @@ async fn create(config: &aws_config::SdkConfig, imports: ImportOptions) -> Resul
         eprintln!("  ✓ Using existing security group: {sg}");
         (vpc, sg.clone())
     } else {
-        let default_vpc = ec2.describe_vpcs()
-            .filters(aws_sdk_ec2::types::Filter::builder().name("isDefault").values("true").build())
-            .send().await?;
+        let default_vpc = ec2
+            .describe_vpcs()
+            .filters(
+                aws_sdk_ec2::types::Filter::builder()
+                    .name("isDefault")
+                    .values("true")
+                    .build(),
+            )
+            .send()
+            .await?;
         let vid = imports.vpc.clone().unwrap_or_else(|| {
-            default_vpc.vpcs().first()
+            default_vpc
+                .vpcs()
+                .first()
                 .and_then(|v| v.vpc_id())
                 .unwrap_or_default()
                 .to_string()
         });
 
-        let sid = match ec2.describe_security_groups()
-            .filters(aws_sdk_ec2::types::Filter::builder().name("group-name").values(SG_NAME).build())
-            .filters(aws_sdk_ec2::types::Filter::builder().name("vpc-id").values(&vid).build())
-            .send().await
+        let sid = match ec2
+            .describe_security_groups()
+            .filters(
+                aws_sdk_ec2::types::Filter::builder()
+                    .name("group-name")
+                    .values(SG_NAME)
+                    .build(),
+            )
+            .filters(
+                aws_sdk_ec2::types::Filter::builder()
+                    .name("vpc-id")
+                    .values(&vid)
+                    .build(),
+            )
+            .send()
+            .await
         {
             Ok(resp) if !resp.security_groups().is_empty() => {
-                let id = resp.security_groups()[0].group_id().unwrap_or_default().to_string();
+                let id = resp.security_groups()[0]
+                    .group_id()
+                    .unwrap_or_default()
+                    .to_string();
                 eprintln!("  ✓ Security group already exists: {id}");
                 id
             }
             _ => {
-                let resp = ec2.create_security_group()
+                let resp = ec2
+                    .create_security_group()
                     .group_name(SG_NAME)
                     .description("OAB agent containers — managed by oabctl bootstrap")
                     .vpc_id(&vid)
-                    .send().await
+                    .send()
+                    .await
                     .context("failed to create security group")?;
                 let id = resp.group_id().unwrap_or_default().to_string();
                 managed.security_group = true;
@@ -388,17 +506,34 @@ async fn create(config: &aws_config::SdkConfig, imports: ImportOptions) -> Resul
         eprintln!("  ✓ Using provided subnets: {}", s.join(", "));
         s.clone()
     } else {
-        let subnets_resp = ec2.describe_subnets()
-            .filters(aws_sdk_ec2::types::Filter::builder().name("vpc-id").values(&vpc_id).build())
-            .send().await?;
-        subnets_resp.subnets().iter()
+        let subnets_resp = ec2
+            .describe_subnets()
+            .filters(
+                aws_sdk_ec2::types::Filter::builder()
+                    .name("vpc-id")
+                    .values(&vpc_id)
+                    .build(),
+            )
+            .send()
+            .await?;
+        subnets_resp
+            .subnets()
+            .iter()
             .filter_map(|s| s.subnet_id().map(|id| id.to_string()))
             .collect()
     };
 
     // 7. CloudWatch Log Group
-    match logs.create_log_group().log_group_name(LOG_GROUP).send().await {
-        Ok(_) => { managed.log_group = true; eprintln!("  ✓ Created log group: {LOG_GROUP}"); }
+    match logs
+        .create_log_group()
+        .log_group_name(LOG_GROUP)
+        .send()
+        .await
+    {
+        Ok(_) => {
+            managed.log_group = true;
+            eprintln!("  ✓ Created log group: {LOG_GROUP}");
+        }
         Err(_) => eprintln!("  ✓ Log group already exists: {LOG_GROUP}"),
     }
 
@@ -431,7 +566,8 @@ async fn teardown(config: &aws_config::SdkConfig) -> Result<()> {
     let bucket = bucket_name(&account);
     let s3 = S3Client::new(config);
 
-    let state = load_state(&s3, &bucket).await?
+    let state = load_state(&s3, &bucket)
+        .await?
         .context("no bootstrap state found — nothing to delete")?;
 
     eprintln!("🗑️  Tearing down OAB bootstrap resources...\n");
@@ -456,7 +592,12 @@ async fn teardown(config: &aws_config::SdkConfig) -> Result<()> {
     // Reverse order — only delete resources we created (managed)
     // 1. Log group
     if state.managed.log_group {
-        match logs.delete_log_group().log_group_name(&state.resources.log_group).send().await {
+        match logs
+            .delete_log_group()
+            .log_group_name(&state.resources.log_group)
+            .send()
+            .await
+        {
             Ok(_) => eprintln!("  ✓ Deleted log group: {}", state.resources.log_group),
             Err(e) => eprintln!("  ⚠ Failed to delete log group: {e}"),
         }
@@ -466,8 +607,16 @@ async fn teardown(config: &aws_config::SdkConfig) -> Result<()> {
 
     // 2. Security group
     if state.managed.security_group {
-        match ec2.delete_security_group().group_id(&state.resources.security_group_id).send().await {
-            Ok(_) => eprintln!("  ✓ Deleted security group: {}", state.resources.security_group_id),
+        match ec2
+            .delete_security_group()
+            .group_id(&state.resources.security_group_id)
+            .send()
+            .await
+        {
+            Ok(_) => eprintln!(
+                "  ✓ Deleted security group: {}",
+                state.resources.security_group_id
+            ),
             Err(e) => eprintln!("  ⚠ Failed to delete security group: {e}"),
         }
     } else {
@@ -499,7 +648,12 @@ async fn teardown(config: &aws_config::SdkConfig) -> Result<()> {
     }
 
     // 5. Delete state file (keep bucket for user data)
-    s3.delete_object().bucket(&bucket).key(STATE_KEY).send().await.ok();
+    s3.delete_object()
+        .bucket(&bucket)
+        .key(STATE_KEY)
+        .send()
+        .await
+        .ok();
     eprintln!("  ✓ Deleted bootstrap state");
     eprintln!("\n  ℹ️  S3 bucket '{bucket}' preserved (may contain manifests/config).");
     eprintln!("     To fully remove: aws s3 rb s3://{bucket} --force");
@@ -542,31 +696,56 @@ async fn show_status(config: &aws_config::SdkConfig) -> Result<()> {
 
 async fn ensure_role(iam: &IamClient, name: &str, _account: &str) -> Result<String> {
     match iam.get_role().role_name(name).send().await {
-        Ok(resp) => Ok(resp.role().context("no role in response")?.arn().to_string()),
+        Ok(resp) => Ok(resp
+            .role()
+            .context("no role in response")?
+            .arn()
+            .to_string()),
         Err(_) => {
-            let resp = iam.create_role()
+            let resp = iam
+                .create_role()
                 .role_name(name)
                 .assume_role_policy_document(ASSUME_ROLE_POLICY)
-                .send().await
+                .send()
+                .await
                 .with_context(|| format!("failed to create role {name}"))?;
-            Ok(resp.role().context("no role in response")?.arn().to_string())
+            Ok(resp
+                .role()
+                .context("no role in response")?
+                .arn()
+                .to_string())
         }
     }
 }
 
 async fn delete_role(iam: &IamClient, name: &str) {
     // Detach managed policies
-    if let Ok(resp) = iam.list_attached_role_policies().role_name(name).send().await {
+    if let Ok(resp) = iam
+        .list_attached_role_policies()
+        .role_name(name)
+        .send()
+        .await
+    {
         for p in resp.attached_policies() {
             if let Some(arn) = p.policy_arn() {
-                iam.detach_role_policy().role_name(name).policy_arn(arn).send().await.ok();
+                iam.detach_role_policy()
+                    .role_name(name)
+                    .policy_arn(arn)
+                    .send()
+                    .await
+                    .ok();
             }
         }
     }
     // Delete inline policies
     if let Ok(resp) = iam.list_role_policies().role_name(name).send().await {
         for p in resp.policy_names() {
-            iam.delete_role_policy().role_name(name).policy_name(p).send().await.ok();
+            iam.delete_role_policy()
+                .role_name(name)
+                .policy_name(p)
+                .send()
+                .await
+                .ok();
         }
     }
     iam.delete_role().role_name(name).send().await.ok();

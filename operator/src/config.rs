@@ -39,8 +39,12 @@ pub struct BootstrapConfig {
     pub bucket: Option<String>,
 }
 
-fn default_namespace() -> String { "prod".to_string() }
-fn default_cluster() -> String { "oab".to_string() }
+fn default_namespace() -> String {
+    "prod".to_string()
+}
+fn default_cluster() -> String {
+    "oab".to_string()
+}
 
 impl OabConfig {
     pub fn load() -> Result<Self> {
@@ -65,7 +69,9 @@ impl OabConfig {
 
     /// Get the control plane bucket name (config > env var > account-based default)
     pub fn bucket(&self) -> Option<String> {
-        self.bootstrap.bucket.clone()
+        self.bootstrap
+            .bucket
+            .clone()
             .or_else(|| std::env::var("OAB_CONTROL_PLANE_BUCKET").ok())
     }
 }

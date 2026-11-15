@@ -46,14 +46,32 @@ async fn resolve_service(
     Ok((cluster, service_name))
 }
 
-/// Immediate scale: delegates to ecsctl's scale_service for the core ECS call.
+/// Immediate scale for oabctl-managed services. ecsctl 0.13 removes the old
+/// scale_service helper; keep the same UpdateService request here rather than
+/// switching to ecsctl aliases or forcing a new deployment.
 pub async fn run(aws_config: &aws_config::SdkConfig, alias: &str, size: i32) -> Result<()> {
     validate_size(size)?;
     let (cluster, service_name) = resolve_service(aws_config, alias).await?;
     let ecs = aws_sdk_ecs::Client::new(aws_config);
 
-    ecsctl::scale::scale_service(&ecs, &cluster, &service_name, size, false).await?;
+    update_desired_count(&ecs, &cluster, &service_name, size).await
+}
 
+async fn update_desired_count(
+    ecs: &aws_sdk_ecs::Client,
+    cluster: &str,
+    service: &str,
+    size: i32,
+) -> Result<()> {
+    eprintln!("⚖️  Scaling {service} to {size}...");
+    ecs.update_service()
+        .cluster(cluster)
+        .service(service)
+        .desired_count(size)
+        .send()
+        .await
+        .context("UpdateService (scale) failed")?;
+    eprintln!("✓ Desired count set to {size} for {cluster}/{service}");
     Ok(())
 }
 
@@ -363,7 +381,9 @@ pub async fn list_schedules(aws_config: &aws_config::SdkConfig) -> Result<()> {
 
     if all_schedules.is_empty() {
         println!("No schedules found in group '{group_name}'.");
-        println!("  Use 'oabctl schedule create <alias> <size> --expr <expression>' to create one.");
+        println!(
+            "  Use 'oabctl schedule create <alias> <size> --expr <expression>' to create one."
+        );
         return Ok(());
     }
 
@@ -555,6 +575,27 @@ async fn ensure_scheduler_role(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_sdk_ecs::operation::update_service::UpdateServiceOutput;
+    use aws_smithy_mocks::{mock, mock_client, RuleMode};
+
+    #[tokio::test]
+    async fn immediate_scale_preserves_target_and_does_not_force_deployment() {
+        for count in [0, 3] {
+            let update = mock!(aws_sdk_ecs::Client::update_service)
+                .match_requests(move |request| {
+                    request.cluster() == Some("oab-cluster")
+                        && request.service() == Some("oab-prod-example")
+                        && request.desired_count() == Some(count)
+                        && request.force_new_deployment().is_none()
+                })
+                .then_output(|| UpdateServiceOutput::builder().build());
+            let ecs = mock_client!(aws_sdk_ecs, RuleMode::MatchAny, [&update]);
+            update_desired_count(&ecs, "oab-cluster", "oab-prod-example", count)
+                .await
+                .unwrap();
+            assert_eq!(update.num_calls(), 1);
+        }
+    }
 
     #[test]
     fn test_validate_schedule_expression_valid_cron() {
