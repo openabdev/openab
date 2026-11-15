@@ -808,77 +808,12 @@ impl AdapterRouter {
                             }
                         };
                         let (tx, rx) = tokio::sync::watch::channel(initial);
-                        let edit_adapter = adapter.clone();
-                        let edit_msg = msg.clone();
-                        let limit = message_limit;
-                        let mut buf_rx = rx.clone();
-                        let mut close_rx = rx;
-                        let edit_handle = tokio::spawn(async move {
-                            let mut last = String::new();
-                            // Track consecutive edit failures so we can abort cosmetic
-                            // streaming when the platform stops accepting edits (e.g.
-                            // Feishu's 20-edits-per-message hard cap, errcode 230072).
-                            // Once aborted, the final delivery path still runs and the
-                            // user sees the complete content at turn end.
-                            let mut consecutive_failures: u32 = 0;
-                            const MAX_CONSECUTIVE_FAILURES: u32 = 3;
-                            loop {
-                                tokio::select! {
-                                    biased;
-                                    // Exit first on channel closure so a coincident
-                                    // 1.5s tick never sends a post-close edit.
-                                    _ = async { while close_rx.changed().await.is_ok() {} } => break,
-                                    _ = tokio::time::sleep(std::time::Duration::from_millis(1500)) => {}
-                                }
-                                if buf_rx.has_changed().unwrap_or(false) {
-                                    let content = buf_rx.borrow_and_update().clone();
-                                    if content != last {
-                                        let display = if content.chars().count() > limit - 100 {
-                                            format!(
-                                                "…{}",
-                                                format::truncate_chars_tail(&content, limit - 100)
-                                            )
-                                        } else {
-                                            content.clone()
-                                        };
-                                        match edit_adapter
-                                            .edit_message(&edit_msg, &display)
-                                            .await
-                                        {
-                                            Ok(_) => {
-                                                consecutive_failures = 0;
-                                                last = content;
-                                            }
-                                            Err(e) => {
-                                                consecutive_failures += 1;
-                                                tracing::debug!(
-                                                    message_id = %edit_msg.message_id,
-                                                    platform = %edit_msg.channel.platform,
-                                                    error = ?e,
-                                                    consecutive_failures,
-                                                    "mid-stream cosmetic edit failed"
-                                                );
-                                                if consecutive_failures
-                                                    >= MAX_CONSECUTIVE_FAILURES
-                                                {
-                                                    tracing::warn!(
-                                                        message_id = %edit_msg.message_id,
-                                                        platform = %edit_msg.channel.platform,
-                                                        consecutive_failures,
-                                                        "mid-stream cosmetic edit aborted; \
-                                                         final content will be delivered at turn end"
-                                                    );
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                if buf_rx.has_changed().is_err() {
-                                    break;
-                                }
-                            }
-                        });
+                        let edit_handle = spawn_cosmetic_edit_loop(
+                            adapter.clone(),
+                            msg.clone(),
+                            rx,
+                            message_limit,
+                        );
                         (Some(tx), Some(msg), Some(edit_handle))
                     } else {
                         (None, None, None)
@@ -1098,20 +1033,15 @@ impl AdapterRouter {
                     }
 
                     conn.prompt_done().await;
-                    // Signal the cosmetic edit loop to stop and wait boundedly for any
-                    // in-flight edit to settle so it does not overwrite the authoritative
-                    // finalize edit. Abort on timeout (e.g. long 429 backoff) so
-                    // finalization stays responsive without detaching a stale task.
+                    // Stop the cosmetic edit loop and let any in-flight edit
+                    // finish before the authoritative finalize write, so a stale
+                    // preview cannot overwrite it. Dropping buf_tx closes the
+                    // watch channel; the settle helper waits up to
+                    // COSMETIC_EDIT_SETTLE_TIMEOUT, then aborts and joins the
+                    // task. See `settle_cosmetic_edit_task` for the residual risk.
                     drop(buf_tx);
                     if let Some(handle) = edit_handle {
-                        let abort_handle = handle.abort_handle();
-                        if tokio::time::timeout(std::time::Duration::from_secs(3), handle)
-                            .await
-                            .is_err()
-                        {
-                            tracing::warn!("cosmetic edit task timed out at finalize; aborting");
-                            abort_handle.abort();
-                        }
+                        settle_cosmetic_edit_task(handle, COSMETIC_EDIT_SETTLE_TIMEOUT).await;
                     }
 
                     // In send-once mode, deliver only the final answer block —
@@ -1376,6 +1306,120 @@ impl AdapterRouter {
             })
             .await
     }
+}
+
+/// Interval between cosmetic streaming edits of the placeholder message.
+const COSMETIC_EDIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Upper bound on how long finalize waits for an in-flight cosmetic edit to
+/// finish before it aborts the edit task. Gateway acked edits already give up
+/// after 800ms and fire-and-forget gateway edits return right after the socket
+/// write, so this cap is only reached by HTTP adapters stalled on rate limits
+/// or slow API calls (Slack allows 30s per call). It bounds the extra tail
+/// latency a finished turn can see.
+const COSMETIC_EDIT_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Spawn the post+edit cosmetic streaming loop. Every `COSMETIC_EDIT_INTERVAL`
+/// it edits `msg` with the latest content from `rx`, tail-truncated to fit
+/// `limit`. The loop exits when the sender is dropped or after repeated edit
+/// failures.
+fn spawn_cosmetic_edit_loop(
+    edit_adapter: Arc<dyn ChatAdapter>,
+    edit_msg: MessageRef,
+    rx: tokio::sync::watch::Receiver<String>,
+    limit: usize,
+) -> tokio::task::JoinHandle<()> {
+    let mut buf_rx = rx.clone();
+    let mut close_rx = rx;
+    tokio::spawn(async move {
+        let mut last = String::new();
+        // Track consecutive edit failures so we can abort cosmetic
+        // streaming when the platform stops accepting edits (e.g.
+        // Feishu's 20-edits-per-message hard cap, errcode 230072).
+        // Once aborted, the final delivery path still runs and the
+        // user sees the complete content at turn end.
+        let mut consecutive_failures: u32 = 0;
+        const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+        loop {
+            tokio::select! {
+                biased;
+                // Closure is checked first so the loop exits as soon as
+                // `buf_tx` is dropped instead of finishing the sleep. The
+                // old loop already skipped the edit after close (because
+                // `has_changed()` errs once closed), but it could keep
+                // finalize's settle join waiting for up to one interval.
+                _ = async { while close_rx.changed().await.is_ok() {} } => break,
+                _ = tokio::time::sleep(COSMETIC_EDIT_INTERVAL) => {}
+            }
+            if buf_rx.has_changed().unwrap_or(false) {
+                let content = buf_rx.borrow_and_update().clone();
+                if content != last {
+                    let display = if content.chars().count() > limit - 100 {
+                        format!("…{}", format::truncate_chars_tail(&content, limit - 100))
+                    } else {
+                        content.clone()
+                    };
+                    match edit_adapter.edit_message(&edit_msg, &display).await {
+                        Ok(_) => {
+                            consecutive_failures = 0;
+                            last = content;
+                        }
+                        Err(e) => {
+                            consecutive_failures += 1;
+                            tracing::debug!(
+                                message_id = %edit_msg.message_id,
+                                platform = %edit_msg.channel.platform,
+                                error = ?e,
+                                consecutive_failures,
+                                "mid-stream cosmetic edit failed"
+                            );
+                            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                                tracing::warn!(
+                                    message_id = %edit_msg.message_id,
+                                    platform = %edit_msg.channel.platform,
+                                    consecutive_failures,
+                                    "mid-stream cosmetic edit aborted; \
+                                     final content will be delivered at turn end"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if buf_rx.has_changed().is_err() {
+                break;
+            }
+        }
+    })
+}
+
+/// Wait for the cosmetic edit task to finish after its sender was dropped, so
+/// an in-flight edit completes before the authoritative finalize write.
+///
+/// If the task does not finish within `timeout`, it is aborted and then
+/// joined, so the task is gone when this returns and cannot start or resume
+/// an edit afterwards. Residual risk on the timeout path: a request the task
+/// already wrote to the wire cannot be recalled, and HTTP adapters may send
+/// it on a different pooled connection than the finalize write, so it can
+/// still arrive last and leave a stale `...<tail>` preview as the visible
+/// message until a later edit.
+///
+/// Returns `true` if the task finished on its own within `timeout`.
+async fn settle_cosmetic_edit_task(
+    mut handle: tokio::task::JoinHandle<()>,
+    timeout: std::time::Duration,
+) -> bool {
+    if tokio::time::timeout(timeout, &mut handle).await.is_ok() {
+        return true;
+    }
+    tracing::warn!(
+        timeout_ms = timeout.as_millis() as u64,
+        "cosmetic edit task did not settle at finalize; aborting"
+    );
+    handle.abort();
+    let _ = handle.await;
+    false
 }
 
 /// Returns true if `content` contains a Discord user/bot mention (`<@123>`, `<@!123>`)
@@ -2585,5 +2629,171 @@ mod directive_tests {
         };
         let result = classify_empty_turn(None, &tr);
         assert_eq!(result, "_(no response)_");
+    }
+}
+
+#[cfg(test)]
+mod cosmetic_edit_tests {
+    //! Deterministic tests for the cosmetic edit loop and the finalize settle
+    //! join (`spawn_cosmetic_edit_loop` / `settle_cosmetic_edit_task`). They run
+    //! on paused time, so timer-driven paths finish instantly and in a fixed
+    //! order.
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use tokio::sync::{watch, Notify};
+    use tokio::task::JoinHandle;
+
+    /// Records every completed `edit_message` call. While `gate_next` is set,
+    /// the next edit signals `started` and then blocks until `release` is
+    /// notified, which simulates one slow in-flight request. Later edits (for
+    /// example the finalize write) go through immediately.
+    struct RecordingAdapter {
+        edits: Mutex<Vec<String>>,
+        gate_next: AtomicBool,
+        started: Notify,
+        release: Notify,
+    }
+
+    impl RecordingAdapter {
+        fn new(gate_next: bool) -> Arc<Self> {
+            Arc::new(Self {
+                edits: Mutex::new(Vec::new()),
+                gate_next: AtomicBool::new(gate_next),
+                started: Notify::new(),
+                release: Notify::new(),
+            })
+        }
+
+        fn edits(&self) -> Vec<String> {
+            self.edits.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ChatAdapter for RecordingAdapter {
+        fn platform(&self) -> &'static str {
+            "test"
+        }
+        fn message_limit(&self) -> usize {
+            2000
+        }
+        async fn send_message(&self, _: &ChannelRef, _: &str) -> Result<MessageRef> {
+            unimplemented!()
+        }
+        async fn create_thread(
+            &self,
+            _: &ChannelRef,
+            _: &MessageRef,
+            _: &str,
+        ) -> Result<ChannelRef> {
+            unimplemented!()
+        }
+        async fn add_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn remove_reaction(&self, _: &MessageRef, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn edit_message(&self, _: &MessageRef, content: &str) -> Result<()> {
+            if self.gate_next.swap(false, Ordering::SeqCst) {
+                self.started.notify_one();
+                self.release.notified().await;
+            }
+            self.edits.lock().unwrap().push(content.to_string());
+            Ok(())
+        }
+        fn use_streaming(&self, _other_bot_present: bool) -> bool {
+            true
+        }
+    }
+
+    fn test_msg() -> MessageRef {
+        MessageRef {
+            channel: ChannelRef {
+                platform: "test".into(),
+                channel_id: "C1".into(),
+                thread_id: None,
+                parent_id: None,
+                origin_event_id: None,
+            },
+            message_id: "M1".into(),
+        }
+    }
+
+    fn spawn_loop(adapter: &Arc<RecordingAdapter>) -> (watch::Sender<String>, JoinHandle<()>) {
+        let (tx, rx) = watch::channel(String::new());
+        let dyn_adapter: Arc<dyn ChatAdapter> = adapter.clone();
+        let handle = spawn_cosmetic_edit_loop(dyn_adapter, test_msg(), rx, 2000);
+        (tx, handle)
+    }
+
+    /// Closing the channel during the sleep exits the loop immediately: no
+    /// edit is sent for the pending value, and settle does not wait out the
+    /// rest of the interval.
+    #[tokio::test(start_paused = true)]
+    async fn close_during_sleep_exits_without_edit() {
+        let adapter = RecordingAdapter::new(false);
+        let (tx, handle) = spawn_loop(&adapter);
+        tx.send("pending".into()).unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        drop(tx);
+        let start = tokio::time::Instant::now();
+        assert!(settle_cosmetic_edit_task(handle, COSMETIC_EDIT_SETTLE_TIMEOUT).await);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert!(adapter.edits().is_empty());
+    }
+
+    /// An edit that is in flight when the turn ends finishes before settle
+    /// returns, so the finalize write that follows is recorded last.
+    #[tokio::test(start_paused = true)]
+    async fn in_flight_edit_settles_before_finalize() {
+        let adapter = RecordingAdapter::new(true);
+        let (tx, handle) = spawn_loop(&adapter);
+        tx.send("preview".into()).unwrap();
+        adapter.started.notified().await;
+
+        drop(tx);
+        let releaser = {
+            let adapter = adapter.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                adapter.release.notify_one();
+            })
+        };
+        let start = tokio::time::Instant::now();
+        assert!(settle_cosmetic_edit_task(handle, COSMETIC_EDIT_SETTLE_TIMEOUT).await);
+        assert_eq!(start.elapsed(), Duration::from_secs(1));
+        releaser.await.unwrap();
+
+        // Stand-in for the authoritative finalize write.
+        adapter.edit_message(&test_msg(), "final").await.unwrap();
+        assert_eq!(adapter.edits(), vec!["preview".to_string(), "final".to_string()]);
+    }
+
+    /// An edit blocked past the settle cap is aborted and joined: settle
+    /// returns at the cap, the task has already dropped its adapter handle,
+    /// and the stale edit is never recorded, even if the blocked request is
+    /// released later.
+    #[tokio::test(start_paused = true)]
+    async fn stalled_edit_is_aborted_and_joined_at_cap() {
+        let adapter = RecordingAdapter::new(true);
+        let (tx, handle) = spawn_loop(&adapter);
+        tx.send("stale".into()).unwrap();
+        adapter.started.notified().await;
+
+        drop(tx);
+        let start = tokio::time::Instant::now();
+        assert!(!settle_cosmetic_edit_task(handle, COSMETIC_EDIT_SETTLE_TIMEOUT).await);
+        assert_eq!(start.elapsed(), COSMETIC_EDIT_SETTLE_TIMEOUT);
+        // The join dropped the task future, so only this test holds the
+        // adapter. Without the join, the aborted task could still be alive.
+        assert_eq!(Arc::strong_count(&adapter), 1);
+
+        adapter.release.notify_one();
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert!(adapter.edits().is_empty());
     }
 }
