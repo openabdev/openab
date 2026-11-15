@@ -811,7 +811,8 @@ impl AdapterRouter {
                         let edit_adapter = adapter.clone();
                         let edit_msg = msg.clone();
                         let limit = message_limit;
-                        let mut buf_rx = rx;
+                        let mut buf_rx = rx.clone();
+                        let mut close_rx = rx;
                         let edit_handle = tokio::spawn(async move {
                             let mut last = String::new();
                             // Track consecutive edit failures so we can abort cosmetic
@@ -822,7 +823,13 @@ impl AdapterRouter {
                             let mut consecutive_failures: u32 = 0;
                             const MAX_CONSECUTIVE_FAILURES: u32 = 3;
                             loop {
-                                tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                                tokio::select! {
+                                    biased;
+                                    // Exit first on channel closure so a coincident
+                                    // 1.5s tick never sends a post-close edit.
+                                    _ = async { while close_rx.changed().await.is_ok() {} } => break,
+                                    _ = tokio::time::sleep(std::time::Duration::from_millis(1500)) => {}
+                                }
                                 if buf_rx.has_changed().unwrap_or(false) {
                                     let content = buf_rx.borrow_and_update().clone();
                                     if content != last {
@@ -1091,27 +1098,20 @@ impl AdapterRouter {
                     }
 
                     conn.prompt_done().await;
-                    // Stop the cosmetic edit loop before the finalize write path
-                    // issues its authoritative edit. Dropping buf_tx closes the watch
-                    // channel so the loop breaks on its next check, but it may be
-                    // mid-edit (a single edit can now block up to the gateway response
-                    // timeout). Without an explicit abort+join, a cosmetic edit issued
-                    // just before close could land *after* the finalize edit and
-                    // overwrite it with stale, mid-stream content (#1122 review NEW-1).
-                    //
-                    // abort() cancels any cosmetic edit that has not yet been put on
-                    // the wire and interrupts the inter-flush sleep immediately; the
-                    // await confirms the task is gone before we proceed. This narrows
-                    // the race to near zero — it does NOT fully eliminate it: a PUT
-                    // already flushed microseconds before abort cannot be recalled,
-                    // and if finalize's PUT travels a different pooled connection the
-                    // server-side arrival order is not strictly guaranteed. That
-                    // residual window is display-only (stale tail briefly shown) and
-                    // far narrower than before this join existed.
+                    // Signal the cosmetic edit loop to stop and wait boundedly for any
+                    // in-flight edit to settle so it does not overwrite the authoritative
+                    // finalize edit. Abort on timeout (e.g. long 429 backoff) so
+                    // finalization stays responsive without detaching a stale task.
                     drop(buf_tx);
                     if let Some(handle) = edit_handle {
-                        handle.abort();
-                        let _ = handle.await;
+                        let abort_handle = handle.abort_handle();
+                        if tokio::time::timeout(std::time::Duration::from_secs(3), handle)
+                            .await
+                            .is_err()
+                        {
+                            tracing::warn!("cosmetic edit task timed out at finalize; aborting");
+                            abort_handle.abort();
+                        }
                     }
 
                     // In send-once mode, deliver only the final answer block —
