@@ -16,8 +16,8 @@ ARG BUILDER_IMAGE=local_builder
 
 # Pinned so the shipped Node.js version is explicit; bump it on Node security
 # releases. Passing just the major (e.g. NODE22_VERSION=22) floats to the latest.
-ARG NODE22_VERSION=22.23.4
-ARG NODE24_VERSION=24.22.1
+ARG NODE22_VERSION=22.23.5
+ARG NODE24_VERSION=24.22.3
 
 # =============================================================================
 # Stage: local_builder — compile openab binary (unified mode)
