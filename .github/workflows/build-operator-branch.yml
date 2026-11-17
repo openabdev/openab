@@ -17,7 +17,10 @@ jobs:
       - name: Install Rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          # On macmini ~/.cargo/bin is a symlink to the external RAID; putting it on
+          # PATH hangs the runner Worker in opendir (TCC). The runner .env sets
+          # CARGO_HOME to ~/ci-rust/cargo, so use that and fall back to ~/.cargo.
+          echo "${CARGO_HOME:-$HOME/.cargo}/bin" >> "$GITHUB_PATH"
 
       - name: Build (aarch64-apple-darwin)
         run: cargo build --release
