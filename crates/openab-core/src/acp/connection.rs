@@ -685,6 +685,28 @@ impl AcpConnection {
         config_id: &str,
         value: &str,
     ) -> Result<Vec<ConfigOption>> {
+        self.set_config_option_inner(config_id, value, true).await
+    }
+
+    /// Like [`Self::set_config_option`] but without the slash-command
+    /// fallback: an error from `session/set_config_option` is returned, and
+    /// the option list is exactly what the agent reported. Used by
+    /// `[pool] strict_default_config_options`, where a locally synthesized
+    /// value must not count as confirmation.
+    pub async fn set_config_option_reported(
+        &mut self,
+        config_id: &str,
+        value: &str,
+    ) -> Result<Vec<ConfigOption>> {
+        self.set_config_option_inner(config_id, value, false).await
+    }
+
+    async fn set_config_option_inner(
+        &mut self,
+        config_id: &str,
+        value: &str,
+        allow_fallback: bool,
+    ) -> Result<Vec<ConfigOption>> {
         let session_id = self
             .acp_session_id
             .as_ref()
@@ -709,6 +731,7 @@ impl AcpConnection {
                 }
                 info!(config_id, value, "config option set");
             }
+            Err(e) if !allow_fallback => return Err(e),
             Err(_) => {
                 // Fall back: send as a slash command (e.g. "/model claude-sonnet-4")
                 let cmd = format!("/{config_id} {value}");
@@ -1416,6 +1439,21 @@ pub(crate) mod mock_agent {
     /// `require_meta` is set, `session/new` fails unless the request carries
     /// `"workflows":{"enabled":true}`.
     pub(crate) fn script(set_cfg_reply: &str, require_meta: bool) -> String {
+        script_with_prompt(set_cfg_reply, require_meta, false)
+    }
+
+    /// Like [`script`]; `prompt_ok` makes the slash-command fallback prompt
+    /// (id 4) succeed instead of failing.
+    pub(crate) fn script_with_prompt(
+        set_cfg_reply: &str,
+        require_meta: bool,
+        prompt_ok: bool,
+    ) -> String {
+        let prompt_reply = if prompt_ok {
+            r#"{"jsonrpc":"2.0","id":4,"result":{"stopReason":"end_turn"}}"#
+        } else {
+            r#"{"jsonrpc":"2.0","id":4,"error":{"code":-32000,"message":"unsupported"}}"#
+        };
         let new_ok = r#"echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s-1"}}'"#;
         let new_err =
             r#"echo '{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"missing _meta"}}'"#;
@@ -1432,7 +1470,7 @@ case "$l" in
 *'"method":"initialize"'*) echo '{{"jsonrpc":"2.0","id":1,"result":{{"agentInfo":{{"name":"mock"}}}}}}';;
 *'"method":"session/new"'*) {session_new};;
 *'"method":"session/set_config_option"'*) echo '{set_cfg_reply}';;
-*'"method":"session/prompt"'*) echo '{{"jsonrpc":"2.0","id":4,"error":{{"code":-32000,"message":"unsupported"}}}}';;
+*'"method":"session/prompt"'*) echo '{prompt_reply}';;
 esac
 done"#
         )
@@ -1593,6 +1631,7 @@ mod workflow_meta_tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    #[ignore = "integration: spawns a mock agent subprocess"]
     async fn session_new_with_meta_sends_underscore_meta() {
         let script = mock_agent::script(&mock_agent::mode_reply("vibe"), true);
         let meta = json!({"kiro": {"settings": {"workflows": {"enabled": true}}}});
@@ -1610,11 +1649,110 @@ mod workflow_meta_tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    #[ignore = "integration: spawns a mock agent subprocess"]
     async fn set_config_option_returns_agent_reported_value() {
         let script = mock_agent::script(&mock_agent::mode_reply("vibe"), false);
         let mut conn = spawn_mock(script).await;
         conn.session_new("/tmp").await.unwrap();
         let opts = conn.set_config_option("mode", "e2e").await.unwrap();
         assert!(verify_config_option_applied(&opts, "mode", "e2e").is_err());
+    }
+
+    /// Mock agent for the subscriber hand-off: each `session/prompt` is answered
+    /// by a response (ids 3, 4, ...) followed by a late `agent_message_chunk`
+    /// of the parent session `s-1` ("late-<id>").
+    #[cfg(unix)]
+    fn late_chunk_script() -> String {
+        r#"n=3
+while IFS= read -r l; do
+case "$l" in
+*'"method":"initialize"'*) echo '{"jsonrpc":"2.0","id":1,"result":{"agentInfo":{"name":"mock"}}}';;
+*'"method":"session/new"'*) echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s-1"}}';;
+*'"method":"session/prompt"'*)
+echo '{"jsonrpc":"2.0","id":'$n',"result":{"stopReason":"end_turn"}}'
+echo '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"late-'$n'"}}}}'
+n=$((n+1));;
+esac
+done"#
+            .to_string()
+    }
+
+    /// The next `session_prompt` replaces the subscriber: the running tail
+    /// flushes what it buffered and ends, and the new receiver sees only the
+    /// new turn's frames.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "integration: spawns a mock agent subprocess"]
+    async fn next_prompt_replaces_subscriber_and_ends_the_tail() {
+        use super::ContentBlock;
+        use crate::workflow_tail::{run_tail, WorkflowRelayConfig};
+        use std::time::Duration;
+
+        let mut conn = spawn_mock(late_chunk_script()).await;
+        conn.session_new("/tmp").await.unwrap();
+
+        let (mut rx1, id1) = conn
+            .session_prompt(vec![ContentBlock::Text { text: "one".into() }])
+            .await
+            .unwrap();
+        loop {
+            let m = tokio::time::timeout(Duration::from_secs(5), rx1.recv())
+                .await
+                .expect("response")
+                .expect("open");
+            if m.id.as_ref().and_then(|i| i.as_u64()) == Some(id1) {
+                break;
+            }
+        }
+        conn.prompt_done_keep_subscriber().await;
+
+        let out = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = out.clone();
+        let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
+        gate_tx.send(()).unwrap();
+        let tail = tokio::spawn(run_tail(
+            rx1,
+            "s-1".to_string(),
+            ["wf".to_string()].into_iter().collect(),
+            WorkflowRelayConfig {
+                tail_quiet: Duration::from_secs(60),
+                tail_max: Duration::from_secs(60),
+            },
+            tokio::time::Instant::now(),
+            gate_rx,
+            move |t| {
+                sink.lock().unwrap().push(t);
+                std::future::ready(())
+            },
+        ));
+        // Let late-3 reach the tail's buffer before the swap.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let (mut rx2, id2) = conn
+            .session_prompt(vec![ContentBlock::Text { text: "two".into() }])
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), tail)
+            .await
+            .expect("tail must end when the subscriber is replaced")
+            .unwrap();
+        assert_eq!(*out.lock().unwrap(), vec!["late-3".to_string()]);
+
+        let mut texts = Vec::new();
+        let mut got_response = false;
+        while !(got_response && !texts.is_empty()) {
+            let m = tokio::time::timeout(Duration::from_secs(5), rx2.recv())
+                .await
+                .expect("frame")
+                .expect("open");
+            if m.id.as_ref().and_then(|i| i.as_u64()) == Some(id2) {
+                got_response = true;
+            } else if let Some(crate::acp::AcpEvent::Text(t)) =
+                crate::acp::classify_notification(&m)
+            {
+                texts.push(t);
+            }
+        }
+        assert_eq!(texts, vec!["late-4".to_string()]);
     }
 }

@@ -1073,6 +1073,10 @@ impl AdapterRouter {
                             && !platform_is_acp
                             && wf_state.armed()
                     });
+                    let tail_started = tokio::time::Instant::now();
+                    // Hand the receiver to the tail right away so it drains
+                    // frames while the original reply is finalized; it posts
+                    // only after `gate_tx` fires below.
                     let tail_rx = if tail_cfg.is_some() {
                         conn.prompt_done_keep_subscriber().await;
                         Some(rx)
@@ -1080,6 +1084,35 @@ impl AdapterRouter {
                         conn.prompt_done().await;
                         None
                     };
+                    let mut gate_tx = None;
+                    if let (Some(cfg), Some(rx), Some(sid)) = (tail_cfg, tail_rx, parent_sid) {
+                        let (g_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+                        gate_tx = Some(g_tx);
+                        let tail_adapter = adapter.clone();
+                        let tail_channel = thread_channel.clone();
+                        tokio::spawn(crate::workflow_tail::run_tail(
+                            rx,
+                            sid,
+                            std::mem::take(&mut wf_state).into_open(),
+                            cfg,
+                            tail_started,
+                            gate_rx,
+                            move |text| {
+                                let adapter = tail_adapter.clone();
+                                let channel = tail_channel.clone();
+                                async move {
+                                    let text = format!("_Workflow update:_\n\n{text}");
+                                    for chunk in format::split_message(&text, message_limit) {
+                                        if let Err(e) = adapter.send_message(&channel, &chunk).await
+                                        {
+                                            warn!(error = ?e, "workflow tail delivery failed");
+                                            break;
+                                        }
+                                    }
+                                }
+                            },
+                        ));
+                    }
                     // Stop the cosmetic edit loop and let any in-flight edit
                     // finish before the authoritative finalize write, so in the
                     // normal case a stale preview does not overwrite it. Dropping
@@ -1343,29 +1376,9 @@ impl AdapterRouter {
                         }
                     }
 
-                    if let (Some(cfg), Some(rx), Some(sid)) = (tail_cfg, tail_rx, parent_sid) {
-                        let tail_adapter = adapter.clone();
-                        let tail_channel = thread_channel.clone();
-                        tokio::spawn(crate::workflow_tail::run_tail(
-                            rx,
-                            sid,
-                            wf_state.into_open(),
-                            cfg,
-                            move |text| {
-                                let adapter = tail_adapter.clone();
-                                let channel = tail_channel.clone();
-                                async move {
-                                    let text = format!("_Workflow update:_\n\n{text}");
-                                    for chunk in format::split_message(&text, message_limit) {
-                                        if let Err(e) = adapter.send_message(&channel, &chunk).await
-                                        {
-                                            warn!(error = ?e, "workflow tail delivery failed");
-                                            break;
-                                        }
-                                    }
-                                }
-                            },
-                        ));
+                    // Original reply is out: let the tail start posting.
+                    if let Some(g) = gate_tx.take() {
+                        let _ = g.send(());
                     }
 
                     if delivery_failed {

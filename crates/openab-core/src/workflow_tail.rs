@@ -19,7 +19,8 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::time::{sleep_until, Instant};
+use tokio::sync::oneshot;
+use tokio::time::{sleep_until, timeout_at, Instant};
 
 /// Bounds for the late-output relay (`[pool] workflow_tail_*`).
 #[derive(Debug, Clone, Copy)]
@@ -62,25 +63,44 @@ impl TurnWorkflowState {
     }
 }
 
+/// Most text the tail buffers between flushes. Further text is dropped and a
+/// truncation note is appended to the flushed message.
+pub const MAX_BUFFER_BYTES: usize = 256 * 1024;
+
+/// Bound on one `deliver` call, so a stalled platform call cannot keep the
+/// tail (and its deadline checks) blocked.
+pub const DELIVER_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Read late frames from `rx` and hand text to `deliver`.
 ///
+/// `started` is when the prompt response arrived: the hard cap is measured
+/// from it, not from when this task starts. `gate` resolves once the original
+/// reply has been delivered; the tail starts draining `rx` immediately (so the
+/// queue does not grow while the reply is finalized) but posts nothing before
+/// the gate opens. A dropped gate counts as open.
+///
 /// Ends when the channel closes (flushing what is buffered), when nothing is
-/// running and the quiet time has passed, or at `cfg.tail_max` (flushing, and
-/// reporting through `deliver` if a run is still open).
+/// running and the quiet time has passed, or at the hard cap (flushing, and
+/// reporting through `deliver` if a run is still open). Buffered text is
+/// limited to [`MAX_BUFFER_BYTES`] and each `deliver` to [`DELIVER_TIMEOUT`].
 pub async fn run_tail<F, Fut>(
     mut rx: UnboundedReceiver<JsonRpcMessage>,
     parent_session_id: String,
     mut open: HashSet<String>,
     cfg: WorkflowRelayConfig,
+    started: Instant,
+    gate: oneshot::Receiver<()>,
     mut deliver: F,
 ) where
     F: FnMut(String) -> Fut,
     Fut: Future<Output = ()>,
 {
-    let start = Instant::now();
-    let hard = start + cfg.tail_max;
-    let mut last_event = start;
+    let mut gate = gate;
+    let mut gated = true;
+    let hard = started + cfg.tail_max;
+    let mut last_event = Instant::now();
     let mut buf = String::new();
+    let mut truncated = false;
     loop {
         let quiet_applies = !buf.is_empty() || open.is_empty();
         let deadline = if quiet_applies {
@@ -89,9 +109,16 @@ pub async fn run_tail<F, Fut>(
             hard
         };
         tokio::select! {
+            _ = &mut gate, if gated => {
+                gated = false;
+            }
             msg = rx.recv() => {
                 let Some(msg) = msg else {
-                    flush(&mut buf, &mut deliver).await;
+                    if gated {
+                        // Wait for the original reply, but not past the cap.
+                        let _ = timeout_at(hard, &mut gate).await;
+                    }
+                    flush(&mut buf, &mut truncated, &mut deliver).await;
                     return;
                 };
                 if is_foreign_session_update(&msg, &parent_session_id) {
@@ -112,16 +139,30 @@ pub async fn run_tail<F, Fut>(
                 }
                 if msg.id.is_none() {
                     if let Some(AcpEvent::Text(t)) = classify_notification(&msg) {
-                        buf.push_str(&t);
+                        if buf.len() + t.len() <= MAX_BUFFER_BYTES {
+                            buf.push_str(&t);
+                        } else {
+                            truncated = true;
+                        }
                         last_event = Instant::now();
                     }
                 }
             }
             _ = sleep_until(deadline) => {
-                flush(&mut buf, &mut deliver).await;
-                if Instant::now() >= hard {
+                let at_cap = Instant::now() >= hard;
+                if gated && !at_cap {
+                    // Reply still being delivered: keep buffering.
+                    last_event = Instant::now();
+                    continue;
+                }
+                if gated {
+                    // Cap reached before the reply was delivered; drop.
+                    return;
+                }
+                flush(&mut buf, &mut truncated, &mut deliver).await;
+                if at_cap || Instant::now() >= hard {
                     if !open.is_empty() {
-                        deliver(format!(
+                        send(&mut deliver, format!(
                             "⚠ workflow still running after {}s; further output is not relayed",
                             cfg.tail_max.as_secs()
                         ))
@@ -138,14 +179,25 @@ pub async fn run_tail<F, Fut>(
     }
 }
 
-async fn flush<F, Fut>(buf: &mut String, deliver: &mut F)
+async fn send<F, Fut>(deliver: &mut F, text: String)
 where
     F: FnMut(String) -> Fut,
     Fut: Future<Output = ()>,
 {
-    let text = std::mem::take(buf);
+    let _ = tokio::time::timeout(DELIVER_TIMEOUT, deliver(text)).await;
+}
+
+async fn flush<F, Fut>(buf: &mut String, truncated: &mut bool, deliver: &mut F)
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let mut text = std::mem::take(buf);
+    if std::mem::take(truncated) {
+        text.push_str("\n\n…(output truncated)");
+    }
     if !text.trim().is_empty() {
-        deliver(text).await;
+        send(deliver, text).await;
     }
 }
 
@@ -155,6 +207,7 @@ mod tests {
     use serde_json::json;
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc::unbounded_channel;
+    use tokio::sync::oneshot;
 
     const PARENT: &str = "parent";
 
@@ -199,6 +252,12 @@ mod tests {
         })
     }
 
+    fn open_gate() -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        tx.send(()).unwrap();
+        rx
+    }
+
     fn open_set(ids: &[&str]) -> HashSet<String> {
         ids.iter().map(|s| s.to_string()).collect()
     }
@@ -210,7 +269,16 @@ mod tests {
         tx.send(run_complete()).unwrap();
         tx.send(chunk(PARENT, "all ")).unwrap();
         tx.send(chunk(PARENT, "done")).unwrap();
-        run_tail(rx, PARENT.into(), open_set(&["wf_1"]), cfg(), deliver).await;
+        run_tail(
+            rx,
+            PARENT.into(),
+            open_set(&["wf_1"]),
+            cfg(),
+            Instant::now(),
+            open_gate(),
+            deliver,
+        )
+        .await;
         assert_eq!(*out.lock().unwrap(), vec!["all done".to_string()]);
         drop(tx);
     }
@@ -222,7 +290,16 @@ mod tests {
         tx.send(run_complete()).unwrap();
         tx.send(chunk("step-1", "internal")).unwrap();
         tx.send(chunk(PARENT, "summary")).unwrap();
-        run_tail(rx, PARENT.into(), open_set(&["wf_1"]), cfg(), deliver).await;
+        run_tail(
+            rx,
+            PARENT.into(),
+            open_set(&["wf_1"]),
+            cfg(),
+            Instant::now(),
+            open_gate(),
+            deliver,
+        )
+        .await;
         assert_eq!(*out.lock().unwrap(), vec!["summary".to_string()]);
         drop(tx);
     }
@@ -233,7 +310,16 @@ mod tests {
         let (out, deliver) = collector();
         tx.send(chunk(PARENT, "partial")).unwrap();
         drop(tx);
-        run_tail(rx, PARENT.into(), open_set(&["wf_1"]), cfg(), deliver).await;
+        run_tail(
+            rx,
+            PARENT.into(),
+            open_set(&["wf_1"]),
+            cfg(),
+            Instant::now(),
+            open_gate(),
+            deliver,
+        )
+        .await;
         assert_eq!(*out.lock().unwrap(), vec!["partial".to_string()]);
     }
 
@@ -242,7 +328,16 @@ mod tests {
         let (tx, rx) = unbounded_channel();
         let (out, deliver) = collector();
         let started = Instant::now();
-        run_tail(rx, PARENT.into(), open_set(&["wf_1"]), cfg(), deliver).await;
+        run_tail(
+            rx,
+            PARENT.into(),
+            open_set(&["wf_1"]),
+            cfg(),
+            Instant::now(),
+            open_gate(),
+            deliver,
+        )
+        .await;
         assert_eq!(started.elapsed(), Duration::from_secs(900));
         let got = out.lock().unwrap().clone();
         assert_eq!(got.len(), 1);
@@ -259,6 +354,8 @@ mod tests {
             PARENT.into(),
             open_set(&["wf_1"]),
             cfg(),
+            Instant::now(),
+            open_gate(),
             deliver,
         ));
         tx.send(chunk(PARENT, "first")).unwrap();
@@ -279,7 +376,16 @@ mod tests {
         let (tx, rx) = unbounded_channel();
         let (out, deliver) = collector();
         let started = Instant::now();
-        run_tail(rx, PARENT.into(), HashSet::new(), cfg(), deliver).await;
+        run_tail(
+            rx,
+            PARENT.into(),
+            HashSet::new(),
+            cfg(),
+            Instant::now(),
+            open_gate(),
+            deliver,
+        )
+        .await;
         assert_eq!(started.elapsed(), Duration::from_secs(20));
         assert!(out.lock().unwrap().is_empty());
         drop(tx);
@@ -290,8 +396,110 @@ mod tests {
         let (tx, rx) = unbounded_channel::<JsonRpcMessage>();
         drop(tx);
         let (out, deliver) = collector();
-        run_tail(rx, PARENT.into(), open_set(&["wf_1"]), cfg(), deliver).await;
+        run_tail(
+            rx,
+            PARENT.into(),
+            open_set(&["wf_1"]),
+            cfg(),
+            Instant::now(),
+            open_gate(),
+            deliver,
+        )
+        .await;
         assert!(out.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn buffered_text_is_capped_and_marked_truncated() {
+        let (tx, rx) = unbounded_channel();
+        let (out, deliver) = collector();
+        let big = "x".repeat(MAX_BUFFER_BYTES / 2 + 1);
+        tx.send(chunk(PARENT, &big)).unwrap();
+        tx.send(chunk(PARENT, &big)).unwrap();
+        tx.send(chunk(PARENT, &big)).unwrap();
+        drop(tx);
+        run_tail(
+            rx,
+            PARENT.into(),
+            open_set(&["wf_1"]),
+            cfg(),
+            Instant::now(),
+            open_gate(),
+            deliver,
+        )
+        .await;
+        let got = out.lock().unwrap().clone();
+        assert_eq!(got.len(), 1);
+        assert!(got[0].len() <= MAX_BUFFER_BYTES + 64, "{}", got[0].len());
+        assert!(got[0].ends_with("…(output truncated)"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hard_cap_counts_from_the_prompt_response() {
+        let (tx, rx) = unbounded_channel::<JsonRpcMessage>();
+        let (out, deliver) = collector();
+        // The prompt response arrived 800 s ago (original reply was slow).
+        let started = Instant::now();
+        tokio::time::advance(Duration::from_secs(800)).await;
+        let t0 = Instant::now();
+        run_tail(
+            rx,
+            PARENT.into(),
+            open_set(&["wf_1"]),
+            cfg(),
+            started,
+            open_gate(),
+            deliver,
+        )
+        .await;
+        assert_eq!(t0.elapsed(), Duration::from_secs(100));
+        assert!(out.lock().unwrap()[0].contains("still running"));
+        drop(tx);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nothing_is_posted_before_the_original_reply_is_delivered() {
+        let (tx, rx) = unbounded_channel();
+        let (gate_tx, gate_rx) = oneshot::channel();
+        let (out, deliver) = collector();
+        let handle = tokio::spawn(run_tail(
+            rx,
+            PARENT.into(),
+            open_set(&["wf_1"]),
+            cfg(),
+            Instant::now(),
+            gate_rx,
+            deliver,
+        ));
+        tx.send(run_complete()).unwrap();
+        tx.send(chunk(PARENT, "late")).unwrap();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(out.lock().unwrap().is_empty(), "gate still closed");
+        assert!(!handle.is_finished());
+        gate_tx.send(()).unwrap();
+        handle.await.unwrap();
+        assert_eq!(*out.lock().unwrap(), vec!["late".to_string()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_delivery_does_not_hold_the_tail_forever() {
+        let (tx, rx) = unbounded_channel();
+        tx.send(run_complete()).unwrap();
+        tx.send(chunk(PARENT, "late")).unwrap();
+        let started = Instant::now();
+        run_tail(
+            rx,
+            PARENT.into(),
+            open_set(&["wf_1"]),
+            cfg(),
+            started,
+            open_gate(),
+            |_t| std::future::pending::<()>(),
+        )
+        .await;
+        // quiet (20 s) + one delivery timeout, not forever.
+        assert_eq!(started.elapsed(), Duration::from_secs(20) + DELIVER_TIMEOUT);
+        drop(tx);
     }
 
     #[test]

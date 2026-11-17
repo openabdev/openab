@@ -60,8 +60,8 @@ an empty file is the reliable way to run without them.
 
 | Setting | Effect |
 |---------|--------|
-| `[agent] session_new_meta` | Sent as `_meta` in `session/new`. kiro-cli only honours the workflows switch there (not in `initialize`). Not sent on `session/load`. |
-| `[pool] strict_default_config_options` | After each `session/set_config_option`, compares the returned `currentValue` with the requested value and fails session creation on a mismatch or an error. A response without that option is accepted, as is an alias given as the option's display name. Default `false`. |
+| `[agent] session_new_meta` | Sent as the `_meta` field of the `session/new` request. kiro-cli only honours the workflows switch there (not in `initialize`). Not sent on `session/load`. |
+| `[pool] strict_default_config_options` | After each `session/set_config_option`, compares the returned `currentValue` with the requested value and fails session creation on a mismatch or an error. In this mode the legacy slash-command fallback is not used, so only a value the agent reports counts. A response without that option is accepted, as is an alias given as the option's display name. Default `false`. |
 | `[pool] workflow_tail_quiet_secs` / `workflow_tail_max_secs` | Bounds of the late-output relay below. |
 
 ## Workflows
@@ -78,14 +78,14 @@ workflows are enabled openab:
    keeps reading after delivering the reply and posts the late text as a new message in the same
    thread, prefixed `_Workflow update:_`. It ends when the workflow is complete and no output
    has arrived for `workflow_tail_quiet_secs`, when the next prompt on the session starts, when
-   the connection closes, or at `workflow_tail_max_secs`. If a run is still open at the cap, a
+   the connection closes, or at `workflow_tail_max_secs`, measured from the prompt response. If a run is still open at the cap, a
    warning message says that further output is not relayed. Setting `workflow_tail_max_secs = 0`
    disables the relay and keeps the filter.
 
-Limits: one summary can be split in two messages if the agent pauses longer than the quiet time.
+Limits: openab buffers at most 256 KiB of late text per message (the rest is dropped with a note), and each post is bounded to 30 s. Only workflows started during a turn are tracked. A workflow that is still running when the next prompt starts has its later output delivered with that prompt, not as a workflow update. One summary can be split in two messages if the agent pauses longer than the quiet time.
 Late text that arrives after the next prompt started is part of that prompt's reply. The relay is
 not used on the `acp` gateway platform. `session_new_meta` and `default_config_options` are
-applied after `session/new` only, not when a session is restored with `session/load`.
+applied when a session is created with `session/new` only, not when a session is restored with `session/load`.
 
 ## Security notes
 

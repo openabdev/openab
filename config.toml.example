@@ -280,7 +280,7 @@ session_ttl_hours = 24
 # kiro-cli v3 (see docs/kiro-v3.md): select the agent mode and fail fast when it is missing.
 # default_config_options = { mode = "openab-bot" }
 # strict_default_config_options = true
-# Late Kiro workflow output relay (needs [agent].session_new_meta below).
+# Late Kiro workflow output relay (needs [agent].session_new_meta above).
 # workflow_tail_quiet_secs = 20
 # workflow_tail_max_secs = 900
 

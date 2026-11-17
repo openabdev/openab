@@ -116,7 +116,12 @@ fn classify_hung(
 /// either resumes the session, so both are credentials. Extracted from the loop in `cleanup_idle`
 /// so the redaction can be exercised by a test for real — R1 redacted the sites it enumerated and
 /// this force-evict site was outside that list, logging both ids raw.
-fn warn_force_evicting_hung(key: &str, session_id: Option<&str>, age_secs: u64, threshold_secs: u64) {
+fn warn_force_evicting_hung(
+    key: &str,
+    session_id: Option<&str>,
+    age_secs: u64,
+    threshold_secs: u64,
+) {
     warn!(
         thread_id = %crate::redact::redact_session_ids(key),
         session_id = %session_id.map(crate::redact::redact_session_ids).unwrap_or_default(),
@@ -648,9 +653,23 @@ impl SessionPool {
 
             // Apply default config options (e.g. mode=bypass, model=swe-1-6)
             for (config_id, value) in &self.default_config_options {
-                match new_conn.set_config_option(config_id, value).await {
+                let result = if self.strict_default_config_options {
+                    // No slash-command fallback: only a value the agent
+                    // reports counts as applied.
+                    new_conn.set_config_option_reported(config_id, value).await
+                } else {
+                    new_conn.set_config_option(config_id, value).await
+                };
+                match result {
                     Ok(opts) => {
                         if self.strict_default_config_options {
+                            if !opts.iter().any(|o| o.id == *config_id) {
+                                warn!(
+                                    config_id,
+                                    value,
+                                    "strict_default_config_options: the agent did not report this option, so it could not be verified"
+                                );
+                            }
                             // Returning drops `new_conn`, which kills the agent process group.
                             super::connection::verify_config_option_applied(
                                 &opts, config_id, value,
@@ -760,7 +779,12 @@ impl SessionPool {
         // supersedes under the same key (its guard cannot fire if that predecessor is hung). F3.
         #[cfg(feature = "acp-mcp")]
         if let Some(token) = session_token {
-            install_facade_token(&mut state, thread_id, token, self.session_registrar.as_ref());
+            install_facade_token(
+                &mut state,
+                thread_id,
+                token,
+                self.session_registrar.as_ref(),
+            );
         }
         self.save_mapping(&state.persisted);
 
@@ -795,11 +819,12 @@ impl SessionPool {
     {
         let conn = {
             let state = self.state.read().await;
-            state
-                .active
-                .get(thread_id)
-                .cloned()
-                .ok_or_else(|| anyhow!("no connection for thread {}", crate::redact::redact_session_ids(thread_id)))?
+            state.active.get(thread_id).cloned().ok_or_else(|| {
+                anyhow!(
+                    "no connection for thread {}",
+                    crate::redact::redact_session_ids(thread_id)
+                )
+            })?
         };
 
         let mut conn = conn.lock().await;
@@ -827,11 +852,12 @@ impl SessionPool {
     ) -> Result<Vec<ConfigOption>> {
         let conn = {
             let state = self.state.read().await;
-            state
-                .active
-                .get(thread_id)
-                .cloned()
-                .ok_or_else(|| anyhow!("no connection for thread {}", crate::redact::redact_session_ids(thread_id)))?
+            state.active.get(thread_id).cloned().ok_or_else(|| {
+                anyhow!(
+                    "no connection for thread {}",
+                    crate::redact::redact_session_ids(thread_id)
+                )
+            })?
         };
         let mut conn = conn.lock().await;
         conn.set_config_option(config_id, value).await
@@ -843,11 +869,12 @@ impl SessionPool {
     pub async fn get_usage(&self, thread_id: &str) -> Result<crate::acp::protocol::UsageReport> {
         let conn = {
             let state = self.state.read().await;
-            state
-                .active
-                .get(thread_id)
-                .cloned()
-                .ok_or_else(|| anyhow!("no connection for thread {}", crate::redact::redact_session_ids(thread_id)))?
+            state.active.get(thread_id).cloned().ok_or_else(|| {
+                anyhow!(
+                    "no connection for thread {}",
+                    crate::redact::redact_session_ids(thread_id)
+                )
+            })?
         };
         let mut conn = conn.lock().await;
         conn.get_usage().await
@@ -862,7 +889,12 @@ impl SessionPool {
                 .cancel_handles
                 .get(thread_id)
                 .cloned()
-                .ok_or_else(|| anyhow!("no session for thread {}", crate::redact::redact_session_ids(thread_id)))?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "no session for thread {}",
+                        crate::redact::redact_session_ids(thread_id)
+                    )
+                })?
         };
         let data = serde_json::to_string(&serde_json::json!({
             "jsonrpc": "2.0",
@@ -887,7 +919,10 @@ impl SessionPool {
             info!(thread_id = %crate::redact::redact_session_ids(thread_id), "session reset");
             Ok(())
         } else {
-            Err(anyhow!("no session for thread {}", crate::redact::redact_session_ids(thread_id)))
+            Err(anyhow!(
+                "no session for thread {}",
+                crate::redact::redact_session_ids(thread_id)
+            ))
         }
     }
 
@@ -1178,11 +1213,28 @@ mod tests {
         let mut state = empty_pool_state();
 
         // Predecessor registers, then a successor takes over the SAME key.
-        super::install_facade_token(&mut state, "discord:acp_x", "T_pred".into(), Some(&registrar));
-        assert!(reg.revoked().is_empty(), "nothing to revoke on the first install");
-        super::install_facade_token(&mut state, "discord:acp_x", "T_succ".into(), Some(&registrar));
+        super::install_facade_token(
+            &mut state,
+            "discord:acp_x",
+            "T_pred".into(),
+            Some(&registrar),
+        );
+        assert!(
+            reg.revoked().is_empty(),
+            "nothing to revoke on the first install"
+        );
+        super::install_facade_token(
+            &mut state,
+            "discord:acp_x",
+            "T_succ".into(),
+            Some(&registrar),
+        );
 
-        assert_eq!(reg.revoked(), vec!["T_pred"], "the predecessor token must be revoked");
+        assert_eq!(
+            reg.revoked(),
+            vec!["T_pred"],
+            "the predecessor token must be revoked"
+        );
         assert_eq!(
             state.facade_tokens.get("discord:acp_x").map(String::as_str),
             Some("T_succ"),
@@ -1199,14 +1251,25 @@ mod tests {
         let reg = Arc::new(CountingRegistrar::default());
         let registrar: Arc<dyn crate::acp_mcp::SessionTokenRegistrar> = reg.clone();
         let mut state = empty_pool_state();
-        state.facade_tokens.insert("discord:acp_x".into(), "T_hung".into());
+        state
+            .facade_tokens
+            .insert("discord:acp_x".into(), "T_hung".into());
         // A different session's token must be untouched.
-        state.facade_tokens.insert("discord:acp_y".into(), "T_other".into());
+        state
+            .facade_tokens
+            .insert("discord:acp_y".into(), "T_other".into());
 
         super::revoke_facade_token_for_key(&mut state, "discord:acp_x", Some(&registrar));
 
-        assert_eq!(reg.revoked(), vec!["T_hung"], "only the evicted session's token is revoked");
-        assert!(!state.facade_tokens.contains_key("discord:acp_x"), "and it is forgotten");
+        assert_eq!(
+            reg.revoked(),
+            vec!["T_hung"],
+            "only the evicted session's token is revoked"
+        );
+        assert!(
+            !state.facade_tokens.contains_key("discord:acp_x"),
+            "and it is forgotten"
+        );
         assert_eq!(
             state.facade_tokens.get("discord:acp_y").map(String::as_str),
             Some("T_other"),
@@ -1413,11 +1476,23 @@ mod tests {
         });
 
         let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
-        assert!(out.contains("force-evicting hung session"), "the warning must fire: {out}");
+        assert!(
+            out.contains("force-evicting hung session"),
+            "the warning must fire: {out}"
+        );
         assert!(!out.contains(uuid), "no raw uuid may reach the log: {out}");
-        assert!(!out.contains("acp_") && !out.contains("sess_"), "no raw id prefix either: {out}");
-        assert!(out.contains('#'), "the redaction tag must be present: {out}");
-        assert!(out.contains("discord"), "the readable platform half must survive: {out}");
+        assert!(
+            !out.contains("acp_") && !out.contains("sess_"),
+            "no raw id prefix either: {out}"
+        );
+        assert!(
+            out.contains('#'),
+            "the redaction tag must be present: {out}"
+        );
+        assert!(
+            out.contains("discord"),
+            "the readable platform half must survive: {out}"
+        );
     }
 
     #[test]
@@ -1607,9 +1682,24 @@ mod config_option_tests {
         meta: Option<serde_json::Value>,
         strict: bool,
     ) -> SessionPool {
+        pool_with_prompt(dir, set_cfg_reply, require_meta, meta, strict, false)
+    }
+
+    fn pool_with_prompt(
+        dir: &std::path::Path,
+        set_cfg_reply: &str,
+        require_meta: bool,
+        meta: Option<serde_json::Value>,
+        strict: bool,
+        prompt_ok: bool,
+    ) -> SessionPool {
         let agent = AgentConfig {
             command: "sh".into(),
-            args: mock_agent::args(mock_agent::script(set_cfg_reply, require_meta)),
+            args: mock_agent::args(mock_agent::script_with_prompt(
+                set_cfg_reply,
+                require_meta,
+                prompt_ok,
+            )),
             working_dir: "/tmp".into(),
             env: HashMap::new(),
             inherit_env: vec![],
@@ -1627,16 +1717,30 @@ mod config_option_tests {
     }
 
     #[tokio::test]
+    #[ignore = "integration: spawns a mock agent subprocess and uses the filesystem"]
     async fn mismatch_is_ignored_by_default() {
         let dir = tempfile::tempdir().unwrap();
-        let p = pool(dir.path(), &mock_agent::mode_reply("vibe"), false, None, false);
+        let p = pool(
+            dir.path(),
+            &mock_agent::mode_reply("vibe"),
+            false,
+            None,
+            false,
+        );
         assert!(p.get_or_create("t", None).await.is_ok());
     }
 
     #[tokio::test]
+    #[ignore = "integration: spawns a mock agent subprocess and uses the filesystem"]
     async fn strict_mismatch_fails_session_creation() {
         let dir = tempfile::tempdir().unwrap();
-        let p = pool(dir.path(), &mock_agent::mode_reply("vibe"), false, None, true);
+        let p = pool(
+            dir.path(),
+            &mock_agent::mode_reply("vibe"),
+            false,
+            None,
+            true,
+        );
         let err = p.get_or_create("t", None).await.unwrap_err().to_string();
         assert!(err.contains("was not applied"), "{err}");
         assert!(err.contains("`e2e`") && err.contains("`vibe`"), "{err}");
@@ -1644,13 +1748,21 @@ mod config_option_tests {
     }
 
     #[tokio::test]
+    #[ignore = "integration: spawns a mock agent subprocess and uses the filesystem"]
     async fn strict_match_succeeds() {
         let dir = tempfile::tempdir().unwrap();
-        let p = pool(dir.path(), &mock_agent::mode_reply("e2e"), false, None, true);
+        let p = pool(
+            dir.path(),
+            &mock_agent::mode_reply("e2e"),
+            false,
+            None,
+            true,
+        );
         assert!(p.get_or_create("t", None).await.is_ok());
     }
 
     #[tokio::test]
+    #[ignore = "integration: spawns a mock agent subprocess and uses the filesystem"]
     async fn strict_response_without_options_keeps_legacy_behaviour() {
         let dir = tempfile::tempdir().unwrap();
         let reply = r#"{"jsonrpc":"2.0","id":3,"result":{}}"#;
@@ -1659,6 +1771,7 @@ mod config_option_tests {
     }
 
     #[tokio::test]
+    #[ignore = "integration: spawns a mock agent subprocess and uses the filesystem"]
     async fn strict_error_response_fails_session_creation() {
         let dir = tempfile::tempdir().unwrap();
         let reply = r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"bad"}}"#;
@@ -1668,6 +1781,7 @@ mod config_option_tests {
     }
 
     #[tokio::test]
+    #[ignore = "integration: spawns a mock agent subprocess and uses the filesystem"]
     async fn non_strict_error_response_is_only_a_warning() {
         let dir = tempfile::tempdir().unwrap();
         let reply = r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"bad"}}"#;
@@ -1676,6 +1790,7 @@ mod config_option_tests {
     }
 
     #[tokio::test]
+    #[ignore = "integration: spawns a mock agent subprocess and uses the filesystem"]
     async fn session_new_meta_is_sent_when_configured() {
         let dir = tempfile::tempdir().unwrap();
         let meta = serde_json::json!({"kiro": {"settings": {"workflows": {"enabled": true}}}});
@@ -1688,5 +1803,24 @@ mod config_option_tests {
         let without = pool(dir2.path(), &reply, true, None, true);
         assert!(!without.workflows_enabled());
         assert!(without.get_or_create("t", None).await.is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "integration: spawns a mock agent subprocess and uses the filesystem"]
+    async fn strict_error_is_not_masked_by_a_successful_slash_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let reply = r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"bad"}}"#;
+        // The fallback prompt (id 4) succeeds, yet strict mode must still fail.
+        let strict = pool_with_prompt(dir.path(), reply, false, None, true, true);
+        let err = strict
+            .get_or_create("t", None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("failed to set default config option"), "{err}");
+        // Non-strict keeps the legacy fallback behaviour.
+        let dir2 = tempfile::tempdir().unwrap();
+        let lenient = pool_with_prompt(dir2.path(), reply, false, None, false, true);
+        assert!(lenient.get_or_create("t", None).await.is_ok());
     }
 }
