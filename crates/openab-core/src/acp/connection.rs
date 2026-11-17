@@ -239,6 +239,48 @@ where
     }
 }
 
+/// Params for `session/new`. `_meta` is added only when configured, so the
+/// default request is byte-identical to the legacy one.
+pub(crate) fn build_session_new_params(cwd: &str, meta: Option<&Value>) -> Value {
+    let mut params = json!({"cwd": cwd, "mcpServers": []});
+    if let Some(meta) = meta {
+        params["_meta"] = meta.clone();
+    }
+    params
+}
+
+/// Check that `session/set_config_option` really applied `requested` for
+/// `config_id`, using the option list the agent returned.
+///
+/// Lenient where the response is silent: no option with that id (or an empty
+/// list) is accepted. A different `currentValue` is accepted only when the
+/// returned option lists a value whose display `name` equals `requested` and
+/// whose `value` is the current one (agents that normalize aliases).
+pub(crate) fn verify_config_option_applied(
+    options: &[ConfigOption],
+    config_id: &str,
+    requested: &str,
+) -> std::result::Result<(), String> {
+    let Some(opt) = options.iter().find(|o| o.id == config_id) else {
+        return Ok(());
+    };
+    if opt.current_value == requested {
+        return Ok(());
+    }
+    if opt
+        .options
+        .iter()
+        .any(|v| v.name == requested && v.value == opt.current_value)
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "default_config_options `{config_id}` = `{requested}` was not applied: the agent reports `{}`. \
+         Check that the value exists for this agent (for kiro v3, that `~/.kiro/agents/{requested}.md` is present in the bot's HOME).",
+        opt.current_value
+    ))
+}
+
 /// Reader loop body: reads JSON-RPC messages from `reader`, auto-replies
 /// `session/request_permission` via `writer`, resolves pending responses,
 /// and forwards notifications + stale id-bearing messages to the active
@@ -604,8 +646,17 @@ impl AcpConnection {
     }
 
     pub async fn session_new(&mut self, cwd: &str) -> Result<String> {
+        self.session_new_with_meta(cwd, None).await
+    }
+
+    /// `session/new` with an optional `_meta` object (`[agent].session_new_meta`).
+    pub async fn session_new_with_meta(
+        &mut self,
+        cwd: &str,
+        meta: Option<&Value>,
+    ) -> Result<String> {
         let resp = self
-            .send_request("session/new", Some(json!({"cwd": cwd, "mcpServers": []})))
+            .send_request("session/new", Some(build_session_new_params(cwd, meta)))
             .await?;
 
         let session_id = resp
@@ -768,6 +819,16 @@ impl AcpConnection {
 
         self.send_raw(&data).await?;
         Ok((rx, id))
+    }
+
+    /// Like [`Self::prompt_done`] but leaves the notify subscriber installed so
+    /// the caller can keep reading late frames from the receiver returned by
+    /// `session_prompt` (Kiro workflow output). The next `session_prompt`
+    /// replaces the subscriber, which closes the old receiver.
+    pub async fn prompt_done_keep_subscriber(&mut self) {
+        self.activity.touch();
+        self.activity.set_in_flight(false);
+        self.last_active = Instant::now();
     }
 
     /// Call after prompt streaming is done to clean up subscriber.
@@ -1342,5 +1403,218 @@ mod reader_loop_tests {
         assert!(activity.in_flight());
         activity.set_in_flight(false);
         assert!(!activity.in_flight());
+    }
+}
+
+/// `sh -c` stand-in for an ACP agent, with fixed request ids
+/// (initialize = 1, session/new = 2, first set_config_option = 3, and the
+/// slash-command fallback prompt = 4), shared with the pool tests.
+#[cfg(all(test, unix))]
+pub(crate) mod mock_agent {
+    /// `set_cfg_reply` is the full JSON-RPC line answering the first
+    /// `session/set_config_option` (it must contain no single quote). When
+    /// `require_meta` is set, `session/new` fails unless the request carries
+    /// `"workflows":{"enabled":true}`.
+    pub(crate) fn script(set_cfg_reply: &str, require_meta: bool) -> String {
+        let new_ok = r#"echo '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"s-1"}}'"#;
+        let new_err =
+            r#"echo '{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"missing _meta"}}'"#;
+        let session_new = if require_meta {
+            format!(
+                r#"case "$l" in *'"workflows":{{"enabled":true}}'*) {new_ok};; *) {new_err};; esac"#
+            )
+        } else {
+            new_ok.to_string()
+        };
+        format!(
+            r#"while IFS= read -r l; do
+case "$l" in
+*'"method":"initialize"'*) echo '{{"jsonrpc":"2.0","id":1,"result":{{"agentInfo":{{"name":"mock"}}}}}}';;
+*'"method":"session/new"'*) {session_new};;
+*'"method":"session/set_config_option"'*) echo '{set_cfg_reply}';;
+*'"method":"session/prompt"'*) echo '{{"jsonrpc":"2.0","id":4,"error":{{"code":-32000,"message":"unsupported"}}}}';;
+esac
+done"#
+        )
+    }
+
+    pub(crate) fn args(script: String) -> Vec<String> {
+        vec!["-c".to_string(), script]
+    }
+
+    /// A `set_config_option` reply whose `mode` option reports `current`.
+    pub(crate) fn mode_reply(current: &str) -> String {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":3,"result":{{"configOptions":[{{"type":"select","id":"mode","name":"Mode","currentValue":"{current}","options":[{{"value":"vibe","name":"Default"}},{{"value":"e2e","name":"e2e"}}]}}]}}}}"#
+        )
+    }
+}
+
+#[cfg(test)]
+mod workflow_meta_tests {
+    use super::*;
+    use crate::acp::protocol::ConfigOptionValue;
+
+    fn opt(id: &str, current: &str, values: &[(&str, &str)]) -> ConfigOption {
+        ConfigOption {
+            id: id.into(),
+            name: id.into(),
+            description: None,
+            category: None,
+            option_type: "select".into(),
+            current_value: current.into(),
+            options: values
+                .iter()
+                .map(|(value, name)| ConfigOptionValue {
+                    value: (*value).into(),
+                    name: (*name).into(),
+                    description: None,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn session_new_params_without_meta_match_legacy_shape() {
+        assert_eq!(
+            build_session_new_params("/w", None),
+            json!({"cwd": "/w", "mcpServers": []})
+        );
+    }
+
+    #[test]
+    fn session_new_params_with_meta_carry_underscore_meta() {
+        let meta = json!({"kiro": {"settings": {"workflows": {"enabled": true}}}});
+        let params = build_session_new_params("/w", Some(&meta));
+        assert_eq!(
+            params["_meta"]["kiro"]["settings"]["workflows"]["enabled"],
+            true
+        );
+        assert_eq!(params["cwd"], "/w");
+        assert_eq!(params["mcpServers"], json!([]));
+    }
+
+    #[test]
+    fn verify_accepts_equal_value() {
+        let o = [opt("mode", "e2e", &[("vibe", "Default"), ("e2e", "e2e")])];
+        assert!(verify_config_option_applied(&o, "mode", "e2e").is_ok());
+    }
+
+    #[test]
+    fn verify_rejects_different_value_with_clear_error() {
+        let o = [opt("mode", "vibe", &[("vibe", "Default"), ("e2e", "e2e")])];
+        let err = verify_config_option_applied(&o, "mode", "e2e").unwrap_err();
+        assert!(err.contains("`mode`"), "{err}");
+        assert!(err.contains("`e2e`"), "{err}");
+        assert!(err.contains("`vibe`"), "{err}");
+        assert!(err.contains("was not applied"), "{err}");
+    }
+
+    #[test]
+    fn verify_accepts_missing_option_or_empty_list() {
+        assert!(verify_config_option_applied(&[], "mode", "e2e").is_ok());
+        let o = [opt("model", "x", &[])];
+        assert!(verify_config_option_applied(&o, "mode", "e2e").is_ok());
+    }
+
+    #[test]
+    fn verify_accepts_alias_by_option_name() {
+        // agy-acp style: the row name is requested, the id is reported.
+        let o = [opt(
+            "model",
+            "gemini-3.8-flash-high",
+            &[("gemini-3.8-flash-high", "Gemini 3.8 Flash (High)")],
+        )];
+        assert!(verify_config_option_applied(&o, "model", "Gemini 3.8 Flash (High)").is_ok());
+        assert!(verify_config_option_applied(&o, "model", "something-else").is_err());
+    }
+
+    #[test]
+    fn verify_ignores_kiro_v2_agent_option_for_mode_key() {
+        // kiro v2 reports modes under id `agent`, so `mode` is simply absent.
+        let o = [opt("agent", "kiro_default", &[("kiro_default", "default")])];
+        assert!(verify_config_option_applied(&o, "mode", "openab-bot").is_ok());
+    }
+
+    /// Step sessions ask for permission too; the answer goes out by request id
+    /// regardless of the `sessionId` the request carries.
+    #[tokio::test]
+    async fn permission_request_from_another_session_is_still_answered() {
+        use tokio::io::{duplex, AsyncWriteExt};
+        let (mut agent_out, agent_out_r) = duplex(8 * 1024);
+        let (agent_in_w, agent_in_r) = duplex(8 * 1024);
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let notify_tx = Arc::new(Mutex::new(None));
+        let handle = tokio::spawn(run_reader_loop(
+            agent_out_r,
+            Arc::new(Mutex::new(agent_in_w)),
+            pending,
+            notify_tx,
+        ));
+        let req = json!({"jsonrpc": "2.0", "id": 9, "method": "session/request_permission",
+            "params": {"sessionId": "step-session",
+                "toolCall": {"title": "run"},
+                "options": [{"optionId": "ao", "kind": "allow_once"},
+                            {"optionId": "aa", "kind": "allow_always"}]}});
+        agent_out
+            .write_all(format!("{req}\n").as_bytes())
+            .await
+            .unwrap();
+        agent_out.flush().await.unwrap();
+        let mut line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            BufReader::new(agent_in_r).read_line(&mut line),
+        )
+        .await
+        .expect("permission request must be answered")
+        .unwrap();
+        let reply: Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(reply["id"], 9);
+        assert_eq!(reply["result"]["outcome"]["optionId"], "aa");
+        drop(agent_out);
+        handle.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    async fn spawn_mock(script: String) -> AcpConnection {
+        let mut conn = AcpConnection::spawn(
+            "sh",
+            &mock_agent::args(script),
+            "/tmp",
+            &HashMap::new(),
+            &[],
+        )
+        .await
+        .expect("spawn mock agent");
+        conn.initialize().await.expect("initialize");
+        conn
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_new_with_meta_sends_underscore_meta() {
+        let script = mock_agent::script(&mock_agent::mode_reply("vibe"), true);
+        let meta = json!({"kiro": {"settings": {"workflows": {"enabled": true}}}});
+        let mut conn = spawn_mock(script.clone()).await;
+        assert_eq!(
+            conn.session_new_with_meta("/tmp", Some(&meta))
+                .await
+                .unwrap(),
+            "s-1"
+        );
+        // Without meta the mock (which requires it) refuses: nothing is sent.
+        let mut conn = spawn_mock(script).await;
+        assert!(conn.session_new("/tmp").await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn set_config_option_returns_agent_reported_value() {
+        let script = mock_agent::script(&mock_agent::mode_reply("vibe"), false);
+        let mut conn = spawn_mock(script).await;
+        conn.session_new("/tmp").await.unwrap();
+        let opts = conn.set_config_option("mode", "e2e").await.unwrap();
+        assert!(verify_config_option_applied(&opts, "mode", "e2e").is_err());
     }
 }

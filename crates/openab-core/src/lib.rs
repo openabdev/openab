@@ -27,6 +27,7 @@ pub mod setup;
 pub mod stt;
 pub mod timestamp;
 pub mod trust;
+pub mod workflow_tail;
 
 #[cfg(feature = "discord")]
 pub mod discord;

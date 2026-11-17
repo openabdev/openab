@@ -5,7 +5,8 @@ use std::sync::Arc;
 use tracing::{error, warn};
 
 use crate::acp::{
-    classify_notification, parse_turn_result, AcpEvent, ContentBlock, SessionPool, TurnResult,
+    classify_notification, is_foreign_session_update, parse_turn_result, AcpEvent, ContentBlock,
+    SessionPool, TurnResult,
 };
 use crate::config::{ReactionsConfig, ToolDisplay};
 use crate::error_display::{format_coded_error, format_user_error};
@@ -490,6 +491,10 @@ pub struct AdapterRouter {
     /// [`AdapterRouter::with_trust`]; empty default = deny-all per platform
     /// (only consulted by paths wired to the gate — currently the gateway path).
     trust: crate::trust::PlatformTrustConfigs,
+    /// Set only when `[agent].session_new_meta` enables Kiro workflows. Turns on
+    /// the step-session frame filter and, unless `tail_max` is zero, the relay
+    /// of late workflow output. `None` = legacy behaviour.
+    workflow_relay: Option<crate::workflow_tail::WorkflowRelayConfig>,
 }
 
 impl AdapterRouter {
@@ -520,7 +525,16 @@ impl AdapterRouter {
             workspace_aliases,
             bot_home,
             trust: crate::trust::PlatformTrustConfigs::default(),
+            workflow_relay: None,
         }
+    }
+
+    /// Enable Kiro workflow handling (builder style, before `Arc`-wrapping):
+    /// drop `session/update` frames of other sessions and relay late workflow
+    /// output. Only call when workflows are enabled in `session/new` meta.
+    pub fn with_workflow_relay(mut self, cfg: crate::workflow_tail::WorkflowRelayConfig) -> Self {
+        self.workflow_relay = Some(cfg);
+        self
     }
 
     /// Attach the per-platform trust registry (builder style, before `Arc`-wrapping).
@@ -759,6 +773,7 @@ impl AdapterRouter {
         let platform_is_acp = thread_channel.platform == "acp";
         let prompt_hard_timeout = self.prompt_hard_timeout;
         let liveness_check_interval = self.liveness_check_interval;
+        let relay = self.workflow_relay;
 
         self.pool
             .with_connection(thread_key, |conn| {
@@ -768,6 +783,8 @@ impl AdapterRouter {
                     conn.session_reset = false;
 
                     let (mut rx, request_id) = conn.session_prompt(content_blocks).await?;
+                    let parent_sid = conn.acp_session_id.clone();
+                    let mut wf_state = crate::workflow_tail::TurnWorkflowState::default();
                     if assistant_status {
                         let _ = adapter.set_status(&thread_channel, "Thinking…").await;
                     } else {
@@ -895,6 +912,15 @@ impl AdapterRouter {
                                 turn_result = parse_turn_result(result);
                             }
                             break;
+                        }
+
+                        if let (Some(_), Some(sid)) = (relay, parent_sid.as_deref()) {
+                            // Workflow step sessions share this agent process; their
+                            // frames must not reach the parent's reply.
+                            if is_foreign_session_update(&notification, sid) {
+                                continue;
+                            }
+                            wf_state.observe(&notification, sid);
                         }
 
                         if let Some(event) = classify_notification(&notification) {
@@ -1039,7 +1065,21 @@ impl AdapterRouter {
                         }
                     }
 
-                    conn.prompt_done().await;
+                    // Late workflow output: keep the subscriber and hand the
+                    // receiver to a detached tail after the reply is delivered.
+                    let tail_cfg = relay.filter(|c| {
+                        !c.tail_max.is_zero()
+                            && response_error.is_none()
+                            && !platform_is_acp
+                            && wf_state.armed()
+                    });
+                    let tail_rx = if tail_cfg.is_some() {
+                        conn.prompt_done_keep_subscriber().await;
+                        Some(rx)
+                    } else {
+                        conn.prompt_done().await;
+                        None
+                    };
                     // Stop the cosmetic edit loop and let any in-flight edit
                     // finish before the authoritative finalize write, so in the
                     // normal case a stale preview does not overwrite it. Dropping
@@ -1301,6 +1341,31 @@ impl AdapterRouter {
                             }
                             first = false;
                         }
+                    }
+
+                    if let (Some(cfg), Some(rx), Some(sid)) = (tail_cfg, tail_rx, parent_sid) {
+                        let tail_adapter = adapter.clone();
+                        let tail_channel = thread_channel.clone();
+                        tokio::spawn(crate::workflow_tail::run_tail(
+                            rx,
+                            sid,
+                            wf_state.into_open(),
+                            cfg,
+                            move |text| {
+                                let adapter = tail_adapter.clone();
+                                let channel = tail_channel.clone();
+                                async move {
+                                    let text = format!("_Workflow update:_\n\n{text}");
+                                    for chunk in format::split_message(&text, message_limit) {
+                                        if let Err(e) = adapter.send_message(&channel, &chunk).await
+                                        {
+                                            warn!(error = ?e, "workflow tail delivery failed");
+                                            break;
+                                        }
+                                    }
+                                }
+                            },
+                        ));
                     }
 
                     if delivery_failed {

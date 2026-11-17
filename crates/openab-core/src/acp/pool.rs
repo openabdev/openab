@@ -63,6 +63,8 @@ pub struct SessionPool {
     mapping_path: PathBuf,
     meta_path: PathBuf,
     default_config_options: HashMap<String, String>,
+    /// Fail session creation when a default config option is not applied.
+    strict_default_config_options: bool,
     #[cfg(feature = "acp-mcp")]
     session_registrar: Option<Arc<dyn crate::acp_mcp::SessionTokenRegistrar>>,
     #[cfg(feature = "acp-mcp")]
@@ -334,11 +336,24 @@ impl SessionPool {
             mapping_path,
             meta_path,
             default_config_options,
+            strict_default_config_options: false,
             #[cfg(feature = "acp-mcp")]
             session_registrar: None,
             #[cfg(feature = "acp-mcp")]
             facade_url: None,
         }
+    }
+
+    /// Verify `default_config_options` after `session/set_config_option`
+    /// (`[pool] strict_default_config_options`). Default: off.
+    pub fn with_strict_default_config_options(mut self, strict: bool) -> Self {
+        self.strict_default_config_options = strict;
+        self
+    }
+
+    /// True when `[agent].session_new_meta` enables Kiro workflows.
+    pub fn workflows_enabled(&self) -> bool {
+        crate::config::meta_enables_workflows(self.config.session_new_meta.as_ref())
     }
 
     /// Wire the facade session-token registrar + facade URL, set by the root
@@ -627,12 +642,30 @@ impl SessionPool {
         }
 
         if !resumed {
-            new_conn.session_new(&effective_workdir).await?;
+            new_conn
+                .session_new_with_meta(&effective_workdir, self.config.session_new_meta.as_ref())
+                .await?;
 
             // Apply default config options (e.g. mode=bypass, model=swe-1-6)
             for (config_id, value) in &self.default_config_options {
-                if let Err(e) = new_conn.set_config_option(config_id, value).await {
-                    warn!(config_id, value, error = %e, "failed to set default config option");
+                match new_conn.set_config_option(config_id, value).await {
+                    Ok(opts) => {
+                        if self.strict_default_config_options {
+                            // Returning drops `new_conn`, which kills the agent process group.
+                            super::connection::verify_config_option_applied(
+                                &opts, config_id, value,
+                            )
+                            .map_err(|msg| anyhow!(msg))?;
+                        }
+                    }
+                    Err(e) => {
+                        if self.strict_default_config_options {
+                            return Err(anyhow!(
+                                "failed to set default config option `{config_id}`: {e}"
+                            ));
+                        }
+                        warn!(config_id, value, error = %e, "failed to set default config option");
+                    }
                 }
             }
 
@@ -1557,5 +1590,103 @@ mod tests {
             roundtrip.get("suspended-thread"),
             Some(&"session-suspended".to_string())
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod config_option_tests {
+    use super::SessionPool;
+    use crate::acp::connection::mock_agent;
+    use crate::config::AgentConfig;
+    use std::collections::HashMap;
+
+    fn pool(
+        dir: &std::path::Path,
+        set_cfg_reply: &str,
+        require_meta: bool,
+        meta: Option<serde_json::Value>,
+        strict: bool,
+    ) -> SessionPool {
+        let agent = AgentConfig {
+            command: "sh".into(),
+            args: mock_agent::args(mock_agent::script(set_cfg_reply, require_meta)),
+            working_dir: "/tmp".into(),
+            env: HashMap::new(),
+            inherit_env: vec![],
+            command_explicit: true,
+            session_new_meta: meta,
+        };
+        SessionPool::new_in(
+            agent,
+            1,
+            60,
+            HashMap::from([("mode".to_string(), "e2e".to_string())]),
+            dir.to_path_buf(),
+        )
+        .with_strict_default_config_options(strict)
+    }
+
+    #[tokio::test]
+    async fn mismatch_is_ignored_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = pool(dir.path(), &mock_agent::mode_reply("vibe"), false, None, false);
+        assert!(p.get_or_create("t", None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn strict_mismatch_fails_session_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = pool(dir.path(), &mock_agent::mode_reply("vibe"), false, None, true);
+        let err = p.get_or_create("t", None).await.unwrap_err().to_string();
+        assert!(err.contains("was not applied"), "{err}");
+        assert!(err.contains("`e2e`") && err.contains("`vibe`"), "{err}");
+        assert!(p.state.read().await.active.is_empty());
+    }
+
+    #[tokio::test]
+    async fn strict_match_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = pool(dir.path(), &mock_agent::mode_reply("e2e"), false, None, true);
+        assert!(p.get_or_create("t", None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn strict_response_without_options_keeps_legacy_behaviour() {
+        let dir = tempfile::tempdir().unwrap();
+        let reply = r#"{"jsonrpc":"2.0","id":3,"result":{}}"#;
+        let p = pool(dir.path(), reply, false, None, true);
+        assert!(p.get_or_create("t", None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn strict_error_response_fails_session_creation() {
+        let dir = tempfile::tempdir().unwrap();
+        let reply = r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"bad"}}"#;
+        let p = pool(dir.path(), reply, false, None, true);
+        let err = p.get_or_create("t", None).await.unwrap_err().to_string();
+        assert!(err.contains("failed to set default config option"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn non_strict_error_response_is_only_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let reply = r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"bad"}}"#;
+        let p = pool(dir.path(), reply, false, None, false);
+        assert!(p.get_or_create("t", None).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn session_new_meta_is_sent_when_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = serde_json::json!({"kiro": {"settings": {"workflows": {"enabled": true}}}});
+        let reply = mock_agent::mode_reply("e2e");
+        // The mock refuses session/new without the meta.
+        let with = pool(dir.path(), &reply, true, Some(meta), true);
+        assert!(with.workflows_enabled());
+        assert!(with.get_or_create("t", None).await.is_ok());
+        let dir2 = tempfile::tempdir().unwrap();
+        let without = pool(dir2.path(), &reply, true, None, true);
+        assert!(!without.workflows_enabled());
+        assert!(without.get_or_create("t", None).await.is_err());
     }
 }
