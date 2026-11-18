@@ -301,9 +301,9 @@ CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
 # Target: devin
 # =============================================================================
 FROM base-debian AS devin
-ARG DEVIN_VERSION=3000.11.3
-ARG DEVIN_SHA256_AMD64=83b3b113c01bf2a3e9e100db08d77e6b086806a7754f091e20831bdfe215157e
-ARG DEVIN_SHA256_ARM64=21a2d7a8dea67987067cde7eb3fe7193a48daa8f8c3d50d414c603c4a2b67f15
+ARG DEVIN_VERSION=3000.14.30821
+ARG DEVIN_SHA256_AMD64=4dc43e3e4388bace60fe2aa8010cbb399402e724892d7175845b1cdef00e7ddb
+ARG DEVIN_SHA256_ARM64=3deb8af6b026060e975ed371936e139818020e5dc5abbcba07cde039f473a5a5
 ARG TARGETPLATFORM
 RUN set -eux; \
     case "${TARGETPLATFORM:-linux/amd64}" in \
