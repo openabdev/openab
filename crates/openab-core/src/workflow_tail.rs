@@ -86,7 +86,7 @@ pub const DELIVER_TIMEOUT: Duration = Duration::from_secs(30);
 pub async fn run_tail<F, Fut>(
     mut rx: UnboundedReceiver<JsonRpcMessage>,
     parent_session_id: String,
-    mut open: HashSet<String>,
+    open: HashSet<String>,
     cfg: WorkflowRelayConfig,
     started: Instant,
     gate: oneshot::Receiver<()>,
@@ -98,13 +98,18 @@ pub async fn run_tail<F, Fut>(
     let mut gate = gate;
     let mut gated = true;
     let hard = started + cfg.tail_max;
-    let mut last_event = Instant::now();
-    let mut buf = String::new();
-    let mut truncated = false;
+    let mut st = TailState {
+        parent: parent_session_id,
+        open,
+        buf: String::new(),
+        truncated: false,
+        last_event: Instant::now(),
+        closed: false,
+    };
     loop {
-        let quiet_applies = !buf.is_empty() || open.is_empty();
+        let quiet_applies = !st.buf.is_empty() || st.open.is_empty();
         let deadline = if quiet_applies {
-            (last_event + cfg.tail_quiet).min(hard)
+            (st.last_event + cfg.tail_quiet).min(hard)
         } else {
             hard
         };
@@ -118,51 +123,26 @@ pub async fn run_tail<F, Fut>(
                         // Wait for the original reply, but not past the cap.
                         let _ = timeout_at(hard, &mut gate).await;
                     }
-                    flush(&mut buf, &mut truncated, &mut deliver).await;
+                    flush(&mut st, &mut rx, &mut deliver).await;
                     return;
                 };
-                if is_foreign_session_update(&msg, &parent_session_id) {
-                    continue;
-                }
-                match classify_workflow_signal(&msg, &parent_session_id) {
-                    Some(WorkflowSignal::RunStart { workflow_id }) => {
-                        open.insert(workflow_id);
-                        last_event = Instant::now();
-                        continue;
-                    }
-                    Some(WorkflowSignal::RunComplete { workflow_id }) => {
-                        open.remove(&workflow_id);
-                        last_event = Instant::now();
-                        continue;
-                    }
-                    None => {}
-                }
-                if msg.id.is_none() {
-                    if let Some(AcpEvent::Text(t)) = classify_notification(&msg) {
-                        if buf.len() + t.len() <= MAX_BUFFER_BYTES {
-                            buf.push_str(&t);
-                        } else {
-                            truncated = true;
-                        }
-                        last_event = Instant::now();
-                    }
-                }
+                st.ingest(msg);
             }
             _ = sleep_until(deadline) => {
                 let at_cap = Instant::now() >= hard;
                 if gated && !at_cap {
                     // Reply still being delivered: keep buffering.
-                    last_event = Instant::now();
+                    st.last_event = Instant::now();
                     continue;
                 }
                 if gated {
                     // Cap reached before the reply was delivered; drop.
                     return;
                 }
-                flush(&mut buf, &mut truncated, &mut deliver).await;
+                flush(&mut st, &mut rx, &mut deliver).await;
                 if at_cap || Instant::now() >= hard {
-                    if !open.is_empty() {
-                        send(&mut deliver, format!(
+                    if !st.open.is_empty() {
+                        send(&mut st, &mut rx, &mut deliver, format!(
                             "⚠ workflow still running after {}s; further output is not relayed",
                             cfg.tail_max.as_secs()
                         ))
@@ -170,8 +150,8 @@ pub async fn run_tail<F, Fut>(
                     }
                     return;
                 }
-                last_event = Instant::now();
-                if open.is_empty() {
+                st.last_event = Instant::now();
+                if (st.open.is_empty() || st.closed) && st.buf.is_empty() {
                     return;
                 }
             }
@@ -179,25 +159,87 @@ pub async fn run_tail<F, Fut>(
     }
 }
 
-async fn send<F, Fut>(deliver: &mut F, text: String)
-where
-    F: FnMut(String) -> Fut,
-    Fut: Future<Output = ()>,
-{
-    let _ = tokio::time::timeout(DELIVER_TIMEOUT, deliver(text)).await;
+/// Mutable bookkeeping of one tail.
+struct TailState {
+    parent: String,
+    open: HashSet<String>,
+    buf: String,
+    truncated: bool,
+    last_event: Instant,
+    /// The sender side closed while a delivery was pending.
+    closed: bool,
 }
 
-async fn flush<F, Fut>(buf: &mut String, truncated: &mut bool, deliver: &mut F)
-where
+impl TailState {
+    fn ingest(&mut self, msg: JsonRpcMessage) {
+        if is_foreign_session_update(&msg, &self.parent) {
+            return;
+        }
+        match classify_workflow_signal(&msg, &self.parent) {
+            Some(WorkflowSignal::RunStart { workflow_id }) => {
+                self.open.insert(workflow_id);
+                self.last_event = Instant::now();
+                return;
+            }
+            Some(WorkflowSignal::RunComplete { workflow_id }) => {
+                self.open.remove(&workflow_id);
+                self.last_event = Instant::now();
+                return;
+            }
+            None => {}
+        }
+        if msg.id.is_none() {
+            if let Some(AcpEvent::Text(t)) = classify_notification(&msg) {
+                if self.buf.len() + t.len() <= MAX_BUFFER_BYTES {
+                    self.buf.push_str(&t);
+                } else {
+                    self.truncated = true;
+                }
+                self.last_event = Instant::now();
+            }
+        }
+    }
+}
+
+/// Run one delivery (bounded by [`DELIVER_TIMEOUT`]) while still draining
+/// `rx` into the capped buffer, so the notification queue cannot grow while
+/// the platform call is pending.
+async fn send<F, Fut>(
+    st: &mut TailState,
+    rx: &mut UnboundedReceiver<JsonRpcMessage>,
+    deliver: &mut F,
+    text: String,
+) where
     F: FnMut(String) -> Fut,
     Fut: Future<Output = ()>,
 {
-    let mut text = std::mem::take(buf);
-    if std::mem::take(truncated) {
+    let fut = tokio::time::timeout(DELIVER_TIMEOUT, deliver(text));
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            _ = &mut fut => return,
+            msg = rx.recv(), if !st.closed => match msg {
+                Some(m) => st.ingest(m),
+                None => st.closed = true,
+            },
+        }
+    }
+}
+
+async fn flush<F, Fut>(
+    st: &mut TailState,
+    rx: &mut UnboundedReceiver<JsonRpcMessage>,
+    deliver: &mut F,
+) where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let mut text = std::mem::take(&mut st.buf);
+    if std::mem::take(&mut st.truncated) {
         text.push_str("\n\n…(output truncated)");
     }
     if !text.trim().is_empty() {
-        send(deliver, text).await;
+        send(st, rx, deliver, text).await;
     }
 }
 
@@ -500,6 +542,54 @@ mod tests {
         // quiet (20 s) + one delivery timeout, not forever.
         assert_eq!(started.elapsed(), Duration::from_secs(20) + DELIVER_TIMEOUT);
         drop(tx);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn frames_sent_during_a_pending_delivery_are_drained_and_capped() {
+        let (tx, rx) = unbounded_channel();
+        tx.send(run_complete()).unwrap();
+        tx.send(chunk(PARENT, "first")).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = calls.clone();
+        let deliver = move |t: String| {
+            let first = {
+                let mut g = sink.lock().unwrap();
+                g.push(t);
+                g.len() == 1
+            };
+            async move {
+                if first {
+                    // Platform call that hangs until the delivery timeout.
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+        let flood = async move {
+            // Quiet period (20 s) has passed; the first delivery is pending.
+            tokio::time::sleep(Duration::from_secs(25)).await;
+            let big = "x".repeat(MAX_BUFFER_BYTES / 2 + 1);
+            for _ in 0..50 {
+                tx.send(chunk(PARENT, &big)).unwrap();
+            }
+            // Let the tail drain the queue while the delivery is pending.
+            tokio::task::yield_now().await;
+            drop(tx);
+        };
+        let tail = run_tail(
+            rx,
+            PARENT.into(),
+            open_set(&["wf_1"]),
+            cfg(),
+            Instant::now(),
+            open_gate(),
+            deliver,
+        );
+        tokio::join!(tail, flood);
+        let got = calls.lock().unwrap().clone();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0], "first");
+        assert!(got[1].len() <= MAX_BUFFER_BYTES + 64, "{}", got[1].len());
+        assert!(got[1].ends_with("…(output truncated)"));
     }
 
     #[test]
