@@ -728,6 +728,9 @@ impl AcpConnection {
             Ok(r) => {
                 if let Some(result) = r.result.as_ref() {
                     self.config_options = parse_config_options(result);
+                } else if !allow_fallback {
+                    // Strict path: never compare against pre-switch cached options.
+                    self.config_options.clear();
                 }
                 info!(config_id, value, "config option set");
             }

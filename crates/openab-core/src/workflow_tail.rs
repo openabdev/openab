@@ -141,6 +141,11 @@ pub async fn run_tail<F, Fut>(
                 }
                 flush(&mut st, &mut rx, &mut deliver).await;
                 if at_cap || Instant::now() >= hard {
+                    // Frames drained while that delivery was pending are still
+                    // buffered: one bounded final flush (frames arriving during
+                    // it are dropped, the tail ends here).
+                    st.closed = true;
+                    flush(&mut st, &mut rx, &mut deliver).await;
                     if !st.open.is_empty() {
                         send(&mut st, &mut rx, &mut deliver, format!(
                             "⚠ workflow still running after {}s; further output is not relayed",
@@ -590,6 +595,52 @@ mod tests {
         assert_eq!(got[0], "first");
         assert!(got[1].len() <= MAX_BUFFER_BYTES + 64, "{}", got[1].len());
         assert!(got[1].ends_with("…(output truncated)"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn text_buffered_while_a_delivery_crosses_the_hard_cap_is_flushed() {
+        let (tx, rx) = unbounded_channel();
+        tx.send(chunk(PARENT, "first")).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = calls.clone();
+        let deliver = move |t: String| {
+            let first = {
+                let mut g = sink.lock().unwrap();
+                g.push(t);
+                g.len() == 1
+            };
+            async move {
+                if first {
+                    // Hangs until DELIVER_TIMEOUT, which ends after the cap.
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+        let late = async move {
+            // Delivery started at the 20 s quiet mark and is still pending.
+            tokio::time::sleep(Duration::from_secs(25)).await;
+            tx.send(chunk(PARENT, "late")).unwrap();
+            tokio::time::sleep(Duration::from_secs(1000)).await;
+            drop(tx);
+        };
+        let mut c = cfg();
+        c.tail_max = Duration::from_secs(40);
+        let tail = run_tail(
+            rx,
+            PARENT.into(),
+            HashSet::new(),
+            c,
+            Instant::now(),
+            open_gate(),
+            deliver,
+        );
+        tokio::join!(tail, late);
+        let got = calls.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec!["first".to_string(), "late".to_string()],
+            "{got:?}"
+        );
     }
 
     #[test]
