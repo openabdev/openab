@@ -16,12 +16,14 @@ jobs:
 
       - name: Install Rust
         run: |
-          # The macmini runner .env sets CARGO_HOME=/Users/pahud/ci-rust/cargo (internal
-          # disk). ~/.cargo is a symlink onto the external RAID; rustup would install
-          # there if CARGO_HOME were unset, so fail closed instead of falling back.
+          # The macmini runner .env sets CARGO_HOME=/Users/pahud/ci-rust/cargo and
+          # RUSTUP_HOME=/Users/pahud/ci-rust/rustup (internal disk). ~/.cargo and ~/.rustup
+          # are symlinks onto the external RAID; rustup would install there if either were
+          # unset, so fail closed instead of falling back.
           : "${CARGO_HOME:?CARGO_HOME must be set by the runner .env}"
+          : "${RUSTUP_HOME:?RUSTUP_HOME must be set by the runner .env}"
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          test -x "$CARGO_HOME/bin/cargo"
+          test -x "$CARGO_HOME/bin/cargo" || { echo "cargo not found in $CARGO_HOME/bin" >&2; exit 1; }
           echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
 
       - name: Build (aarch64-apple-darwin)
