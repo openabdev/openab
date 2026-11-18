@@ -17,8 +17,10 @@ use crate::acp::{
 };
 use std::collections::HashSet;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::sync::oneshot;
 use tokio::time::{sleep_until, timeout_at, Instant};
 
@@ -63,6 +65,69 @@ impl TurnWorkflowState {
     }
 }
 
+/// Most frames queued between the connection reader and the tail. A full queue
+/// drops the newest frame and marks the next flush as truncated.
+pub const RELAY_QUEUE_CAPACITY: usize = 1024;
+
+/// Producer side of the relay queue. `send` never waits.
+#[derive(Debug, Clone)]
+pub struct RelaySender {
+    tx: mpsc::Sender<JsonRpcMessage>,
+    overflow: Arc<AtomicBool>,
+}
+
+/// A frame was not queued: the queue was full or the tail has ended.
+#[derive(Debug)]
+pub struct RelayDropped;
+
+impl RelaySender {
+    pub fn send(&self, msg: JsonRpcMessage) -> Result<(), RelayDropped> {
+        match self.tx.try_send(msg) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                self.overflow.store(true, Ordering::Relaxed);
+                Err(RelayDropped)
+            }
+            Err(TrySendError::Closed(_)) => Err(RelayDropped),
+        }
+    }
+}
+
+/// Consumer side of the relay queue, read by [`run_tail`].
+#[derive(Debug)]
+pub struct RelayReceiver {
+    rx: mpsc::Receiver<JsonRpcMessage>,
+    overflow: Arc<AtomicBool>,
+}
+
+impl RelayReceiver {
+    pub async fn recv(&mut self) -> Option<JsonRpcMessage> {
+        self.rx.recv().await
+    }
+
+    pub fn try_recv(&mut self) -> Option<JsonRpcMessage> {
+        self.rx.try_recv().ok()
+    }
+
+    /// True once if a frame was dropped on a full queue since the last call.
+    fn take_overflow(&self) -> bool {
+        self.overflow.swap(false, Ordering::Relaxed)
+    }
+}
+
+/// A bounded relay queue of [`RELAY_QUEUE_CAPACITY`] frames.
+pub fn relay_channel() -> (RelaySender, RelayReceiver) {
+    let (tx, rx) = mpsc::channel(RELAY_QUEUE_CAPACITY);
+    let overflow = Arc::new(AtomicBool::new(false));
+    (
+        RelaySender {
+            tx,
+            overflow: overflow.clone(),
+        },
+        RelayReceiver { rx, overflow },
+    )
+}
+
 /// Most text the tail buffers between flushes. Further text is dropped and a
 /// truncation note is appended to the flushed message.
 pub const MAX_BUFFER_BYTES: usize = 256 * 1024;
@@ -85,8 +150,10 @@ pub const DELIVER_TIMEOUT: Duration = Duration::from_secs(30);
 /// (flushing, and reporting through `deliver` if a run is still open). Any
 /// parent-session `session/update` restarts the quiet timer. Buffered text is
 /// limited to [`MAX_BUFFER_BYTES`] and each `deliver` to [`DELIVER_TIMEOUT`].
+/// Frames dropped on a full queue ([`RELAY_QUEUE_CAPACITY`]) mark the flushed
+/// text as truncated.
 pub async fn run_tail<F, Fut>(
-    mut rx: UnboundedReceiver<JsonRpcMessage>,
+    mut rx: RelayReceiver,
     parent_session_id: String,
     open: HashSet<String>,
     cfg: WorkflowRelayConfig,
@@ -107,6 +174,7 @@ pub async fn run_tail<F, Fut>(
         truncated: false,
         last_event: Instant::now(),
         closed: false,
+        ending: false,
     };
     loop {
         let quiet_applies = !st.buf.is_empty() || st.open.is_empty();
@@ -146,7 +214,7 @@ pub async fn run_tail<F, Fut>(
                     // Frames drained while that delivery was pending are still
                     // buffered: one bounded final flush (frames arriving during
                     // it are dropped, the tail ends here).
-                    st.closed = true;
+                    st.ending = true;
                     flush(&mut st, &mut rx, &mut deliver).await;
                     if !st.open.is_empty() {
                         send(&mut st, &mut rx, &mut deliver, format!(
@@ -172,6 +240,9 @@ struct TailState {
     last_event: Instant,
     /// The sender side closed while a delivery was pending.
     closed: bool,
+    /// The final delivery is running: queued frames are read and dropped so
+    /// the queue keeps draining until the tail returns.
+    ending: bool,
 }
 
 impl TailState {
@@ -199,7 +270,9 @@ impl TailState {
         }
         if msg.id.is_none() {
             if let Some(AcpEvent::Text(t)) = classify_notification(&msg) {
-                if self.buf.len() + t.len() <= MAX_BUFFER_BYTES {
+                // Once text is cut, later text is dropped too, so the flushed
+                // message stays a contiguous prefix before the truncation note.
+                if !self.truncated && self.buf.len() + t.len() <= MAX_BUFFER_BYTES {
                     self.buf.push_str(&t);
                 } else {
                     self.truncated = true;
@@ -213,12 +286,8 @@ impl TailState {
 /// Run one delivery (bounded by [`DELIVER_TIMEOUT`]) while still draining
 /// `rx` into the capped buffer, so the notification queue cannot grow while
 /// the platform call is pending.
-async fn send<F, Fut>(
-    st: &mut TailState,
-    rx: &mut UnboundedReceiver<JsonRpcMessage>,
-    deliver: &mut F,
-    text: String,
-) where
+async fn send<F, Fut>(st: &mut TailState, rx: &mut RelayReceiver, deliver: &mut F, text: String)
+where
     F: FnMut(String) -> Fut,
     Fut: Future<Output = ()>,
 {
@@ -228,23 +297,25 @@ async fn send<F, Fut>(
         tokio::select! {
             _ = &mut fut => return,
             msg = rx.recv(), if !st.closed => match msg {
-                Some(m) => st.ingest(m),
+                Some(m) => {
+                    if !st.ending {
+                        st.ingest(m);
+                    }
+                }
                 None => st.closed = true,
             },
         }
     }
 }
 
-async fn flush<F, Fut>(
-    st: &mut TailState,
-    rx: &mut UnboundedReceiver<JsonRpcMessage>,
-    deliver: &mut F,
-) where
+async fn flush<F, Fut>(st: &mut TailState, rx: &mut RelayReceiver, deliver: &mut F)
+where
     F: FnMut(String) -> Fut,
     Fut: Future<Output = ()>,
 {
     let mut text = std::mem::take(&mut st.buf);
-    if std::mem::take(&mut st.truncated) {
+    let dropped = rx.take_overflow();
+    if std::mem::take(&mut st.truncated) || dropped {
         text.push_str("\n\n…(output truncated)");
     }
     if !text.trim().is_empty() {
@@ -257,7 +328,6 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
-    use tokio::sync::mpsc::unbounded_channel;
     use tokio::sync::oneshot;
 
     const PARENT: &str = "parent";
@@ -315,7 +385,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn late_parent_text_is_delivered_after_run_complete_and_quiet() {
-        let (tx, rx) = unbounded_channel();
+        let (tx, rx) = relay_channel();
         let (out, deliver) = collector();
         tx.send(run_complete()).unwrap();
         tx.send(chunk(PARENT, "all ")).unwrap();
@@ -336,7 +406,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn step_session_text_is_dropped() {
-        let (tx, rx) = unbounded_channel();
+        let (tx, rx) = relay_channel();
         let (out, deliver) = collector();
         tx.send(run_complete()).unwrap();
         tx.send(chunk("step-1", "internal")).unwrap();
@@ -357,7 +427,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn replaced_subscriber_flushes_buffer_and_ends() {
-        let (tx, rx) = unbounded_channel();
+        let (tx, rx) = relay_channel();
         let (out, deliver) = collector();
         tx.send(chunk(PARENT, "partial")).unwrap();
         drop(tx);
@@ -376,7 +446,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn run_that_never_completes_reports_at_the_cap() {
-        let (tx, rx) = unbounded_channel();
+        let (tx, rx) = relay_channel();
         let (out, deliver) = collector();
         let started = Instant::now();
         run_tail(
@@ -398,7 +468,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn text_during_open_run_is_flushed_after_quiet_and_tail_continues() {
-        let (tx, rx) = unbounded_channel();
+        let (tx, rx) = relay_channel();
         let (out, deliver) = collector();
         let handle = tokio::spawn(run_tail(
             rx,
@@ -424,7 +494,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn idle_tail_without_open_run_ends_at_cap_with_no_delivery() {
-        let (tx, rx) = unbounded_channel();
+        let (tx, rx) = relay_channel();
         let (out, deliver) = collector();
         let started = Instant::now();
         run_tail(
@@ -444,7 +514,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn summary_after_a_quiet_gap_is_delivered() {
-        let (tx, rx) = unbounded_channel();
+        let (tx, rx) = relay_channel();
         let (out, deliver) = collector();
         let handle = tokio::spawn(run_tail(
             rx,
@@ -466,7 +536,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn thought_and_tool_frames_keep_a_summary_in_one_message() {
-        let (tx, rx) = unbounded_channel();
+        let (tx, rx) = relay_channel();
         let (out, deliver) = collector();
         let handle = tokio::spawn(run_tail(
             rx,
@@ -502,7 +572,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn closed_channel_with_empty_buffer_ends_without_delivery() {
-        let (tx, rx) = unbounded_channel::<JsonRpcMessage>();
+        let (tx, rx) = relay_channel();
         drop(tx);
         let (out, deliver) = collector();
         run_tail(
@@ -520,7 +590,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn buffered_text_is_capped_and_marked_truncated() {
-        let (tx, rx) = unbounded_channel();
+        let (tx, rx) = relay_channel();
         let (out, deliver) = collector();
         let big = "x".repeat(MAX_BUFFER_BYTES / 2 + 1);
         tx.send(chunk(PARENT, &big)).unwrap();
@@ -544,8 +614,38 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn text_after_a_cut_is_not_appended_out_of_order() {
+        let (tx, rx) = relay_channel();
+        let (out, deliver) = collector();
+        tx.send(chunk(PARENT, &"a".repeat(MAX_BUFFER_BYTES - 10)))
+            .unwrap();
+        // Does not fit: the buffer is cut here.
+        tx.send(chunk(PARENT, &"b".repeat(100))).unwrap();
+        // Would fit in the 10 bytes left, but must not follow the cut.
+        tx.send(chunk(PARENT, "ccccc")).unwrap();
+        drop(tx);
+        run_tail(
+            rx,
+            PARENT.into(),
+            open_set(&["wf_1"]),
+            cfg(),
+            Instant::now(),
+            open_gate(),
+            deliver,
+        )
+        .await;
+        assert_eq!(
+            *out.lock().unwrap(),
+            vec![format!(
+                "{}\n\n…(output truncated)",
+                "a".repeat(MAX_BUFFER_BYTES - 10)
+            )]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn hard_cap_counts_from_the_prompt_response() {
-        let (tx, rx) = unbounded_channel::<JsonRpcMessage>();
+        let (tx, rx) = relay_channel();
         let (out, deliver) = collector();
         // The prompt response arrived 800 s ago (original reply was slow).
         let started = Instant::now();
@@ -568,7 +668,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn nothing_is_posted_before_the_original_reply_is_delivered() {
-        let (tx, rx) = unbounded_channel();
+        let (tx, rx) = relay_channel();
         let (gate_tx, gate_rx) = oneshot::channel();
         let (out, deliver) = collector();
         let handle = tokio::spawn(run_tail(
@@ -592,7 +692,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn stalled_delivery_does_not_hold_the_tail_forever() {
-        let (tx, rx) = unbounded_channel();
+        let (tx, rx) = relay_channel();
         let calls = Arc::new(Mutex::new(Vec::<String>::new()));
         let sink = calls.clone();
         let deliver = move |t: String| {
@@ -633,7 +733,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn frames_sent_during_a_pending_delivery_are_drained_and_capped() {
-        let (tx, rx) = unbounded_channel();
+        let (tx, rx) = relay_channel();
         tx.send(run_complete()).unwrap();
         tx.send(chunk(PARENT, "first")).unwrap();
         let calls = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -680,8 +780,63 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn queue_overflow_while_delivery_is_stalled_is_bounded_and_marked() {
+        let (tx, rx) = relay_channel();
+        tx.send(chunk(PARENT, "first")).unwrap();
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = calls.clone();
+        let deliver = move |t: String| {
+            let first = {
+                let mut g = sink.lock().unwrap();
+                g.push(t);
+                g.len() == 1
+            };
+            async move {
+                if first {
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
+        let flood = async move {
+            // The first delivery is pending from the 20 s quiet mark.
+            tokio::time::sleep(Duration::from_secs(25)).await;
+            // One synchronous burst: the tail cannot drain until this task
+            // yields, so the queue fills and the surplus is dropped.
+            let mut dropped = 0;
+            for _ in 0..RELAY_QUEUE_CAPACITY + 500 {
+                if tx.send(chunk(PARENT, "x")).is_err() {
+                    dropped += 1;
+                }
+            }
+            assert_eq!(dropped, 500);
+            tokio::task::yield_now().await;
+            drop(tx);
+        };
+        let tail = run_tail(
+            rx,
+            PARENT.into(),
+            open_set(&["wf_1"]),
+            cfg(),
+            Instant::now(),
+            open_gate(),
+            deliver,
+        );
+        tokio::join!(tail, flood);
+        let got = calls.lock().unwrap().clone();
+        assert_eq!(got.len(), 2, "{got:?}");
+        assert_eq!(got[0], "first");
+        assert_eq!(
+            got[1],
+            format!(
+                "{}\n\n…(output truncated)",
+                "x".repeat(RELAY_QUEUE_CAPACITY)
+            )
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn text_buffered_while_a_delivery_crosses_the_hard_cap_is_flushed() {
-        let (tx, rx) = unbounded_channel();
+        let (tx, rx) = relay_channel();
         tx.send(chunk(PARENT, "first")).unwrap();
         let calls = Arc::new(Mutex::new(Vec::<String>::new()));
         let sink = calls.clone();

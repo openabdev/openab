@@ -1078,8 +1078,7 @@ impl AdapterRouter {
                     // frames while the original reply is finalized; it posts
                     // only after `gate_tx` fires below.
                     let tail_rx = if tail_cfg.is_some() {
-                        conn.prompt_done_keep_subscriber().await;
-                        Some(rx)
+                        Some(conn.prompt_done_keep_subscriber(&mut rx).await)
                     } else {
                         conn.prompt_done().await;
                         None

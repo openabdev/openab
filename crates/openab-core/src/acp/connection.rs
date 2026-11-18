@@ -2,6 +2,7 @@ use crate::acp::protocol::{
     parse_config_options, parse_usage_report, ConfigOption, JsonRpcErrorResponse, JsonRpcId,
     JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, UsageReport,
 };
+use crate::workflow_tail::{relay_channel, RelayReceiver, RelaySender};
 use anyhow::{anyhow, Result};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -171,6 +172,27 @@ impl SessionActivity {
     }
 }
 
+/// Where the reader loop forwards notifications. `Prompt` is the foreground
+/// prompt's unbounded queue. `Relay` is the bounded queue that takes over
+/// after the reply for late workflow output (see `prompt_done_keep_subscriber`).
+pub(crate) enum NotifySink {
+    Prompt(mpsc::UnboundedSender<JsonRpcMessage>),
+    Relay(RelaySender),
+}
+
+impl NotifySink {
+    fn push(&self, msg: JsonRpcMessage) {
+        match self {
+            Self::Prompt(tx) => {
+                let _ = tx.send(msg);
+            }
+            Self::Relay(tx) => {
+                let _ = tx.send(msg);
+            }
+        }
+    }
+}
+
 pub struct AcpConnection {
     _proc: Child,
     /// PID of the direct child, used as the process group ID for cleanup.
@@ -178,7 +200,7 @@ pub struct AcpConnection {
     stdin: Arc<Mutex<ChildStdin>>,
     next_id: AtomicU64,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
-    notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
+    notify_tx: Arc<Mutex<Option<NotifySink>>>,
     pub acp_session_id: Option<String>,
     pub supports_load_session: bool,
     /// Agent name from `initialize` (`agentInfo.name`), e.g. "Kiro CLI Agent".
@@ -290,7 +312,7 @@ pub(crate) async fn run_reader_loop<R, W>(
     reader: R,
     writer: Arc<Mutex<W>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
-    notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
+    notify_tx: Arc<Mutex<Option<NotifySink>>>,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -355,7 +377,7 @@ pub(crate) async fn run_reader_loop<R, W>(
                 let sub = notify_tx.lock().await;
                 if let Some(ntx) = sub.as_ref() {
                     // Clone the essential fields for the subscriber
-                    let _ = ntx.send(JsonRpcMessage {
+                    ntx.push(JsonRpcMessage {
                         id: msg.id.clone(),
                         method: None,
                         result: msg.result.clone(),
@@ -375,7 +397,7 @@ pub(crate) async fn run_reader_loop<R, W>(
         // Notification → forward to subscriber
         let sub = notify_tx.lock().await;
         if let Some(tx) = sub.as_ref() {
-            let _ = tx.send(msg);
+            tx.push(msg);
         }
     }
 
@@ -532,8 +554,7 @@ impl AcpConnection {
 
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
-            Arc::new(Mutex::new(None));
+        let notify_tx: Arc<Mutex<Option<NotifySink>>> = Arc::new(Mutex::new(None));
 
         let reader_handle = tokio::spawn(run_reader_loop(
             stdout,
@@ -823,7 +844,7 @@ impl AcpConnection {
             .ok_or_else(|| anyhow!("no session"))?;
 
         let (tx, rx) = mpsc::unbounded_channel();
-        *self.notify_tx.lock().await = Some(tx);
+        *self.notify_tx.lock().await = Some(NotifySink::Prompt(tx));
 
         let id = self.next_id();
 
@@ -847,14 +868,28 @@ impl AcpConnection {
         Ok((rx, id))
     }
 
-    /// Like [`Self::prompt_done`] but leaves the notify subscriber installed so
-    /// the caller can keep reading late frames from the receiver returned by
-    /// `session_prompt` (Kiro workflow output). The next `session_prompt`
-    /// replaces the subscriber, which closes the old receiver.
-    pub async fn prompt_done_keep_subscriber(&mut self) {
+    /// Like [`Self::prompt_done`] but keeps a subscriber installed so late
+    /// frames (Kiro workflow output) keep arriving. The foreground `prompt_rx`
+    /// (from `session_prompt`) is replaced by a bounded relay queue: frames
+    /// still queued in `prompt_rx` move to the new queue first, under the
+    /// subscriber lock, so their order is kept. The next `session_prompt`
+    /// replaces the subscriber, which closes the relay receiver.
+    pub async fn prompt_done_keep_subscriber(
+        &mut self,
+        prompt_rx: &mut mpsc::UnboundedReceiver<JsonRpcMessage>,
+    ) -> RelayReceiver {
+        let (tx, rx) = relay_channel();
+        {
+            let mut sub = self.notify_tx.lock().await;
+            while let Ok(msg) = prompt_rx.try_recv() {
+                let _ = tx.send(msg);
+            }
+            *sub = Some(NotifySink::Relay(tx));
+        }
         self.activity.touch();
         self.activity.set_in_flight(false);
         self.last_active = Instant::now();
+        rx
     }
 
     /// Call after prompt streaming is done to clean up subscriber.
@@ -1119,11 +1154,10 @@ mod reader_loop_tests {
 
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
-            Arc::new(Mutex::new(None));
+        let notify_tx: Arc<Mutex<Option<NotifySink>>> = Arc::new(Mutex::new(None));
 
         let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
-        *notify_tx.lock().await = Some(sub_tx);
+        *notify_tx.lock().await = Some(NotifySink::Prompt(sub_tx));
 
         let writer = Arc::new(Mutex::new(agent_stdin_writer));
         let handle = tokio::spawn(run_reader_loop(
@@ -1159,14 +1193,13 @@ mod reader_loop_tests {
 
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
-            Arc::new(Mutex::new(None));
+        let notify_tx: Arc<Mutex<Option<NotifySink>>> = Arc::new(Mutex::new(None));
 
         let (resp_tx, resp_rx) = oneshot::channel();
         pending.lock().await.insert(7, resp_tx);
 
         let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
-        *notify_tx.lock().await = Some(sub_tx);
+        *notify_tx.lock().await = Some(NotifySink::Prompt(sub_tx));
 
         let writer = Arc::new(Mutex::new(agent_stdin_writer));
         let handle = tokio::spawn(run_reader_loop(
@@ -1206,8 +1239,7 @@ mod reader_loop_tests {
             Arc::new(Mutex::new(HashMap::new()));
         let (resp_tx, mut resp_rx) = oneshot::channel();
         pending.lock().await.insert(7, resp_tx);
-        let notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>> =
-            Arc::new(Mutex::new(None));
+        let notify_tx: Arc<Mutex<Option<NotifySink>>> = Arc::new(Mutex::new(None));
 
         let handle = tokio::spawn(run_reader_loop(
             agent_stdout_reader,
@@ -1251,7 +1283,7 @@ mod reader_loop_tests {
         let (resp_tx, mut resp_rx) = oneshot::channel();
         pending.lock().await.insert(u64::MAX, resp_tx);
         let (sub_tx, mut sub_rx) = mpsc::unbounded_channel();
-        let notify_tx = Arc::new(Mutex::new(Some(sub_tx)));
+        let notify_tx = Arc::new(Mutex::new(Some(NotifySink::Prompt(sub_tx))));
 
         let handle = tokio::spawn(run_reader_loop(
             agent_stdout_reader,
@@ -1694,12 +1726,12 @@ done"#
         let mut conn = spawn_mock(late_chunk_script()).await;
         conn.session_new("/tmp").await.unwrap();
 
-        let (mut rx1, id1) = conn
+        let (mut prompt_rx, id1) = conn
             .session_prompt(vec![ContentBlock::Text { text: "one".into() }])
             .await
             .unwrap();
         loop {
-            let m = tokio::time::timeout(Duration::from_secs(5), rx1.recv())
+            let m = tokio::time::timeout(Duration::from_secs(5), prompt_rx.recv())
                 .await
                 .expect("response")
                 .expect("open");
@@ -1707,7 +1739,7 @@ done"#
                 break;
             }
         }
-        conn.prompt_done_keep_subscriber().await;
+        let rx1 = conn.prompt_done_keep_subscriber(&mut prompt_rx).await;
 
         let out = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let sink = out.clone();
