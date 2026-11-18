@@ -79,9 +79,11 @@ pub const DELIVER_TIMEOUT: Duration = Duration::from_secs(30);
 /// queue does not grow while the reply is finalized) but posts nothing before
 /// the gate opens. A dropped gate counts as open.
 ///
-/// Ends when the channel closes (flushing what is buffered), when nothing is
-/// running and the quiet time has passed, or at the hard cap (flushing, and
-/// reporting through `deliver` if a run is still open). Buffered text is
+/// Quiet time only decides when buffered text is posted. The tail does not end
+/// on quiet, so output that arrives after a gap is still delivered. It ends
+/// when the channel closes (flushing what is buffered) or at the hard cap
+/// (flushing, and reporting through `deliver` if a run is still open). Any
+/// parent-session `session/update` restarts the quiet timer. Buffered text is
 /// limited to [`MAX_BUFFER_BYTES`] and each `deliver` to [`DELIVER_TIMEOUT`].
 pub async fn run_tail<F, Fut>(
     mut rx: UnboundedReceiver<JsonRpcMessage>,
@@ -156,9 +158,6 @@ pub async fn run_tail<F, Fut>(
                     return;
                 }
                 st.last_event = Instant::now();
-                if (st.open.is_empty() || st.closed) && st.buf.is_empty() {
-                    return;
-                }
             }
         }
     }
@@ -179,6 +178,11 @@ impl TailState {
     fn ingest(&mut self, msg: JsonRpcMessage) {
         if is_foreign_session_update(&msg, &self.parent) {
             return;
+        }
+        if msg.id.is_none() && msg.method.as_deref() == Some("session/update") {
+            // Thinking and tool frames are not relayed, but they count as
+            // activity so a pause inside a summary does not split it.
+            self.last_event = Instant::now();
         }
         match classify_workflow_signal(&msg, &self.parent) {
             Some(WorkflowSignal::RunStart { workflow_id }) => {
@@ -419,7 +423,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn idle_tail_without_open_run_ends_after_quiet_with_no_delivery() {
+    async fn idle_tail_without_open_run_ends_at_cap_with_no_delivery() {
         let (tx, rx) = unbounded_channel();
         let (out, deliver) = collector();
         let started = Instant::now();
@@ -433,9 +437,67 @@ mod tests {
             deliver,
         )
         .await;
-        assert_eq!(started.elapsed(), Duration::from_secs(20));
+        assert_eq!(started.elapsed(), Duration::from_secs(900));
         assert!(out.lock().unwrap().is_empty());
         drop(tx);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn summary_after_a_quiet_gap_is_delivered() {
+        let (tx, rx) = unbounded_channel();
+        let (out, deliver) = collector();
+        let handle = tokio::spawn(run_tail(
+            rx,
+            PARENT.into(),
+            HashSet::new(),
+            cfg(),
+            Instant::now(),
+            open_gate(),
+            deliver,
+        ));
+        tx.send(run_complete()).unwrap();
+        tokio::time::sleep(Duration::from_secs(25)).await;
+        tx.send(chunk(PARENT, "summary")).unwrap();
+        tokio::time::sleep(Duration::from_secs(25)).await;
+        assert_eq!(*out.lock().unwrap(), vec!["summary".to_string()]);
+        drop(tx);
+        handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn thought_and_tool_frames_keep_a_summary_in_one_message() {
+        let (tx, rx) = unbounded_channel();
+        let (out, deliver) = collector();
+        let handle = tokio::spawn(run_tail(
+            rx,
+            PARENT.into(),
+            open_set(&["wf_1"]),
+            cfg(),
+            Instant::now(),
+            open_gate(),
+            deliver,
+        ));
+        tx.send(chunk(PARENT, "A")).unwrap();
+        // Thinking and tool calls arrive every 15 s, each inside the quiet
+        // window, so "A" and "B" stay in one message.
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        tx.send(frame(json!({"method": "session/update", "params": {
+            "sessionId": PARENT,
+            "update": {"sessionUpdate": "agent_thought_chunk",
+                "content": {"type": "text", "text": "thinking"}}}})))
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        tx.send(frame(json!({"method": "session/update", "params": {
+            "sessionId": PARENT,
+            "update": {"sessionUpdate": "tool_call", "toolCallId": "t1",
+                "title": "read"}}})))
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        tx.send(chunk(PARENT, "B")).unwrap();
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        assert_eq!(*out.lock().unwrap(), vec!["AB".to_string()]);
+        drop(tx);
+        handle.await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -531,22 +593,42 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stalled_delivery_does_not_hold_the_tail_forever() {
         let (tx, rx) = unbounded_channel();
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = calls.clone();
+        let deliver = move |t: String| {
+            let first = {
+                let mut g = sink.lock().unwrap();
+                g.push(t);
+                g.len() == 1
+            };
+            async move {
+                if first {
+                    std::future::pending::<()>().await;
+                }
+            }
+        };
         tx.send(run_complete()).unwrap();
         tx.send(chunk(PARENT, "late")).unwrap();
-        let started = Instant::now();
-        run_tail(
+        let handle = tokio::spawn(run_tail(
             rx,
             PARENT.into(),
             open_set(&["wf_1"]),
             cfg(),
-            started,
+            Instant::now(),
             open_gate(),
-            |_t| std::future::pending::<()>(),
-        )
-        .await;
-        // quiet (20 s) + one delivery timeout, not forever.
-        assert_eq!(started.elapsed(), Duration::from_secs(20) + DELIVER_TIMEOUT);
+            deliver,
+        ));
+        // Quiet (20 s) plus one delivery timeout (30 s); the tail must still
+        // post output that arrives after that.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        tx.send(chunk(PARENT, "later")).unwrap();
+        tokio::time::sleep(Duration::from_secs(40)).await;
         drop(tx);
+        handle.await.unwrap();
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["late".to_string(), "later".to_string()]
+        );
     }
 
     #[tokio::test(start_paused = true)]

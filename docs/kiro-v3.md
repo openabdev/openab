@@ -76,13 +76,14 @@ workflows are enabled openab:
    sessions are still auto-answered.
 2. **Relays the late summary.** If a workflow started for the session during the turn, openab
    keeps reading after delivering the reply and posts the late text as a new message in the same
-   thread, prefixed `_Workflow update:_`. It ends when the workflow is complete and no output
-   has arrived for `workflow_tail_quiet_secs`, when the next prompt on the session starts, when
-   the connection closes, or at `workflow_tail_max_secs`, measured from the prompt response. If a run is still open at the cap, a
-   warning message says that further output is not relayed. Setting `workflow_tail_max_secs = 0`
-   disables the relay and keeps the filter.
+   thread, prefixed `_Workflow update:_`. Text is posted after `workflow_tail_quiet_secs` without
+   new output, so text that arrives after a long pause is still delivered. Thinking and tool
+   activity count as output for this timer but are not posted. The relay ends when the connection
+   closes, when the next prompt on the session starts, or at `workflow_tail_max_secs`, measured from
+   the prompt response. If a run is still open at the cap, a warning message says that further
+   output is not relayed. Setting `workflow_tail_max_secs = 0` disables the relay and keeps the filter.
 
-Limits: openab buffers at most 256 KiB of late text per message (the rest is dropped with a note), and each post is bounded to 30 s. Only workflows started during a turn are tracked. A workflow that is still running when the next prompt starts has its later output delivered with that prompt, not as a workflow update. One summary can be split in two messages if the agent pauses longer than the quiet time.
+Limits: openab buffers at most 256 KiB of late text per message (the rest is dropped with a note), and each post is bounded to 30 s. Only workflows started during a turn are tracked. A workflow that is still running when the next prompt starts has its later output delivered with that prompt, not as a workflow update. If the agent pauses for longer than the quiet time while a run is still open, the text before the pause is posted as its own message and later text starts a new one.
 Late text that arrives after the next prompt started is part of that prompt's reply. The relay is
 not used on the `acp` gateway platform. `session_new_meta` and `default_config_options` are
 applied when a session is created with `session/new` only, not when a session is restored with `session/load`.
