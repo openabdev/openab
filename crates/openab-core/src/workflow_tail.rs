@@ -136,6 +136,24 @@ pub const MAX_BUFFER_BYTES: usize = 256 * 1024;
 /// tail (and its deadline checks) blocked.
 pub const DELIVER_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Most platform messages one late-output flush may post. When the text needs
+/// more, the last message is [`TRUNCATED_NOTE`] and the rest is not posted.
+pub const MAX_FLUSH_MESSAGES: usize = 16;
+
+/// Posted in place of the chunks that do not fit into [`MAX_FLUSH_MESSAGES`].
+pub const TRUNCATED_NOTE: &str = "…(output truncated: further workflow output is not relayed)";
+
+/// Apply the per-flush message cap to already platform-split `chunks`. The
+/// note takes the last slot, so it is always posted when anything is dropped.
+pub fn limit_flush_messages(mut chunks: Vec<String>, max: usize, note: &str) -> Vec<String> {
+    if chunks.len() <= max {
+        return chunks;
+    }
+    chunks.truncate(max.saturating_sub(1));
+    chunks.push(note.to_string());
+    chunks
+}
+
 /// Read late frames from `rx` and hand text to `deliver`.
 ///
 /// `started` is when the prompt response arrived: the hard cap is measured
@@ -878,6 +896,46 @@ mod tests {
             vec!["first".to_string(), "late".to_string()],
             "{got:?}"
         );
+    }
+
+    #[test]
+    fn flush_messages_are_capped_with_a_note_in_the_last_slot() {
+        let short = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(
+            limit_flush_messages(short.clone(), MAX_FLUSH_MESSAGES, TRUNCATED_NOTE),
+            short
+        );
+
+        // Exactly the cap: nothing is dropped, so no note.
+        let exact: Vec<String> = (0..MAX_FLUSH_MESSAGES).map(|i| i.to_string()).collect();
+        assert_eq!(
+            limit_flush_messages(exact.clone(), MAX_FLUSH_MESSAGES, TRUNCATED_NOTE),
+            exact
+        );
+
+        let long: Vec<String> = (0..100).map(|i| i.to_string()).collect();
+        let got = limit_flush_messages(long, MAX_FLUSH_MESSAGES, TRUNCATED_NOTE);
+        assert_eq!(got.len(), MAX_FLUSH_MESSAGES);
+        assert_eq!(
+            got[MAX_FLUSH_MESSAGES - 2],
+            (MAX_FLUSH_MESSAGES - 2).to_string()
+        );
+        assert_eq!(got[MAX_FLUSH_MESSAGES - 1], TRUNCATED_NOTE);
+    }
+
+    #[test]
+    fn full_buffer_splits_into_at_most_the_cap_on_a_discord_sized_limit() {
+        // 256 KiB of text at Discord's 2000-character message limit would be
+        // about 130 messages; the cap keeps 15 of them plus the note.
+        let text = "line of late output\n".repeat(MAX_BUFFER_BYTES / 20);
+        let chunks = crate::format::split_message(&text, 2000);
+        assert!(chunks.len() > MAX_FLUSH_MESSAGES);
+        let got = limit_flush_messages(chunks, MAX_FLUSH_MESSAGES, TRUNCATED_NOTE);
+        assert_eq!(got.len(), MAX_FLUSH_MESSAGES);
+        assert_eq!(got.last().unwrap(), TRUNCATED_NOTE);
+        assert!(got[..MAX_FLUSH_MESSAGES - 1]
+            .iter()
+            .all(|c| c.chars().count() <= 2000));
     }
 
     #[test]

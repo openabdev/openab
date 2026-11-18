@@ -1101,7 +1101,12 @@ impl AdapterRouter {
                                 let channel = tail_channel.clone();
                                 async move {
                                     let text = format!("_Workflow update:_\n\n{text}");
-                                    for chunk in format::split_message(&text, message_limit) {
+                                    let chunks = crate::workflow_tail::limit_flush_messages(
+                                        format::split_message(&text, message_limit),
+                                        crate::workflow_tail::MAX_FLUSH_MESSAGES,
+                                        crate::workflow_tail::TRUNCATED_NOTE,
+                                    );
+                                    for chunk in chunks {
                                         if let Err(e) = adapter.send_message(&channel, &chunk).await
                                         {
                                             warn!(error = ?e, "workflow tail delivery failed");
