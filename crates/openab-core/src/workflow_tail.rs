@@ -141,7 +141,7 @@ pub const DELIVER_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_FLUSH_MESSAGES: usize = 16;
 
 /// Posted in place of the chunks that do not fit into [`MAX_FLUSH_MESSAGES`].
-pub const TRUNCATED_NOTE: &str = "…(output truncated: this update stopped at 16 messages and the rest was not posted; later output is still relayed)";
+pub const TRUNCATED_NOTE: &str = "…(output truncated: this flush was cut at 16 platform messages and the rest of this flush was not sent; later output is still relayed)";
 
 /// Apply the per-flush message cap to already platform-split `chunks`. The
 /// note takes the last slot, so it is always posted when anything is dropped.
@@ -925,7 +925,7 @@ mod tests {
         assert_eq!(got[MAX_FLUSH_MESSAGES - 1], TRUNCATED_NOTE);
         assert_eq!(
             TRUNCATED_NOTE,
-            "…(output truncated: this update stopped at 16 messages and the rest was not posted; later output is still relayed)"
+            "…(output truncated: this flush was cut at 16 platform messages and the rest of this flush was not sent; later output is still relayed)"
         );
     }
 
