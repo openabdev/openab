@@ -7,8 +7,10 @@
 //! delivered and hands it to [`run_tail`], which buffers that text and posts
 //! it as a follow-up message.
 //!
-//! The tail holds no connection lock. The next prompt on the same session
-//! replaces the subscriber, which closes the receiver and ends the tail.
+//! The tail holds no connection lock. The connection cancels the tail before
+//! the next prompt on the same session replaces the subscriber, and when the
+//! connection is torn down (see [`TailControl`]). A cancelled tail discards
+//! its buffered text and posts nothing more.
 
 use crate::acp::protocol::JsonRpcMessage;
 use crate::acp::{
@@ -22,7 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::sync::oneshot;
-use tokio::time::{sleep_until, timeout, timeout_at, Instant};
+use tokio::time::{sleep_until, timeout_at, Instant};
 
 /// Bounds for the late-output relay (`[pool] workflow_tail_*`).
 #[derive(Debug, Clone, Copy)]
@@ -154,18 +156,31 @@ pub fn limit_flush_messages(mut chunks: Vec<String>, max: usize, note: &str) -> 
     chunks
 }
 
+/// Gate and cancel signals of one tail.
+///
+/// `gate` resolves once the original reply has been delivered. `cancel` ends
+/// the tail: it is cancelled when its sender is dropped, which the connection
+/// does before the next prompt on the session and on teardown. Both a sent
+/// value and a dropped sender count as a signal for `cancel`, and a dropped
+/// `gate` counts as open.
+pub struct TailControl {
+    pub gate: oneshot::Receiver<()>,
+    pub cancel: oneshot::Receiver<()>,
+}
+
 /// Read late frames from `rx` and hand text to `deliver`.
 ///
 /// `started` is when the prompt response arrived: the hard cap is measured
-/// from it, not from when this task starts. `gate` resolves once the original
-/// reply has been delivered; the tail starts draining `rx` immediately (so the
-/// queue does not grow while the reply is finalized) but posts nothing before
-/// the gate opens. A dropped gate counts as open.
+/// from it, not from when this task starts. The tail starts draining `rx`
+/// immediately (so the queue does not grow while the reply is finalized) but
+/// posts nothing before `control.gate` opens.
 ///
 /// Quiet time only decides when buffered text is posted. The tail does not end
 /// on quiet, so output that arrives after a gap is still delivered. It ends
-/// when the channel closes (flushing what is buffered) or at the hard cap
-/// (flushing, and reporting through `deliver` if a run is still open). Any
+/// when the channel closes (flushing what is buffered), at the hard cap
+/// (flushing, and reporting through `deliver` if a run is still open), or when
+/// `control.cancel` fires. A cancel discards buffered text, drops an in-flight
+/// `deliver`, and posts nothing afterwards; it does not flush. Any
 /// parent-session `session/update` restarts the quiet timer. Buffered text is
 /// limited to [`MAX_BUFFER_BYTES`] and each `deliver` to [`DELIVER_TIMEOUT`].
 /// Frames dropped on a full queue ([`RELAY_QUEUE_CAPACITY`]) mark the flushed
@@ -176,13 +191,13 @@ pub async fn run_tail<F, Fut>(
     open: HashSet<String>,
     cfg: WorkflowRelayConfig,
     started: Instant,
-    gate: oneshot::Receiver<()>,
+    control: TailControl,
     mut deliver: F,
 ) where
     F: FnMut(String) -> Fut,
     Fut: Future<Output = ()>,
 {
-    let mut gate = gate;
+    let TailControl { mut gate, cancel } = control;
     let mut gated = true;
     let hard = started + cfg.tail_max;
     let mut st = TailState {
@@ -193,6 +208,8 @@ pub async fn run_tail<F, Fut>(
         last_event: Instant::now(),
         closed: false,
         ending: false,
+        cancel,
+        cancelled: false,
     };
     loop {
         let quiet_applies = !st.buf.is_empty() || st.open.is_empty();
@@ -202,15 +219,31 @@ pub async fn run_tail<F, Fut>(
             hard
         };
         tokio::select! {
+            biased;
+            _ = &mut st.cancel => {
+                // Discard what is buffered and end. Nothing is posted.
+                st.cancelled = true;
+                return;
+            }
             _ = &mut gate, if gated => {
                 gated = false;
             }
             msg = rx.recv() => {
                 let Some(msg) = msg else {
                     if gated {
-                        // Wait for the original reply, but not past the cap.
-                        if timeout_at(hard, &mut gate).await.is_err() {
-                            return;
+                        // Wait for the original reply, but not past the cap or
+                        // a cancel.
+                        tokio::select! {
+                            biased;
+                            _ = &mut st.cancel => {
+                                st.cancelled = true;
+                                return;
+                            }
+                            r = timeout_at(hard, &mut gate) => {
+                                if r.is_err() {
+                                    return;
+                                }
+                            }
                         }
                     }
                     flush(&mut st, &mut rx, &mut deliver).await;
@@ -230,12 +263,18 @@ pub async fn run_tail<F, Fut>(
                     return;
                 }
                 flush(&mut st, &mut rx, &mut deliver).await;
+                if st.cancelled {
+                    return;
+                }
                 if at_cap || Instant::now() >= hard {
                     // Frames drained while that delivery was pending are still
                     // buffered: one bounded final flush (frames arriving during
                     // it are dropped, the tail ends here).
                     st.ending = true;
                     flush(&mut st, &mut rx, &mut deliver).await;
+                    if st.cancelled {
+                        return;
+                    }
                     if !st.open.is_empty() {
                         send(&mut st, &mut rx, &mut deliver, format!(
                             "⚠ workflow still running after {}s; further output is not relayed",
@@ -252,15 +291,16 @@ pub async fn run_tail<F, Fut>(
 }
 
 /// Start [`run_tail`] on a detached task. The returned receiver resolves once
-/// the tail has returned, after its final flush. The next turn on the same
-/// connection waits on it with [`wait_for_previous_tail`] before posting.
+/// the tail has returned: after its final flush, or right after a cancel. The
+/// next turn on the same connection waits on it with
+/// [`wait_for_previous_tail`] before posting.
 pub fn spawn_tail<F, Fut>(
     rx: RelayReceiver,
     parent_session_id: String,
     open: HashSet<String>,
     cfg: WorkflowRelayConfig,
     started: Instant,
-    gate: oneshot::Receiver<()>,
+    control: TailControl,
     deliver: F,
 ) -> oneshot::Receiver<()>
 where
@@ -269,19 +309,20 @@ where
 {
     let (done_tx, done_rx) = oneshot::channel();
     tokio::spawn(async move {
-        run_tail(rx, parent_session_id, open, cfg, started, gate, deliver).await;
+        run_tail(rx, parent_session_id, open, cfg, started, control, deliver).await;
         let _ = done_tx.send(());
     });
     done_rx
 }
 
-/// Wait until a previous tail has finished its final flush, so the next reply
-/// is not posted into the middle of it. Gives up after [`DELIVER_TIMEOUT`]; a
-/// tail still delivering then may overlap the reply.
+/// Wait until a previous tail has finished, so the next reply is not posted
+/// into the middle of it. There is no timeout. The connection cancels the
+/// previous tail before the next prompt, and a cancelled tail returns as soon
+/// as its in-flight delivery is dropped, so this wait cannot hang on a stalled
+/// platform call. A tail that is not cancelled is still running and this
+/// waits for it.
 pub async fn wait_for_previous_tail(done: oneshot::Receiver<()>) {
-    if timeout(DELIVER_TIMEOUT, done).await.is_err() {
-        tracing::warn!("previous workflow tail still delivering; starting the next reply anyway");
-    }
+    let _ = done.await;
 }
 
 /// Mutable bookkeeping of one tail.
@@ -296,6 +337,10 @@ struct TailState {
     /// The final delivery is running: queued frames are read and dropped so
     /// the queue keeps draining until the tail returns.
     ending: bool,
+    /// Fires when the connection cancels this tail. Polled by every wait.
+    cancel: oneshot::Receiver<()>,
+    /// Set once a cancel was observed. Nothing is posted afterwards.
+    cancelled: bool,
 }
 
 impl TailState {
@@ -344,10 +389,20 @@ where
     F: FnMut(String) -> Fut,
     Fut: Future<Output = ()>,
 {
+    if st.cancelled {
+        return;
+    }
     let fut = tokio::time::timeout(DELIVER_TIMEOUT, deliver(text));
     tokio::pin!(fut);
     loop {
         tokio::select! {
+            biased;
+            _ = &mut st.cancel => {
+                // Drops the in-flight delivery: the platform call stops at its
+                // next await, and nothing else is posted.
+                st.cancelled = true;
+                return;
+            }
             _ = &mut fut => return,
             msg = rx.recv(), if !st.closed => match msg {
                 Some(m) => {
@@ -432,6 +487,21 @@ mod tests {
         rx
     }
 
+    /// A cancel signal that never fires. Its sender is leaked on purpose so the
+    /// receiver stays open for the whole test.
+    fn never_cancelled() -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        std::mem::forget(tx);
+        rx
+    }
+
+    fn open_control() -> TailControl {
+        TailControl {
+            gate: open_gate(),
+            cancel: never_cancelled(),
+        }
+    }
+
     fn open_set(ids: &[&str]) -> HashSet<String> {
         ids.iter().map(|s| s.to_string()).collect()
     }
@@ -449,7 +519,7 @@ mod tests {
             open_set(&["wf_1"]),
             cfg(),
             Instant::now(),
-            open_gate(),
+            open_control(),
             deliver,
         )
         .await;
@@ -470,7 +540,7 @@ mod tests {
             open_set(&["wf_1"]),
             cfg(),
             Instant::now(),
-            open_gate(),
+            open_control(),
             deliver,
         )
         .await;
@@ -479,7 +549,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn replaced_subscriber_flushes_buffer_and_ends() {
+    async fn closed_channel_flushes_buffer_and_ends() {
         let (tx, rx) = relay_channel();
         let (out, deliver) = collector();
         tx.send(chunk(PARENT, "partial")).unwrap();
@@ -490,7 +560,7 @@ mod tests {
             open_set(&["wf_1"]),
             cfg(),
             Instant::now(),
-            open_gate(),
+            open_control(),
             deliver,
         )
         .await;
@@ -508,7 +578,7 @@ mod tests {
             open_set(&["wf_1"]),
             cfg(),
             Instant::now(),
-            open_gate(),
+            open_control(),
             deliver,
         )
         .await;
@@ -529,7 +599,7 @@ mod tests {
             open_set(&["wf_1"]),
             cfg(),
             Instant::now(),
-            open_gate(),
+            open_control(),
             deliver,
         ));
         tx.send(chunk(PARENT, "first")).unwrap();
@@ -556,7 +626,7 @@ mod tests {
             HashSet::new(),
             cfg(),
             Instant::now(),
-            open_gate(),
+            open_control(),
             deliver,
         )
         .await;
@@ -575,7 +645,7 @@ mod tests {
             HashSet::new(),
             cfg(),
             Instant::now(),
-            open_gate(),
+            open_control(),
             deliver,
         ));
         tx.send(run_complete()).unwrap();
@@ -597,7 +667,7 @@ mod tests {
             open_set(&["wf_1"]),
             cfg(),
             Instant::now(),
-            open_gate(),
+            open_control(),
             deliver,
         ));
         tx.send(chunk(PARENT, "A")).unwrap();
@@ -634,7 +704,7 @@ mod tests {
             open_set(&["wf_1"]),
             cfg(),
             Instant::now(),
-            open_gate(),
+            open_control(),
             deliver,
         )
         .await;
@@ -656,7 +726,7 @@ mod tests {
             open_set(&["wf_1"]),
             cfg(),
             Instant::now(),
-            open_gate(),
+            open_control(),
             deliver,
         )
         .await;
@@ -683,7 +753,7 @@ mod tests {
             open_set(&["wf_1"]),
             cfg(),
             Instant::now(),
-            open_gate(),
+            open_control(),
             deliver,
         )
         .await;
@@ -710,7 +780,7 @@ mod tests {
             open_set(&["wf_1"]),
             cfg(),
             started,
-            open_gate(),
+            open_control(),
             deliver,
         )
         .await;
@@ -730,7 +800,10 @@ mod tests {
             open_set(&["wf_1"]),
             cfg(),
             Instant::now(),
-            gate_rx,
+            TailControl {
+                gate: gate_rx,
+                cancel: never_cancelled(),
+            },
             deliver,
         ));
         tx.send(run_complete()).unwrap();
@@ -765,7 +838,7 @@ mod tests {
             HashSet::new(),
             cfg(),
             Instant::now(),
-            open_gate(),
+            open_control(),
             deliver,
         );
         wait_for_previous_tail(done).await;
@@ -773,6 +846,82 @@ mod tests {
         assert_eq!(
             *log.lock().unwrap(),
             vec!["tail: late".to_string(), "next reply".to_string()]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_tail_discards_buffered_text() {
+        let (tx, rx) = relay_channel();
+        let (out, deliver) = collector();
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let handle = tokio::spawn(run_tail(
+            rx,
+            PARENT.into(),
+            open_set(&["wf_1"]),
+            cfg(),
+            Instant::now(),
+            TailControl {
+                gate: open_gate(),
+                cancel: cancel_rx,
+            },
+            deliver,
+        ));
+        tx.send(chunk(PARENT, "buffered")).unwrap();
+        // Buffered, but the 20 s quiet mark has not come yet.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        drop(cancel_tx);
+        handle.await.unwrap();
+        assert!(out.lock().unwrap().is_empty());
+        drop(tx);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn teardown_cancels_an_in_progress_tail_and_nothing_posts_after_the_next_reply() {
+        let (tx, rx) = relay_channel();
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = log.clone();
+        // The platform call for the flush never returns on its own.
+        let deliver = move |t: String| {
+            let sink = sink.clone();
+            async move {
+                sink.lock().unwrap().push(format!("post: {t}"));
+                std::future::pending::<()>().await;
+            }
+        };
+        tx.send(chunk(PARENT, "late")).unwrap();
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let done = spawn_tail(
+            rx,
+            PARENT.into(),
+            HashSet::new(),
+            cfg(),
+            Instant::now(),
+            TailControl {
+                gate: open_gate(),
+                cancel: cancel_rx,
+            },
+            deliver,
+        );
+        // Quiet mark (20 s) passed: the flush is in flight and blocked.
+        tokio::time::sleep(Duration::from_secs(25)).await;
+        assert_eq!(*log.lock().unwrap(), vec!["post: late".to_string()]);
+
+        // Teardown: the connection drops its cancel sender.
+        drop(cancel_tx);
+        let waited = Instant::now();
+        wait_for_previous_tail(done).await;
+        assert!(
+            waited.elapsed() < DELIVER_TIMEOUT,
+            "the wait must end on cancel, not after the delivery timeout"
+        );
+        log.lock().unwrap().push("next reply".into());
+
+        // Well past the delivery timeout, the cancelled tail still posts nothing.
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        drop(tx);
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["post: late".to_string(), "next reply".to_string()]
         );
     }
 
@@ -801,7 +950,7 @@ mod tests {
             open_set(&["wf_1"]),
             cfg(),
             Instant::now(),
-            open_gate(),
+            open_control(),
             deliver,
         ));
         // Quiet (20 s) plus one delivery timeout (30 s); the tail must still
@@ -854,7 +1003,7 @@ mod tests {
             open_set(&["wf_1"]),
             cfg(),
             Instant::now(),
-            open_gate(),
+            open_control(),
             deliver,
         );
         tokio::join!(tail, flood);
@@ -904,7 +1053,7 @@ mod tests {
             open_set(&["wf_1"]),
             cfg(),
             Instant::now(),
-            open_gate(),
+            open_control(),
             deliver,
         );
         tokio::join!(tail, flood);
@@ -954,7 +1103,7 @@ mod tests {
             HashSet::new(),
             c,
             Instant::now(),
-            open_gate(),
+            open_control(),
             deliver,
         );
         tokio::join!(tail, late);

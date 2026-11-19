@@ -783,8 +783,8 @@ impl AdapterRouter {
                     conn.session_reset = false;
 
                     let (mut rx, request_id) = conn.session_prompt(content_blocks).await?;
-                    // The previous turn's tail ends when this prompt replaced its
-                    // subscriber. Let its final flush post before this reply does.
+                    // This prompt cancelled the previous turn's tail (see
+                    // `session_prompt`). Let its final post, if any, land before this reply.
                     if let Some(done) = conn.tail_done.take() {
                         crate::workflow_tail::wait_for_previous_tail(done).await;
                     }
@@ -1092,6 +1092,9 @@ impl AdapterRouter {
                     if let (Some(cfg), Some(rx), Some(sid)) = (tail_cfg, tail_rx, parent_sid) {
                         let (g_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
                         gate_tx = Some(g_tx);
+                        // Dropping `cancel_tx` (next prompt or connection teardown) cancels the tail.
+                        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+                        conn.tail_cancel = Some(cancel_tx);
                         let tail_adapter = adapter.clone();
                         let tail_channel = thread_channel.clone();
                         conn.tail_done = Some(crate::workflow_tail::spawn_tail(
@@ -1100,7 +1103,10 @@ impl AdapterRouter {
                             std::mem::take(&mut wf_state).into_open(),
                             cfg,
                             tail_started,
-                            gate_rx,
+                            crate::workflow_tail::TailControl {
+                                gate: gate_rx,
+                                cancel: cancel_rx,
+                            },
                             move |text| {
                                 let adapter = tail_adapter.clone();
                                 let channel = tail_channel.clone();

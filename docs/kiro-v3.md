@@ -83,13 +83,24 @@ workflows are enabled openab:
    keeps reading after delivering the reply and posts the late text as a new message in the same
    thread, prefixed `_Workflow update:_`. Text is posted after `workflow_tail_quiet_secs` without
    new output, so text that arrives after a long pause is still delivered. Thinking and tool
-   activity count as output for this timer but are not posted. The relay ends when the connection
-   closes, when the next prompt on the session starts, or at `workflow_tail_max_secs`, measured from
-   the prompt response. If a run is still open at the cap, a warning message says that further
-   output is not relayed. Setting `workflow_tail_max_secs = 0` disables the relay and keeps the filter.
-   Ordering: the next prompt's reply is not posted until the previous relay has finished its final
-   flush. That wait lasts at most 30 s (the delivery timeout). If the previous flush is still
-   posting after that, the two can overlap.
+   activity count as output for this timer but are not posted. The relay ends when the channel closes
+   (flushing what it holds), at `workflow_tail_max_secs`, measured from the prompt response, or when
+   it is cancelled (see the cancel path below). If a run is still open at the cap, a warning message
+   says that further output is not relayed. Setting `workflow_tail_max_secs = 0` disables the relay
+   and keeps the filter.
+   Ordering: the next prompt's reply is not posted until the previous relay has finished. That wait
+   has no timeout. The next prompt cancels the previous relay first, so the wait ends as soon as the
+   relay drops its in-flight post.
+
+   **Cancel path.** A relay is cancelled by two events. The first is the next `session/prompt` on
+   the same connection: `session_prompt` drops the connection's cancel sender before it replaces the
+   subscriber. The second is teardown of the connection (reset, idle cleanup, pool eviction, or
+   shutdown): dropping the connection drops the same sender. A cancelled relay discards its
+   buffered, unposted text, drops any platform call still in flight at its next await, and returns.
+   It posts nothing after the cancel, and it signals completion so the next reply can start. A
+   cancel does not flush. Buffered text is therefore lost when the user sends another message before
+   the quiet time has passed. A connection whose streaming task is stuck still holds its
+   connection, so its relay is cancelled only when that task releases it.
 
 Limits: openab buffers at most 256 KiB of late text per flush. Text past that cap is dropped and the posted text ends with `…(output truncated)`, so the posted text is always a contiguous prefix. One flush posts at most 16 platform messages, split to the platform's message limit. When the text needs more, the first 15 messages are posted and the 16th says that this flush was cut at 16 platform messages and the rest of this flush was not sent; later output is still relayed, so a dropped part is always announced. The relay queue between the connection and the tail holds at most 1024 frames. Frames past that are dropped and also mark the next flush as truncated. A flush has a 30 s budget in total, not per message. If the platform is slower than that, the flush stops and the note may not be posted. Messages are sent one at a time, and rate limiting is left to the platform client. The relay lasts up to `workflow_tail_max_secs` (default 900) from the prompt response. While it lasts, parent-session text caused by other requests on the same connection (for example the slash-command fallback that applies a runtime `/model` change) is also posted, as a workflow update. If the agent pauses for longer than the quiet time, the text before the pause is posted as its own message, whether or not a run is still open, and later text starts a new one. Only workflows started during a turn are tracked. A workflow that is still running when the next prompt starts has its later output delivered with that prompt, not as a workflow update.
 Late text that arrives after the next prompt started is part of that prompt's reply. The relay is

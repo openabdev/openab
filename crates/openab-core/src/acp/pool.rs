@@ -1649,7 +1649,6 @@ mod config_option_tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration: spawns a mock agent subprocess and uses the filesystem"]
     async fn mismatch_is_ignored_by_default() {
         let dir = tempfile::tempdir().unwrap();
         let p = pool(
@@ -1663,7 +1662,6 @@ mod config_option_tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration: spawns a mock agent subprocess and uses the filesystem"]
     async fn strict_mismatch_fails_session_creation() {
         let dir = tempfile::tempdir().unwrap();
         let p = pool(
@@ -1680,7 +1678,6 @@ mod config_option_tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration: spawns a mock agent subprocess and uses the filesystem"]
     async fn strict_match_succeeds() {
         let dir = tempfile::tempdir().unwrap();
         let p = pool(
@@ -1694,7 +1691,6 @@ mod config_option_tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration: spawns a mock agent subprocess and uses the filesystem"]
     async fn strict_response_without_options_fails_session_creation() {
         let dir = tempfile::tempdir().unwrap();
         let reply = r#"{"jsonrpc":"2.0","id":3,"result":{}}"#;
@@ -1705,7 +1701,6 @@ mod config_option_tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration: spawns a mock agent subprocess and uses the filesystem"]
     async fn strict_response_lacking_the_requested_option_fails_session_creation() {
         let dir = tempfile::tempdir().unwrap();
         let reply = r#"{"jsonrpc":"2.0","id":3,"result":{"configOptions":[{"type":"select","id":"model","name":"Model","currentValue":"x","options":[]}]}}"#;
@@ -1715,7 +1710,6 @@ mod config_option_tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration: spawns a mock agent subprocess and uses the filesystem"]
     async fn non_strict_response_without_options_is_accepted() {
         let dir = tempfile::tempdir().unwrap();
         let reply = r#"{"jsonrpc":"2.0","id":3,"result":{}}"#;
@@ -1724,7 +1718,6 @@ mod config_option_tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration: spawns a mock agent subprocess and uses the filesystem"]
     async fn strict_error_response_fails_session_creation() {
         let dir = tempfile::tempdir().unwrap();
         let reply = r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"bad"}}"#;
@@ -1734,7 +1727,6 @@ mod config_option_tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration: spawns a mock agent subprocess and uses the filesystem"]
     async fn non_strict_error_response_is_only_a_warning() {
         let dir = tempfile::tempdir().unwrap();
         let reply = r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"bad"}}"#;
@@ -1743,7 +1735,6 @@ mod config_option_tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration: spawns a mock agent subprocess and uses the filesystem"]
     async fn session_new_meta_is_sent_when_configured() {
         let dir = tempfile::tempdir().unwrap();
         let meta = serde_json::json!({"kiro": {"settings": {"workflows": {"enabled": true}}}});
@@ -1759,7 +1750,6 @@ mod config_option_tests {
     }
 
     #[tokio::test]
-    #[ignore = "integration: spawns a mock agent subprocess and uses the filesystem"]
     async fn strict_error_is_not_masked_by_a_successful_slash_fallback() {
         let dir = tempfile::tempdir().unwrap();
         let reply = r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32602,"message":"bad"}}"#;

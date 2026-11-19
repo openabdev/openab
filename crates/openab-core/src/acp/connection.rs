@@ -213,6 +213,10 @@ pub struct AcpConnection {
     /// Completion of the workflow tail that took over the previous turn's late
     /// output. The next turn waits for it before posting its own reply.
     pub tail_done: Option<oneshot::Receiver<()>>,
+    /// Cancel signal of that tail. Dropping the sender cancels the tail: it discards
+    /// buffered text and ends. `session_prompt` drops it before the next prompt replaces
+    /// the subscriber, and dropping the connection drops it on teardown.
+    pub tail_cancel: Option<oneshot::Sender<()>>,
     _reader_handle: JoinHandle<()>,    _stderr_handle: Option<JoinHandle<()>>,
     /// Revokes this session's facade token when the connection is dropped, on any evict path.
     /// Held only for its `Drop` side effect (never read).
@@ -586,6 +590,7 @@ impl AcpConnection {
             activity,
             session_reset: false,
             tail_done: None,
+            tail_cancel: None,
             _reader_handle: reader_handle,
             _stderr_handle: stderr_handle,
             #[cfg(feature = "acp-mcp")]
@@ -850,6 +855,9 @@ impl AcpConnection {
             .as_ref()
             .ok_or_else(|| anyhow!("no session"))?;
 
+        // Cancel the previous turn's tail before its subscriber is replaced, so it posts
+        // nothing from this point on. Its buffered text is discarded.
+        self.tail_cancel.take();
         let (tx, rx) = mpsc::unbounded_channel();
         *self.notify_tx.lock().await = Some(NotifySink::Prompt(tx));
 
@@ -1675,7 +1683,6 @@ mod workflow_meta_tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    #[ignore = "integration: spawns a mock agent subprocess"]
     async fn session_new_with_meta_sends_underscore_meta() {
         let script = mock_agent::script(&mock_agent::mode_reply("vibe"), true);
         let meta = json!({"kiro": {"settings": {"workflows": {"enabled": true}}}});
@@ -1693,7 +1700,6 @@ mod workflow_meta_tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    #[ignore = "integration: spawns a mock agent subprocess"]
     async fn set_config_option_returns_agent_reported_value() {
         let script = mock_agent::script(&mock_agent::mode_reply("vibe"), false);
         let mut conn = spawn_mock(script).await;
@@ -1721,15 +1727,14 @@ done"#
             .to_string()
     }
 
-    /// The next `session_prompt` replaces the subscriber: the running tail
-    /// flushes what it buffered and ends, and the new receiver sees only the
-    /// new turn's frames.
+    /// The next `session_prompt` cancels the running tail: it posts nothing,
+    /// its buffered text is discarded, and the new receiver sees only the new
+    /// turn's frames.
     #[cfg(unix)]
     #[tokio::test]
-    #[ignore = "integration: spawns a mock agent subprocess"]
     async fn next_prompt_replaces_subscriber_and_ends_the_tail() {
         use super::ContentBlock;
-        use crate::workflow_tail::{run_tail, WorkflowRelayConfig};
+        use crate::workflow_tail::{run_tail, TailControl, WorkflowRelayConfig};
         use std::time::Duration;
 
         let mut conn = spawn_mock(late_chunk_script()).await;
@@ -1754,6 +1759,8 @@ done"#
         let sink = out.clone();
         let (gate_tx, gate_rx) = tokio::sync::oneshot::channel();
         gate_tx.send(()).unwrap();
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
+        conn.tail_cancel = Some(cancel_tx);
         let tail = tokio::spawn(run_tail(
             rx1,
             "s-1".to_string(),
@@ -1763,13 +1770,17 @@ done"#
                 tail_max: Duration::from_secs(60),
             },
             tokio::time::Instant::now(),
-            gate_rx,
+            TailControl {
+                gate: gate_rx,
+                cancel: cancel_rx,
+            },
             move |t| {
                 sink.lock().unwrap().push(t);
                 std::future::ready(())
             },
         ));
-        // Let late-3 reach the tail's buffer before the swap.
+        // Let late-3 reach the tail's buffer before the cancel. The assertion
+        // below holds whether or not it got there.
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         let (mut rx2, id2) = conn
@@ -1778,9 +1789,12 @@ done"#
             .unwrap();
         tokio::time::timeout(Duration::from_secs(5), tail)
             .await
-            .expect("tail must end when the subscriber is replaced")
+            .expect("tail must end when the next prompt cancels it")
             .unwrap();
-        assert_eq!(*out.lock().unwrap(), vec!["late-3".to_string()]);
+        assert!(
+            out.lock().unwrap().is_empty(),
+            "a cancelled tail posts nothing"
+        );
 
         let mut texts = Vec::new();
         let mut got_response = false;
