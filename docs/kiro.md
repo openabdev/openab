@@ -41,6 +41,8 @@ To override a single agent's image instead of the global tag:
 
 > ⚠️ There is no `latest` tag. Use `beta` or `stable`, or pin to an exact version.
 
+> Using kiro-cli 3.x (`--agent-engine=v3`) or Kiro workflows? See [kiro-v3.md](kiro-v3.md).
+
 ## Manual config.toml
 
 ```toml

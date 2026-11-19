@@ -1,0 +1,119 @@
+# Kiro CLI v3 engine and Kiro workflows
+
+kiro-cli 3.x ships a second engine, selected with `--agent-engine=v3`. It changes how agents are
+selected and adds Kiro workflows over ACP. openab supports both, and every setting below is
+opt-in: with none of them set, a kiro-cli v2 bot behaves as before.
+
+## What changes with v3
+
+- Agents appear as ACP **modes**. The flags `--agent`, `--trust-all-tools` and `--model` are
+  rejected, and v2 JSON agents (`~/.kiro/agents/*.json`) are not read.
+- A custom agent is a Markdown file `~/.kiro/agents/<name>.md`. Select it with
+  `[pool] default_config_options = { mode = "<name>" }`.
+- A session is created in the default mode (`vibe`) and then switched. An unknown mode name is
+  **not** an error: kiro-cli answers success and the session stays in `vibe` with its default tool
+  set. Turn on `strict_default_config_options` so openab refuses such a session.
+- Each `kiro-cli` process uses about 0.5 GB of memory, and openab starts one per session. Size
+  the container and `[pool] max_sessions` for the peak (about 2 GiB for 4 sessions plus openab).
+
+## Configuration
+
+```toml
+[agent]
+command = "kiro-cli"
+args = ["acp", "--agent-engine=v3"]
+# Optional, only for Kiro workflows:
+session_new_meta = { kiro = { settings = { workflows = { enabled = true } } } }
+
+[pool]
+max_sessions = 2
+default_config_options = { mode = "openab-bot" }
+strict_default_config_options = true
+```
+
+Agent file `~/.kiro/agents/openab-bot.md` (in the bot's `HOME`):
+
+```markdown
+---
+name: openab-bot
+description: Chat bot agent
+tools: ["*"]
+includeMcpJson: false
+---
+
+You are a helpful assistant in a chat thread.
+```
+
+Restrict `tools` to what the bot needs. openab auto-approves every permission request, so the
+tool list is the only limit on what the agent can do.
+
+Create an empty user MCP config, `~/.kiro/settings/mcp.json`:
+
+```json
+{"mcpServers": {}}
+```
+
+`includeMcpJson: false` does not stop user-level MCP servers from starting at `session/new`, so
+an empty file is the reliable way to run without them.
+
+## What the openab settings do
+
+| Setting | Effect |
+|---------|--------|
+| `[agent] session_new_meta` | Sent as the `_meta` field of the `session/new` request. kiro-cli only honours the workflows switch there (not in `initialize`). Not sent on `session/load`. |
+| `[pool] strict_default_config_options` | After each `session/set_config_option`, compares the returned `currentValue` with the requested value. Session creation fails when the agent returns an error, when the response does not list the requested option id (including a response with no result), or when the value does not match. The error says the agent did not report the option, or that the value was not applied. In this mode the legacy slash-command fallback is not used, so only a value the agent reports counts. An alias given as the option's display name is accepted. Default `false`. Without strict mode, an error from `set_config_option` is logged as a warning and the session is created anyway; the returned value is not checked.
+| `[pool] workflow_tail_quiet_secs` / `workflow_tail_max_secs` | Bounds of the late-output relay below. |
+
+## Workflows
+
+With workflows enabled, a prompt can start a workflow and `session/prompt` returns **before** the
+workflow ends. The summary arrives later as unsolicited message chunks of the same session. When
+workflows are enabled openab:
+
+1. **Filters step sessions.** Each workflow step runs in its own ACP session and streams
+   `session/update` frames with a different `params.sessionId`. openab accepts a `session/update`
+   only when its `params.sessionId` is the string id of the served session, and drops every other
+   one: another id, or a missing, null or non-string `sessionId`. The check applies to
+   notifications only; responses and other methods are not affected. The ACP schema in this repo
+   (`crates/openab-gateway/schemas/acp-v1.schema.json`) requires `sessionId` on
+   `SessionNotification`, and the existing mock agents and tests send it. No kiro-cli frame is known
+   to omit it. If a kiro-cli release starts omitting it, parent text is dropped and this rule needs
+   revisiting. Permission requests from step sessions are still auto-answered.
+2. **Relays the late summary.** If a workflow started for the session during the turn, openab
+   keeps reading after delivering the reply and posts the late text as a new message in the same
+   thread, prefixed `_Workflow update:_`. Text is posted after `workflow_tail_quiet_secs` without
+   new output, so text that arrives after a long pause is still delivered. Thinking and tool
+   activity count as output for this timer but are not posted. The relay ends when the channel closes
+   (flushing what it holds), at `workflow_tail_max_secs`, measured from the prompt response, or when
+   it is cancelled (see the cancel path below). If a run is still open at the cap, a warning message
+   says that further output is not relayed. Setting `workflow_tail_max_secs = 0` disables the relay
+   and keeps the filter.
+   Ordering: the next prompt's reply is not posted until the previous relay has finished. That wait
+   has no timeout. The next prompt cancels the previous relay first, so the wait ends as soon as the
+   relay drops its in-flight post.
+
+   **Cancel path.** A relay is cancelled by two events. The first is the next `session/prompt` on
+   the same connection: `session_prompt` drops the connection's cancel sender before it replaces the
+   subscriber. The second is teardown of the connection (reset, idle cleanup, pool eviction, or
+   shutdown): dropping the connection drops the same sender. A cancelled relay discards its
+   buffered, unposted text, drops any platform call still in flight at its next await, and returns.
+   It posts nothing after the cancel, and it signals completion so the next reply can start. A
+   cancel does not flush. Buffered text is therefore lost when the user sends another message before
+   the quiet time has passed. A connection whose streaming task is stuck still holds its
+   connection, so its relay is cancelled only when that task releases it.
+
+Limits: openab buffers at most 256 KiB of late text per flush. Text past that cap is dropped and the posted text ends with `…(output truncated)`, so the posted text is always a contiguous prefix. One flush posts at most 16 platform messages, split to the platform's message limit. When the text needs more, the first 15 messages are posted and the 16th says that this flush was cut at 16 platform messages and the rest of this flush was not sent; later output is still relayed, so a dropped part is always announced. The relay queue between the connection and the tail holds at most 1024 frames. Frames past that are dropped and also mark the next flush as truncated. A flush has a 30 s budget in total, not per message. If the platform is slower than that, the flush stops and the note may not be posted. Messages are sent one at a time, and rate limiting is left to the platform client. The relay lasts up to `workflow_tail_max_secs` (default 900) from the prompt response. While it lasts, parent-session text caused by other requests on the same connection (for example the slash-command fallback that applies a runtime `/model` change) is also posted, as a workflow update. If the agent pauses for longer than the quiet time, the text before the pause is posted as its own message, whether or not a run is still open, and later text starts a new one. Only workflows started during a turn are tracked. A workflow that is still running when the next prompt starts has its later output delivered with that prompt, not as a workflow update.
+Late text that arrives after the next prompt started is part of that prompt's reply. The relay is
+not used on the `acp` gateway platform. `session_new_meta` and `default_config_options` are
+applied when a session is created with `session/new` only, not when a session is restored with `session/load`.
+
+## Security notes
+
+- Workflow steps run shell commands, and openab answers every permission request with
+  "allow always". Each step session asks two to three times per command.
+- Text from the chat reaches workflow steps as user text. Allow only fixed, reviewed workflow
+  files, use a private channel, and keep step agents (`.md` files) to the minimum tool set.
+- Custom agent `resources` are not loaded inside workflow steps.
+- Upstream issues to know about: a workflow result can be lost when the parent session is busy,
+  and a run can hang if a permission request is never answered. openab bounds the wait but does
+  not fix either.

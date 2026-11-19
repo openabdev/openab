@@ -566,7 +566,8 @@ async fn main() -> anyhow::Result<()> {
             .prompt_hard_timeout_secs
             .saturating_add(cfg.pool.hung_grace_secs),
         cfg.pool.default_config_options,
-    );
+    )
+    .with_strict_default_config_options(cfg.pool.strict_default_config_options);
     // Facade session wiring: only when the facade is actually serving. With no `[mcp]` there is
     // no registrar and no facade url, and the pool simply starts sessions without browser
     // capabilities — there is no longer a proxy path for it to fall back to.
@@ -855,24 +856,32 @@ async fn main() -> anyhow::Result<()> {
         reg
     };
 
-    let router = Arc::new(
-        AdapterRouter::new(
-            pool.clone(),
-            cfg.reactions,
-            cfg.markdown.tables,
-            cfg.pool.prompt_hard_timeout_secs,
-            cfg.pool.liveness_check_secs,
-            cfg.workspace.aliases,
-            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| {
-                tracing::warn!(
-                    "HOME environment variable is not set — falling back to /tmp as bot_home. \
+    let workflow_relay =
+        pool.workflows_enabled()
+            .then(|| openab_core::workflow_tail::WorkflowRelayConfig {
+                tail_quiet: std::time::Duration::from_secs(cfg.pool.workflow_tail_quiet_secs),
+                tail_max: std::time::Duration::from_secs(cfg.pool.workflow_tail_max_secs),
+            });
+    let router = AdapterRouter::new(
+        pool.clone(),
+        cfg.reactions,
+        cfg.markdown.tables,
+        cfg.pool.prompt_hard_timeout_secs,
+        cfg.pool.liveness_check_secs,
+        cfg.workspace.aliases,
+        std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| {
+            tracing::warn!(
+                "HOME environment variable is not set — falling back to /tmp as bot_home. \
                      This weakens the workspace security boundary."
-                );
-                "/tmp".into()
-            })),
-        )
-        .with_trust(gateway_trust),
-    );
+            );
+            "/tmp".into()
+        })),
+    )
+    .with_trust(gateway_trust);
+    let router = Arc::new(match workflow_relay {
+        Some(relay) => router.with_workflow_relay(relay),
+        None => router,
+    });
 
     // Shutdown signal for Slack adapter
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
