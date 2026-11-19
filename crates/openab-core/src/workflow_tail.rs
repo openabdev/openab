@@ -141,7 +141,7 @@ pub const DELIVER_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_FLUSH_MESSAGES: usize = 16;
 
 /// Posted in place of the chunks that do not fit into [`MAX_FLUSH_MESSAGES`].
-pub const TRUNCATED_NOTE: &str = "…(output truncated: further workflow output is not relayed)";
+pub const TRUNCATED_NOTE: &str = "…(output truncated: this update stopped at 16 messages and the rest was not posted; later output is still relayed)";
 
 /// Apply the per-flush message cap to already platform-split `chunks`. The
 /// note takes the last slot, so it is always posted when anything is dropped.
@@ -209,7 +209,9 @@ pub async fn run_tail<F, Fut>(
                 let Some(msg) = msg else {
                     if gated {
                         // Wait for the original reply, but not past the cap.
-                        let _ = timeout_at(hard, &mut gate).await;
+                        if timeout_at(hard, &mut gate).await.is_err() {
+                            return;
+                        }
                     }
                     flush(&mut st, &mut rx, &mut deliver).await;
                     return;
@@ -921,6 +923,10 @@ mod tests {
             (MAX_FLUSH_MESSAGES - 2).to_string()
         );
         assert_eq!(got[MAX_FLUSH_MESSAGES - 1], TRUNCATED_NOTE);
+        assert_eq!(
+            TRUNCATED_NOTE,
+            "…(output truncated: this update stopped at 16 messages and the rest was not posted; later output is still relayed)"
+        );
     }
 
     #[test]
