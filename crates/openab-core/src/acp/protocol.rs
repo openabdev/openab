@@ -409,20 +409,21 @@ pub enum AcpEvent {
     Status,
 }
 
-/// True only for a `session/update` notification that carries a string
-/// `params.sessionId` different from `expected_session_id`. Such frames come
-/// from another session of the same agent process (e.g. Kiro workflow step
-/// sessions). Frames without a `sessionId`, other methods and responses are
-/// never foreign.
+/// True for a `session/update` notification whose `params.sessionId` is not the
+/// string `expected_session_id`. Such frames come from another session of the
+/// same agent process (e.g. Kiro workflow step sessions), or cannot be tied to
+/// the served session: a missing, null or non-string `sessionId` also counts.
+/// Other methods and responses are never foreign.
 pub fn is_foreign_session_update(msg: &JsonRpcMessage, expected_session_id: &str) -> bool {
     if msg.id.is_some() || msg.method.as_deref() != Some("session/update") {
         return false;
     }
-    msg.params
+    let session_id = msg
+        .params
         .as_ref()
         .and_then(|p| p.get("sessionId"))
-        .and_then(Value::as_str)
-        .is_some_and(|sid| sid != expected_session_id)
+        .and_then(Value::as_str);
+    session_id != Some(expected_session_id)
 }
 
 /// Kiro workflow lifecycle signal relevant to the served (parent) session.
@@ -537,15 +538,21 @@ mod tests {
     fn foreign_session_update_detection() {
         assert!(!is_foreign_session_update(&chunk(Some("p"), "x"), "p"));
         assert!(is_foreign_session_update(&chunk(Some("step"), "x"), "p"));
-        assert!(!is_foreign_session_update(&chunk(None, "x"), "p"));
+        // A frame that cannot be tied to the parent session is not parent traffic.
+        assert!(is_foreign_session_update(&chunk(None, "x"), "p"));
+        let null_id = msg(json!({"method": "session/update",
+            "params": {"sessionId": null, "update": {}}}));
+        assert!(is_foreign_session_update(&null_id, "p"));
+        let numeric_id = msg(json!({"method": "session/update",
+            "params": {"sessionId": 7, "update": {}}}));
+        assert!(is_foreign_session_update(&numeric_id, "p"));
+        let no_params = msg(json!({"method": "session/update"}));
+        assert!(is_foreign_session_update(&no_params, "p"));
         let other_method = msg(json!({"method": "_kiro/other",
             "params": {"sessionId": "step"}}));
         assert!(!is_foreign_session_update(&other_method, "p"));
         let response = msg(json!({"id": 3, "result": {"sessionId": "step"}}));
         assert!(!is_foreign_session_update(&response, "p"));
-        let non_string = msg(json!({"method": "session/update",
-            "params": {"sessionId": 7, "update": {}}}));
-        assert!(!is_foreign_session_update(&non_string, "p"));
     }
 
     #[test]

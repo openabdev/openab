@@ -61,7 +61,7 @@ an empty file is the reliable way to run without them.
 | Setting | Effect |
 |---------|--------|
 | `[agent] session_new_meta` | Sent as the `_meta` field of the `session/new` request. kiro-cli only honours the workflows switch there (not in `initialize`). Not sent on `session/load`. |
-| `[pool] strict_default_config_options` | After each `session/set_config_option`, compares the returned `currentValue` with the requested value and fails session creation on a mismatch or an error. In this mode the legacy slash-command fallback is not used, so only a value the agent reports counts. A response without that option is accepted, as is an alias given as the option's display name. Default `false`. |
+| `[pool] strict_default_config_options` | After each `session/set_config_option`, compares the returned `currentValue` with the requested value. Session creation fails when the agent returns an error, when the response does not list the requested option id (including a response with no result), or when the value does not match. The error says the agent did not report the option, or that the value was not applied. In this mode the legacy slash-command fallback is not used, so only a value the agent reports counts. An alias given as the option's display name is accepted. Default `false`. Without strict mode, an error from `set_config_option` is logged as a warning and the session is created anyway; the returned value is not checked.
 | `[pool] workflow_tail_quiet_secs` / `workflow_tail_max_secs` | Bounds of the late-output relay below. |
 
 ## Workflows
@@ -71,9 +71,14 @@ workflow ends. The summary arrives later as unsolicited message chunks of the sa
 workflows are enabled openab:
 
 1. **Filters step sessions.** Each workflow step runs in its own ACP session and streams
-   `session/update` frames with a different `params.sessionId`. Those frames are dropped from
-   the reply. Frames without a `sessionId` are never dropped. Permission requests from step
-   sessions are still auto-answered.
+   `session/update` frames with a different `params.sessionId`. openab accepts a `session/update`
+   only when its `params.sessionId` is the string id of the served session, and drops every other
+   one: another id, or a missing, null or non-string `sessionId`. The check applies to
+   notifications only; responses and other methods are not affected. The ACP schema in this repo
+   (`crates/openab-gateway/schemas/acp-v1.schema.json`) requires `sessionId` on
+   `SessionNotification`, and the existing mock agents and tests send it. No kiro-cli frame is known
+   to omit it. If a kiro-cli release starts omitting it, parent text is dropped and this rule needs
+   revisiting. Permission requests from step sessions are still auto-answered.
 2. **Relays the late summary.** If a workflow started for the session during the turn, openab
    keeps reading after delivering the reply and posts the late text as a new message in the same
    thread, prefixed `_Workflow update:_`. Text is posted after `workflow_tail_quiet_secs` without
@@ -82,6 +87,9 @@ workflows are enabled openab:
    closes, when the next prompt on the session starts, or at `workflow_tail_max_secs`, measured from
    the prompt response. If a run is still open at the cap, a warning message says that further
    output is not relayed. Setting `workflow_tail_max_secs = 0` disables the relay and keeps the filter.
+   Ordering: the next prompt's reply is not posted until the previous relay has finished its final
+   flush. That wait lasts at most 30 s (the delivery timeout). If the previous flush is still
+   posting after that, the two can overlap.
 
 Limits: openab buffers at most 256 KiB of late text per flush. Text past that cap is dropped and the posted text ends with `…(output truncated)`, so the posted text is always a contiguous prefix. One flush posts at most 16 platform messages, split to the platform's message limit. When the text needs more, the first 15 messages are posted and the 16th says that this flush was cut at 16 platform messages and the rest of this flush was not sent; later output is still relayed, so a dropped part is always announced. The relay queue between the connection and the tail holds at most 1024 frames. Frames past that are dropped and also mark the next flush as truncated. A flush has a 30 s budget in total, not per message. If the platform is slower than that, the flush stops and the note may not be posted. Messages are sent one at a time, and rate limiting is left to the platform client. The relay lasts up to `workflow_tail_max_secs` (default 900) from the prompt response. While it lasts, parent-session text caused by other requests on the same connection (for example the slash-command fallback that applies a runtime `/model` change) is also posted, as a workflow update. If the agent pauses for longer than the quiet time, the text before the pause is posted as its own message, whether or not a run is still open, and later text starts a new one. Only workflows started during a turn are tracked. A workflow that is still running when the next prompt starts has its later output delivered with that prompt, not as a workflow update.
 Late text that arrives after the next prompt started is part of that prompt's reply. The relay is

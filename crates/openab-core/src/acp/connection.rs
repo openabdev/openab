@@ -210,8 +210,10 @@ pub struct AcpConnection {
     pub last_active: Instant,
     pub activity: Arc<SessionActivity>,
     pub session_reset: bool,
-    _reader_handle: JoinHandle<()>,
-    _stderr_handle: Option<JoinHandle<()>>,
+    /// Completion of the workflow tail that took over the previous turn's late
+    /// output. The next turn waits for it before posting its own reply.
+    pub tail_done: Option<oneshot::Receiver<()>>,
+    _reader_handle: JoinHandle<()>,    _stderr_handle: Option<JoinHandle<()>>,
     /// Revokes this session's facade token when the connection is dropped, on any evict path.
     /// Held only for its `Drop` side effect (never read).
     ///
@@ -274,17 +276,21 @@ pub(crate) fn build_session_new_params(cwd: &str, meta: Option<&Value>) -> Value
 /// Check that `session/set_config_option` really applied `requested` for
 /// `config_id`, using the option list the agent returned.
 ///
-/// Lenient where the response is silent: no option with that id (or an empty
-/// list) is accepted. A different `currentValue` is accepted only when the
-/// returned option lists a value whose display `name` equals `requested` and
-/// whose `value` is the current one (agents that normalize aliases).
+/// An option list without `config_id` (including an empty list, which is what
+/// a response with no `result` yields) is an error: the agent did not report
+/// the option, so nothing confirms it. A different `currentValue` is accepted
+/// only when the returned option lists a value whose display `name` equals
+/// `requested` and whose `value` is the current one (agents that normalize
+/// aliases).
 pub(crate) fn verify_config_option_applied(
     options: &[ConfigOption],
     config_id: &str,
     requested: &str,
 ) -> std::result::Result<(), String> {
     let Some(opt) = options.iter().find(|o| o.id == config_id) else {
-        return Ok(());
+        return Err(format!(
+            "default_config_options `{config_id}` = `{requested}` was not verified: the agent did not report the `{config_id}` option in its response"
+        ));
     };
     if opt.current_value == requested {
         return Ok(());
@@ -579,6 +585,7 @@ impl AcpConnection {
             last_active: Instant::now(),
             activity,
             session_reset: false,
+            tail_done: None,
             _reader_handle: reader_handle,
             _stderr_handle: stderr_handle,
             #[cfg(feature = "acp-mcp")]
@@ -1584,10 +1591,12 @@ mod workflow_meta_tests {
     }
 
     #[test]
-    fn verify_accepts_missing_option_or_empty_list() {
-        assert!(verify_config_option_applied(&[], "mode", "e2e").is_ok());
+    fn verify_rejects_missing_option_or_empty_list() {
+        let err = verify_config_option_applied(&[], "mode", "e2e").unwrap_err();
+        assert!(err.contains("did not report the `mode` option"), "{err}");
         let o = [opt("model", "x", &[])];
-        assert!(verify_config_option_applied(&o, "mode", "e2e").is_ok());
+        let err = verify_config_option_applied(&o, "mode", "e2e").unwrap_err();
+        assert!(err.contains("did not report the `mode` option"), "{err}");
     }
 
     #[test]
@@ -1603,10 +1612,10 @@ mod workflow_meta_tests {
     }
 
     #[test]
-    fn verify_ignores_kiro_v2_agent_option_for_mode_key() {
-        // kiro v2 reports modes under id `agent`, so `mode` is simply absent.
+    fn verify_rejects_kiro_v2_agent_option_for_mode_key() {
+        // kiro v2 reports modes under id `agent`, so `mode` is absent: not verified.
         let o = [opt("agent", "kiro_default", &[("kiro_default", "default")])];
-        assert!(verify_config_option_applied(&o, "mode", "openab-bot").is_ok());
+        assert!(verify_config_option_applied(&o, "mode", "openab-bot").is_err());
     }
 
     /// Step sessions ask for permission too; the answer goes out by request id

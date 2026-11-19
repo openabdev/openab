@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::sync::oneshot;
-use tokio::time::{sleep_until, timeout_at, Instant};
+use tokio::time::{sleep_until, timeout, timeout_at, Instant};
 
 /// Bounds for the late-output relay (`[pool] workflow_tail_*`).
 #[derive(Debug, Clone, Copy)]
@@ -248,6 +248,39 @@ pub async fn run_tail<F, Fut>(
                 st.last_event = Instant::now();
             }
         }
+    }
+}
+
+/// Start [`run_tail`] on a detached task. The returned receiver resolves once
+/// the tail has returned, after its final flush. The next turn on the same
+/// connection waits on it with [`wait_for_previous_tail`] before posting.
+pub fn spawn_tail<F, Fut>(
+    rx: RelayReceiver,
+    parent_session_id: String,
+    open: HashSet<String>,
+    cfg: WorkflowRelayConfig,
+    started: Instant,
+    gate: oneshot::Receiver<()>,
+    deliver: F,
+) -> oneshot::Receiver<()>
+where
+    F: FnMut(String) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let (done_tx, done_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        run_tail(rx, parent_session_id, open, cfg, started, gate, deliver).await;
+        let _ = done_tx.send(());
+    });
+    done_rx
+}
+
+/// Wait until a previous tail has finished its final flush, so the next reply
+/// is not posted into the middle of it. Gives up after [`DELIVER_TIMEOUT`]; a
+/// tail still delivering then may overlap the reply.
+pub async fn wait_for_previous_tail(done: oneshot::Receiver<()>) {
+    if timeout(DELIVER_TIMEOUT, done).await.is_err() {
+        tracing::warn!("previous workflow tail still delivering; starting the next reply anyway");
     }
 }
 
@@ -708,6 +741,39 @@ mod tests {
         gate_tx.send(()).unwrap();
         handle.await.unwrap();
         assert_eq!(*out.lock().unwrap(), vec!["late".to_string()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn next_reply_waits_for_the_previous_tail_final_flush() {
+        let (tx, rx) = relay_channel();
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = log.clone();
+        // The tail's delivery takes 5 s and records itself only when it completes.
+        let deliver = move |t: String| {
+            let sink = sink.clone();
+            async move {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                sink.lock().unwrap().push(format!("tail: {t}"));
+            }
+        };
+        tx.send(chunk(PARENT, "late")).unwrap();
+        // The next prompt on the session replaces the subscriber: the tail ends.
+        drop(tx);
+        let done = spawn_tail(
+            rx,
+            PARENT.into(),
+            HashSet::new(),
+            cfg(),
+            Instant::now(),
+            open_gate(),
+            deliver,
+        );
+        wait_for_previous_tail(done).await;
+        log.lock().unwrap().push("next reply".into());
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["tail: late".to_string(), "next reply".to_string()]
+        );
     }
 
     #[tokio::test(start_paused = true)]

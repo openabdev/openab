@@ -783,6 +783,11 @@ impl AdapterRouter {
                     conn.session_reset = false;
 
                     let (mut rx, request_id) = conn.session_prompt(content_blocks).await?;
+                    // The previous turn's tail ends when this prompt replaced its
+                    // subscriber. Let its final flush post before this reply does.
+                    if let Some(done) = conn.tail_done.take() {
+                        crate::workflow_tail::wait_for_previous_tail(done).await;
+                    }
                     let parent_sid = conn.acp_session_id.clone();
                     let mut wf_state = crate::workflow_tail::TurnWorkflowState::default();
                     if assistant_status {
@@ -1089,7 +1094,7 @@ impl AdapterRouter {
                         gate_tx = Some(g_tx);
                         let tail_adapter = adapter.clone();
                         let tail_channel = thread_channel.clone();
-                        tokio::spawn(crate::workflow_tail::run_tail(
+                        conn.tail_done = Some(crate::workflow_tail::spawn_tail(
                             rx,
                             sid,
                             std::mem::take(&mut wf_state).into_open(),
