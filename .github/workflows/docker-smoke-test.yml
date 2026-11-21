@@ -13,6 +13,7 @@ on:
       - 'Cargo.*'
       - '.github/scripts/node_base_arg.sh'
       - '.github/scripts/test_node_base_arg.sh'
+      - '.github/workflows/docker-smoke-test.yml'
 
 concurrency:
   group: smoke-test-${{ github.event.pull_request.number }}
@@ -132,23 +133,27 @@ jobs:
 
       - name: Verify agent responds
         run: |
-          if [ "${{ matrix.variant.suffix }}" = "-codex" ]; then
-            INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"ci-test","version":"0.0.1"}}}'
-          else
-            INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientCapabilities":{},"clientInfo":{"name":"ci-test","version":"0.0.1"}}}'
-          fi
+          # ACP v1 requires an integer protocolVersion. A string value is
+          # rejected with "Invalid params" by strict agents, which then fall
+          # through to the weaker --help check below.
+          INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"ci-test","version":"0.0.1"}}}'
 
-          # Start agent in background, send init, capture output with timeout
+          # Start agent in background, send init, and poll for the first
+          # JSON-RPC line instead of a fixed sleep: cold starts vary.
           CID=$(docker run -d -i --entrypoint sh openab-test${{ matrix.variant.suffix }} -c 'exec ${{ matrix.variant.agent }} ${{ matrix.variant.agent_args }} 2>/dev/null')
           echo "$INIT" | docker attach --no-stdin=false "$CID" &
-          sleep 5
-          RESPONSE=$(docker logs "$CID" 2>/dev/null | grep -m1 '^{' || true)
+          RESPONSE=""
+          for _ in $(seq 1 30); do
+            RESPONSE=$(docker logs "$CID" 2>/dev/null | grep -m1 '^{' || true)
+            [ -n "$RESPONSE" ] && break
+            sleep 1
+          done
           docker rm -f "$CID" >/dev/null 2>&1
 
           echo "Response: $RESPONSE"
 
-          if [ -n "$RESPONSE" ] && echo "$RESPONSE" | jq -e '.result.agentInfo.name' > /dev/null 2>&1; then
-            AGENT_NAME=$(echo "$RESPONSE" | jq -r '.result.agentInfo.name')
+          if [ -n "$RESPONSE" ] && echo "$RESPONSE" | jq -e '.result.protocolVersion' > /dev/null 2>&1; then
+            AGENT_NAME=$(echo "$RESPONSE" | jq -r '.result.agentInfo.name // "unknown"')
             echo "✅ ACP handshake ok — agent=$AGENT_NAME"
           elif [ "${{ matrix.variant.suffix }}" = "-codex" ]; then
             echo "❌ Codex ACP handshake failed"
