@@ -13,6 +13,7 @@ on:
       - 'Cargo.*'
       - '.github/scripts/node_base_arg.sh'
       - '.github/scripts/test_node_base_arg.sh'
+      - '.github/scripts/test-antigravity-acp.sh'
 
 concurrency:
   group: smoke-test-${{ github.event.pull_request.number }}
@@ -37,7 +38,7 @@ jobs:
           - { dockerfile: Dockerfile.mimocode, suffix: "-mimocode", agent: "mimo", agent_args: "acp", build_args: "" }
           - { dockerfile: Dockerfile.grok, suffix: "-grok", agent: "grok", agent_args: "agent stdio", build_args: "" }
           - { dockerfile: Dockerfile.devin, suffix: "-devin", agent: "devin", agent_args: "acp", build_args: "" }
-          - { dockerfile: Dockerfile.antigravity, suffix: "-antigravity", agent: "agy-acp", agent_args: "", build_args: "" }
+          - { dockerfile: Dockerfile.antigravity, suffix: "-antigravity", agent: "agy", agent_args: "acp", build_args: "" }
           - { dockerfile: Dockerfile.pi, suffix: "-pi", agent: "pi-acp", agent_args: "", build_args: "" }
           - { dockerfile: openshell/Dockerfile, suffix: "-native-sandbox", agent: "openab-agent", agent_args: "", build_args: "" }
     runs-on: ubuntu-latest
@@ -130,7 +131,12 @@ jobs:
               ;;
           esac
 
+      - name: Verify native Antigravity ACP image support
+        if: matrix.variant.suffix == '-antigravity'
+        run: bash .github/scripts/test-antigravity-acp.sh openab-test-antigravity
+
       - name: Verify agent responds
+        if: matrix.variant.suffix != '-antigravity'
         run: |
           if [ "${{ matrix.variant.suffix }}" = "-codex" ]; then
             INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"ci-test","version":"0.0.1"}}}'
@@ -213,12 +219,14 @@ jobs:
           assert_line 'ARG DEVIN_VERSION=3000.14.30821' Dockerfile.devin Dockerfile.package Dockerfile.unified
           assert_line 'ARG DEVIN_SHA256_AMD64=4dc43e3e4388bace60fe2aa8010cbb399402e724892d7175845b1cdef00e7ddb' Dockerfile.devin Dockerfile.package Dockerfile.unified
           assert_line 'ARG DEVIN_SHA256_ARM64=3deb8af6b026060e975ed371936e139818020e5dc5abbcba07cde039f473a5a5' Dockerfile.devin Dockerfile.package Dockerfile.unified
-          assert_line 'ENV AGY_VERSION=1.2.13' Dockerfile.antigravity Dockerfile.unified Dockerfile.final Dockerfile.ci
-          assert_line 'ARG AGY_VERSION=1.2.13' Dockerfile.package
+          assert_line 'ENV AGY_VERSION=1.5.14' Dockerfile.antigravity Dockerfile.unified Dockerfile.final Dockerfile.ci
+          assert_line 'ARG AGY_VERSION=1.5.14' Dockerfile.package
           assert_line 'ENV AGY_VERSION="${AGY_VERSION}"' Dockerfile.package
           assert_line 'LABEL dev.openab.agy.version="${AGY_VERSION}"' Dockerfile.package
-          assert_line 'ARG AGY_SHA256_AMD64=b0f195d37973be7b08c3b705d7fbbcd948dacb4a3c2176ee52ca29f7159bdc21' Dockerfile.antigravity Dockerfile.package Dockerfile.unified Dockerfile.final Dockerfile.ci
-          assert_line 'ARG AGY_SHA256_ARM64=43bf59be5895475f8a32d4f94f1241f665986ea41a3622579e03b74e1b63dcfb' Dockerfile.antigravity Dockerfile.package Dockerfile.unified Dockerfile.final Dockerfile.ci
+          assert_line 'ENV OPENAB_AGENT_COMMAND="agy acp"' Dockerfile.antigravity Dockerfile.package Dockerfile.unified
+          assert_line 'ENV OPENAB_AGENT_AUTH_COMMAND="agy acp --login"' Dockerfile.antigravity Dockerfile.package Dockerfile.unified
+          assert_line 'ARG AGY_SHA256_AMD64=d58386322d2073e96b33f7cc32b4e9ae2db6228f58440369725967b2de48c7b5' Dockerfile.antigravity Dockerfile.package Dockerfile.unified Dockerfile.final Dockerfile.ci
+          assert_line 'ARG AGY_SHA256_ARM64=e5f69a3123fac66974b303d9a201f381a0fb32b3ef869d9139da85d5caf67a2a' Dockerfile.antigravity Dockerfile.package Dockerfile.unified Dockerfile.final Dockerfile.ci
 
           # Nightly checksum relaxation must be explicit and limited to the two
           # TLS-only vendor paths. These substring checks intentionally ignore

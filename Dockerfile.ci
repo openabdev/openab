@@ -2,10 +2,10 @@
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl procps tini unzip && rm -rf /var/lib/apt/lists/*
 
-# Install agy (Google Antigravity CLI) — pinned to v1.1.13
-ENV AGY_VERSION=1.2.13
-ARG AGY_SHA256_AMD64=b0f195d37973be7b08c3b705d7fbbcd948dacb4a3c2176ee52ca29f7159bdc21
-ARG AGY_SHA256_ARM64=43bf59be5895475f8a32d4f94f1241f665986ea41a3622579e03b74e1b63dcfb
+# Install agy (Google Antigravity CLI) — pinned version
+ENV AGY_VERSION=1.5.14
+ARG AGY_SHA256_AMD64=d58386322d2073e96b33f7cc32b4e9ae2db6228f58440369725967b2de48c7b5
+ARG AGY_SHA256_ARM64=e5f69a3123fac66974b303d9a201f381a0fb32b3ef869d9139da85d5caf67a2a
 RUN ARCH=$(dpkg --print-architecture) && \
     case "$ARCH" in \
       amd64) ASSET="agy_cli_linux_x64.tar.gz"; sha="${AGY_SHA256_AMD64}" ;; \
