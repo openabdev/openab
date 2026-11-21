@@ -28,7 +28,7 @@ A lightweight, secure, cloud-native ACP harness that bridges **Discord, Slack**,
 │ User         │              │ │ standalone or    │          │ kimi acp                │
 │              │              │ │                  │          │ grok agent stdio        │
 ├──────────────┤              │ │ embedded unified │          │ devin acp               │
-│ Google Chat  │◄webhook/API─►┤ └──────────────────┘          │ agy acp                 │
+│ Google Chat  │◄webhook/API─►┤ └──────────────────┘          │ agy-acp                 │
 │ User         │              │                               │ pi-acp                  │
 ├──────────────┤              │                               │ openab-agent            │
 │ WeCom        │◄webhook/API─►┤                               │ agentcore-acp           │
@@ -191,7 +191,7 @@ The bot creates a thread. After that, just type in the thread — no @mention ne
 | Cursor | `cursor-agent acp` | Native | [docs/cursor.md](docs/cursor.md) |
 | Grok Build | `grok agent stdio` | Native | [docs/grok.md](docs/grok.md) |
 | Devin | `devin acp` | Native | [docs/devin.md](docs/devin.md) |
-| Antigravity | `agy acp` | Native | [docs/antigravity.md](docs/antigravity.md) |
+| Antigravity | `agy-acp` | [agy-acp](agy-acp/) | [docs/antigravity.md](docs/antigravity.md) |
 | Pi | `pi-acp` | [pi-acp](https://www.npmjs.com/package/pi-acp) | [docs/pi.md](docs/pi.md) |
 | **Native Agent** | `openab-agent` | Built-in (Rust) | [docs/native-agent.md](docs/native-agent.md) |
 

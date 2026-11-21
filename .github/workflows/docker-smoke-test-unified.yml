@@ -11,7 +11,6 @@ on:
       - 'openab-agent/**'
       - 'agy-acp/**'
       - '.github/scripts/node_base_arg.sh'
-      - '.github/scripts/test-antigravity-acp.sh'
 
 concurrency:
   group: smoke-test-unified-${{ github.event.pull_request.number }}
@@ -61,7 +60,7 @@ jobs:
           - { name: kimi, agent: "kimi" }
           - { name: mimocode, agent: "mimo" }
           - { name: opencode, agent: "opencode" }
-          - { name: antigravity, agent: "agy" }
+          - { name: antigravity, agent: "agy-acp" }
           - { name: pi, agent: "pi-acp" }
           - { name: native, agent: "openab-agent" }
           - { name: agentcore, agent: "openab" }
@@ -86,10 +85,6 @@ jobs:
 
       - name: Verify agent CLI exists
         run: docker run --rm --entrypoint which openab-unified-${{ matrix.target.name }}:test ${{ matrix.target.agent }}
-
-      - name: Verify native Antigravity ACP image support
-        if: matrix.target.name == 'antigravity'
-        run: bash .github/scripts/test-antigravity-acp.sh openab-unified-antigravity:test
 
       - name: Verify Node.js runtime version
         shell: bash

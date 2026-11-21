@@ -28,7 +28,7 @@
 │ User         │              │ │ standalone or    │          │ kimi acp                │
 │              │              │ │                  │          │ grok agent stdio        │
 ├──────────────┤              │ │ embedded unified │          │ devin acp               │
-│ Google Chat  │◄webhook/API─►┤ └──────────────────┘          │ agy acp                 │
+│ Google Chat  │◄webhook/API─►┤ └──────────────────┘          │ agy-acp                 │
 │ User         │              │                               │ pi-acp                  │
 ├──────────────┤              │                               │ openab-agent            │
 │ WeCom        │◄webhook/API─►┤                               │ agentcore-acp           │
@@ -191,7 +191,7 @@ bot 會建立一個討論串。之後只要直接在討論串中輸入即可，�
 | Cursor | `cursor-agent acp` | Native | [docs/cursor.md](docs/cursor.md) |
 | Grok Build | `grok agent stdio` | Native | [docs/grok.md](docs/grok.md) |
 | Devin | `devin acp` | Native | [docs/devin.md](docs/devin.md) |
-| Antigravity | `agy acp` | Native | [docs/antigravity.md](docs/antigravity.md) |
+| Antigravity | `agy-acp` | [agy-acp](agy-acp/) | [docs/antigravity.md](docs/antigravity.md) |
 | Pi | `pi-acp` | [pi-acp](https://www.npmjs.com/package/pi-acp) | [docs/pi.md](docs/pi.md) |
 | **Native Agent** | `openab-agent` | Built-in（Rust） | [docs/native-agent.md](docs/native-agent.md) |
 
