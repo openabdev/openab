@@ -133,9 +133,8 @@ jobs:
 
       - name: Verify agent responds
         run: |
-          # ACP v1 requires an integer protocolVersion. A string value is
-          # rejected with "Invalid params" by strict agents, which then fall
-          # through to the weaker --help check below.
+          # ACP v1 requires an integer protocolVersion. Strict agents reject a
+          # string value with "Invalid params", which now fails the leg below.
           INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"ci-test","version":"0.0.1"}}}'
 
           CID=""
@@ -152,15 +151,17 @@ jobs:
           trap cleanup EXIT
 
           # Start agent in background, send init, and poll for the reply to
-          # request id 1 instead of a fixed sleep: cold starts vary. Other
-          # JSON lines (notifications, logs, malformed output) are skipped.
+          # request id 1 instead of a fixed sleep: cold starts vary. Only a
+          # JSON-RPC response (result or error) counts; notifications, agent
+          # requests, logs, and malformed lines are skipped. An error with
+          # id null (parse error, per JSON-RPC 2.0) also counts.
           CID=$(docker run -d -i --entrypoint sh openab-test${{ matrix.variant.suffix }} -c 'exec ${{ matrix.variant.agent }} ${{ matrix.variant.agent_args }} 2>/dev/null')
           echo "$INIT" | docker attach --no-stdin=false "$CID" &
           ATTACH_PID=$!
           RESPONSE=""
           for _ in $(seq 1 30); do
             RESPONSE=$(docker logs "$CID" 2>/dev/null \
-              | jq -R -c 'fromjson? | select(type == "object" and .id == 1)' 2>/dev/null \
+              | jq -R -c 'fromjson? | select(type == "object" and .jsonrpc == "2.0" and (has("result") or has("error")) and (.id == 1 or (.id == null and has("error"))))' 2>/dev/null \
               | head -n1 || true)
             [ -n "$RESPONSE" ] && break
             sleep 1
