@@ -13,6 +13,7 @@ on:
       - 'Cargo.*'
       - '.github/scripts/node_base_arg.sh'
       - '.github/scripts/test_node_base_arg.sh'
+      - '.github/workflows/nightly-build.yml'
       - '.github/workflows/docker-smoke-test.yml'
 
 concurrency:
@@ -246,6 +247,12 @@ jobs:
           assert_line 'ARG AGY_VERSION=1.2.13' Dockerfile.package
           assert_line 'ENV AGY_VERSION="${AGY_VERSION}"' Dockerfile.package
           assert_line 'LABEL dev.openab.agy.version="${AGY_VERSION}"' Dockerfile.package
+          assert_line 'ARG AGY_AGENT_COMMAND=agy-acp' Dockerfile.package
+          assert_line 'ARG AGY_AGENT_AUTH_COMMAND="agy auth"' Dockerfile.package
+          assert_line 'ENV OPENAB_AGENT_COMMAND="${AGY_AGENT_COMMAND}"' Dockerfile.package
+          assert_line 'ENV OPENAB_AGENT_AUTH_COMMAND="${AGY_AGENT_AUTH_COMMAND}"' Dockerfile.package
+          assert_line 'ENV OPENAB_AGENT_COMMAND="agy-acp"' Dockerfile.antigravity Dockerfile.unified
+          assert_line 'ENV OPENAB_AGENT_AUTH_COMMAND="agy auth"' Dockerfile.antigravity Dockerfile.unified
           assert_line 'ARG AGY_SHA256_AMD64=b0f195d37973be7b08c3b705d7fbbcd948dacb4a3c2176ee52ca29f7159bdc21' Dockerfile.antigravity Dockerfile.package Dockerfile.unified Dockerfile.final Dockerfile.ci
           assert_line 'ARG AGY_SHA256_ARM64=43bf59be5895475f8a32d4f94f1241f665986ea41a3622579e03b74e1b63dcfb' Dockerfile.antigravity Dockerfile.package Dockerfile.unified Dockerfile.final Dockerfile.ci
 

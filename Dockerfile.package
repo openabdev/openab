@@ -367,8 +367,10 @@ RUN mkdir -p /home/agent/.agy && chown -R agent:agent /home/agent
 USER agent
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
   CMD pgrep -x openab || exit 1
-ENV OPENAB_AGENT_COMMAND="agy-acp"
-ENV OPENAB_AGENT_AUTH_COMMAND="agy auth"
+ARG AGY_AGENT_COMMAND=agy-acp
+ARG AGY_AGENT_AUTH_COMMAND="agy auth"
+ENV OPENAB_AGENT_COMMAND="${AGY_AGENT_COMMAND}"
+ENV OPENAB_AGENT_AUTH_COMMAND="${AGY_AGENT_AUTH_COMMAND}"
 ENTRYPOINT ["tini", "--"]
 CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
 

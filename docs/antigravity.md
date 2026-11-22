@@ -2,7 +2,67 @@
 
 OpenAB supports [Google Antigravity CLI](https://antigravity.google/) via the `agy-acp` adapter — a thin Rust binary that translates ACP JSON-RPC into `agy -p` invocations.
 
-## How It Works
+## Native ACP preview in nightly
+
+The `nightly-antigravity` image defaults to Google's [native `agy acp` server](https://antigravity.google/docs/cli/acp). Native ACP accepts Discord image prompts, exposes models through `/models`, and can resume sessions that were created with native ACP. Release and pre-beta images default to `agy-acp`.
+
+For a first-time sign-in on nightly, run `agy acp --login` inside the container and follow the prompts. Persist the agent's home directory across container replacements.
+
+### Keep the adapter on nightly
+
+If you need to continue an existing `agy-acp` thread, set this explicitly before upgrading your nightly image:
+
+```toml
+[agent]
+command = "agy-acp"
+args = []
+```
+
+Existing explicit agent commands take precedence over the image default.
+
+### Recover a thread after switching to native ACP
+
+The native server can accept `session/load` with a legacy adapter session ID and then return `trajectory not found` when you send a message. Run [`/reset`](slash-commands.md#reset) in the affected Discord thread. This clears the previous agent session and its context. Your next message starts a fresh native ACP session in the same thread. You can also start a new Discord thread.
+
+## Docker
+
+```bash
+docker build -f Dockerfile.antigravity -t openab-antigravity .
+```
+
+## Authentication
+
+Antigravity CLI uses Google Sign-In (OAuth). Run the image's sign-in command inside the container.
+
+```bash
+kubectl exec -it deployment/openab-antigravity -- sh -c 'exec $OPENAB_AGENT_AUTH_COMMAND'
+```
+
+Complete the device flow in your browser. Persist the agent's home directory to retain your sign-in.
+
+## Helm
+
+This example deploys only Antigravity and inherits the selected image's agent command. Replace the bot token and channel ID before deploying. Select a release or pre-beta tag to use its adapter default, or add the explicit `[agent]` override from [Keep the adapter on nightly](#keep-the-adapter-on-nightly) to `configToml`.
+
+```yaml
+agents:
+  kiro:
+    enabled: false
+  antigravity:
+    image: ghcr.io/openabdev/openab:nightly-antigravity
+    discord:
+      botToken: "YOUR_DISCORD_BOT_TOKEN"
+    configToml: |
+      [discord]
+      bot_token = "${DISCORD_BOT_TOKEN}"
+      allowed_channels = ["123456789"]
+```
+
+## Legacy adapter
+
+The following settings and behavior apply to `agy-acp`.
+
+### How It Works
 
 ```
 openab ──ACP JSON-RPC──► agy-acp ──spawns──► agy --add-dir /home/agent -p "prompt"
@@ -14,19 +74,10 @@ openab ──ACP JSON-RPC──► agy-acp ──spawns──► agy --add-dir /
 - Only the **delta** (new response) is sent back — previous turns are not repeated
 - Full `<sender_context>` metadata is passed through to agy
 
-## Configuration
-
-```toml
-[agent]
-# command defaults from OPENAB_AGENT_COMMAND="agy-acp"
-# Only override if you need non-default behavior
-```
-
 ### Environment Variables
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `AGY_WORKING_DIR` | Working directory for agy invocations | `/tmp` |
 | `AGY_EXTRA_ARGS` | Extra arguments added to every `agy` prompt invocation (optional) | (none) |
 | `OPENAB_TOOL_DISPLAY` | Controls filtering of intermediate thinking narration ("I will..."). `full` or unset keeps all output; `compact`/`none`/`off` drops leading narration-only parts. | `full` |
 
@@ -49,53 +100,22 @@ AGY_EXTRA_ARGS = "--print-timeout 5m"
 The timeout remains finite; tasks exceeding the configured duration can still
 fail. This setting controls the CLI print timeout, not other OpenAB timeouts.
 
-## Steering Files
+### Steering Files
 
 agy reads `AGENTS.md` and `GEMINI.md` when it considers a directory a workspace:
 
 1. `AGENTS.md` and `GEMINI.md` are loaded first and injected into the system prompt
 2. agy does not disclose how it determines HOME as a workspace, but `--add-dir` explicitly adds a directory
-3. agy-acp **automatically** passes `--add-dir <working_dir>` on every invocation — no configuration needed
+3. `agy-acp` uses OpenAB's `[agent].working_dir` and automatically passes it through `--add-dir` on every invocation
 
 Place your steering instructions in `/home/agent/AGENTS.md` or `/home/agent/GEMINI.md` — they will be read on every prompt as long as `working_dir` points to that directory.
 
-## Docker
-
-```bash
-docker build -f Dockerfile.antigravity -t openab-antigravity .
-```
-
-## Authentication
-
-Antigravity CLI uses Google Sign-In (OAuth). Authenticate inside the container:
-
-```bash
-kubectl exec -it deployment/openab-antigravity -- sh -c "$OPENAB_AGENT_AUTH_COMMAND"
-```
-
-Complete the device flow in your browser. Auth tokens persist in the PVC at `~/.gemini/`.
-
-## Helm
-
-```yaml
-agents:
-  antigravity:
-    discord:
-      botToken: "${DISCORD_BOT_TOKEN}"
-      allowedChannels: ["123456789"]
-    agent:
-      command: "agy-acp"
-      args: []
-      workingDir: "/home/agent"
-    # image: leave empty — chart auto-resolves to openab:<tag>-antigravity
-```
-
-## Limitations
+### Limitations
 
 - **No streaming**: `agy -p` returns the full response at once; the adapter sends it as a single `agent_message_chunk` notification.
 - **Cancel is a no-op**: `agy -p` runs to completion; `session/cancel` acknowledges but cannot interrupt.
 
-## Model Selection
+### Model Selection
 
 The Discord `/models` dropdown is supported. `agy-acp` returns model
 `configOptions` when a session is created or loaded. It fetches the available

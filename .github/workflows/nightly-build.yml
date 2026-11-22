@@ -318,6 +318,8 @@ jobs:
               BUILD_ARGS="AGY_VERSION=$V
           AGY_SHA256_AMD64=
           AGY_SHA256_ARM64=
+          AGY_AGENT_COMMAND=agy acp
+          AGY_AGENT_AUTH_COMMAND=agy acp --login
           ALLOW_UNVERIFIED_NIGHTLY_DOWNLOADS=true" ;;
             *)
               echo "::error::no resolver for variant $VARIANT"; exit 1 ;;
@@ -464,6 +466,16 @@ jobs:
           path: /tmp/kiro-versions/*
           if-no-files-found: error
           retention-days: 1
+
+      - name: Verify native Antigravity ACP image support
+        if: matrix.variant == 'antigravity'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
+          docker pull "$IMAGE"
+          bash .github/scripts/test-antigravity-acp.sh "$IMAGE"
 
       - name: Export digest
         env:
