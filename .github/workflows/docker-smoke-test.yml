@@ -13,6 +13,7 @@ on:
       - 'Cargo.*'
       - '.github/scripts/node_base_arg.sh'
       - '.github/scripts/test_node_base_arg.sh'
+      - '.github/workflows/docker-smoke-test.yml'
 
 concurrency:
   group: smoke-test-${{ github.event.pull_request.number }}
@@ -132,29 +133,57 @@ jobs:
 
       - name: Verify agent responds
         run: |
-          if [ "${{ matrix.variant.suffix }}" = "-codex" ]; then
-            INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"ci-test","version":"0.0.1"}}}'
-          else
-            INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","clientCapabilities":{},"clientInfo":{"name":"ci-test","version":"0.0.1"}}}'
-          fi
+          # ACP v1 requires an integer protocolVersion. Strict agents reject a
+          # string value with "Invalid params", which now fails the leg below.
+          INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"ci-test","version":"0.0.1"}}}'
 
-          # Start agent in background, send init, capture output with timeout
+          CID=""
+          ATTACH_PID=""
+          cleanup() {
+            if [ -n "$CID" ]; then docker rm -f "$CID" >/dev/null 2>&1 || true; fi
+            if [ -n "$ATTACH_PID" ]; then
+              kill "$ATTACH_PID" 2>/dev/null || true
+              wait "$ATTACH_PID" 2>/dev/null || true
+            fi
+            CID=""
+            ATTACH_PID=""
+          }
+          trap cleanup EXIT
+
+          # Start agent in background, send init, and poll for the reply to
+          # request id 1 instead of a fixed sleep: cold starts vary. Only a
+          # JSON-RPC response (result or error) counts; notifications, agent
+          # requests, logs, and malformed lines are skipped. An error with
+          # id null (parse error, per JSON-RPC 2.0) also counts.
           CID=$(docker run -d -i --entrypoint sh openab-test${{ matrix.variant.suffix }} -c 'exec ${{ matrix.variant.agent }} ${{ matrix.variant.agent_args }} 2>/dev/null')
           echo "$INIT" | docker attach --no-stdin=false "$CID" &
-          sleep 5
-          RESPONSE=$(docker logs "$CID" 2>/dev/null | grep -m1 '^{' || true)
-          docker rm -f "$CID" >/dev/null 2>&1
+          ATTACH_PID=$!
+          RESPONSE=""
+          for _ in $(seq 1 30); do
+            RESPONSE=$(docker logs "$CID" 2>/dev/null \
+              | jq -R -c 'fromjson? | select(type == "object" and .jsonrpc == "2.0" and (has("result") or has("error")) and (.id == 1 or (.id == null and has("error"))))' 2>/dev/null \
+              | head -n1 || true)
+            [ -n "$RESPONSE" ] && break
+            sleep 1
+          done
+          cleanup
 
           echo "Response: $RESPONSE"
 
-          if [ -n "$RESPONSE" ] && echo "$RESPONSE" | jq -e '.result.agentInfo.name' > /dev/null 2>&1; then
-            AGENT_NAME=$(echo "$RESPONSE" | jq -r '.result.agentInfo.name')
+          # agentInfo is optional in ACP, so only the version is asserted.
+          if [ -n "$RESPONSE" ] && echo "$RESPONSE" | jq -e '.jsonrpc == "2.0" and .result.protocolVersion == 1' > /dev/null 2>&1; then
+            AGENT_NAME=$(echo "$RESPONSE" | jq -r '.result.agentInfo.name // "unknown"')
             echo "✅ ACP handshake ok — agent=$AGENT_NAME"
+          elif [ -n "$RESPONSE" ]; then
+            # The agent answered but rejected initialize (JSON-RPC error) or
+            # negotiated a different version. Do not hide this behind --help.
+            echo "❌ ACP initialize was rejected or returned an unexpected protocolVersion"
+            exit 1
           elif [ "${{ matrix.variant.suffix }}" = "-codex" ]; then
             echo "❌ Codex ACP handshake failed"
             exit 1
           else
-            echo "⚠️ ACP handshake returned no response — falling back to CLI check"
+            echo "⚠️ ACP handshake returned no response within 30 s — falling back to CLI check"
             docker run --rm --entrypoint ${{ matrix.variant.agent }} \
               openab-test${{ matrix.variant.suffix }} --help >/dev/null 2>&1
             echo "✅ Agent CLI responds (ACP skipped — likely needs auth)"
