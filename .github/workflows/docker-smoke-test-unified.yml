@@ -11,6 +11,7 @@ on:
       - 'openab-agent/**'
       - 'agy-acp/**'
       - '.github/scripts/node_base_arg.sh'
+      - '.github/workflows/docker-smoke-test-unified.yml'
 
 concurrency:
   group: smoke-test-unified-${{ github.event.pull_request.number }}
