@@ -13,8 +13,14 @@ docker build -f Dockerfile.codex -t openab-codex:latest .
 
 The image installs `@agentclientprotocol/codex-acp` and `@openai/codex`
 globally in the same npm transaction. The global Codex CLI keeps
-`codex login --device-auth` available, while npm deduplicates the adapter's
-compatible Codex dependency to the pinned CLI version.
+`codex login --device-auth` available. The adapter's own `@openai/codex`
+dependency range (`^0.158.0` for codex-acp 2.0.0) does not include the pinned
+CLI, so npm nests an older copy under the adapter. To make the adapter run the
+pinned CLI, the image replaces the `codex-acp` bin link with a small wrapper
+that sets `CODEX_PATH` to the global `codex` before starting the adapter.
+A Docker `ENV` would not work, because OpenAB clears the agent environment
+before spawning it. To use a different CLI, set `CODEX_PATH` in `[agent].env`;
+the wrapper keeps an explicit value.
 
 For containerized deployments where the outer container or VM is the security
 boundary, set `[pool] default_config_options = { mode = "agent-full-access" }`

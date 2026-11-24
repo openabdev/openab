@@ -123,7 +123,20 @@ FROM base-node AS codex
 ARG CODEX_ACP_VERSION=2.0.0
 ARG CODEX_VERSION=0.166.0
 RUN npm install -g @agentclientprotocol/codex-acp@${CODEX_ACP_VERSION} @openai/codex@${CODEX_VERSION} --fetch-retries=3
-ENV CODEX_PATH=/usr/local/bin/codex
+# codex-acp otherwise spawns the older @openai/codex that npm nests under it
+# (its ^0.158.0 range excludes CODEX_VERSION). OpenAB clears the agent
+# environment before spawning, so a Docker ENV would not reach codex-acp.
+# Replace the npm bin link with a wrapper that sets CODEX_PATH to the pinned
+# global CLI. An explicit CODEX_PATH (e.g. from [agent].env) still wins.
+RUN set -eu; \
+    root="$(npm root -g)"; bin="$(npm prefix -g)/bin"; \
+    pkg="$root/@agentclientprotocol/codex-acp"; \
+    js="$pkg/$(node -p "require('$pkg/package.json').bin['codex-acp']")"; \
+    test -f "$js"; test -x "$bin/codex"; \
+    rm "$bin/codex-acp"; \
+    printf '#!/bin/sh\n: "${CODEX_PATH:=%s}"\nexport CODEX_PATH\nexec "%s" "%s" "$@"\n' \
+      "$bin/codex" "$(command -v node)" "$js" > "$bin/codex-acp"; \
+    chmod 755 "$bin/codex-acp"
 ENV HOME=/home/node
 WORKDIR /home/node
 COPY --from=bins --chown=node:node /openab /usr/local/bin/openab

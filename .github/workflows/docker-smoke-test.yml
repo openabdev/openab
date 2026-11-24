@@ -89,6 +89,20 @@ jobs:
           docker run --rm --entrypoint codex openab-test-codex --version \
             | grep -F "codex-cli ${CODEX_VERSION}"
 
+      - name: Verify codex-acp uses the pinned Codex CLI
+        if: matrix.variant.suffix == '-codex'
+        run: |
+          # OpenAB clears the agent environment before spawning (env_clear in
+          # crates/openab-core/src/acp/connection.rs) and passes only HOME,
+          # PATH, USER and [agent].env. Run codex-acp the same way so a Docker
+          # ENV cannot hide a fallback to the older CLI nested under codex-acp.
+          CODEX_VERSION=$(awk -F= '$1 == "ARG CODEX_VERSION" {print $2; exit}' Dockerfile.codex)
+          test -n "$CODEX_VERSION"
+          docker run --rm --entrypoint env openab-test-codex -i \
+            HOME=/home/node PATH=/usr/local/bin:/usr/bin:/bin USER=node \
+            codex-acp cli -V \
+            | grep -F "codex-cli ${CODEX_VERSION}"
+
       - name: Verify Codex agent command is a single token
         if: matrix.variant.suffix == '-codex'
         run: |
