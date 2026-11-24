@@ -77,13 +77,15 @@ on:
 
 | HEAD commit status | Action |
 |-------------------|--------|
-| `pending` (< 30 min) | **Skip** — previous review still in progress |
-| `pending` (≥ 30 min) | **Trigger** — stale, agent likely missed it |
+| `pending` by `github-actions[bot]` (< 30 min) | **Skip** — webhook just sent, waiting for the coordinator to take ownership |
+| `pending` by `github-actions[bot]` (≥ 30 min) | **Trigger** — stale, agent likely missed the webhook |
+| `pending` by the coordinator (< 2 h) | **Skip** — the coordinator owns an active round (it may be waiting on reviewers) |
+| `pending` by the coordinator (≥ 2 h) | **Trigger** — coordinator presumed crashed |
 | `success` | **Skip** — already reviewed this SHA (LGTM) |
 | `failure` | **Skip** — already reviewed this SHA (CHANGES REQUESTED); new push = new SHA = auto-triggers |
 | `error` / none | **Trigger** — needs review (new SHA or webhook previously failed) |
 
-The 30-minute stale timeout handles the case where the agent is down or missed the webhook — the status would otherwise stay `pending` indefinitely, blocking further reviews.
+The stale timeouts handle the case where the agent is down or missed the webhook — the status would otherwise stay `pending` indefinitely, blocking further reviews. The `creator` of the latest status tells the two cases apart: the poller writes `pending` as `github-actions[bot]` when it sends the webhook, and the coordinator writes its own `pending` when it starts a round, which marks the round as owned.
 
 This guarantees **at most one in-flight review per PR** at any time, regardless of push frequency.
 
@@ -104,9 +106,11 @@ This guarantees **at most one in-flight review per PR** at any time, regardless 
 - Reduces GitHub Actions billing (one run covers all PRs)
 - **Cron caveat:** GitHub Actions `schedule` is best-effort — actual interval may be 5–25 min during platform congestion. This is acceptable since review latency is not user-facing.
 
-### Stale Timeout Rationale (30 minutes)
+### Stale Timeout Rationale (30 minutes / 2 hours)
 
-The 30-min threshold is based on observed review completion times: typical reviews finish in 5–15 minutes (LLM processing + GitHub API calls). A legitimate review exceeding 30 min is rare (only very large PRs with many files). If re-triggered, the agent validates HEAD SHA and will skip if the original session is still active — so a false stale trigger is harmless.
+The 30-min threshold for an unowned `pending` is based on observed review completion times: typical reviews finish in 5–15 minutes (LLM processing + GitHub API calls), and a coordinator that received the webhook writes its own `pending` within a minute. If only the poller's `pending` exists after 30 min, no round is running.
+
+A coordinator-owned round can legitimately take longer than 30 min while it waits for reviewer reports. Re-triggering it at 30 min started a second round on the same SHA (#1621), so owned rounds use a 2-hour hard timeout that only recovers from a crashed coordinator. The coordinator also refuses to start a round when the latest status is already its own `pending`.
 
 ### Fork PRs & `safe-to-review` in Scheduled Mode
 
@@ -125,8 +129,10 @@ The scheduled poller runs on `schedule` events (base repo context), so it has fu
 │                                                                     │
 │  For each eligible PR:                                              │
 │  1. Check HEAD commit status for "OpenAB PR Review"                 │
-│     - pending (< 30 min) → SKIP (review still in progress)         │
-│     - pending (≥ 30 min) → TRIGGER (stale)                         │
+│     - pending by bot (< 30 min) → SKIP (webhook just sent)          │
+│     - pending by bot (≥ 30 min) → TRIGGER (stale)                   │
+│     - pending by coordinator (< 2 h) → SKIP (round owned)           │
+│     - pending by coordinator (≥ 2 h) → TRIGGER (crashed)            │
 │     - success / failure → SKIP (already reviewed this SHA)          │
 │     - error / none → TRIGGER                                        │
 │                                                                     │
@@ -301,16 +307,16 @@ Add `OpenAB PR Review` as a required status check in branch protection rules. Th
 
 **Negative:**
 - Up to 5-min latency before review starts (GitHub cron is best-effort, may lag further under load)
-- If OpenAB agent is down, status stays "pending" until stale timeout re-triggers (30 min)
+- If OpenAB agent is down, status stays "pending" until stale timeout re-triggers (30 min if no coordinator took the round, 2 h if one did)
 - Webhook messages lack user identity — OpenAB must allow webhook-originated messages
 - Fork PRs: `pull_request` runs triggered by a fork get no secrets and a read-only `GITHUB_TOKEN` (GitHub security policy), so the workflow skips the event-driven path for fork PRs instead of failing. The scheduled poller and the maintainer `/review` command run in the base repository with secrets and a write token, so fork PRs from trusted authors (or labeled `safe-to-review`) are still reviewed by the poller on its next run. A maintainer can also comment `/review` for an immediate review; this checks only the commenter's association, so it bypasses the PR-author gate by design (the maintainer is asserting the diff is safe). Note: the `safe-to-review` label does **not** grant secrets to fork-triggered runs — it only bypasses the poller's `author_association` gate.
 
 **Mitigations:**
 - Filter: skip draft PRs and untrusted authors — only `OWNER`, `MEMBER`, `COLLABORATOR`, and `CONTRIBUTOR` (returning contributor with merged PR) trigger automatic review. First-time contributors and unknown authors are skipped; maintainers can add `safe-to-review` label or manually @mention the agent.
-- Dedup: status-based gating — `pending` (fresh) and `failure`/`success` skip review. Only new SHAs with no status or stale `pending` (>30 min) trigger.
+- Dedup: status-based gating — `pending` (fresh) and `failure`/`success` skip review. Only new SHAs with no status or stale `pending` (>30 min when written by the poller, >2 h when written by the coordinator) trigger.
 - Concurrency: workflow-level `concurrency` group prevents overlapping cron runs from racing.
 - Error fallback: webhook failure marks status as "error", which will be retried on next poll cycle.
-- Timeout: stale `pending` >30 min is treated as agent-down and re-triggered automatically.
+- Timeout: a poller-written `pending` >30 min is treated as agent-down, and a coordinator-written `pending` >2 h as a crashed coordinator; both are re-triggered automatically.
 
 ## Safeguards
 
@@ -352,7 +358,7 @@ When the auto-fix loop completes (LGTM or cap reached), the agent removes the `a
 
 ### Circuit Breaker (workflow hard cap: 30)
 
-The workflow enforces a hard cap of 30 review cycles per PR (across all triggers over the PR's lifetime). This is distinct from the agent-side soft cap of 3 cycles per auto-fix session — the workflow cap catches edge cases where multiple auto-fix requests accumulate. On each run, it counts how many `pending` statuses with context `"OpenAB PR Review"` exist across all commits in the PR. If the count reaches 30:
+The workflow enforces a hard cap of 30 review cycles per PR (across all triggers over the PR's lifetime). This is distinct from the agent-side soft cap of 3 cycles per auto-fix session — the workflow cap catches edge cases where multiple auto-fix requests accumulate. On each run, it counts how many review triggers happened across all commits in the PR: `pending` statuses with context `"OpenAB PR Review"` written by `github-actions[bot]` (one per webhook sent). The coordinator's own `pending` writes are not counted. If the count reaches 30:
 
 1. Adds `review-limit-reached` label to the PR
 2. Sets commit status to `error` with description "Circuit breaker: exceeded 30 review cycles"

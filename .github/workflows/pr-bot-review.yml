@@ -50,8 +50,15 @@ jobs:
         id: poll
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Login that writes this workflow's own statuses (GITHUB_TOKEN).
+          TRIGGER_LOGIN: "github-actions[bot]"
+          # Pending written by this workflow: webhook sent, round not yet owned.
+          TRIGGER_STALE_SECONDS: 1800
+          # Pending written by the coordinator: round owned and in progress.
+          OWNED_STALE_SECONDS: 7200
         run: |
           set -eo pipefail
+          : "${TRIGGER_LOGIN:?TRIGGER_LOGIN must be set}"
 
           if [ "${{ github.event_name }}" = "issue_comment" ]; then
             # Targeted path: "/review" comment on a PR from a maintainer
@@ -92,23 +99,41 @@ jobs:
             SHA=$(echo "$ROW" | jq -r '.sha')
             LABELS=$(echo "$ROW" | jq -c '.labels')
 
-            # Get latest status for this SHA (single API call)
+            # Get latest status for this SHA (single API call). creator tells
+            # who wrote it: this workflow (github-actions[bot]) writes pending
+            # when it sends the webhook; the review coordinator writes its own
+            # pending when it takes ownership of a round.
             STATUS_JSON=$(gh api "repos/${{ github.repository }}/commits/${SHA}/statuses" \
-              --jq '[.[] | select(.context == "OpenAB PR Review")] | sort_by(.created_at) | last | {state, created_at} // empty')
+              --jq '[.[] | select(.context == "OpenAB PR Review")] | sort_by(.created_at) | last | {state, created_at, creator: .creator.login} // empty')
             STATE=$(echo "$STATUS_JSON" | jq -r '.state // empty')
+            CREATOR=$(echo "$STATUS_JSON" | jq -r '.creator // empty')
 
-            # Skip if still pending, UNLESS pending > 30 min (stale)
+            # Skip if still pending, UNLESS it is stale:
+            # - pending written by this workflow: the webhook was sent but no
+            #   coordinator took ownership; stale after 30 min (lost webhook,
+            #   agent down).
+            # - pending written by anyone else: a coordinator owns an active
+            #   round (it may be waiting on reviewers). Re-triggering would
+            #   start a duplicate round on the same SHA (#1621), so only do it
+            #   after a hard timeout, to recover from a crashed coordinator.
             if [ "$STATE" = "pending" ]; then
               PENDING_AT=$(echo "$STATUS_JSON" | jq -r '.created_at // empty')
               if [ -n "$PENDING_AT" ]; then
                 PENDING_TS=$(date -d "$PENDING_AT" +%s 2>/dev/null || date -u +%s)
                 NOW_TS=$(date -u +%s)
                 ELAPSED=$(( NOW_TS - PENDING_TS ))
-                if [ "$ELAPSED" -lt 1800 ]; then
-                  echo "PR #${NUMBER}: still pending (${ELAPSED}s), skipping"
+                if [ "$CREATOR" = "$TRIGGER_LOGIN" ]; then
+                  LIMIT=$TRIGGER_STALE_SECONDS
+                  OWNER="trigger"
+                else
+                  LIMIT=$OWNED_STALE_SECONDS
+                  OWNER="coordinator ${CREATOR:-unknown}"
+                fi
+                if [ "$ELAPSED" -lt "$LIMIT" ]; then
+                  echo "PR #${NUMBER}: still pending (${OWNER}, ${ELAPSED}s < ${LIMIT}s), skipping"
                   continue
                 fi
-                echo "PR #${NUMBER}: pending stale (${ELAPSED}s > 30m), re-triggering"
+                echo "PR #${NUMBER}: pending stale (${OWNER}, ${ELAPSED}s >= ${LIMIT}s), re-triggering"
               fi
             fi
 
@@ -136,19 +161,24 @@ jobs:
           WEBHOOK_URL: ${{ secrets.OAB_REVIEW_ACTION_WEBHOOK }}
           BOT_UID: ${{ secrets.OAB_REVIEW_ACTION_BOT_UID }}
           TARGETS: ${{ steps.poll.outputs.targets }}
+          # Must match the poll step: circuit breaker counts only its pending writes.
+          TRIGGER_LOGIN: "github-actions[bot]"
         run: |
           set -eo pipefail
+          : "${TRIGGER_LOGIN:?TRIGGER_LOGIN must be set}"
 
           while IFS= read -r ROW; do
             NUMBER=$(echo "$ROW" | jq -r '.number')
             SHA=$(echo "$ROW" | jq -r '.sha')
             LABELS=$(echo "$ROW" | jq -c '.labels')
 
-            # Circuit breaker check
+            # Circuit breaker: count review triggers, i.e. pending statuses this
+            # workflow wrote (one per webhook sent). The coordinator's own
+            # pending writes are not triggers and must not use up the budget.
             COUNT=$(gh api --paginate "repos/${{ github.repository }}/pulls/${NUMBER}/commits" \
               --jq '.[].sha' | while read -r C_SHA; do
                 gh api "repos/${{ github.repository }}/commits/${C_SHA}/statuses" \
-                  --paginate --jq '[.[] | select(.context == "OpenAB PR Review" and .state == "pending")] | length'
+                  --paginate --jq '[.[] | select(.context == "OpenAB PR Review" and .state == "pending" and .creator.login == env.TRIGGER_LOGIN)] | length'
               done | awk '{s+=$1} END {print s+0}')
 
             if [ "${COUNT}" -ge 30 ]; then
