@@ -1,8 +1,14 @@
 # Kiro CLI v3 engine and Kiro workflows
 
-kiro-cli 3.x ships a second engine, selected with `--agent-engine=v3`. It changes how agents are
-selected and adds Kiro workflows over ACP. openab supports both, and every setting below is
-opt-in: with none of them set, a kiro-cli v2 bot behaves as before.
+kiro-cli 3.x ships a second engine, v3. It changes how agents are selected and adds Kiro
+workflows over ACP. `kiro-cli acp` starts v3 by default, but stays on v2 when a v2-only flag such
+as `--trust-all-tools` is passed; see [kiro.md](kiro.md) for the full rule. openab supports both
+engines, and every openab setting below is opt-in: with none of them set, a bot that runs the v2
+engine behaves as before.
+
+The official kiro image bundles kiro-cli 3.x (pinned by `KIRO_CLI_VERSION` in the Dockerfile), so
+no extra install is needed. Older images bundle 2.x, which has no v3 engine; check with
+`kiro-cli --version`.
 
 ## What changes with v3
 
