@@ -76,6 +76,24 @@ jobs:
           [ "$actual" = "v$expected" ] || { echo "::error::Node.js version mismatch: expected v$expected ($arg), got $actual"; exit 1; }
           echo "✅ Node.js $actual"
 
+      - name: Verify claude-agent-acp uses the pinned Claude Code CLI
+        if: matrix.variant.suffix == '-claude'
+        run: |
+          # claude-agent-acp runs the native binary of its own
+          # @anthropic-ai/claude-agent-sdk dependency unless CLAUDE_CODE_EXECUTABLE
+          # is set, and OpenAB clears the agent environment before spawning
+          # (env_clear in crates/openab-core/src/acp/connection.rs). Run it the
+          # same way and require the CLI it uses to match CLAUDE_CODE_VERSION, so
+          # CLAUDE_AGENT_ACP_VERSION must be bumped to a release whose SDK ships
+          # that Claude Code version.
+          CLAUDE_CODE_VERSION=$(awk -F= '$1 == "ARG CLAUDE_CODE_VERSION" {print $2; exit}' Dockerfile.claude)
+          test -n "$CLAUDE_CODE_VERSION"
+          actual=$(docker run --rm --entrypoint env openab-test-claude -i \
+            HOME=/home/node PATH=/usr/local/bin:/usr/bin:/bin USER=node \
+            claude-agent-acp --cli --version)
+          echo "claude-agent-acp --cli --version: $actual"
+          [ "${actual%% *}" = "$CLAUDE_CODE_VERSION" ] || { echo "::error::claude-agent-acp runs Claude Code '$actual', expected $CLAUDE_CODE_VERSION (CLAUDE_CODE_VERSION)"; exit 1; }
+
       - name: Verify Codex runtime versions
         if: matrix.variant.suffix == '-codex'
         run: |

@@ -185,6 +185,24 @@ jobs:
             -e 'console.log(require("/usr/local/lib/node_modules/@agentclientprotocol/claude-agent-acp/package.json").version)' \
             | grep -Fx "${CLAUDE_AGENT_ACP_VERSION}"
 
+      - name: Verify claude-agent-acp uses the pinned Claude Code CLI
+        if: matrix.target.name == 'claude'
+        run: |
+          # claude-agent-acp runs the native binary of its own
+          # @anthropic-ai/claude-agent-sdk dependency unless CLAUDE_CODE_EXECUTABLE
+          # is set, and OpenAB clears the agent environment before spawning
+          # (env_clear in crates/openab-core/src/acp/connection.rs). Run it the
+          # same way and require the CLI it uses to match CLAUDE_CODE_VERSION, so
+          # CLAUDE_AGENT_ACP_VERSION must be bumped to a release whose SDK ships
+          # that Claude Code version.
+          CLAUDE_CODE_VERSION=$(awk -F= '$1 == "ARG CLAUDE_CODE_VERSION" {print $2; exit}' Dockerfile.unified)
+          test -n "$CLAUDE_CODE_VERSION"
+          actual=$(docker run --rm --entrypoint env openab-unified-claude:test -i \
+            HOME=/home/node PATH=/usr/local/bin:/usr/bin:/bin USER=node \
+            claude-agent-acp --cli --version)
+          echo "claude-agent-acp --cli --version: $actual"
+          [ "${actual%% *}" = "$CLAUDE_CODE_VERSION" ] || { echo "::error::claude-agent-acp runs Claude Code '$actual', expected $CLAUDE_CODE_VERSION (CLAUDE_CODE_VERSION)"; exit 1; }
+
       - name: Verify Claude agent command is the ACP adapter
         if: matrix.target.name == 'claude'
         run: |
