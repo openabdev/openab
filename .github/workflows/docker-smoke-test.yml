@@ -136,7 +136,7 @@ jobs:
               expected=$(awk -F= '$1 == "ARG MIMOCODE_VERSION" {print $2; exit}' Dockerfile.mimocode)
               test -n "$expected" || { echo "❌ Failed to extract MiMo-Code expected version"; exit 1; }
               docker run --rm --entrypoint mimo openab-test-mimocode --version \
-                | grep -F "$expected"
+                | grep -Fx -- "$expected"
               ;;
           esac
 
