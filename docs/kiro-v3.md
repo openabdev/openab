@@ -4,6 +4,9 @@ kiro-cli 3.x ships a second engine, selected with `--agent-engine=v3`. It change
 selected and adds Kiro workflows over ACP. openab supports both, and every setting below is
 opt-in: with none of them set, a kiro-cli v2 bot behaves as before.
 
+The official kiro image bundles kiro-cli 3.5.0 (`KIRO_CLI_VERSION` in the Dockerfile), so no extra
+install is needed. Older images bundle 2.x, which has no v3 engine; check with `kiro-cli --version`.
+
 ## What changes with v3
 
 - Agents appear as ACP **modes**. The flags `--agent`, `--trust-all-tools` and `--model` are

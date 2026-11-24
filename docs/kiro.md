@@ -10,6 +10,8 @@ The default `Dockerfile` bundles both `openab` and `kiro-cli`:
 docker build -t openab:latest .
 ```
 
+The bundled kiro-cli version is pinned by `KIRO_CLI_VERSION` in the Dockerfile (currently 3.5.0). kiro-cli 3.x picks the v3 engine by default, but falls back to v2 when a v2-only flag such as `--trust-all-tools` is passed. The image default (`kiro-cli acp --trust-all-tools`) therefore keeps running the v2 engine. If you override `[agent] args` without a v2-only flag, add `--agent-engine=v2` to stay on v2, or follow [kiro-v3.md](kiro-v3.md) to move to v3.
+
 ## Helm Install
 
 ```bash
@@ -192,6 +194,8 @@ Follow the device code flow in your browser, then restart the pod:
 ```bash
 kubectl rollout restart deployment/openab-kiro
 ```
+
+If replies fail with `The monthly usage limit has been reached` after upgrading from an image with kiro-cli 2.x, the stored token may still be the one 2.x created. Run the login command above again and restart the pod. See [#1615](https://github.com/openabdev/openab/issues/1615).
 
 ### Persisted Paths (PVC)
 
