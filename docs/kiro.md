@@ -10,7 +10,9 @@ The default `Dockerfile` bundles both `openab` and `kiro-cli`:
 docker build -t openab:latest .
 ```
 
-The bundled kiro-cli version is pinned by `KIRO_CLI_VERSION` in the Dockerfile (currently 3.5.0). kiro-cli 3.x picks the v3 engine by default, but falls back to v2 when a v2-only flag such as `--trust-all-tools` is passed. The image default (`kiro-cli acp --trust-all-tools`) therefore keeps running the v2 engine. If you override `[agent] args` without a v2-only flag, add `--agent-engine=v2` to stay on v2, or follow [kiro-v3.md](kiro-v3.md) to move to v3.
+The image bundles kiro-cli 3.x, pinned by `KIRO_CLI_VERSION` in the Dockerfile. `kiro-cli acp` picks the v3 engine by default, but stays on v2 when a v2-only flag such as `--trust-all-tools` is passed. The image default (`kiro-cli acp --trust-all-tools`) therefore keeps running the v2 engine. If you override `[agent] args` without a v2-only flag, add `--agent-engine=v2` to stay on v2, or follow [kiro-v3.md](kiro-v3.md) to move to v3.
+
+A persisted `acp.agentEngine` setting (from `kiro-cli settings`) takes precedence over the v2-only flag rule. With `acp.agentEngine = "v3"`, the image default fails at startup with `the following arguments are not supported with --agent-engine=v3: --trust-all-tools`. Remove the setting or set it to `v2`. `kiro-cli acp` does not read `chat.agentEngine`.
 
 ## Helm Install
 
