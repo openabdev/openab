@@ -409,6 +409,51 @@ pub enum AcpEvent {
     Status,
 }
 
+/// True for a `session/update` notification whose `params.sessionId` is not the
+/// string `expected_session_id`. Such frames come from another session of the
+/// same agent process (e.g. Kiro workflow step sessions), or cannot be tied to
+/// the served session: a missing, null or non-string `sessionId` also counts.
+/// Other methods and responses are never foreign.
+pub fn is_foreign_session_update(msg: &JsonRpcMessage, expected_session_id: &str) -> bool {
+    if msg.id.is_some() || msg.method.as_deref() != Some("session/update") {
+        return false;
+    }
+    let session_id = msg
+        .params
+        .as_ref()
+        .and_then(|p| p.get("sessionId"))
+        .and_then(Value::as_str);
+    session_id != Some(expected_session_id)
+}
+
+/// Kiro workflow lifecycle signal relevant to the served (parent) session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowSignal {
+    RunStart { workflow_id: String },
+    RunComplete { workflow_id: String },
+}
+
+/// Classify `_kiro/workflow/run_start` (only when its `parentSessionId` is
+/// `parent_session_id`) and `_kiro/workflow/run_complete` notifications.
+pub fn classify_workflow_signal(
+    msg: &JsonRpcMessage,
+    parent_session_id: &str,
+) -> Option<WorkflowSignal> {
+    if msg.id.is_some() {
+        return None;
+    }
+    let params = msg.params.as_ref()?;
+    let workflow_id = params.get("workflowId")?.as_str()?.to_string();
+    match msg.method.as_deref()? {
+        "_kiro/workflow/run_start" => {
+            let parent = params.get("parentSessionId")?.as_str()?;
+            (parent == parent_session_id).then_some(WorkflowSignal::RunStart { workflow_id })
+        }
+        "_kiro/workflow/run_complete" => Some(WorkflowSignal::RunComplete { workflow_id }),
+        _ => None,
+    }
+}
+
 pub fn classify_notification(msg: &JsonRpcMessage) -> Option<AcpEvent> {
     let params = msg.params.as_ref()?;
     let update = params.get("update")?;
@@ -475,6 +520,66 @@ pub fn classify_notification(msg: &JsonRpcMessage) -> Option<AcpEvent> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn msg(v: Value) -> JsonRpcMessage {
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn chunk(session_id: Option<&str>, text: &str) -> JsonRpcMessage {
+        let mut params = json!({"update": {"sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": text}}});
+        if let Some(sid) = session_id {
+            params["sessionId"] = json!(sid);
+        }
+        msg(json!({"jsonrpc": "2.0", "method": "session/update", "params": params}))
+    }
+
+    #[test]
+    fn foreign_session_update_detection() {
+        assert!(!is_foreign_session_update(&chunk(Some("p"), "x"), "p"));
+        assert!(is_foreign_session_update(&chunk(Some("step"), "x"), "p"));
+        // A frame that cannot be tied to the parent session is not parent traffic.
+        assert!(is_foreign_session_update(&chunk(None, "x"), "p"));
+        let null_id = msg(json!({"method": "session/update",
+            "params": {"sessionId": null, "update": {}}}));
+        assert!(is_foreign_session_update(&null_id, "p"));
+        let numeric_id = msg(json!({"method": "session/update",
+            "params": {"sessionId": 7, "update": {}}}));
+        assert!(is_foreign_session_update(&numeric_id, "p"));
+        let no_params = msg(json!({"method": "session/update"}));
+        assert!(is_foreign_session_update(&no_params, "p"));
+        let other_method = msg(json!({"method": "_kiro/other",
+            "params": {"sessionId": "step"}}));
+        assert!(!is_foreign_session_update(&other_method, "p"));
+        let response = msg(json!({"id": 3, "result": {"sessionId": "step"}}));
+        assert!(!is_foreign_session_update(&response, "p"));
+    }
+
+    #[test]
+    fn workflow_signal_classification() {
+        let start = msg(
+            json!({"jsonrpc": "2.0", "method": "_kiro/workflow/run_start",
+            "params": {"workflowId": "wf_1", "workflowName": "w", "parentSessionId": "p"}}),
+        );
+        assert_eq!(
+            classify_workflow_signal(&start, "p"),
+            Some(WorkflowSignal::RunStart {
+                workflow_id: "wf_1".into()
+            })
+        );
+        assert_eq!(classify_workflow_signal(&start, "other"), None);
+        let done = msg(json!({"method": "_kiro/workflow/run_complete",
+            "params": {"workflowId": "wf_1", "status": "completed"}}));
+        assert_eq!(
+            classify_workflow_signal(&done, "p"),
+            Some(WorkflowSignal::RunComplete {
+                workflow_id: "wf_1".into()
+            })
+        );
+        let unrelated = msg(json!({"method": "_kiro/workflow/node_start",
+            "params": {"workflowId": "wf_1"}}));
+        assert_eq!(classify_workflow_signal(&unrelated, "p"), None);
+    }
 
     #[test]
     fn json_rpc_ids_preserve_all_supported_integer_ranges() {
