@@ -100,7 +100,7 @@ jobs:
             | grep -Fx 'OPENAB_AGENT_COMMAND=codex-acp'
 
       - name: Verify bumped runtime versions
-        if: matrix.variant.suffix == '' || matrix.variant.suffix == '-unified' || matrix.variant.suffix == '-copilot' || matrix.variant.suffix == '-devin' || matrix.variant.suffix == '-antigravity'
+        if: matrix.variant.suffix == '' || matrix.variant.suffix == '-unified' || matrix.variant.suffix == '-copilot' || matrix.variant.suffix == '-devin' || matrix.variant.suffix == '-antigravity' || matrix.variant.suffix == '-mimocode'
         shell: bash
         run: |
           set -euo pipefail
@@ -128,6 +128,14 @@ jobs:
               expected=$(awk -F= '$1 == "ENV AGY_VERSION" {print $2; exit}' Dockerfile.antigravity)
               test -n "$expected" || { echo "❌ Failed to extract Antigravity expected version"; exit 1; }
               docker run --rm --entrypoint agy openab-test-antigravity --version \
+                | grep -F "$expected"
+              ;;
+            -mimocode)
+              # Runs as USER node, so this also fails if postinstall skipped the
+              # native binary download (the vendor dir is root-owned).
+              expected=$(awk -F= '$1 == "ARG MIMOCODE_VERSION" {print $2; exit}' Dockerfile.mimocode)
+              test -n "$expected" || { echo "❌ Failed to extract MiMo-Code expected version"; exit 1; }
+              docker run --rm --entrypoint mimo openab-test-mimocode --version \
                 | grep -F "$expected"
               ;;
           esac
