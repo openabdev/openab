@@ -293,7 +293,7 @@ CMD ["openab", "run", "-c", "/etc/openab/config.toml"]
 # Target: mimocode
 # =============================================================================
 FROM base-node AS mimocode
-ARG MIMOCODE_VERSION=0.1.16
+ARG MIMOCODE_VERSION=0.1.17
 RUN npm install -g @mimo-ai/cli@${MIMOCODE_VERSION} --retry 3
 ENV HOME=/home/node
 WORKDIR /home/node
