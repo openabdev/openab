@@ -243,6 +243,11 @@ jobs:
           assert_line 'ARG DEVIN_VERSION=3000.14.30821' Dockerfile.devin Dockerfile.package Dockerfile.unified
           assert_line 'ARG DEVIN_SHA256_AMD64=4dc43e3e4388bace60fe2aa8010cbb399402e724892d7175845b1cdef00e7ddb' Dockerfile.devin Dockerfile.package Dockerfile.unified
           assert_line 'ARG DEVIN_SHA256_ARM64=3deb8af6b026060e975ed371936e139818020e5dc5abbcba07cde039f473a5a5' Dockerfile.devin Dockerfile.package Dockerfile.unified
+          # MiMo-Code pin: Dockerfile.unified is the reference, so a bump edits
+          # only Dockerfiles and a partial bump fails.
+          mimo_pin=$(grep -m1 '^ARG MIMOCODE_VERSION=' Dockerfile.unified) || { echo "::error::MIMOCODE_VERSION is not pinned in Dockerfile.unified" >&2; exit 1; }
+          [[ "$mimo_pin" =~ ^ARG\ MIMOCODE_VERSION=[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Dockerfile.unified must pin a full MiMo-Code version (got '$mimo_pin')" >&2; exit 1; }
+          assert_line "$mimo_pin" Dockerfile.mimocode Dockerfile.package
           assert_line 'ENV AGY_VERSION=1.2.13' Dockerfile.antigravity Dockerfile.unified Dockerfile.final Dockerfile.ci
           assert_line 'ARG AGY_VERSION=1.2.13' Dockerfile.package
           assert_line 'ENV AGY_VERSION="${AGY_VERSION}"' Dockerfile.package
