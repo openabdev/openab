@@ -158,6 +158,7 @@ FROM base-node AS codex
 ARG CODEX_ACP_VERSION=2.0.0
 ARG CODEX_VERSION=0.166.0
 RUN npm install -g @agentclientprotocol/codex-acp@${CODEX_ACP_VERSION} @openai/codex@${CODEX_VERSION} --fetch-retries=3
+ENV CODEX_PATH=/usr/local/bin/codex
 ENV HOME=/home/node
 WORKDIR /home/node
 COPY --from=builder --chown=node:node /build/target/release/openab /usr/local/bin/openab

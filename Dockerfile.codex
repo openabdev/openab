@@ -30,6 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 ARG CODEX_ACP_VERSION=2.0.0
 ARG CODEX_VERSION=0.166.0
 RUN npm install -g @agentclientprotocol/codex-acp@${CODEX_ACP_VERSION} @openai/codex@${CODEX_VERSION} --fetch-retries=3
+ENV CODEX_PATH=/usr/local/bin/codex
 
 # Install gh CLI
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
