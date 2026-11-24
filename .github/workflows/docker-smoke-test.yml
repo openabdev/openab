@@ -89,6 +89,22 @@ jobs:
           docker run --rm --entrypoint codex openab-test-codex --version \
             | grep -F "codex-cli ${CODEX_VERSION}"
 
+      - name: Verify codex-acp uses the pinned Codex CLI
+        if: matrix.variant.suffix == '-codex'
+        run: |
+          # codex-acp runs the @openai/codex npm nests under it unless CODEX_PATH
+          # is set, and OpenAB clears the agent environment before spawning
+          # (env_clear in crates/openab-core/src/acp/connection.rs). Run it the
+          # same way and require the CLI it uses to match CODEX_VERSION, so
+          # CODEX_ACP_VERSION must be bumped to a release whose @openai/codex
+          # range includes CODEX_VERSION.
+          CODEX_VERSION=$(awk -F= '$1 == "ARG CODEX_VERSION" {print $2; exit}' Dockerfile.codex)
+          test -n "$CODEX_VERSION"
+          docker run --rm --entrypoint env openab-test-codex -i \
+            HOME=/home/node PATH=/usr/local/bin:/usr/bin:/bin USER=node \
+            codex-acp cli -V \
+            | grep -Fx "codex-cli ${CODEX_VERSION}"
+
       - name: Verify Codex agent command is a single token
         if: matrix.variant.suffix == '-codex'
         run: |
@@ -245,7 +261,7 @@ jobs:
           assert_line 'ARG KIRO_CLI_VERSION=3.5.0' Dockerfile Dockerfile.package Dockerfile.unified
           assert_line 'ARG KIRO_SHA256_AMD64=7f9bb76921f477125629619450d5942e160942aba9dd8cdc4a66f7678a20c56d' Dockerfile Dockerfile.package Dockerfile.unified
           assert_line 'ARG KIRO_SHA256_ARM64=ed45f387bca9356d1e767022a7cb504c3fbda20d3881c55c7d771877335ceec0' Dockerfile Dockerfile.package Dockerfile.unified
-          assert_line 'ARG CODEX_ACP_VERSION=2.0.0' Dockerfile.codex Dockerfile.package Dockerfile.unified
+          assert_line 'ARG CODEX_ACP_VERSION=2.7.0' Dockerfile.codex Dockerfile.package Dockerfile.unified
           assert_line 'ARG CODEX_VERSION=0.166.0' Dockerfile.codex Dockerfile.package Dockerfile.unified
           assert_line 'ARG COPILOT_VERSION=1.0.105' Dockerfile.copilot Dockerfile.package Dockerfile.unified
           assert_line 'ARG DEVIN_VERSION=3000.14.30821' Dockerfile.devin Dockerfile.package Dockerfile.unified
