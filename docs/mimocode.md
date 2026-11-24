@@ -80,3 +80,11 @@ env = { GHPOOL_URL = "http://ghpool.openab.local:8080", PATH = "/home/node/bin:/
 - Default model is set during `mimo auth login` and stored in the DB
 - No `config set` CLI command — model selection is via auth flow only
 - The `-m/--model` flag only works for TUI/run modes, not ACP
+
+## Web Search
+
+Since MiMo-Code 0.1.17, built-in web search is off by default. To turn it on, set `MIMOCODE_ENABLE_EXA=1` in `[agent].env`, or add a search MCP server.
+
+## Downgrading
+
+MiMo-Code 0.1.17 runs SQLite migrations on `~/.local/share/mimocode/mimocode.db`: it rebuilds the memory full-text index and removes session-share data. If you roll an image back to 0.1.16 on a persistent volume, the older CLI may fail on the migrated database. Back up the database before upgrading and restore that backup after downgrading. If no backup exists, the last resort is to delete the database (steps in "SQLite DB Locking" above) and log in again. Deleting it permanently removes local memory and session history, not only the login.
