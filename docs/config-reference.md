@@ -338,6 +338,7 @@ The AI agent subprocess that OpenAB spawns to handle messages via ACP.
 | `working_dir` | string | `$HOME` | Working directory for the agent process. Optional — defaults to container's `$HOME`. |
 | `env` | map | `{}` | Extra environment variables (e.g. `{ OPENAI_API_KEY = "${OPENAI_API_KEY}" }`). |
 | `inherit_env` | string[] | `[]` | Env var names to inherit from the OAB process (e.g. vars injected via K8s `envFrom`). Keys in `env` take precedence. |
+| `session_new_meta` | table | none | Optional `_meta` object sent verbatim in every `session/new` request. For Kiro workflows: `{ kiro = { settings = { workflows = { enabled = true } } } }`. Enabling workflows also turns on the step-session frame filter and the late-output relay (see [kiro-v3.md](kiro-v3.md)). Must be a table. |
 
 > **Default inherited vars:** After `env_clear()`, the agent always receives `HOME`, `PATH`, and `USER` (on Windows: `USERPROFILE`, `USERNAME`, `PATH`, `SystemRoot`, `SystemDrive`). Use `inherit_env` to pass additional vars beyond this baseline.
 
@@ -429,6 +430,9 @@ Session pool settings for managing concurrent agent sessions.
 | `session_ttl_hours` | u64 | `4` | Session time-to-live in hours. Idle sessions are reclaimed after this period. The example config uses `24`. |
 | `hung_grace_secs` | u64 | `120` | Grace period after `prompt_hard_timeout_secs` before a session stuck with its connection mutex held (in-flight prompt) is force-evicted from the pool. Eviction threshold: `prompt_hard_timeout_secs + hung_grace_secs`. |
 | `default_config_options` | map | `{}` | Config options to set automatically after session creation. Keys are config option IDs (e.g. `mode`, `model`), values are the desired values (e.g. `bypass`, `swe-1-6`). Sent via ACP `session/set_config_option` after each `session/new`. |
+| `strict_default_config_options` | bool | `false` | When `true`, session creation fails if the agent's `session/set_config_option` response reports a `currentValue` different from the requested value (an alias given as the option's display name is accepted), or if the call errors. Responses without that option are accepted. Recommended for kiro-cli v3, which answers success for an unknown agent. Not applied when a session is resumed via `session/load`. |
+| `workflow_tail_quiet_secs` | u64 | `20` | Only with Kiro workflows enabled in `[agent].session_new_meta`. Seconds without agent output after which buffered late workflow text is posted to the thread. Must be `> 0` unless `workflow_tail_max_secs = 0`. |
+| `workflow_tail_max_secs` | u64 | `900` | Only with Kiro workflows enabled. Hard cap (seconds from the prompt response) on relaying late workflow output. `0` disables the relay. |
 
 **Example** — force Devin to bypass mode and use a specific model:
 

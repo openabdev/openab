@@ -208,6 +208,12 @@ working_dir = "/home/agent"
 # default_config_options = { mode = "agent-full-access" }
 
 # [agent]
+# kiro-cli v3 engine with Kiro workflows (see docs/kiro-v3.md):
+# command = "kiro-cli"
+# args = ["acp", "--agent-engine=v3"]
+# session_new_meta = { kiro = { settings = { workflows = { enabled = true } } } }
+
+# [agent]
 # command = "gemini"
 # args = ["--acp"]
 # working_dir = "/home/node"
@@ -271,6 +277,12 @@ session_ttl_hours = 24
 # Grace (sec) past prompt_hard_timeout_secs before a hung in-flight session is
 # force-evicted from the pool. Default: 120.
 # hung_grace_secs = 120
+# kiro-cli v3 (see docs/kiro-v3.md): select the agent mode and fail fast when it is missing.
+# default_config_options = { mode = "openab-bot" }
+# strict_default_config_options = true
+# Late Kiro workflow output relay (needs [agent].session_new_meta above).
+# workflow_tail_quiet_secs = 20
+# workflow_tail_max_secs = 900
 
 [markdown]
 tables = "code"  # "code" (default) | "bullets" | "off"

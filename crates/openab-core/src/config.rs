@@ -1668,6 +1668,7 @@ struct AgentConfigRaw {
     working_dir: String,
     env: HashMap<String, String>,
     inherit_env: Vec<String>,
+    session_new_meta: Option<serde_json::Value>,
 }
 
 impl Default for AgentConfigRaw {
@@ -1678,6 +1679,7 @@ impl Default for AgentConfigRaw {
             working_dir: default_working_dir(),
             env: HashMap::new(),
             inherit_env: Vec::new(),
+            session_new_meta: None,
         }
     }
 }
@@ -1691,6 +1693,18 @@ pub struct AgentConfig {
     pub inherit_env: Vec<String>,
     /// Whether the command was explicitly set in config (vs defaulted from env/fallback).
     pub command_explicit: bool,
+    /// Optional `_meta` object sent verbatim in every `session/new` request.
+    /// Default: none (nothing is added to the request). Example for kiro-cli v3:
+    /// `{ kiro = { settings = { workflows = { enabled = true } } } }`.
+    pub session_new_meta: Option<serde_json::Value>,
+}
+
+/// True when `meta` (the `[agent].session_new_meta` table) switches on Kiro
+/// workflows (`kiro.settings.workflows.enabled = true`).
+pub fn meta_enables_workflows(meta: Option<&serde_json::Value>) -> bool {
+    meta.and_then(|m| m.pointer("/kiro/settings/workflows/enabled"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
 }
 
 impl Default for AgentConfig {
@@ -1702,6 +1716,7 @@ impl Default for AgentConfig {
             env: HashMap::new(),
             inherit_env: Vec::new(),
             command_explicit: false,
+            session_new_meta: None,
         }
     }
 }
@@ -1721,6 +1736,13 @@ impl<'de> serde::Deserialize<'de> for AgentConfig {
             (true, None) => Vec::new(),            // command set, args omitted → empty
             (false, None) => default_agent_args(), // neither set → env var
         };
+        if let Some(meta) = &raw.session_new_meta {
+            if !meta.is_object() {
+                return Err(serde::de::Error::custom(
+                    "[agent].session_new_meta must be a table",
+                ));
+            }
+        }
         Ok(AgentConfig {
             command,
             args,
@@ -1728,6 +1750,7 @@ impl<'de> serde::Deserialize<'de> for AgentConfig {
             env: raw.env,
             inherit_env: raw.inherit_env,
             command_explicit: cmd_explicit,
+            session_new_meta: raw.session_new_meta,
         })
     }
 }
@@ -1762,6 +1785,28 @@ pub struct PoolConfig {
     /// Sent via `session/set_config_option` after each `session/new`.
     #[serde(default)]
     pub default_config_options: HashMap<String, String>,
+    /// When true, `default_config_options` entries are verified: after each
+    /// `session/set_config_option` the returned `currentValue` must equal the
+    /// requested value (or be the value behind a matching option name), else
+    /// session creation fails. Default false (legacy: mismatches are ignored).
+    #[serde(default)]
+    pub strict_default_config_options: bool,
+    /// Seconds without agent output after which late workflow output is
+    /// flushed to the thread (only with `[agent].session_new_meta` enabling
+    /// Kiro workflows). Must be > 0 when `workflow_tail_max_secs` > 0.
+    #[serde(default = "default_workflow_tail_quiet_secs")]
+    pub workflow_tail_quiet_secs: u64,
+    /// Hard cap (seconds, from the prompt response) on how long openab keeps
+    /// relaying late workflow output. 0 disables the relay.
+    #[serde(default = "default_workflow_tail_max_secs")]
+    pub workflow_tail_max_secs: u64,
+}
+
+fn default_workflow_tail_quiet_secs() -> u64 {
+    20
+}
+fn default_workflow_tail_max_secs() -> u64 {
+    900
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1994,6 +2039,9 @@ impl Default for PoolConfig {
             liveness_check_secs: default_liveness_check_secs(),
             hung_grace_secs: default_hung_grace_secs(),
             default_config_options: HashMap::new(),
+            strict_default_config_options: false,
+            workflow_tail_quiet_secs: default_workflow_tail_quiet_secs(),
+            workflow_tail_max_secs: default_workflow_tail_max_secs(),
         }
     }
 }
@@ -2307,9 +2355,15 @@ fn parse_config_inner(expanded: &str, source: &str) -> anyhow::Result<Config> {
                 env: config.agent.env.clone(),
                 inherit_env: config.agent.inherit_env.clone(),
                 command_explicit: true, // synthesized counts as explicit
+                session_new_meta: config.agent.session_new_meta.clone(),
             };
         }
     }
+
+    anyhow::ensure!(
+        config.pool.workflow_tail_max_secs == 0 || config.pool.workflow_tail_quiet_secs > 0,
+        "pool.workflow_tail_quiet_secs must be > 0 when pool.workflow_tail_max_secs > 0"
+    );
 
     // Validate max_buffered_messages > 0 (tokio::sync::mpsc::channel panics on 0)
     // and max_batch_tokens > 0 (otherwise the consumer's token-cap check forces every
@@ -2501,6 +2555,78 @@ fn default_ambient_context_flushes() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DISCORD_STUB: &str = "[discord]\nbot_token = \"x\"\n";
+
+    #[test]
+    fn session_new_meta_defaults_to_none() {
+        let cfg = parse_config_str(DISCORD_STUB, "test").unwrap();
+        assert!(cfg.agent.session_new_meta.is_none());
+        assert!(!meta_enables_workflows(cfg.agent.session_new_meta.as_ref()));
+    }
+
+    #[test]
+    fn session_new_meta_table_parses() {
+        let toml_str = format!(
+            "{DISCORD_STUB}[agent]\ncommand = \"kiro-cli\"\n\
+             session_new_meta = {{ kiro = {{ settings = {{ workflows = {{ enabled = true }} }} }} }}\n"
+        );
+        let cfg = parse_config_str(&toml_str, "test").unwrap();
+        assert_eq!(
+            cfg.agent.session_new_meta,
+            Some(serde_json::json!({"kiro": {"settings": {"workflows": {"enabled": true}}}}))
+        );
+        assert!(meta_enables_workflows(cfg.agent.session_new_meta.as_ref()));
+    }
+
+    #[test]
+    fn session_new_meta_must_be_a_table() {
+        let toml_str = format!("{DISCORD_STUB}[agent]\nsession_new_meta = \"x\"\n");
+        let err = parse_config_str(&toml_str, "test").unwrap_err();
+        assert!(format!("{err:#}").contains("session_new_meta must be a table"));
+    }
+
+    #[test]
+    fn meta_enables_workflows_requires_boolean_true() {
+        use serde_json::json;
+        assert!(meta_enables_workflows(Some(
+            &json!({"kiro": {"settings": {"workflows": {"enabled": true}}}})
+        )));
+        assert!(!meta_enables_workflows(Some(
+            &json!({"kiro": {"settings": {"workflows": {"enabled": false}}}})
+        )));
+        assert!(!meta_enables_workflows(Some(
+            &json!({"kiro": {"settings": {"workflows": {"enabled": "true"}}}})
+        )));
+        assert!(!meta_enables_workflows(Some(&json!({"other": 1}))));
+        assert!(!meta_enables_workflows(None));
+    }
+
+    #[test]
+    fn pool_workflow_and_strict_defaults() {
+        let cfg = parse_config_str(DISCORD_STUB, "test").unwrap();
+        assert!(!cfg.pool.strict_default_config_options);
+        assert_eq!(cfg.pool.workflow_tail_quiet_secs, 20);
+        assert_eq!(cfg.pool.workflow_tail_max_secs, 900);
+        let toml_str = format!(
+            "{DISCORD_STUB}[pool]\nstrict_default_config_options = true\n\
+             workflow_tail_quiet_secs = 5\nworkflow_tail_max_secs = 60\n"
+        );
+        let cfg = parse_config_str(&toml_str, "test").unwrap();
+        assert!(cfg.pool.strict_default_config_options);
+        assert_eq!(cfg.pool.workflow_tail_quiet_secs, 5);
+        assert_eq!(cfg.pool.workflow_tail_max_secs, 60);
+    }
+
+    #[test]
+    fn workflow_tail_quiet_zero_is_rejected_unless_tail_disabled() {
+        let bad = format!("{DISCORD_STUB}[pool]\nworkflow_tail_quiet_secs = 0\n");
+        assert!(parse_config_str(&bad, "test").is_err());
+        let ok = format!(
+            "{DISCORD_STUB}[pool]\nworkflow_tail_quiet_secs = 0\nworkflow_tail_max_secs = 0\n"
+        );
+        assert!(parse_config_str(&ok, "test").is_ok());
+    }
 
     #[test]
     fn mcp_facade_absent_by_default() {

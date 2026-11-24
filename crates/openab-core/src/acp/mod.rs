@@ -6,4 +6,7 @@ pub mod protocol;
 
 pub use connection::ContentBlock;
 pub use pool::SessionPool;
-pub use protocol::{classify_notification, parse_turn_result, AcpEvent, TurnResult};
+pub use protocol::{
+    classify_notification, classify_workflow_signal, is_foreign_session_update, parse_turn_result,
+    AcpEvent, TurnResult, WorkflowSignal,
+};
