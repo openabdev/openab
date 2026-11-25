@@ -50,8 +50,15 @@ jobs:
         id: poll
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Login the review coordinator uses when it writes its own pending
+          # status to take ownership of a round.
+          COORDINATOR_LOGIN: "chaodu-agent"
         run: |
           set -eo pipefail
+          # Stale window for a pending no coordinator has taken (30 min), and
+          # hard timeout for a coordinator-owned pending (2 h).
+          STALE_SECONDS=1800
+          OWNED_STALE_SECONDS=7200
 
           if [ "${{ github.event_name }}" = "issue_comment" ]; then
             # Targeted path: "/review" comment on a PR from a maintainer
@@ -92,23 +99,43 @@ jobs:
             SHA=$(echo "$ROW" | jq -r '.sha')
             LABELS=$(echo "$ROW" | jq -c '.labels')
 
-            # Get latest status for this SHA (single API call)
+            # Get latest status for this SHA (single API call). creator tells
+            # who wrote it: this workflow (github-actions[bot]) writes pending
+            # when it sends the webhook; the review coordinator writes its own
+            # pending when it takes ownership of a round.
             STATUS_JSON=$(gh api "repos/${{ github.repository }}/commits/${SHA}/statuses" \
-              --jq '[.[] | select(.context == "OpenAB PR Review")] | sort_by(.created_at) | last | {state, created_at} // empty')
+              --jq '[.[] | select(.context == "OpenAB PR Review")] | sort_by(.created_at) | last | {state, created_at, creator: .creator.login} // empty')
             STATE=$(echo "$STATUS_JSON" | jq -r '.state // empty')
+            CREATOR=$(echo "$STATUS_JSON" | jq -r '.creator // empty')
 
-            # Skip if still pending, UNLESS pending > 30 min (stale)
+            # Skip if still pending, UNLESS it is stale:
+            # - pending written by the coordinator: it owns an active round
+            #   (it may be waiting on reviewers). Re-triggering would start a
+            #   duplicate round on the same SHA (#1621), so the poller waits
+            #   for a 2 h hard timeout (crashed coordinator). A maintainer
+            #   /review (FORCE=1) may take the SHA over after 30 min.
+            # - any other pending (this workflow's webhook, a manual status):
+            #   no round is known to be owned; stale after 30 min (lost
+            #   webhook, agent down).
             if [ "$STATE" = "pending" ]; then
               PENDING_AT=$(echo "$STATUS_JSON" | jq -r '.created_at // empty')
               if [ -n "$PENDING_AT" ]; then
                 PENDING_TS=$(date -d "$PENDING_AT" +%s 2>/dev/null || date -u +%s)
                 NOW_TS=$(date -u +%s)
                 ELAPSED=$(( NOW_TS - PENDING_TS ))
-                if [ "$ELAPSED" -lt 1800 ]; then
-                  echo "PR #${NUMBER}: still pending (${ELAPSED}s), skipping"
+                LIMIT=$STALE_SECONDS
+                OWNER="unowned, creator ${CREATOR:-unknown}"
+                if [ "$CREATOR" = "$COORDINATOR_LOGIN" ]; then
+                  OWNER="owned by ${CREATOR}"
+                  if [ "$FORCE" -eq 0 ]; then
+                    LIMIT=$OWNED_STALE_SECONDS
+                  fi
+                fi
+                if [ "$ELAPSED" -lt "$LIMIT" ]; then
+                  echo "PR #${NUMBER}: still pending (${OWNER}, ${ELAPSED}s < ${LIMIT}s), skipping"
                   continue
                 fi
-                echo "PR #${NUMBER}: pending stale (${ELAPSED}s > 30m), re-triggering"
+                echo "PR #${NUMBER}: pending stale (${OWNER}, ${ELAPSED}s >= ${LIMIT}s), re-triggering"
               fi
             fi
 
