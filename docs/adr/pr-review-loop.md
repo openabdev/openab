@@ -6,370 +6,69 @@
 
 ## Context
 
-OpenAB's PR review workflow currently relies on manual triggers — a human @mentions the review bot in Discord to initiate a review. This works well for ad-hoc reviews but does not scale for repositories with frequent PR activity. Maintainers want automated PR reviews that:
+Reviews were started by hand: a maintainer @mentioned the review agent in Discord. The goal is to start reviews automatically and show the result as a commit status on the PR head.
 
-1. Trigger automatically when a PR is opened or updated
-2. Show review status as a commit status (🟡 pending → ✅/❌ complete)
-3. Preserve the full review process in a Discord thread for auditability
-4. Post a single aggregated comment on the PR (hiding previous comments)
-5. Work with the existing OpenAB agent running on ECS Fargate (long-lived)
-
-The agent should not need to be ephemeral — it stays running and receives review requests like any other Discord message.
+An earlier design sent a Discord webhook on every push. Webhooks cannot be recalled, so rapid pushes started reviews of commits that were already superseded. The current design polls open PRs on a schedule and also reacts to a few events.
 
 ## Decision
 
-Use a **GitHub Action → Discord Webhook → OpenAB (ECS)** architecture with GitHub Commit Status API for check status feedback.
+The workflow `.github/workflows/pr-bot-review.yml` starts a review in two steps:
 
-### Why Commit Status API (not Check Runs)
+1. Set a `pending` commit status with context `OpenAB PR Review` on the PR head SHA.
+2. Post a message to a Discord webhook. The message @mentions the review agent, names the PR, and includes the SHA.
 
-Check Runs API requires a GitHub App with `checks:write` permission. Commit Status API works with a standard PAT or fine-grained token (`commit statuses: write`), which the agent already has via `gh` CLI auth. This avoids creating an additional GitHub App solely for status reporting.
+The agent sets the final status (`success` or `failure`) after its review. The workflow does not do that step.
 
-### Why Discord Webhook
+Implemented triggers, declared in the `on:` block (L3-14):
 
-- Simplest setup — only one secret (webhook URL), no Bot Token management
-- Webhook messages posted to a channel will trigger OpenAB's existing message pipeline via @mention
-- OpenAB auto-creates a thread for the conversation (existing behavior)
+- `pull_request`: `opened`, `synchronize`, `reopened`.
+- `schedule`: every 5 minutes (`*/5 * * * *`).
+- `workflow_dispatch`: manual run.
+- `issue_comment`: `created`. The job runs only for a `/review` comment on a PR, from an OWNER, MEMBER, or COLLABORATOR.
 
-### Configuration Prerequisites
+The job-level `if` skips `pull_request` events from forks (L47). A fork run gets a read-only token, so it cannot write statuses.
 
-Discord webhook messages are flagged `author.bot == true` at the API level. OpenAB's Discord adapter defaults to `allow_bot_messages: "off"`, which silently drops bot messages. For this automation to work, the deployment **must** configure one of:
+What a run does:
 
-1. Set `allow_bot_messages: "mentions"` — allows bot messages that @mention the agent
-2. Add the webhook's author ID to `trusted_bot_ids`
+- A `/review` run polls only its own PR, adds a 👀 reaction, and re-reviews the SHA even if it already has `success` or `failure`.
+- Any other run lists all open PRs, skips drafts, and checks the latest `OpenAB PR Review` status on each head SHA:
 
-These settings are configured in the OpenAB ECS task definition's environment variables or the agent's runtime configuration file.
+| Latest status | Action |
+|---|---|
+| none, or `error` | trigger |
+| `success`, `failure` | skip |
+| `pending` by `chaodu-agent` (the coordinator) | skip for 2 h, then trigger |
+| `pending` by any other login | skip for 30 min, then trigger |
 
-**Example (ECS environment variable):**
-```
-DISCORD_ALLOW_BOT_MESSAGES=mentions
-```
+A `/review` run uses 30 min instead of 2 h for a coordinator-owned `pending` (L130).
 
-**Example (config.toml):**
-```toml
-[discord]
-allow_bot_messages = "mentions"
-```
+Circuit breaker: before triggering, the workflow counts `pending` statuses with this context across all commits of the PR. At 30 or more (L181), it adds the `review-limit-reached` label, sets `error` on the SHA, and skips the PR.
 
-Without this, the webhook @mention will be ignored and reviews will never trigger.
-
-## Amendment: Reactive → Scheduled Polling (2026-06-18)
-
-### Problem with Reactive Mode
-
-The original reactive design (`pull_request_target` trigger) fires a webhook on every push. While GitHub Actions' `concurrency` group cancels in-flight runs, once a Discord webhook is delivered it cannot be recalled. This causes:
-
-1. Rapid pushes spawn multiple concurrent agent review sessions in Discord
-2. Agent callbacks race — stale reviews may overwrite fresh status
-3. Wasted compute and API tokens on superseded commits
-
-### Solution: Scheduled Polling
-
-Replace the event-driven trigger with a `schedule` cron job that polls every 5 minutes:
-
-```yaml
-on:
-  schedule:
-    - cron: '*/5 * * * *'
-  workflow_dispatch: {}
-```
-
-**Polling logic per open PR:**
-
-| HEAD commit status | Action |
-|-------------------|--------|
-| `pending` by the coordinator (`chaodu-agent`) (< 2 h) | **Skip** — the coordinator owns an active round (it may be waiting on reviewers) |
-| `pending` by the coordinator (≥ 2 h) | **Trigger** — coordinator presumed crashed |
-| `pending` by anyone else, e.g. `github-actions[bot]` (< 30 min) | **Skip** — webhook just sent, waiting for the coordinator to take ownership |
-| `pending` by anyone else (≥ 30 min) | **Trigger** — stale, agent likely missed the webhook |
-| `success` | **Skip** — already reviewed this SHA (LGTM) |
-| `failure` | **Skip** — already reviewed this SHA (CHANGES REQUESTED); new push = new SHA = auto-triggers |
-| `error` / none | **Trigger** — needs review (new SHA or webhook previously failed) |
-
-The stale timeouts handle the case where the agent is down or missed the webhook — the status would otherwise stay `pending` indefinitely, blocking further reviews. The `creator` of the latest status tells the two cases apart: the poller writes `pending` as `github-actions[bot]` when it sends the webhook, and the coordinator writes its own `pending` as `chaodu-agent` (`COORDINATOR_LOGIN` in the workflow) when it starts a round, which marks the round as owned. Only that login gets the 2 h window; a `pending` written by any other login (the poller, a maintainer, another automation) is treated as unowned and uses the 30 min window.
-
-A maintainer `/review` comment re-reviews a `success` or `failure` SHA right away, and also skips a fresh `pending`. For a coordinator-owned `pending`, `/review` uses the 30 min window instead of 2 h, so a maintainer can take over a crashed round after 30 min. To recover sooner, push a new commit (new SHA) or set the `OpenAB PR Review` status on the SHA to `error`; the next poll re-triggers it.
-
-This gives best-effort deduplication per HEAD SHA: the poller starts at most one review per SHA within the stale window. It is not a per-PR single-flight guarantee. A push during an open round makes the new SHA eligible right away, and `/review` runs use a separate concurrency group (see Mitigations), so two rounds on the same PR can still overlap.
-
-### Trade-offs vs Reactive Mode
-
-| Aspect | Reactive (old) | Scheduled (new) |
-|--------|---------------|-----------------|
-| Latency | Immediate on push | Up to 5 min (best-effort; may lag under GH load) |
-| Duplicate reviews | Possible (webhook already sent) | Extremely unlikely (skip if pending; narrow race only) |
-| GitHub Actions minutes | Per-push (many short runs) | Fixed (one run per 5 min) |
-| Complexity | Simple trigger | Polling + state check logic |
-
-### Why This Is Acceptable
-
-- 5-minute latency is fine for code review (not user-facing)
-- Eliminates duplicate-review bugs without agent-side dedup (agent SHA validation remains as belt-and-suspenders for narrow race)
-- `workflow_dispatch` allows manual trigger for urgent reviews
-- Reduces GitHub Actions billing (one run covers all PRs)
-- **Cron caveat:** GitHub Actions `schedule` is best-effort — actual interval may be 5–25 min during platform congestion. This is acceptable since review latency is not user-facing.
-
-### Stale Timeout Rationale (30 minutes / 2 hours)
-
-The 30-min threshold for an unowned `pending` is based on observed review completion times: typical reviews finish in 5–15 minutes (LLM processing + GitHub API calls), and a coordinator that received the webhook writes its own `pending` within a minute. If only the poller's `pending` exists after 30 min, no round is running.
-
-A coordinator-owned round can legitimately take longer than 30 min while it waits for reviewer reports. Re-triggering it at 30 min started a second round on the same SHA (#1621), so owned rounds use a 2-hour hard timeout that only recovers from a crashed coordinator. The coordinator also refuses to start a round when the latest status is already its own `pending`. The cost is that a coordinator crash blocks automatic re-review of that SHA for up to 2 h; the manual recovery paths above cover it.
-
-### Fork PRs & `safe-to-review` in Scheduled Mode
-
-The scheduled poller runs on `schedule` events (base repo context), so it has full access to secrets. The `safe-to-review` label bypass is preserved in the jq filter — PRs with untrusted `author_association` are included if the label is present. Fork PRs are handled the same as before: the poller can set statuses and fire webhooks for any open PR regardless of source, since it operates in the base repo context.
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│  Cron: every 5 minutes (schedule) / manual (workflow_dispatch)       │
-└───────────────────────────┬─────────────────────────────────────────┘
-                            │ polls open PRs
-                            ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  GitHub Action (.github/workflows/pr-bot-review.yml)                │
-│                                                                     │
-│  For each eligible PR:                                              │
-│  1. Check HEAD commit status for "OpenAB PR Review"                 │
-│     - pending by coordinator (< 2 h) → SKIP (round owned)           │
-│     - pending by coordinator (≥ 2 h) → TRIGGER (crashed)            │
-│     - other pending (< 30 min) → SKIP (webhook just sent)           │
-│     - other pending (≥ 30 min) → TRIGGER (stale)                    │
-│     - success / failure → SKIP (already reviewed this SHA)          │
-│     - error / none → TRIGGER                                        │
-│                                                                     │
-│  2. POST /repos/{owner}/{repo}/statuses/{sha}                       │
-│     state: "pending", context: "OpenAB PR Review"                   │
-│                                                                     │
-│  3. Discord Webhook: "@bot review <PR_URL>"                         │
-└───────────────────────────┬─────────────────────────────────────────┘
-                            │ Discord message
-                            ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  OpenAB Agent (ECS Fargate, long-lived)                             │
-│                                                                     │
-│  Receives @mention → opens agent session (auto-creates thread)      │
-│  → Delegates to reviewer team (angle-based review)                  │
-│  → Collects findings in Discord thread                              │
-│  → Aggregates into single review comment                            │
-└───────────────────────────┬─────────────────────────────────────────┘
-                            │ review complete
-                            ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  Post Results to GitHub                                             │
-│                                                                     │
-│  1. Minimize all previous chaodu-agent comments (GraphQL)           │
-│  2. Post aggregated review comment (gh pr comment)                  │
-│  3. Update commit status:                                           │
-│     → "success" if LGTM ✅                                          │
-│     → "failure" if CHANGES REQUESTED ⚠️                             │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-## Review Loop (Auto-Fix Cycle)
-
-The architecture supports a closed-loop review cycle:
-
-```
-                    ┌─────────────────────────────────────────┐
-                    │                                         │
-                    ▼                                         │
-┌──────────┐    ┌─────────────────┐     ┌──────────────┐      │
-│  PR push │───▶│  GitHub Action   │───▶│  OpenAB      │      │
-│          │    │  (set pending)   │    │  Review      │      │
-└──────────┘    └─────────────────┘     └──────┬───────┘      │
-                                              │               │
-                                    ┌─────────┴─────────┐     │
-                                    │                   │     │
-                                    ▼                   ▼     │
-                             ┌────────────┐    ┌────────────┐ │
-                             │  LGTM ✅   │    │ CHANGES    │ │
-                             │            │    │ REQUESTED  │ │
-                             └─────┬──────┘    └─────┬──────┘ │
-                                   │                 │        │
-                                   ▼                 ▼        │
-                             ┌────────────┐    ┌────────────┐ │
-                             │  status:   │    │ Auto-fix   │ │
-                             │  success   │    │ commit +   │─┘
-                             │  (done)    │    │ push       │
-                             └────────────┘    └────────────┘
-                                              (re-triggers Action)
-```
-
-By default, the agent **only reviews and reports findings** — it does not push fixes automatically. The auto-fix loop is only activated when a human (maintainer) explicitly requests it (e.g. "fix and push" or option 4️⃣ in the post-review menu).
-
-When explicitly requested:
-
-1. Agent fixes the code directly on the PR branch
-2. Commits and pushes the fix
-3. The new SHA has no status → next poll cycle triggers a new review
-4. Repeat until LGTM or max iterations reached
-
-### Safeguards
-
-- **Max iterations** — agent enforces a soft cap (3 cycles per auto-fix request) to prevent runaway fixes within a single session. The workflow's circuit breaker (30 cycles) is a hard cap across the entire PR lifetime, catching edge cases where the agent cap is bypassed (e.g. multiple maintainer requests).
-- **Human-only issues** — if findings require design decisions or are ambiguous, the agent requests human input instead of auto-fixing
-- **Commit attribution** — auto-fix commits are authored by `chaodu-agent` with a clear prefix (e.g. `fix(review):`) so the loop is auditable
-
-### When Auto-Fix Is Skipped
-
-- Any 🔴 Critical finding (correctness, security) — requires human judgment
-- Ambiguous 🟡 findings where multiple valid solutions exist
-- Maintainer explicitly opts out of auto-fix for the PR
-
-## Dedup & Performance
-
-The scheduled polling model inherently deduplicates reviews:
-
-### Primary Dedup: Status-Based Gating
-
-The poller checks HEAD commit status before triggering. If status is a fresh `pending` (within the creator-specific window in the polling table above), the PR is skipped, so the poller starts at most one review per SHA within the stale window (best effort; see the note under the polling table). Rapid pushes between polls simply update HEAD; only the latest SHA is reviewed on next poll.
-
-### Agent-Side SHA Validation (Belt-and-Suspenders)
-
-Even with polling, a narrow race is possible (push arrives between status check and webhook delivery). The agent still validates:
-
-1. Agent extracts `__commit: <SHA>__` from the trigger message
-2. Agent queries current PR HEAD: `gh pr view <N> --json headRefOid --jq .headRefOid`
-3. If request SHA ≠ HEAD → skip review, respond "Superseded by newer commit"
-4. If request SHA = HEAD → proceed with normal review
-
-This prevents wasting API tokens and reviewer compute on commits that are no longer relevant.
-
-### Cost Impact
-
-Without dedup, N rapid pushes could trigger N full reviews (~5 LLM calls each for angle-based delegation). With both layers active, at most 1 review runs per push burst.
-
-## Implementation Plan
-
-### Phase 1: GitHub Action Workflow
-
-> **Canonical source:** [`.github/workflows/pr-bot-review.yml`](../../.github/workflows/pr-bot-review.yml)
->
-> Refer to the workflow file for the current implementation. Key design points:
-
-- **Trigger:** `schedule` (cron `*/5 * * * *`) + `workflow_dispatch` for manual runs
-- **Polling logic:** iterates all open PRs, checks HEAD commit status, skips if `pending` (fresh, per the creator-specific window in the polling table), `success`, or `failure`
-- **Guard condition:** skips drafts, untrusted authors, and PRs with `review-limit-reached` label
-- **Steps:** poll open PRs → for each eligible PR: circuit breaker check → set pending status → trigger Discord webhook → error fallback on failure
-
-### Phase 2: Agent Callback (Status Update)
-
-After the agent posts the final PR comment, update the commit status (using the comment's `html_url` from the API response as `target_url` so "Details" links directly to the review):
-
-```bash
-# LGTM
-gh api repos/OWNER/REPO/statuses/SHA \
-  -f state="success" \
-  -f context="OpenAB PR Review" \
-  -f description="LGTM ✅" \
-  -f target_url="<comment_html_url>"
-
-# Changes Requested
-gh api repos/OWNER/REPO/statuses/SHA \
-  -f state="failure" \
-  -f context="OpenAB PR Review" \
-  -f description="Changes Requested ⚠️" \
-  -f target_url="<comment_html_url>"
-```
-
-### Phase 3: Branch Protection
-
-Add `OpenAB PR Review` as a required status check in branch protection rules. This enforces that PRs cannot merge until the review completes successfully.
-
-**Setup:** Repository Settings → Branches → Branch protection rules → Edit `main` → Require status checks to pass before merging → Add `OpenAB PR Review` to the required checks list.
-
-## Token & Permissions
-
-| Secret | Purpose | Minimum Permission |
-|--------|---------|-------------------|
-| `GITHUB_TOKEN` (Actions) | Set pending status + circuit breaker label | `statuses: write` + `issues: write` |
-| `OAB_REVIEW_ACTION_WEBHOOK` | Post review request to Discord channel | Webhook URL (channel-scoped) |
-| Agent's `gh` auth (PAT) | Post comment + update status + push auto-fix | `repo` (classic) or `contents: write` + `pull_requests: write` + `commit statuses: write` (fine-grained) |
-
-### GitHub Actions Secrets Setup
-
-| Secret Name | Value |
-|-------------|-------|
-| `OAB_REVIEW_ACTION_WEBHOOK` | Discord channel webhook URL (Settings → Integrations → Webhooks) |
-| `OAB_REVIEW_ACTION_BOT_UID` | Discord user ID of the bot to @mention (e.g. the review agent's UID) |
-
-`GITHUB_TOKEN` is automatically provided by Actions — no manual setup needed.
+Concurrency: each `/review` run has its own group per PR (`pr-review-poller-<number>`, L19). `pull_request`, `schedule`, and `workflow_dispatch` share the group `pr-review-poller-poll` with `cancel-in-progress: true` (L20), so a newer run cancels an older one.
 
 ## Consequences
 
-**Positive:**
-- Fully automated — no manual @mention needed for PR reviews
-- PR Checks tab shows live review status (🟡 → ✅/❌)
-- Can enforce review via branch protection rules
-- Discord thread preserves full review audit trail (OpenAB auto-creates threads)
-- No architectural changes to OpenAB — agent receives messages normally
-- Fire-and-forget Action — no runner time wasted waiting for review
-- Minimal secrets — only one webhook URL needed in GitHub Secrets
+**Latency.** A same-repo PR that opens, gets a push, or reopens starts a run at once. Other changes wait for the next scheduled run, at most about 5 minutes by the cron interval. GitHub may delay scheduled runs; this ADR does not measure that delay. The following changes wait for the next scheduled run:
 
-**Negative:**
-- Up to 5-min latency before review starts (GitHub cron is best-effort, may lag further under load)
-- If OpenAB agent is down, status stays "pending" until stale timeout re-triggers (30 min if no coordinator took the round, 2 h if one did)
-- Webhook messages lack user identity — OpenAB must allow webhook-originated messages
-- Fork PRs: `pull_request` runs triggered by a fork get no secrets and a read-only `GITHUB_TOKEN` (GitHub security policy), so the workflow skips the event-driven path for fork PRs instead of failing. The scheduled poller and the maintainer `/review` command run in the base repository with secrets and a write token, so fork PRs from trusted authors (or labeled `safe-to-review`) are still reviewed by the poller on its next run. A maintainer can also comment `/review` for an immediate review; this checks only the commenter's association, so it bypasses the PR-author gate by design (the maintainer is asserting the diff is safe). Note: the `safe-to-review` label does **not** grant secrets to fork-triggered runs — it only bypasses the poller's `author_association` gate.
+- Fork PRs. The poll reviews them, but no event run starts.
+- A draft marked ready for review. `ready_for_review` is not in the trigger types (L5).
+- Label changes. `labeled` is not in the trigger types (L5).
 
-**Mitigations:**
-- Filter: skip draft PRs and untrusted authors — only `OWNER`, `MEMBER`, `COLLABORATOR`, and `CONTRIBUTOR` (returning contributor with merged PR) trigger automatic review. First-time contributors and unknown authors are skipped; maintainers can add `safe-to-review` label or manually @mention the agent.
-- Dedup: status-based gating — `pending` (fresh) and `failure`/`success` skip review. Only new SHAs with no status or stale `pending` (≥ 2 h when written by the coordinator, ≥ 30 min otherwise) trigger.
-- Concurrency: scheduled, `pull_request` and `workflow_dispatch` runs share one `concurrency` group, so overlapping poller runs do not race each other. `/review` runs use a separate per-PR group, so a `/review` run and a poller run can still overlap.
-- Error fallback: webhook failure marks status as "error", which will be retried on next poll cycle.
-- Timeout: a coordinator-written `pending` ≥ 2 h old is treated as a crashed coordinator, and any other `pending` ≥ 30 min old as agent-down; both are re-triggered automatically.
+**Run count.** One run per 5-minute tick, plus one run per same-repo `pull_request` event, plus one run per `/review` comment. A draft PR that opens starts a same-repo run that finds nothing to review. Every run except `/review` lists all open PRs (L85).
 
-## Safeguards
+**Dedup limits.**
 
-### Trusted Contributor Filter
+- Dedup is per SHA and best-effort. The poll step reads the status and the trigger step writes `pending` (L194) later in the same job. Two runs can both read "no status" before either writes, so both can trigger the same SHA.
+- Each `/review` restarts a finished SHA, so a maintainer can start repeated reviews of the same commit.
+- A `/review` can take over a coordinator-owned `pending` after 30 min. That can start a second round while the coordinator still works on the first. The workflow comment near the 2 h rule records that a 30 min re-trigger caused a duplicate round (#1621).
+- The circuit breaker counts every `pending` status on the PR. This workflow never deletes statuses, so the count never falls. Removing `review-limit-reached` does not reset it, and the next run re-applies the label.
+- A coordinator-owned `pending` blocks automatic re-review of that SHA for up to 2 h when the coordinator has crashed. A new push (new SHA) or a manual `error` status on the SHA lets the next poll trigger.
 
-The workflow uses GitHub's `author_association` field to gate automatic reviews. Only PRs from trusted authors trigger the review pipeline:
+**Draft handling.** Draft PRs are excluded from the poll list and from `/review`. A draft receives a review only after it is marked ready and the next scheduled run (or a manual `workflow_dispatch`) finds it.
 
-| `author_association` | Auto-review? | Meaning |
-|---------------------|--------------|---------|
-| `OWNER` | ✅ | Repository owner |
-| `MEMBER` | ✅ | Organization member |
-| `COLLABORATOR` | ✅ | Explicitly granted write access |
-| `CONTRIBUTOR` | ✅ | Has previously merged a PR |
-| `FIRST_TIME_CONTRIBUTOR` | ❌ | First PR to this repo |
-| `NONE` | ❌ | No prior relationship |
+## Open questions
 
-**Why:** Prevents token waste and prompt-injection risk from untrusted PR diffs being fed into agent context. Maintainers can still manually @mention the agent to review skipped PRs after visual inspection.
-
-### Label Override: `safe-to-review`
-
-Maintainers can add the `safe-to-review` label to any PR to bypass the poller's `author_association` check. The workflow has no `labeled` trigger: the next scheduled poll picks the PR up, allowing untrusted contributors' PRs to be reviewed automatically after a maintainer has visually confirmed the PR is safe. A maintainer `/review` comment triggers an immediate review instead of waiting for the poll.
-
-**Important:** This works for **same-repo and fork PRs**. The label does not give fork-triggered `pull_request` runs any secrets (those runs are skipped), but the poller runs in the base repository with secrets, so a labeled fork PR is reviewed on the next poll.
-
-### Auto-Fix Mode: `auto-fix`
-
-When the `auto-fix` label is present, the webhook payload includes `__mode: auto-fix__`. The agent enters an iterative loop:
-
-1. Review PR → identify actionable findings (🔴/🟡)
-2. Fix all findings → push commit
-3. Re-review until LGTM or max iterations reached (agent-side cap, recommended: 3)
-
-When the auto-fix loop completes (LGTM or cap reached), the agent removes the `auto-fix` label to prevent subsequent pushes from re-entering the fix loop.
-
-**Constraints:**
-- Only effective on same-repo branches (agent needs push access)
-- Fork PRs: review still runs via the scheduled poller or `/review`, but auto-fix is not supported for fork branches (pushes fail unless the contributor allows edits by maintainers)
-- Agent must implement iteration cap to prevent infinite push→review loops
-
-### Circuit Breaker (workflow hard cap: 30)
-
-The workflow enforces a hard cap of 30 review cycles per PR (across all triggers over the PR's lifetime). This is distinct from the agent-side soft cap of 3 cycles per auto-fix session — the workflow cap catches edge cases where multiple auto-fix requests accumulate. On each run, it counts how many `pending` statuses with context `"OpenAB PR Review"` exist across all commits in the PR. If the count reaches 30:
-
-1. Adds `review-limit-reached` label to the PR
-2. Sets commit status to `error` with description "Circuit breaker: exceeded 30 review cycles"
-3. Fails the workflow step
-
-The `review-limit-reached` label is checked in the job `if` condition — once applied, no further review runs will trigger. A maintainer can remove the label to reset the circuit breaker if needed.
-
-## References
-
-- [GitHub Commit Status API](https://docs.github.com/en/rest/commits/statuses)
-- [Discord Webhooks](https://discord.com/developers/docs/resources/webhook#execute-webhook)
-- OpenAB PR Review Spec — internal agent document (not in this repository)
+1. **Should the `pull_request` trigger stay?** The types list at L5 starts a run on every push to a same-repo PR. The reactive design was rejected for this reason. Options: keep the trigger (one extra webhook per push), remove it (poll-level latency), or add a debounce.
+2. **Should an event run scan every open PR?** Every run except `/review` lists all open PRs (L85), so a `pull_request` event on one PR can start reviews on other PRs. Is that intended? Or should the event path target its own PR number, as `/review` does?
+3. **Should `/review` take over a coordinator-owned `pending` after 30 min?** The poll path waits 2 h (`OWNED_STALE_SECONDS`, L61). `/review` uses 30 min (L130). Options: keep the 30 min takeover, use 2 h for `/review` too, or require a second confirmation.
+4. **Does `cancel-in-progress` on the shared poll group drop a review?** Untested: the shared `pr-review-poller-poll` group uses `cancel-in-progress: true` (origin/main:.github/workflows/pr-bot-review.yml lines 19-20). A newer poll or `pull_request` run may cancel an older one after the older run has written `pending` and before it has sent its webhook. This would leave a SHA marked `pending` with no review. This has not been reproduced; it is a design question, not a confirmed defect.
