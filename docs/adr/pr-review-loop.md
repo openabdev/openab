@@ -89,7 +89,7 @@ The stale timeouts handle the case where the agent is down or missed the webhook
 
 A maintainer `/review` comment re-reviews a `success` or `failure` SHA right away, and also skips a fresh `pending`. For a coordinator-owned `pending`, `/review` uses the 30 min window instead of 2 h, so a maintainer can take over a crashed round after 30 min. To recover sooner, push a new commit (new SHA) or set the `OpenAB PR Review` status on the SHA to `error`; the next poll re-triggers it.
 
-This guarantees **at most one in-flight review per PR** at any time, regardless of push frequency.
+This gives best-effort deduplication per HEAD SHA: the poller starts at most one review per SHA within the stale window. It is not a per-PR single-flight guarantee. A push during an open round makes the new SHA eligible right away, and `/review` runs use a separate concurrency group (see Mitigations), so two rounds on the same PR can still overlap.
 
 ### Trade-offs vs Reactive Mode
 
@@ -223,7 +223,7 @@ The scheduled polling model inherently deduplicates reviews:
 
 ### Primary Dedup: Status-Based Gating
 
-The poller checks HEAD commit status before triggering. If status is a fresh `pending` (within the creator-specific window in the polling table above), the PR is skipped — guaranteeing at most one in-flight review per PR at any time. Rapid pushes between polls simply update HEAD; only the latest SHA is reviewed on next poll.
+The poller checks HEAD commit status before triggering. If status is a fresh `pending` (within the creator-specific window in the polling table above), the PR is skipped, so the poller starts at most one review per SHA within the stale window (best effort; see the note under the polling table). Rapid pushes between polls simply update HEAD; only the latest SHA is reviewed on next poll.
 
 ### Agent-Side SHA Validation (Belt-and-Suspenders)
 
@@ -315,10 +315,10 @@ Add `OpenAB PR Review` as a required status check in branch protection rules. Th
 
 **Mitigations:**
 - Filter: skip draft PRs and untrusted authors — only `OWNER`, `MEMBER`, `COLLABORATOR`, and `CONTRIBUTOR` (returning contributor with merged PR) trigger automatic review. First-time contributors and unknown authors are skipped; maintainers can add `safe-to-review` label or manually @mention the agent.
-- Dedup: status-based gating — `pending` (fresh) and `failure`/`success` skip review. Only new SHAs with no status or stale `pending` (>2 h when written by the coordinator, >30 min otherwise) trigger.
+- Dedup: status-based gating — `pending` (fresh) and `failure`/`success` skip review. Only new SHAs with no status or stale `pending` (≥ 2 h when written by the coordinator, ≥ 30 min otherwise) trigger.
 - Concurrency: scheduled, `pull_request` and `workflow_dispatch` runs share one `concurrency` group, so overlapping poller runs do not race each other. `/review` runs use a separate per-PR group, so a `/review` run and a poller run can still overlap.
 - Error fallback: webhook failure marks status as "error", which will be retried on next poll cycle.
-- Timeout: a coordinator-written `pending` >2 h is treated as a crashed coordinator, and any other `pending` >30 min as agent-down; both are re-triggered automatically.
+- Timeout: a coordinator-written `pending` ≥ 2 h old is treated as a crashed coordinator, and any other `pending` ≥ 30 min old as agent-down; both are re-triggered automatically.
 
 ## Safeguards
 
