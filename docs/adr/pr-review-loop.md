@@ -62,16 +62,27 @@ The original reactive design (`pull_request_target` trigger) fires a webhook on 
 2. Agent callbacks race — stale reviews may overwrite fresh status
 3. Wasted compute and API tokens on superseded commits
 
-### Solution: Scheduled Polling
+### Solution: Scheduled Polling, Plus Event and Manual Triggers
 
-Replace the event-driven trigger with a `schedule` cron job that polls every 5 minutes:
+Add a `schedule` cron job that polls every 5 minutes, and keep the event-driven trigger for same-repo PRs. The workflow runs on four triggers:
 
 ```yaml
 on:
+  pull_request:
+    types: [opened, synchronize, reopened]
   schedule:
     - cron: '*/5 * * * *'
   workflow_dispatch: {}
+  issue_comment:
+    types: [created]
 ```
+
+- `pull_request`: runs the poller as soon as a same-repo PR is opened or pushed. Fork PRs are skipped on this path because their `GITHUB_TOKEN` is read-only (see Negative).
+- `schedule`: the sweep. It picks up fork PRs, PRs whose event run failed or was cancelled, and stale `pending` statuses.
+- `workflow_dispatch`: manual run of the poller.
+- `issue_comment`: a maintainer `/review` comment triggers a targeted review of that one PR.
+
+The `pull_request`, `schedule` and `workflow_dispatch` paths all run the same poller over every open PR, and all of them rely on the status gating below to avoid duplicate reviews.
 
 **Polling logic per open PR:**
 
@@ -93,19 +104,19 @@ This gives best-effort deduplication per HEAD SHA: the poller starts at most one
 
 ### Trade-offs vs Reactive Mode
 
-| Aspect | Reactive (old) | Scheduled (new) |
+| Aspect | Reactive (old) | Scheduled + event (new) |
 |--------|---------------|-----------------|
-| Latency | Immediate on push | Up to 5 min (best-effort; may lag under GH load) |
-| Duplicate reviews | Possible (webhook already sent) | Extremely unlikely (skip if pending; narrow race only) |
-| GitHub Actions minutes | Per-push (many short runs) | Fixed (one run per 5 min) |
+| Latency | Immediate on push | Immediate for same-repo pushes; up to 5 min for fork PRs and retries (cron is best-effort; may lag under GH load) |
+| Duplicate reviews | Possible (webhook already sent) | Reduced (skip if pending; push bursts and `/review` can still overlap) |
+| GitHub Actions minutes | Per-push (many short runs) | One run per 5 min, plus one short run per same-repo push |
 | Complexity | Simple trigger | Polling + state check logic |
 
 ### Why This Is Acceptable
 
-- 5-minute latency is fine for code review (not user-facing)
-- Eliminates duplicate-review bugs without agent-side dedup (agent SHA validation remains as belt-and-suspenders for narrow race)
-- `workflow_dispatch` allows manual trigger for urgent reviews
-- Reduces GitHub Actions billing (one run covers all PRs)
+- Same-repo PRs still start review on push; the 5-minute sweep only adds latency for fork PRs and retries, which is fine for code review (not user-facing)
+- Status gating removes most duplicate reviews on its own; agent SHA validation remains as belt-and-suspenders. Rounds can still overlap in the cases listed under the polling table
+- `workflow_dispatch` and `/review` allow manual triggers for urgent reviews
+- One poller run covers all PRs, so retries and fork PRs do not add per-PR runs
 - **Cron caveat:** GitHub Actions `schedule` is best-effort — actual interval may be 5–25 min during platform congestion. This is acceptable since review latency is not user-facing.
 
 ### Stale Timeout Rationale (30 minutes / 2 hours)
@@ -122,7 +133,7 @@ The scheduled poller runs on `schedule` events (base repo context), so it has fu
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│  Cron: every 5 minutes (schedule) / manual (workflow_dispatch)       │
+│  Cron every 5 min / same-repo pull_request / manual / /review        │
 └───────────────────────────┬─────────────────────────────────────────┘
                             │ polls open PRs
                             ▼
@@ -219,11 +230,11 @@ When explicitly requested:
 
 ## Dedup & Performance
 
-The scheduled polling model inherently deduplicates reviews:
+The poller deduplicates reviews through commit status, with an agent-side SHA check as a second layer:
 
 ### Primary Dedup: Status-Based Gating
 
-The poller checks HEAD commit status before triggering. If status is a fresh `pending` (within the creator-specific window in the polling table above), the PR is skipped, so the poller starts at most one review per SHA within the stale window (best effort; see the note under the polling table). Rapid pushes between polls simply update HEAD; only the latest SHA is reviewed on next poll.
+The poller checks HEAD commit status before triggering. If status is a fresh `pending` (within the creator-specific window in the polling table above), the PR is skipped, so the poller starts at most one review per SHA within the stale window (best effort; see the note under the polling table). Each same-repo push also starts a poller run. The shared concurrency group cancels an in-flight run when a newer one starts, but a webhook that was already sent cannot be recalled, so a push burst can trigger one review per pushed SHA. The agent-side SHA check below skips the ones that are no longer HEAD.
 
 ### Agent-Side SHA Validation (Belt-and-Suspenders)
 
@@ -238,7 +249,7 @@ This prevents wasting API tokens and reviewer compute on commits that are no lon
 
 ### Cost Impact
 
-Without dedup, N rapid pushes could trigger N full reviews (~5 LLM calls each for angle-based delegation). With both layers active, at most 1 review runs per push burst.
+Without dedup, N rapid pushes could trigger N full reviews (~5 LLM calls each for angle-based delegation). With both layers active, the poller triggers at most one review per SHA, and the agent skips any SHA that is no longer HEAD when it starts, so a push burst usually costs one full review plus a few short "superseded" replies.
 
 ## Implementation Plan
 
@@ -248,7 +259,7 @@ Without dedup, N rapid pushes could trigger N full reviews (~5 LLM calls each fo
 >
 > Refer to the workflow file for the current implementation. Key design points:
 
-- **Trigger:** `schedule` (cron `*/5 * * * *`) + `workflow_dispatch` for manual runs
+- **Trigger:** `pull_request` (same-repo PRs, opened/synchronize/reopened) + `schedule` (cron `*/5 * * * *`) + `workflow_dispatch` for manual runs + `issue_comment` for maintainer `/review` commands
 - **Polling logic:** iterates all open PRs, checks HEAD commit status, skips if `pending` (fresh, per the creator-specific window in the polling table), `success`, or `failure`
 - **Guard condition:** skips drafts, untrusted authors, and PRs with `review-limit-reached` label
 - **Steps:** poll open PRs → for each eligible PR: circuit breaker check → set pending status → trigger Discord webhook → error fallback on failure
@@ -308,7 +319,7 @@ Add `OpenAB PR Review` as a required status check in branch protection rules. Th
 - Minimal secrets — only one webhook URL needed in GitHub Secrets
 
 **Negative:**
-- Up to 5-min latency before review starts (GitHub cron is best-effort, may lag further under load)
+- Fork PRs and retries wait for the next scheduled poll, up to 5 min (GitHub cron is best-effort, may lag further under load)
 - If OpenAB agent is down, status stays "pending" until stale timeout re-triggers (30 min if no coordinator took the round, 2 h if one did)
 - Webhook messages lack user identity — OpenAB must allow webhook-originated messages
 - Fork PRs: `pull_request` runs triggered by a fork get no secrets and a read-only `GITHUB_TOKEN` (GitHub security policy), so the workflow skips the event-driven path for fork PRs instead of failing. The scheduled poller and the maintainer `/review` command run in the base repository with secrets and a write token, so fork PRs from trusted authors (or labeled `safe-to-review`) are still reviewed by the poller on its next run. A maintainer can also comment `/review` for an immediate review; this checks only the commenter's association, so it bypasses the PR-author gate by design (the maintainer is asserting the diff is safe). Note: the `safe-to-review` label does **not** grant secrets to fork-triggered runs — it only bypasses the poller's `author_association` gate.
