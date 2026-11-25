@@ -138,7 +138,6 @@ FROM base-node AS claude
 ARG CLAUDE_AGENT_ACP_VERSION=0.84.0
 ARG CLAUDE_CODE_VERSION=2.1.284
 RUN npm install -g @agentclientprotocol/claude-agent-acp@${CLAUDE_AGENT_ACP_VERSION} @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} --retry 3
-ENV CLAUDE_CODE_EXECUTABLE=/usr/local/bin/claude
 ENV HOME=/home/node
 WORKDIR /home/node
 COPY --from=builder --chown=node:node /build/target/release/openab /usr/local/bin/openab

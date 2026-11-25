@@ -76,6 +76,26 @@ jobs:
           [ "$actual" = "v$expected" ] || { echo "::error::Node.js version mismatch: expected v$expected ($arg), got $actual"; exit 1; }
           echo "✅ Node.js $actual"
 
+      - name: Verify claude-agent-acp uses the pinned Claude Code CLI
+        if: matrix.variant.suffix == '-claude'
+        run: |
+          # claude-agent-acp runs the native binary of its own
+          # @anthropic-ai/claude-agent-sdk dependency unless CLAUDE_CODE_EXECUTABLE
+          # is set. OpenAB clears the agent environment before spawning
+          # (env_clear in crates/openab-core/src/acp/connection.rs), so a Docker
+          # ENV never reaches it. This checks the default image with an empty
+          # environment and no CLAUDE_CODE_EXECUTABLE; it does not model
+          # [agent].env or inherit_env. The CLI the adapter runs must match
+          # CLAUDE_CODE_VERSION, so CLAUDE_AGENT_ACP_VERSION must be bumped to a
+          # release whose SDK ships that Claude Code version.
+          CLAUDE_CODE_VERSION=$(awk -F= '$1 == "ARG CLAUDE_CODE_VERSION" {print $2; exit}' Dockerfile.claude)
+          test -n "$CLAUDE_CODE_VERSION"
+          actual=$(docker run --rm --entrypoint env openab-test-claude -i \
+            HOME=/home/node PATH=/usr/local/bin:/usr/bin:/bin USER=node \
+            claude-agent-acp --cli --version)
+          echo "claude-agent-acp --cli --version: $actual"
+          [ "${actual%% *}" = "$CLAUDE_CODE_VERSION" ] || { echo "::error::claude-agent-acp runs Claude Code '$actual', expected $CLAUDE_CODE_VERSION (CLAUDE_CODE_VERSION)"; exit 1; }
+
       - name: Verify Codex runtime versions
         if: matrix.variant.suffix == '-codex'
         run: |
@@ -272,6 +292,13 @@ jobs:
           mimo_pin=$(grep -m1 '^ARG MIMOCODE_VERSION=' Dockerfile.unified) || { echo "::error::MIMOCODE_VERSION is not pinned in Dockerfile.unified" >&2; exit 1; }
           [[ "$mimo_pin" =~ ^ARG\ MIMOCODE_VERSION=[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Dockerfile.unified must pin a full MiMo-Code version (got '$mimo_pin')" >&2; exit 1; }
           assert_line "$mimo_pin" Dockerfile.mimocode Dockerfile.package
+          # Claude pins: Dockerfile.unified is the reference. Dockerfile.package
+          # has no runtime smoke test, so a partial bump must fail here.
+          for arg in CLAUDE_AGENT_ACP_VERSION CLAUDE_CODE_VERSION; do
+            pin=$(grep -m1 "^ARG $arg=" Dockerfile.unified) || { echo "::error::$arg is not pinned in Dockerfile.unified" >&2; exit 1; }
+            [[ "$pin" =~ ^ARG\ [A-Z_]+=[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::Dockerfile.unified must pin a full $arg (got '$pin')" >&2; exit 1; }
+            assert_line "$pin" Dockerfile.claude Dockerfile.package
+          done
           assert_line 'ENV AGY_VERSION=1.2.13' Dockerfile.antigravity Dockerfile.unified Dockerfile.final Dockerfile.ci
           assert_line 'ARG AGY_VERSION=1.2.13' Dockerfile.package
           assert_line 'ENV AGY_VERSION="${AGY_VERSION}"' Dockerfile.package
