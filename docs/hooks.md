@@ -65,9 +65,8 @@ Layer 1 (first)  ─── base layer
 
 ### Safety
 
-- **Integrity verification**: two layers of protection:
-  1. **S3-native checksum (automatic)**: if the object was uploaded with `--checksum-algorithm SHA256`, OpenAB automatically verifies it on download — no config needed
-  2. **User-provided `sha256s` (optional)**: explicit checksums in config for additional defense-in-depth
+- **Integrity verification**: only the S3-native checksum is checked:
+  1. **S3-native checksum (automatic)**: if S3 returns a SHA-256 checksum for the object (for example, it was uploaded with `--checksum-algorithm SHA256`), OpenAB verifies it on download — no config needed. If S3 returns no checksum, the download is **not verified**.
 - **Size cap**: downloads exceeding `max_bytes` are rejected before extraction
 - **Atomic extraction**: archives are first extracted to a temp directory, then moved into target — if extraction fails, target is not corrupted. Note: the move phase is per-file; if it fails mid-way with `on_failure = "warn"`, the target may be partially updated.
 - **Path traversal prevention**: zip uses `enclosed_name()`; tarball uses `unpack_in()` which rejects `..` escapes
@@ -97,7 +96,7 @@ Layer 1 (first)  ─── base layer
 
 ### Recommended: Enable S3 Checksums on Upload
 
-For automatic integrity verification without maintaining `sha256s` in config, upload zip archives with SHA-256 checksums enabled:
+For automatic integrity verification, upload zip archives with SHA-256 checksums enabled:
 
 ```bash
 # Upload with SHA-256 checksum (recommended)
@@ -107,9 +106,12 @@ aws s3 cp env.zip s3://my-bucket/env.zip --checksum-algorithm SHA256
 aws s3api head-object --bucket my-bucket --key env.zip --checksum-mode ENABLED
 ```
 
-When objects have S3-native SHA-256 checksums, OpenAB verifies them automatically on download — no `sha256s` config needed. This is the simplest path to integrity verification.
+When S3 returns a SHA-256 checksum for an object, OpenAB verifies it automatically on download. This is the only integrity check `pre_seed` performs.
 
-> **Note:** If `sha256s` is also provided in config, both checks run. The S3-native check uses the base64-encoded checksum from the `x-amz-checksum-sha256` response header. If neither is available, download proceeds without integrity verification (relies on IAM + bucket policy for trust).
+> **Note:** `pre_seed` has no checksum config field. The check uses the base64 checksum that S3 returns in the `x-amz-checksum-sha256` response header.
+>
+> - If S3 returns no checksum for an object, the download is **not verified**, and extraction proceeds. Trust then rests on IAM and the bucket policy.
+> - If S3 returns a multipart composite checksum (`<hash>-<N>`), the value cannot be base64-decoded and `pre_seed` **aborts**. See [tailscale.md](tailscale.md) for the upload options.
 
 ---
 
