@@ -12,9 +12,9 @@ The image installs `@agentclientprotocol/claude-agent-acp` and `@anthropic-ai/cl
 globally via npm. The global Claude Code CLI keeps `claude auth login` and
 `claude setup-token` available. The adapter does not use it: it runs the native
 Claude Code binary of its own `@anthropic-ai/claude-agent-sdk` dependency, which
-pins an exact Claude Code version (claude-agent-acp 0.84.0 ships Claude Code
-2.1.284). `CLAUDE_CODE_VERSION` is therefore kept equal to that version, so both
-copies match. When bumping either pin, bump the other to a matching release; the
+pins an exact Claude Code version (the SDK's `claudeCodeVersion`).
+`CLAUDE_CODE_VERSION` is therefore kept equal to that version, so both copies
+match. When bumping either pin, bump the other to a matching release; the
 Docker smoke test fails if the CLI the adapter runs differs from
 `CLAUDE_CODE_VERSION`.
 
