@@ -307,7 +307,7 @@ hooks.pre_seed failed (on_failure=abort) layer=5 error=hooks.pre_seed: invalid b
 aws s3 cp tailscale-bin.tar.gz s3://my-bucket/shared/tailscale-bin.tar.gz
 ```
 
-If you need integrity verification, use the `sha256s` field in `[hooks.pre_seed]` config instead of relying on S3-native checksums for archives that will be multipart-uploaded.
+With this upload, `pre_seed` does not verify the download. It checks only the SHA-256 value that S3 returns, and it skips the check when S3 returns none (`crates/openab-core/src/pre_seed.rs:118`, `:135-146`). This page does not document a verified way to keep checksum verification for an archive of this size.
 
 ## Gotcha: `pre_seed` max 5 sources
 
