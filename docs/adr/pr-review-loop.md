@@ -52,7 +52,9 @@ allow_bot_messages = "mentions"
 
 Without this, the webhook @mention will be ignored and reviews will never trigger.
 
-## Amendment: Reactive → Scheduled Polling (2026-06-18)
+## Amendment: Reactive → Scheduled Polling, Plus Event and Manual Triggers (2026-06-18; amended 2026-06-27, 2026-07-16)
+
+The 2026-06-18 amendment (#1145) replaced the reactive trigger with scheduled polling. The same-repo `pull_request` trigger was restored on 2026-06-27 (#1218, #1219), and the `/review` slash command was added on 2026-07-16 (#1412).
 
 ### Problem with Reactive Mode
 
@@ -135,18 +137,18 @@ The scheduled poller runs on `schedule` events (base repo context), so it has fu
 ┌─────────────────────────────────────────────────────────────────────┐
 │  Cron every 5 min / same-repo pull_request / manual / /review        │
 └───────────────────────────┬─────────────────────────────────────────┘
-                            │ polls open PRs
+                            │ polls open PRs (/review: only that PR, FORCE=1)
                             ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │  GitHub Action (.github/workflows/pr-bot-review.yml)                │
 │                                                                     │
-│  For each eligible PR:                                              │
+│  For each eligible PR (/review: only its own PR, FORCE=1):          │
 │  1. Check HEAD commit status for "OpenAB PR Review"                 │
-│     - pending by coordinator (< 2 h) → SKIP (round owned)           │
-│     - pending by coordinator (≥ 2 h) → TRIGGER (crashed)            │
+│     - pending by coordinator (< 2 h; /review: < 30 min) → SKIP      │
+│     - pending by coordinator (≥ 2 h; /review: ≥ 30 min) → TRIGGER   │
 │     - other pending (< 30 min) → SKIP (webhook just sent)           │
 │     - other pending (≥ 30 min) → TRIGGER (stale)                    │
-│     - success / failure → SKIP (already reviewed this SHA)          │
+│     - success / failure → SKIP (/review: TRIGGER, re-review)        │
 │     - error / none → TRIGGER                                        │
 │                                                                     │
 │  2. POST /repos/{owner}/{repo}/statuses/{sha}                       │
