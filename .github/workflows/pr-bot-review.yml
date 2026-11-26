@@ -36,11 +36,13 @@ jobs:
     # schedule/workflow_dispatch always run; same-repo PRs run on the event.
     # issue_comment runs only for "/review" comments on PRs from maintainers
     # (OWNER/MEMBER/COLLABORATOR) — comment body is never interpolated into
-    # shell, only the numeric issue number is used.
+    # shell, only the numeric issue number is used. The comment must be
+    # exactly "/review" (case-insensitive), so "/reviewer", "/review please"
+    # or prose that starts with "/review" does not trigger a forced review.
     if: >-
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request &&
-       startsWith(github.event.comment.body, '/review') &&
+       github.event.comment.body == '/review' &&
        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
       (github.event_name != 'issue_comment' &&
        (github.event_name != 'pull_request' ||
