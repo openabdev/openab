@@ -82,7 +82,7 @@ on:
 - `pull_request`: runs the poller as soon as a same-repo PR is opened or pushed. Fork PRs are skipped on this path because their `GITHUB_TOKEN` is read-only (see Negative).
 - `schedule`: the sweep. It picks up fork PRs, PRs whose event run failed or was cancelled, and stale `pending` statuses.
 - `workflow_dispatch`: manual run of the poller.
-- `issue_comment`: a maintainer `/review` comment triggers a targeted review of that one PR.
+- `issue_comment`: a maintainer comment that is exactly `/review` triggers a targeted review of that one PR.
 
 The `pull_request`, `schedule` and `workflow_dispatch` paths all run the same poller over every open PR, and all of them rely on the status gating below to avoid duplicate reviews.
 
