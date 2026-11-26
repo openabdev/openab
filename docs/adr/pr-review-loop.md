@@ -135,7 +135,7 @@ The scheduled poller runs on `schedule` events (base repo context), so it has fu
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│  Cron every 5 min / same-repo pull_request / manual / /review        │
+│  Cron every 5 min / same-repo pull_request / manual / /review       │
 └───────────────────────────┬─────────────────────────────────────────┘
                             │ polls open PRs (/review: only that PR, FORCE=1)
                             ▼
