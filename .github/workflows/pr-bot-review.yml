@@ -38,7 +38,9 @@ jobs:
     # (OWNER/MEMBER/COLLABORATOR) — comment body is never interpolated into
     # shell, only the numeric issue number is used. "/review" must be the
     # whole first word: alone, or followed by a space or line break, so
-    # "/reviewer" or "/reviewanything" does not match.
+    # "/reviewer" or "/reviewanything" does not match. The LF/CR prefixes use
+    # fromJSON because expression string literals have no escape sequences:
+    # '/review\n' is a literal backslash-n and would never match a newline.
     if: >-
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request &&

@@ -215,7 +215,7 @@ When explicitly requested:
 
 1. Agent fixes the code directly on the PR branch
 2. Commits and pushes the fix
-3. The new SHA has no status → next poll cycle triggers a new review
+3. The new SHA has no status → the same-repo `pull_request` event triggers a new review immediately (the next scheduled poll is the fallback)
 4. Repeat until LGTM or max iterations reached
 
 ### Safeguards
